@@ -1,3 +1,5 @@
+import hashlib
+
 from triton.backends.compiler import BaseBackend, GPUTarget
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -22,6 +24,10 @@ class SpyreOptions:
         # Normalize list → tuple for hashability / dataclass equality.
         if isinstance(self.grid, list):
             self.grid = tuple(self.grid)
+
+    def hash(self):
+        key = "_".join(f"{name}-{val}" for name, val in sorted(self.__dict__.items()))
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 class SpyreBackend(BaseBackend):
