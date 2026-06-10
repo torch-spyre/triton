@@ -1481,6 +1481,21 @@ LogicalResult GatherOp::inferReturnTypes(
   return success();
 }
 
+// --- START --- added for spyre
+// tt.descriptor_gather / tt.descriptor_scatter accept rank-N source
+// blocks (rank >= 2) — the original rank-2-exact rule, the TMA min-cols
+// rule, and the single-dim cols-match check are loosened or removed
+// below. The leading "block.shape[0] == 1" rule is the load-bearing
+// gather contract and stays enforced.
+//
+// TODO: re-tighten the relaxation behind a Spyre-only module
+// attribute. The attribute would have to be stamped at
+// module-creation time — earlier than `_make_ttir`, since the
+// verifier fires during Triton frontend op construction in
+// `code_generator.py`, before any pass runs. Until that hook exists
+// the relaxation is unconditional.
+// --- END --- added for spyre
+
 // -- DescriptorGatherOp
 static LogicalResult verifyGatherScatterResultType(Operation *op,
                                                    ShapedType resultType,
@@ -1488,8 +1503,8 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
   if (indicesType.getRank() != 1)
     return op->emitOpError("x offsets must be a 1D tensor, but got ")
            << indicesType;
-  if (resultType.getRank() != 2)
-    return op->emitOpError("result must be a 2D tensor, but got ")
+  if (resultType.getRank() < 2)                          // --- changed for spyre: was != 2
+    return op->emitOpError("result must be at least 2D, but got ")
            << resultType;
 
   // The swizzling of TMA accesses matches that of the MMAv3 shared memory
@@ -1504,11 +1519,13 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
   if (dtype.getIntOrFloatBitWidth() > 32)
     return op->emitOpError("TMA dtype cannot be greater than 32 bits");
 
-  unsigned minCols = 32 / dtype.getIntOrFloatBitWidth() * 8;
-  if (unsigned cols = resultType.getShape()[1]; cols < minCols) {
-    return op->emitOpError("must have at least ")
-           << minCols << " columns for " << dtype << ", but got " << cols;
-  }
+  // --- changed for spyre: TMA min-cols check removed.
+  // The original rule rejected `result.shape[1] < 32 / bitwidth * 8`.
+  // It enforces an NVIDIA TMA-specific minimum that Spyre does not
+  // lower through; for N-D gather, dim 1 is often legitimately small
+  // (e.g. 1, when y_offset selects a single head). Non-Spyre targets
+  // rejecting tt.descriptor_gather happens at their lowering pass
+  // instead.
 
   if (resultType.getShape()[0] != indicesType.getShape()[0]) {
     return op->emitOpError("result tensor must have as many rows as indices (")
@@ -1521,9 +1538,11 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
 LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
                                     ShapedType resultType,
                                     ShapedType indicesType) {
-  // Gather from `!tt.tensordesc<1xMxdtype>`.
-  if (blockType.getRank() != 2) {
-    return op->emitOpError("descriptor block must be a 2D tensor, but got ")
+  // Gather from `!tt.tensordesc<1x...xdtype>`. Block rank must be >= 2
+  // (--- changed for spyre: was != 2); the leading 1 is the gather
+  // contract and stays enforced below.
+  if (blockType.getRank() < 2) {
+    return op->emitOpError("descriptor block must be at least 2D, but got ")
            << blockType;
   }
   if (blockType.getShape()[0] != 1) {
@@ -1535,9 +1554,19 @@ LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
   if (failed(verifyGatherScatterResultType(op, resultType, indicesType)))
     return failure();
 
-  if (resultType.getShape()[1] != blockType.getShape()[1]) {
-    return op->emitOpError("result tensor number of columns must match block (")
-           << blockType.getShape()[1] << "), but got " << resultType;
+  // --- changed for spyre: generalised the original single-dim check
+  // (`result.shape[1] == block.shape[1]`) to a per-dim loop over
+  // `block.shape[1:]` so the cols-match invariant holds at any rank.
+  if (blockType.getRank() != resultType.getRank()) {
+    return op->emitOpError("result tensor rank must match block rank (")
+           << blockType.getRank() << "), but got " << resultType;
+  }
+  for (int i = 1; i < blockType.getRank(); ++i) {
+    if (resultType.getShape()[i] != blockType.getShape()[i]) {
+      return op->emitOpError("result tensor dim ")
+             << i << " must match block (" << blockType.getShape()[i]
+             << "), but got " << resultType;
+    }
   }
   if (resultType.getElementType() != blockType.getElementType()) {
     return op->emitOpError("result tensor element type must match block (")

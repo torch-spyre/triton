@@ -934,54 +934,688 @@ class TestDescriptorGather(LowerDescMemoryTester):
 
 
 # =========================================================================
-# tt.descriptor_gather — N-D block (not yet supported, tracking gap)
+# tt.descriptor_gather — N-D block (Spyre extension)
 # =========================================================================
 
 class TestDescriptorGatherND(LowerDescMemoryTester):
-    # tt.descriptor_gather requires a 2D block type today.  A 3D block
-    # (e.g. <1x16x128xf16>) would express paged-attention style gather:
-    #   BT_v = block_table.reshape(batch * num_pages)   # flat index buffer
-    #   K_cache shape: (max_pages, block_size, dim)
-    #   result = K_cache.gather(BT_v, 0)               # -> (batch*num_pages, block_size, dim)
-    # The verifier rejects this today — tracked here so the gap is visible.
+    # N-D ``tt.descriptor_gather`` accepts rank ≥ 2 source blocks.
+    # ``buildGatherSubscriptMaps`` / ``buildIndirectAccessTile`` produce
+    # one indirect map on dim 0 (``c_x + d_0``), one direct map with
+    # ``y_offset`` on dim 1 (``c_y + d_1``), and a plain ``d_i`` direct
+    # map for every dim ``i ∈ [2, rank)``.  The ``IntegerSet`` covers
+    # the full result shape; the order is identity over rank.
+    #
+    # Tests:
+    #   test_gather_3d_lowered    — rank-3 block, one indirect dim + two direct
+    #   test_gather_4d_lowered    — rank-4 block, indirect dim + group dim + two direct
+    #   test_gather_5d_lowered    — rank-5 block, stickified inner dim
+    #   test_scatter_3d_lowered   — scatter mirror of the rank-3 case
 
-    @pattern("descriptor-gather-nd", category="memory", negative=True, example=[
-        "# NOT supported: descriptor_gather with N-D block (rank > 2)",
-        "# Paged attention pattern — block table drives the indirect dim,",
-        "# remaining dims tile over (block_size, head_dim):",
-        "k_desc = tl.make_tensor_descriptor(k_cache_ptr, [...], block_shape=[1, block_size, dim])",
-        "result = tl.descriptor_gather(k_desc, BT_v, head_offset)",
-        "# → tensor<num_pages x block_size x dim x f16>  (3D result, not yet supported)",
+    @pattern("descriptor-gather-nd", category="memory", example=[
+        "# rank-3 N-D indirect-access gather (Spyre extension):",
+        "src_desc = tl.make_tensor_descriptor(src_ptr, [NUM_BLOCKS, BLOCK_SIZE, INNER_DIM], ...,",
+        "                                     block_shape=[1, BLOCK_SIZE, INNER_DIM])",
+        "result = tl.descriptor_gather(src_desc, indices, 0)",
+        "# → tensor<32 x BLOCK_SIZE x INNER_DIM x f16>  (3D result; one indirect axis,",
+        "#                                                two direct dims with no offset)",
     ])
-    def test_gather_nd_block_rejected(self, capfd):
-        """3D block type is rejected by verifyGatherScatterOp.
+    def test_gather_3d_lowered(self):
+        """Rank-3 ``tt.descriptor_gather`` lowers cleanly.
 
-        ``<1x16x128xf16>`` has rank 3; the verifier requires exactly rank 2.
-        This is the gap that prevents paged-attention style N-D gather:
-        the block table lookup could drive the outermost indirect dimension,
-        with the remaining dims iterating over (block_size, head_dim).
-        Caught during ``ir.parse_mlir_module`` (verifier runs at parse time).
+        Block shape ``<1 x BLOCK_SIZE x INNER_DIM>`` (the source tensor is
+        ``NUM_BLOCKS x BLOCK_SIZE x INNER_DIM``). Indices drive dim 0 (block id);
+        ``y_offset`` lands on dim 1 (in-block row); dim 2 (the contiguous inner
+        dim) is direct with no offset.
+
+        Subscript-map shape after lowering:
+          dim 0 (indirect): c_x + d_0
+          dim 1 (direct):   c_y + d_1
+          dim 2 (direct):           d_2
+
+        The full iteration space is ``0 ≤ d_0 < 32, 0 ≤ d_1 < 16, 0 ≤ d_2 < 128``.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {
+            %P = arith.constant 1024 : i32     // NUM_BLOCKS
+            %B = arith.constant 16   : i32     // BLOCK_SIZE
+            %D = arith.constant 128  : i32     // INNER_DIM
+            %s0 = arith.constant 2048 : i64    // block stride = BLOCK_SIZE * INNER_DIM
+            %s1 = arith.constant 128  : i64    // row stride   = INNER_DIM
+            %s2 = arith.constant 1    : i64
+            %idx_count  = arith.constant 32 : i32
+            %idx_stride = arith.constant 1  : i64
+            %c0_i32     = arith.constant 0  : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%P, %B, %D], [%s0, %s1, %s2]
+                : <f16>, <1x16x128xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x16x128xf16>, tensor<32xi32>, i32) -> tensor<32x16x128xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_indirect_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_gather")
+        self.assert_absent("unrealized_conversion_cast")
+        self.assert_count("ktdp.construct_memory_view", 2, cmp="eq")
+        self.assert_result("ktdp.construct_memory_view",
+                           shape=[1024, 16, 128], elem_type="f16")
+        # variables_space_set: 3 dims × 2 inequalities each = 6 constraints.
+        self.assert_integer_set("ktdp.construct_indirect_access_tile",
+                                "variables_space_set",
+                                num_dims=3, num_symbols=0, num_constraints=6)
+        # Result tile is the rank-3 N-D-gather shape.
+        self.assert_result("ktdp.load", shape=[32, 16, 128], elem_type="f16")
+
+    @pattern("descriptor-gather-4d", category="memory", example=[
+        "# rank-4 N-D indirect-access gather with a group dim:",
+        "src_desc = tl.make_tensor_descriptor(",
+        "    src_ptr,",
+        "    shape=[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM],   # groups at dim 1",
+        "    strides=[..., INNER_DIM, NUM_GROUPS*INNER_DIM, 1],",
+        "    block_shape=[1, 1, BLOCK_SIZE, INNER_DIM])",
+        "result = tl.descriptor_gather(src_desc, indices, group_idx)",
+    ])
+    def test_gather_4d_lowered(self):
+        """Rank-4 gather: indirect dim plus a group dim that takes the y_offset.
+
+        The descriptor's group axis is permuted to dim 1 so the single
+        ``y_offset = group_idx`` lands there; dims 2 and 3 (the inner
+        ``BLOCK_SIZE`` and ``INNER_DIM`` axes) are direct with no offset.
+        Pins that the lowering handles a rank > 3 result block where the
+        indirect axis is on dim 0 and exactly one direct axis carries an
+        offset.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %group_idx: i32) {
+            %P = arith.constant 64  : i32     // NUM_BLOCKS
+            %H = arith.constant 8   : i32     // NUM_GROUPS (permuted to dim 1)
+            %B = arith.constant 16  : i32     // BLOCK_SIZE
+            %D = arith.constant 128 : i32     // INNER_DIM
+            // Strides over the permuted shape; physical layout is row-major
+            // [NUM_BLOCKS, BLOCK_SIZE, NUM_GROUPS, INNER_DIM]:
+            %s0 = arith.constant 16384 : i64  // block stride = B*H*D
+            %s1 = arith.constant 128   : i64  // group stride = D    (non-monotone)
+            %s2 = arith.constant 1024  : i64  // row   stride = H*D
+            %s3 = arith.constant 1     : i64
+            %idx_count  = arith.constant 32 : i32
+            %idx_stride = arith.constant 1  : i64
+            %c0_i32     = arith.constant 0  : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %indices = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr,
+                        [%P, %H, %B, %D], [%s0, %s1, %s2, %s3]
+                : <f16>, <1x1x16x128xf16>
+            %data = tt.descriptor_gather %desc[%indices, %group_idx]
+                : (!tt.tensordesc<1x1x16x128xf16>, tensor<32xi32>, i32)
+                  -> tensor<32x1x16x128xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_indirect_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_gather")
+        self.assert_absent("unrealized_conversion_cast")
+        # variables_space_set: 4 dims × 2 = 8 constraints.
+        self.assert_integer_set("ktdp.construct_indirect_access_tile",
+                                "variables_space_set",
+                                num_dims=4, num_symbols=0, num_constraints=8)
+        self.assert_result("ktdp.load", shape=[32, 1, 16, 128], elem_type="f16")
+
+    @pattern("descriptor-gather-5d", category="memory", example=[
+        "# rank-5 N-D indirect-access gather with a stickified inner dim:",
+        "src_desc = tl.make_tensor_descriptor(",
+        "    src_ptr,",
+        "    shape=[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, NUM_STICKS, STICK_SIZE],",
+        "    block_shape=[1, 1, BLOCK_SIZE, NUM_STICKS, STICK_SIZE])",
+        "result = tl.descriptor_gather(src_desc, indices, group_idx)",
+    ])
+    def test_gather_5d_lowered(self):
+        """Rank-5 gather: indirect dim, group dim, and a split (stickified) inner dim.
+
+        Group axis permuted to dim 1 (takes the ``y_offset = group_idx``);
+        ``BLOCK_SIZE`` at dim 2; the trailing contiguous dim is split
+        across dim 3 (``NUM_STICKS``, the stick group) and dim 4
+        (``STICK_SIZE``, the within-stick offset). Endpoint coverage for
+        the relaxed rank range — a regression that silently dropped
+        trailing dims would surface here.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %group_idx: i32) {
+            %P  = arith.constant 64  : i32    // NUM_BLOCKS
+            %H  = arith.constant 8   : i32    // NUM_GROUPS
+            %B  = arith.constant 16  : i32    // BLOCK_SIZE
+            %S  = arith.constant 2   : i32    // NUM_STICKS
+            %SE = arith.constant 64  : i32    // STICK_SIZE  (INNER_DIM = NUM_STICKS*STICK_SIZE = 128)
+            %s0 = arith.constant 16384 : i64
+            %s1 = arith.constant 128   : i64
+            %s2 = arith.constant 1024  : i64
+            %s3 = arith.constant 64    : i64
+            %s4 = arith.constant 1     : i64
+            %idx_count  = arith.constant 32 : i32
+            %idx_stride = arith.constant 1  : i64
+            %c0_i32     = arith.constant 0  : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %indices = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr,
+                        [%P, %H, %B, %S, %SE], [%s0, %s1, %s2, %s3, %s4]
+                : <f16>, <1x1x16x2x64xf16>
+            %data = tt.descriptor_gather %desc[%indices, %group_idx]
+                : (!tt.tensordesc<1x1x16x2x64xf16>, tensor<32xi32>, i32)
+                  -> tensor<32x1x16x2x64xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_indirect_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_gather")
+        self.assert_integer_set("ktdp.construct_indirect_access_tile",
+                                "variables_space_set",
+                                num_dims=5, num_symbols=0, num_constraints=10)
+        self.assert_result("ktdp.load", shape=[32, 1, 16, 2, 64], elem_type="f16")
+
+    @pattern("descriptor-scatter-nd", category="memory", example=[
+        "# rank-3 scatter mirror of test_gather_3d_lowered.",
+        "tl.descriptor_scatter(dst_desc, indices, y_offset, value)",
+    ])
+    def test_scatter_3d_lowered(self):
+        """Rank-3 scatter mirror — same machinery via ``ConvertDescriptorScatter``.
+
+        Confirms the lowering's N-D generalisation applies symmetrically
+        to writes.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32,
+                     %src: tensor<32x16x128xf16>) {
+            %P = arith.constant 1024 : i32
+            %B = arith.constant 16   : i32
+            %D = arith.constant 128  : i32
+            %s0 = arith.constant 2048 : i64
+            %s1 = arith.constant 128  : i64
+            %s2 = arith.constant 1    : i64
+            %idx_count  = arith.constant 32 : i32
+            %idx_stride = arith.constant 1  : i64
+            %c0_i32     = arith.constant 0  : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%P, %B, %D], [%s0, %s1, %s2]
+                : <f16>, <1x16x128xf16>
+            tt.descriptor_scatter %desc[%x_offsets, %y_offset], %src
+                : !tt.tensordesc<1x16x128xf16>, tensor<32xi32>, i32, tensor<32x16x128xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_indirect_access_tile", "ktdp.store")
+        self.assert_absent("tt.descriptor_scatter")
+        self.assert_integer_set("ktdp.construct_indirect_access_tile",
+                                "variables_space_set",
+                                num_dims=3, num_symbols=0, num_constraints=6)
+
+    @pattern("descriptor-gather-nd-subscripts", category="memory", example=[
+        "# Subscript layout pinned at rank 3:",
+        "#   dim 0 (page)  : indirect, captures x_offset → ind(idx[c_x + d0])",
+        "#   dim 1 (token) : direct,   captures y_offset → c_y + d1",
+        "#   dim 2 (head)  : direct,   NO capture        → d2  (full extent)",
+        "#",
+        "# Limitation pinned: only dim 0 can be indirect; only dim 1 can",
+        "# carry y_offset. Trailing dims always read the full block extent.",
+    ])
+    def test_gather_3d_subscript_kinds_pin_offset_axis(self):
+        """Pin the dim 0 / dim 1 / dim ≥ 2 role split — the headline N-D limitation.
+
+        At every rank ≥ 2 the lowering encodes exactly two "movable"
+        axes: dim 0 (indirect, fed by the index buffer) and dim 1
+        (direct, offset by ``y_offset``).  Every dim ``i ≥ 2`` is a
+        bare ``d_i`` — no offset, no capture, the kernel reads the
+        block's full extent on that axis with no ability to slice.
+
+        That asymmetry is the most kernel-author-visible consequence
+        of the relaxed verifier: at rank 2 it didn't matter (there
+        was no dim ≥ 2), at rank 3+ it constrains every kernel that
+        wants more than one offset axis or wants to gather along
+        anything other than the outermost axis.
+
+        Without pinning the textual form of ``subscript_kinds`` and
+        ``subscript_maps`` here, a regression that emitted, say, a
+        second indirect axis or a captured ``c_y`` on a trailing dim
+        would slip past the existing rank-3 structural counts (which
+        only check ``num_dims`` / ``num_constraints`` on
+        ``variables_space_set``).
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {
+            %P = arith.constant 1024 : i32
+            %B = arith.constant 16   : i32
+            %D = arith.constant 128  : i32
+            %s0 = arith.constant 2048 : i64
+            %s1 = arith.constant 128  : i64
+            %s2 = arith.constant 1    : i64
+            %idx_count  = arith.constant 32 : i32
+            %idx_stride = arith.constant 1  : i64
+            %c0_i32     = arith.constant 0  : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%P, %B, %D], [%s0, %s1, %s2]
+                : <f16>, <1x16x128xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x16x128xf16>, tensor<32xi32>, i32) -> tensor<32x16x128xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_indirect_access_tile")
+
+        # The custom printer for ``construct_indirect_access_tile`` writes
+        # the per-dim subscripts directly inline rather than as a
+        # ``subscript_kinds = [...]`` attribute list.  The printed form
+        # (single-line, simplified):
+        #
+        #   ktdp.construct_indirect_access_tile
+        #       intermediate_variables(%d0, %d1, %d2)
+        #       %view[ind(%idx[%xoff + %d0]), (%yoff + %d1), (%d2)]
+        #
+        # The kind is encoded by the leading token of each subscript:
+        #   - ``ind(...)`` → indirect (kindTrue)
+        #   - bare ``(...)`` → direct (kindFalse)
+        text = str(self.mod)
+        m = re.search(
+            r"ktdp\.construct_indirect_access_tile([\s\S]*?)\{",
+            text,
+        )
+        assert m, (
+            f"expected a `ktdp.construct_indirect_access_tile` op in:\n{text}"
+        )
+        head = m.group(1)
+
+        # Extract the bracketed subscript list: everything between the
+        # outermost `[` and its matching `]`. We can't use a simple regex
+        # because each subscript itself contains `[...]`, so walk the
+        # string and balance brackets manually.
+        lo = head.find("[")
+        assert lo >= 0, f"no `[...]` subscript list found:\n{head}"
+        depth = 0
+        hi = -1
+        for i, ch in enumerate(head[lo:], start=lo):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    hi = i
+                    break
+        assert hi > lo, f"unbalanced brackets in subscript list:\n{head}"
+        subscripts_blob = head[lo + 1:hi]
+
+        # Split the top-level subscript list on commas that are NOT
+        # inside a nested `[...]` (the inner bracket pair on the
+        # indirect dim).
+        subscripts = []
+        depth = 0
+        last = 0
+        for i, ch in enumerate(subscripts_blob):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                subscripts.append(subscripts_blob[last:i].strip())
+                last = i + 1
+        subscripts.append(subscripts_blob[last:].strip())
+
+        assert len(subscripts) == 3, (
+            f"rank-3 indirect tile must have 3 subscripts; got {len(subscripts)}: "
+            f"{subscripts}\nin:\n{head}"
+        )
+
+        # Dim 0: the *only* indirect axis. Must start with `ind(`.
+        assert subscripts[0].startswith("ind("), (
+            "rank-3: dim 0 must be the indirect axis (`ind(...)`); "
+            f"got `{subscripts[0]}`\nin:\n{head}"
+        )
+        # And must capture x_offset — the printed form is
+        # `ind(<view>[<x_offset> + <iv0>])`, so the inner expression
+        # contains a ` + `.
+        assert " + " in subscripts[0], (
+            "rank-3: dim 0 indirect subscript must capture x_offset "
+            f"(form `ind(idx[<offset> + <iv>])`); got `{subscripts[0]}`"
+        )
+
+        # Dim 1: direct, captures y_offset → printed as `(<y_off> + <iv1>)`.
+        assert not subscripts[1].startswith("ind("), (
+            f"rank-3: dim 1 must NOT be indirect; got `{subscripts[1]}`"
+        )
+        assert " + " in subscripts[1], (
+            "rank-3: dim 1 direct subscript must capture y_offset "
+            f"(form `(<y_offset> + <iv>)`); got `{subscripts[1]}`"
+        )
+
+        # Dim 2: direct, NO capture → printed as bare `(<iv2>)`.
+        # This is the headline N-D limitation: trailing dims read full
+        # extent only.
+        assert not subscripts[2].startswith("ind("), (
+            f"rank-3: dim 2 must NOT be indirect; got `{subscripts[2]}`"
+        )
+        assert " + " not in subscripts[2], (
+            "rank-3: dim 2 must NOT capture an offset (the N-D lowering "
+            "supports at most one offset axis, on dim 1); got "
+            f"`{subscripts[2]}`"
+        )
+
+    @pattern("descriptor-gather-nd-permuted-strides", category="memory", example=[
+        "# Workaround for the dim-0-only-indirect rule:",
+        "# To gather along a logically-inner axis, permute the *strides*",
+        "# so the desired indirect axis becomes physical dim 0.",
+        "#",
+        "# Below: physical layout is [BLOCK_SIZE, NUM_BLOCKS, INNER_DIM]",
+        "# but the kernel author wants to gather over the NUM_BLOCKS axis,",
+        "# not BLOCK_SIZE. Solution: declare descriptor shape as",
+        "# [NUM_BLOCKS, BLOCK_SIZE, INNER_DIM] and pass strides",
+        "# [INNER_DIM, NUM_BLOCKS*INNER_DIM, 1]. Now",
+        "# `descriptor_gather(idx, y)` gathers over the block id.",
+    ])
+    def test_gather_3d_inner_axis_via_stride_permutation(self):
+        """Gathering a 'logically inner' physical axis via stride permutation.
+
+        The lowering wires the index buffer onto dim 0 of the descriptor
+        — there is no way to point it at any other dim.  Kernel authors
+        whose physical tensor stores the gathered axis in the middle or
+        at the end have one option: declare the descriptor's *shape*
+        with the gathered axis at dim 0, then express the original
+        physical layout through the *strides*.
+
+        The example here is a tensor laid out as
+        ``[BLOCK_SIZE, NUM_BLOCKS, INNER_DIM]`` (block-row-major rather
+        than block-id-major) but which the kernel still wants to
+        *gather* by block id.  The descriptor's shape is declared
+        ``[NUM_BLOCKS, BLOCK_SIZE, INNER_DIM]`` and the stride list is
+        ``[INNER_DIM, NUM_BLOCKS*INNER_DIM, 1]`` — the block-id-stride
+        is smaller than the block-row-stride, the inverse of the
+        outermost-block-id case.
+
+        From the lowering's perspective, nothing changes: it still
+        fans index ``i`` onto dim 0.  The trick is purely on the
+        kernel-author side, and the resulting access pattern is
+        identical to the outermost-block-id rank-3 gather.
+
+        Pins: lowering succeeds, view shape matches the *declared*
+        descriptor shape (not the physical layout), result tile
+        matches the gathered shape.  A regression that re-derived the
+        memory view from anything other than the descriptor's shape
+        operands would surface as a wrong view shape here.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {
+            // Declared shape exposes block ids as dim 0, even though the
+            // physical layout stores BLOCK_SIZE outermost.
+            %P  = arith.constant 1024 : i32     // NUM_BLOCKS (declared dim 0)
+            %B  = arith.constant 16   : i32     // BLOCK_SIZE (declared dim 1)
+            %D  = arith.constant 128  : i32     // INNER_DIM  (declared dim 2)
+            // Strides reflect the physical [BLOCK_SIZE, NUM_BLOCKS, INNER_DIM]:
+            //   block-id stride  = INNER_DIM              = 128
+            //   block-row stride = NUM_BLOCKS*INNER_DIM   = 1024 * 128 = 131072
+            //   inner stride     = 1
+            // Note: block-id stride < block-row stride, the *inverse* of
+            // the outermost-block-id layout used elsewhere.
+            %s0 = arith.constant 128    : i64
+            %s1 = arith.constant 131072 : i64
+            %s2 = arith.constant 1      : i64
+            %idx_count  = arith.constant 32 : i32
+            %idx_stride = arith.constant 1  : i64
+            %c0_i32     = arith.constant 0  : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%P, %B, %D], [%s0, %s1, %s2]
+                : <f16>, <1x16x128xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x16x128xf16>, tensor<32xi32>, i32) -> tensor<32x16x128xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_indirect_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_gather")
+        # Memory view shape comes from the *declared* shape operands —
+        # the physical-layout strides are recorded but do not influence
+        # the view's logical shape.
+        self.assert_result("ktdp.construct_memory_view",
+                           shape=[1024, 16, 128], elem_type="f16")
+        self.assert_result("ktdp.load", shape=[32, 16, 128], elem_type="f16")
+
+    @pattern("descriptor-gather-nd-trailing-one", category="memory", example=[
+        "# Block <1x1x128>: trailing dim 1 = 1 — newly legal.",
+        "# Pre-relaxation rejected two ways: rank != 2 and",
+        "# block.shape[1] < min_cols (TMA rule). Both gone.",
+        "src_desc = tl.make_tensor_descriptor(src_ptr, ..., block_shape=[1, 1, 128])",
+        "result = tl.descriptor_gather(src_desc, indices, y_offset)",
+    ])
+    def test_gather_3d_inner_dim_one_lowered(self):
+        """Block ``<1x1x128>``: a singleton at dim 1 is now legal.
+
+        A natural shape for an N-D gather where each indirectly-addressed
+        block contains exactly one row (so dim 1 collapses to size 1 and
+        only the trailing contiguous dim has interior extent).  Before
+        the rank-N relaxation, this was rejected for two unrelated
+        reasons:
+
+        * The descriptor was rank 3, and the verifier required rank 2.
+        * Even after relaxing rank, the TMA min-cols rule required
+          ``block.shape[1] >= 32 / bitwidth * 8`` — for ``f16`` that's
+          ``>= 16``, so ``block.shape[1] = 1`` was rejected.
+
+        Both rules are now gone for Spyre.  This test pins the
+        smallest-possible interior dim so a regression that
+        re-introduced the min-cols check (or that silently
+        rank-reduced the trailing 1 inside the lowering) would surface
+        immediately.
+
+        Coverage handover: the rank-3/4/5 ``test_gather_*_lowered``
+        tests already cover the structural shape of N-D gather; this
+        test specifically probes the *boundary* where dim 1 = 1, which
+        the old verifier would have rejected.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {
+            %P  = arith.constant 1024 : i32
+            %B  = arith.constant 16   : i32
+            %D  = arith.constant 128  : i32
+            %s0 = arith.constant 2048 : i64
+            %s1 = arith.constant 128  : i64
+            %s2 = arith.constant 1    : i64
+            %idx_count  = arith.constant 32 : i32
+            %idx_stride = arith.constant 1  : i64
+            %c0_i32     = arith.constant 0  : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            // Block: 1 page, 1 token row, full 128-wide head dim.
+            %desc = tt.make_tensor_descriptor %ptr, [%P, %B, %D], [%s0, %s1, %s2]
+                : <f16>, <1x1x128xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x1x128xf16>, tensor<32xi32>, i32) -> tensor<32x1x128xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_indirect_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_gather")
+        # The trailing 1 must survive — must NOT be silently rank-reduced.
+        self.assert_result("ktdp.load", shape=[32, 1, 128], elem_type="f16")
+
+
+# =========================================================================
+# tt.descriptor_gather — N-D limits (kernel-author-facing rejections)
+# =========================================================================
+
+class TestDescriptorGatherNDLimits(LowerDescMemoryTester):
+    """Negative tests highlighting kernel-author-facing limits of N-D gather.
+
+    The relaxed verifier (``lib/Dialect/Triton/IR/Ops.cpp``) keeps two
+    invariants — the gather's *load-bearing* contract — that an author
+    coming from rank-2 gather might miss when writing an N-D kernel:
+
+    * ``block.shape[0] == 1`` at *every* rank.  The leading-1 is the
+      gather contract: dim 0 is fanned out by the index buffer one
+      page at a time, so the block can carry exactly one page.
+    * ``indices`` is a 1-D ``tensor<Nxi32>``.  Multi-D index tensors
+      are not supported — the index buffer addresses dim 0, period.
+
+    These tests pin both rules at rank 3, where the loop body of the
+    new per-dim trailing-shape check actually runs.  The existing
+    rank-2 ``test_gather_block_dim0_not_one_fails`` covers the rank-2
+    path; this class extends the same invariants to the N-D
+    extension.
+
+    Diagnostics fire at MLIR parse time (verifiers run during
+    ``ir.parse_mlir_module``), so the raised error is
+    ``"Parse MLIR file failed"`` rather than ``"PassManager::run failed"``.
+    """
+
+    @pattern("descriptor-gather-nd-block-dim0", category="memory", negative=True,
+             example=[
+                 "# REJECTED: rank-3 block whose leading dim is not 1.",
+                 "#   block_shape=[2, 16, 128]  →  'descriptor block must have",
+                 "#                                 exactly 1 row'",
+                 "# Workaround: split the leading dim out of the block. To",
+                 "# gather two blocks per index, use block_shape=[1, 2*16, 128]",
+                 "# and an index buffer that already accounts for the pairing,",
+                 "# OR issue two gathers and concatenate.",
+             ])
+    def test_gather_3d_block_dim0_not_one_fails(self, capfd):
+        """Rank-3 block ``<2x16x128>``: the leading-1 rule still applies.
+
+        The N-D relaxation widened the rank rule but kept the
+        leading-1 rule.  At rank 2 the same rule is pinned by
+        ``test_gather_block_dim0_not_one_fails``; this rank-3 mirror
+        exists because a kernel author writing their first N-D gather
+        is likely to assume the relaxation also widened *which* dim
+        must be 1 (e.g. "any dim that's 1 is fine") — it didn't.  Dim
+        0 specifically.
         """
         with pytest.raises(RuntimeError, match="Parse MLIR file failed"):
             self.run("""
             module {
               tt.func @k(%ptr: !tt.ptr<f16>,
                          %x_offsets: tensor<32xi32>, %y_offset: i32) {
-                %M = arith.constant 1024 : i32
-                %K = arith.constant 16 : i32
-                %D = arith.constant 128 : i32
-                %stride0 = arith.constant 2048 : i64
-                %stride1 = arith.constant 128 : i64
-                %stride2 = arith.constant 1 : i64
-                %desc = tt.make_tensor_descriptor %ptr, [%M, %K, %D], [%stride0, %stride1, %stride2]
-                    : <f16>, <1x16x128xf16>
+                %P = arith.constant 1024 : i32
+                %B = arith.constant 16   : i32
+                %D = arith.constant 128  : i32
+                %s0 = arith.constant 2048 : i64
+                %s1 = arith.constant 128  : i64
+                %s2 = arith.constant 1    : i64
+                %desc = tt.make_tensor_descriptor %ptr, [%P, %B, %D], [%s0, %s1, %s2]
+                    : <f16>, <2x16x128xf16>
                 %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
-                    : (!tt.tensordesc<1x16x128xf16>, tensor<32xi32>, i32) -> tensor<32x128xf16>
+                    : (!tt.tensordesc<2x16x128xf16>, tensor<32xi32>, i32) -> tensor<32x16x128xf16>
                 tt.return
               }
             }
             """)
-        self.assert_stderr(capfd, "descriptor block must be a 2D tensor")
+        self.assert_stderr(capfd, "descriptor block must have exactly 1 row")
+
+    @pattern("descriptor-gather-2d-indices", category="memory", negative=True,
+             example=[
+                 "# REJECTED: 2-D index tensor.",
+                 "#   x_offsets : tensor<8x4xi32>  →  'x offsets must be a 1D tensor'",
+                 "# Workaround: reshape to tensor<32xi32> and (if the original",
+                 "# 2-D structure mattered) recover it post-gather by reshaping",
+                 "# the result tensor.",
+             ])
+    def test_gather_2d_indices_rejected(self, capfd):
+        """2-D index tensor: the index buffer must be 1-D.
+
+        A kernel author who wants to gather a 2-D *grid* of pages
+        (e.g. one page per (sequence, head) pair) cannot pass a 2-D
+        ``x_offsets`` directly.  The verifier in
+        ``verifyGatherScatterResultType`` requires
+        ``indicesType.getRank() == 1``.
+
+        This is *not* a relaxation candidate: the lowering's indirect
+        subscript is ``c_x + d_0`` with a single iteration variable,
+        and ``buildIndirectAccessTile`` builds a single
+        ``construct_memory_view`` over the index tensor.  Allowing
+        rank-2 indices would require either (a) flattening at the
+        verifier — a no-op the kernel author can do themselves and
+        which costs nothing, or (b) carrying a multi-D iteration
+        space through ``buildGatherSubscriptMaps`` — substantially
+        more invasive.
+
+        Pinned at rank-3 (descriptor side) so the failure is
+        unambiguously about the index tensor, not anything trailing.
+        """
+        with pytest.raises(RuntimeError, match="Parse MLIR file failed"):
+            self.run("""
+            module {
+              tt.func @k(%ptr: !tt.ptr<f16>,
+                         %x_offsets: tensor<8x4xi32>,   // 2-D index buffer
+                         %y_offset: i32) {
+                %P = arith.constant 1024 : i32
+                %B = arith.constant 16   : i32
+                %D = arith.constant 128  : i32
+                %s0 = arith.constant 2048 : i64
+                %s1 = arith.constant 128  : i64
+                %s2 = arith.constant 1    : i64
+                %desc = tt.make_tensor_descriptor %ptr, [%P, %B, %D], [%s0, %s1, %s2]
+                    : <f16>, <1x16x128xf16>
+                %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                    : (!tt.tensordesc<1x16x128xf16>, tensor<8x4xi32>, i32) -> tensor<32x16x128xf16>
+                tt.return
+              }
+            }
+            """)
+        self.assert_stderr(capfd, "x offsets must be a 1D tensor")
 
 
 # =========================================================================
