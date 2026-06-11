@@ -2611,6 +2611,51 @@ def make_tensor_descriptor(
     return _semantic.make_tensor_descriptor(base, shape, strides, block_shape, padding_option)
 
 
+# --- START --- added for spyre
+@builtin
+def spyre_tensor_layout(desc, layout, _semantic=None):
+    """(Spyre only) Annotate a tensor descriptor with its physical device layout.
+
+    ``layout`` is a list of per-physical-dim coordinate entries giving the
+    OpSpec ``device_coordinates`` map from the descriptor's logical dims to its
+    physical (stick-tiled) ``device_size``. Each entry is either:
+
+    - ``src`` (a bare int) — identity: physical dim = logical dim ``src``.
+    - ``(src, "floordiv", div)`` — physical dim = ``logical[src] // div``.
+    - ``(src, "mod", mod)`` — physical dim = ``logical[src] % mod``.
+
+    (``(src, "identity")`` is also accepted as the explicit form of a bare int.)
+
+    e.g. an ``[M, N]`` tensor stick-tiled on ``N`` — ``device_size``
+    ``[N // 64, M, N % 64]``::
+
+        tl.spyre_tensor_layout(desc, [
+            (1, "floordiv", 64),   # phys dim 0: N // 64  (stick index)
+            0,                     # phys dim 1: M        (identity on logical dim 0)
+            (1, "mod", 64),        # phys dim 2: N % 64   (stick lane)
+        ])
+
+    The stick dim appears twice — once ``floordiv`` (stick index), once ``mod``
+    (lane) — matching OpSpec ``[floor(c/64), …, c%64]``.
+
+    Carried as *attributes* (not SSA values) so the layout survives constant
+    folding — a static ``[N//64, M, N%64]`` written as live values would fold to
+    ``[4,512,0]`` and lose the stick identity. The Spyre KTDP lowering reads the
+    coordinate map with the descriptor's logical shape operands to build the
+    physical memory view; the descriptor's ``shape``/``strides``/``block_shape``
+    stay logical.
+
+    Note: pass ``layout`` inline at the call site — binding it to a local first
+    makes the ``@triton.jit`` code generator try to tensor-convert the keyword
+    strings.
+
+    Emits a ``tt.spyre_tensor_layout`` marker op. Only valid on the ``spyre``
+    target — raises on any other backend.
+    """
+    return _semantic.spyre_tensor_layout(desc, layout)
+# --- END --- added for spyre
+
+
 # -----------------------
 # Atomic Memory Operations
 # -----------------------
