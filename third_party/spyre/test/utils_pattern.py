@@ -33,6 +33,15 @@ on a negative entry is a reminder that it still needs one.
 import textwrap
 
 
+class PatternEmptyBlockError(Exception):
+    """Raised when @pattern receives an example= with no code lines.
+
+    Fires at import time (class-body evaluation), so pytest surfaces it as a
+    collection error before any test runs. The message names the tag and the
+    decorated function's qualname to pinpoint the misconfigured decorator.
+    """
+
+
 def pattern(tag: str, *, category: str, negative: bool = False,
             example: str | None = None):
     """Decorator that marks a test as a documented pattern entry.
@@ -60,6 +69,19 @@ def pattern(tag: str, *, category: str, negative: bool = False,
             ex = "\n".join(example)
         else:
             ex = textwrap.dedent(example).strip() if example else None
+
+        if ex is not None:
+            code_lines = [
+                line for line in ex.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            if not code_lines:
+                raise PatternEmptyBlockError(
+                    f"@pattern(tag={tag!r}) on {fn.__qualname__}: "
+                    f"example= contains no code lines (only comments/blank). "
+                    f"Move prose to the docstring; put a tl.* / Triton snippet in example=."
+                )
+
         fn._pattern = {
             "tag": tag,
             "category": category,
