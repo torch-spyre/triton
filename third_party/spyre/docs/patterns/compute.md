@@ -37,7 +37,7 @@ for k in range(k_tiles):
     acc = tl.dot(a, b, acc)             # tensor<BM x BN x f32>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:663` (`TestDot.test_f32`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:725` (`TestDot.test_f32`)</sup>
 
 ### Rejected
 
@@ -82,21 +82,24 @@ explicitly emit ``failure()`` with a diagnostic, then add a
 positive test for the rejected-with-diagnostic path.
 
 ```python
-# REJECTED: rank-4 tt.dot.
-#   tl.dot(a4, b4)  where a4, b4 are rank-4 tensors
-#       →  'tt.dot op expected operands to be 2d or 3d'
-#
-# Why this matters for kernel authors: an N-D indirect-access
-# gather produces rank-4 (or rank-5 stickified) tiles. Those
-# tiles must be reshaped down to rank-2 BEFORE feeding tl.dot —
-# the dot op itself does not flatten its inputs.
+# REJECTED: rank-4 tt.dot — verifier accepts only rank 2 or 3.
+# An N-D indirect-access gather produces rank-4 (or rank-5
+# stickified) tiles; those must be reshaped down to rank-2
+# BEFORE tl.dot — the dot op does not flatten its inputs.
+a4 = tl.descriptor_gather(a_desc, idx, y)   # tensor<NUM_BLOCKS x NUM_GROUPS x BLOCK x INNER xf32>
+b4 = tl.descriptor_gather(b_desc, idx, y)   # same rank-4 shape
+out = tl.dot(a4, b4)                         # 'tt.dot op expected operands to be 2d or 3d'
+# Workaround: collapse leading dims first.
+a2 = tl.reshape(a4, [OUT_LEN, INNER])       # rank-2
+b2 = tl.reshape(b4, [INNER, OUT_LEN])
+out = tl.dot(a2, b2)                         # accepted
 ```
 
 Expected diagnostics:
 
 - `expected operands to be 2d or 3d`
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:726` (`TestDot.test_dot_4d_rejected`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:788` (`TestDot.test_dot_4d_rejected`)</sup>
 
 **Round-trip evidence**
 
@@ -137,6 +140,33 @@ pair = tl.join(real, imag)           # tensor<BLOCK x 2 x f32>
 
 <sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:395` (`TestJoin.test_1d`)</sup>
 
+## make-range
+
+### Rejected
+
+#### ❌ `test_make_range_in_arithmetic_survives`
+
+_tt.make_range in pure arithmetic is left untouched by LowerComputeOps_
+
+The pass succeeds (no error), but the op remains in the output —
+which is illegal in our final KTIR target (see test_ktir_examples.py
+::test_no_raw_ptr_ops / ::test_no_tt_ptr_type for the global rule
+that no tt.* ops or types should survive end-to-end lowering).
+
+When a lowering for tt.make_range is added (likely as A8 in
+LowerComputeOps.cpp, rewriting to arith.constant dense<...>),
+flip this assertion to assert_absent and update the @pattern
+decorator to drop negative=True.
+
+```python
+# NOT supported: tl.arange used in pure tensor arithmetic
+# (no descriptor consumer to fold it away)
+bh_idx    = bh_offset + tl.arange(0, BLOCK_BH)   # tt.make_range survives
+bh_active = bh_idx < BH                          # ... into arith.cmpi
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:496` (`TestMakeRange.test_make_range_in_arithmetic_survives`)</sup>
+
 ## reduce
 
 ### Supported
@@ -154,7 +184,7 @@ x = tl.load(x_ptr + offsets)       # tensor<BLOCK_M x BLOCK_N x f32>
 row_max = tl.max(x, axis=1)        # tensor<BLOCK_M x f32>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:525` (`TestReduce.test_max_f32`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:587` (`TestReduce.test_max_f32`)</sup>
 
 #### ✅ `test_multi_operand_reduce`
 
@@ -173,7 +203,7 @@ values, indices = tl.argmax(x, axis=1, return_indices=True)
 # index lane initialised with -1 as an invalid-index sentinel
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:618` (`TestReduce.test_multi_operand_reduce`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:680` (`TestReduce.test_multi_operand_reduce`)</sup>
 
 #### ✅ `test_sum_f32`
 
@@ -187,7 +217,7 @@ x = tl.load(x_ptr + offsets)       # tensor<BLOCK_M x BLOCK_N x f32>
 row_sum = tl.sum(x, axis=1)        # tensor<BLOCK_M x f32>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:499` (`TestReduce.test_sum_f32`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:561` (`TestReduce.test_sum_f32`)</sup>
 
 ### Rejected
 
@@ -210,7 +240,7 @@ Expected diagnostics:
 - `failed to legalize operation 'tt.reduce'`
 - `LowerComputeOps: failed to convert compute ops`
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:552` (`TestReduce.test_subf_combiner_fails`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:614` (`TestReduce.test_subf_combiner_fails`)</sup>
 
 **Round-trip evidence**
 

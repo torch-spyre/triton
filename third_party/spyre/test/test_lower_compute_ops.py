@@ -467,6 +467,68 @@ class TestSplit(LowerComputeOpsTester):
 
 
 # =========================================================================
+# A8. tt.make_range — NOT YET LOWERED
+# =========================================================================
+
+class TestMakeRange(LowerComputeOpsTester):
+    # tt.make_range produces a 1-D tensor `[start, start+1, ..., end-1]`.
+    # In the raw-pointer Triton idiom it commonly feeds tt.addptr to build
+    # a vector of element pointers (`ptr + tl.arange(0, BLOCK)`); in that
+    # role it's eliminated upstream when descriptor lowering rewrites the
+    # whole address chain. But tl.arange can also appear in pure tensor
+    # arithmetic that has no descriptor consumer — for example when the
+    # kernel constructs a per-lane index vector to compare against a runtime
+    # bound (e.g. `bh_idx = bh_offset + tl.arange(0, BLOCK_BH); bh_idx < BH`).
+    #
+    # In that arithmetic role tt.make_range survives every existing pass
+    # and ends up in the final KTIR with no replacement — neither
+    # LowerComputeOps nor LowerDescriptorMemory has a pattern for it. The
+    # natural lowering would be to a constant tensor (`arith.constant
+    # dense<[0, 1, ..., end-1]>`) since the values are known at compile time
+    # for fixed start/end, but that pattern does not exist today.
+    #
+    # Until it does, kernels must avoid tl.arange unless the result feeds
+    # a descriptor index (where the upstream rewrite removes it). The
+    # `kernels/decode_softmax_reducev/spyre_rewrite.py` kernel works around
+    # this by pushing per-lane masking decisions into the wrapper rather
+    # than computing them in-kernel from a tl.arange-derived index vector.
+
+    @pattern("make-range", category="compute", negative=True, example=[
+        "# NOT supported: tl.arange used in pure tensor arithmetic",
+        "# (no descriptor consumer to fold it away)",
+        "bh_idx    = bh_offset + tl.arange(0, BLOCK_BH)   # tt.make_range survives",
+        "bh_active = bh_idx < BH                          # ... into arith.cmpi",
+    ])
+    def test_make_range_in_arithmetic_survives(self):
+        """tt.make_range in pure arithmetic is left untouched by LowerComputeOps.
+
+        The pass succeeds (no error), but the op remains in the output —
+        which is illegal in our final KTIR target (see test_ktir_examples.py
+        ::test_no_raw_ptr_ops / ::test_no_tt_ptr_type for the global rule
+        that no tt.* ops or types should survive end-to-end lowering).
+
+        When a lowering for tt.make_range is added (likely as A8 in
+        LowerComputeOps.cpp, rewriting to arith.constant dense<...>),
+        flip this assertion to assert_absent and update the @pattern
+        decorator to drop negative=True.
+        """
+        self.run("""
+        module {
+          tt.func @k(%scalar: i32) -> tensor<8xi32> {
+            %r = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+            %s = tt.splat %scalar : i32 -> tensor<8xi32>
+            %0 = arith.addi %r, %s : tensor<8xi32>
+            tt.return %0 : tensor<8xi32>
+          }
+        }
+        """)
+        # Pin the unsupported state: the pass returns success but leaves
+        # tt.make_range in place. Flip to assert_absent once a lowering
+        # pattern is added.
+        self.assert_present("tt.make_range")
+
+
+# =========================================================================
 # B1. tt.reduce → linalg.reduce
 # =========================================================================
 
@@ -724,14 +786,17 @@ class TestDot(LowerComputeOpsTester):
         self.assert_result_type("linalg.batch_matmul", "tensor<4x16x8xf32>")
 
     @pattern("dot", category="compute", negative=True, example=[
-        "# REJECTED: rank-4 tt.dot.",
-        "#   tl.dot(a4, b4)  where a4, b4 are rank-4 tensors",
-        "#       →  'tt.dot op expected operands to be 2d or 3d'",
-        "#",
-        "# Why this matters for kernel authors: an N-D indirect-access",
-        "# gather produces rank-4 (or rank-5 stickified) tiles. Those",
-        "# tiles must be reshaped down to rank-2 BEFORE feeding tl.dot —",
-        "# the dot op itself does not flatten its inputs.",
+        "# REJECTED: rank-4 tt.dot — verifier accepts only rank 2 or 3.",
+        "# An N-D indirect-access gather produces rank-4 (or rank-5",
+        "# stickified) tiles; those must be reshaped down to rank-2",
+        "# BEFORE tl.dot — the dot op does not flatten its inputs.",
+        "a4 = tl.descriptor_gather(a_desc, idx, y)   # tensor<NUM_BLOCKS x NUM_GROUPS x BLOCK x INNER xf32>",
+        "b4 = tl.descriptor_gather(b_desc, idx, y)   # same rank-4 shape",
+        "out = tl.dot(a4, b4)                         # 'tt.dot op expected operands to be 2d or 3d'",
+        "# Workaround: collapse leading dims first.",
+        "a2 = tl.reshape(a4, [OUT_LEN, INNER])       # rank-2",
+        "b2 = tl.reshape(b4, [INNER, OUT_LEN])",
+        "out = tl.dot(a2, b2)                         # accepted",
     ])
     def test_dot_4d_rejected(self, capfd):
         """Rank ≥ 4 ``tt.dot`` is rejected by the upstream Triton verifier.

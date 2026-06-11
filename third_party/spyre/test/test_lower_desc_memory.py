@@ -834,10 +834,15 @@ class TestDescriptorGather(LowerDescMemoryTester):
                             "ktdp.load")
 
     @pattern("descriptor-gather", category="memory", negative=True, example=[
-        "# x_offsets as a function argument is REJECTED post-fallback-removal",
-        "# Spyre kernels must stage indices via tt.descriptor_load from a !tt.ptr<i32>",
-        "# arg; a tensor-typed kernel arg has no traceable provenance, so the gather",
-        "# pattern returns failure() and applyPartialConversion errors out.",
+        "# NOT supported: x_offsets passed in as a tensor-typed kernel arg.",
+        "# Spyre kernels must stage indices via tl.make_tensor_descriptor +",
+        "# .load() from a !tt.ptr<i32> arg so the gather pattern can trace",
+        "# the index buffer's provenance.",
+        "@triton.jit",
+        "def k(ptr, x_offsets, y_offset):  # x_offsets: tensor<32xi32> arg — REJECTED",
+        "    desc = tl.make_tensor_descriptor(ptr, shape=[M, K], strides=[K, 1],",
+        "                                     block_shape=[1, 64])",
+        "    data = tl.descriptor_gather(desc, x_offsets, y_offset)",
     ])
     def test_gather_with_x_offsets_arg_fails_to_legalize(self, capfd):
         """An ``x_offsets`` that is a tensor-typed function argument is no
@@ -1185,13 +1190,12 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
                                 num_dims=3, num_symbols=0, num_constraints=6)
 
     @pattern("descriptor-gather-nd-subscripts", category="memory", example=[
-        "# Subscript layout pinned at rank 3:",
-        "#   dim 0 (page)  : indirect, captures x_offset → ind(idx[c_x + d0])",
-        "#   dim 1 (token) : direct,   captures y_offset → c_y + d1",
-        "#   dim 2 (head)  : direct,   NO capture        → d2  (full extent)",
-        "#",
-        "# Limitation pinned: only dim 0 can be indirect; only dim 1 can",
-        "# carry y_offset. Trailing dims always read the full block extent.",
+        "# Rank-3 subscript role split: dim 0 indirect, dim 1 y_offset, dim 2 full",
+        "# desc block shape <1 x TOKEN_DIM x HEAD_DIM>",
+        "result = tl.descriptor_gather(desc, x_offsets, y_offset)",
+        "# lowers to: ind(idx[c_x + d0]), (c_y + d1), (d2)",
+        "# Trailing dim 2 (HEAD_DIM): no offset — full block extent always read.",
+        "# To slice dim 2, reshape the result after the gather.",
     ])
     def test_gather_3d_subscript_kinds_pin_offset_axis(self):
         """Pin the dim 0 / dim 1 / dim ≥ 2 role split — the headline N-D limitation.
@@ -1342,16 +1346,14 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
         )
 
     @pattern("descriptor-gather-nd-permuted-strides", category="memory", example=[
-        "# Workaround for the dim-0-only-indirect rule:",
-        "# To gather along a logically-inner axis, permute the *strides*",
-        "# so the desired indirect axis becomes physical dim 0.",
-        "#",
-        "# Below: physical layout is [BLOCK_SIZE, NUM_BLOCKS, INNER_DIM]",
-        "# but the kernel author wants to gather over the NUM_BLOCKS axis,",
-        "# not BLOCK_SIZE. Solution: declare descriptor shape as",
-        "# [NUM_BLOCKS, BLOCK_SIZE, INNER_DIM] and pass strides",
-        "# [INNER_DIM, NUM_BLOCKS*INNER_DIM, 1]. Now",
-        "# `descriptor_gather(idx, y)` gathers over the block id.",
+        "# Physical layout: [BLOCK_SIZE, NUM_BLOCKS, INNER_DIM] — block id is NOT dim 0.",
+        "# Declare descriptor shape with the gathered axis at dim 0, fix up via strides:",
+        "desc = tl.make_tensor_descriptor(",
+        "    ptr,",
+        "    shape=[NUM_BLOCKS, BLOCK_SIZE, INNER_DIM],",
+        "    strides=[INNER_DIM, NUM_BLOCKS * INNER_DIM, 1],  # inverted stride order",
+        "    block_shape=[1, BLOCK_SIZE, INNER_DIM])",
+        "result = tl.descriptor_gather(desc, block_ids, y_offset)",
     ])
     def test_gather_3d_inner_axis_via_stride_permutation(self):
         """Gathering a 'logically inner' physical axis via stride permutation.
@@ -1525,12 +1527,16 @@ class TestDescriptorGatherNDLimits(LowerDescMemoryTester):
 
     @pattern("descriptor-gather-nd-block-dim0", category="memory", negative=True,
              example=[
-                 "# REJECTED: rank-3 block whose leading dim is not 1.",
-                 "#   block_shape=[2, 16, 128]  →  'descriptor block must have",
-                 "#                                 exactly 1 row'",
-                 "# Workaround: split the leading dim out of the block. To",
-                 "# gather two blocks per index, use block_shape=[1, 2*16, 128]",
-                 "# and an index buffer that already accounts for the pairing,",
+                 "# REJECTED: leading dim of block_shape is not 1.",
+                 "# The N-D relaxation widened the rank rule but kept the",
+                 "# leading-1 rule — dim 0 specifically must be 1.",
+                 "desc = tl.make_tensor_descriptor(ptr, shape=[P, B, D],",
+                 "                                 strides=[B*D, D, 1],",
+                 "                                 block_shape=[2, 16, 128])  # leading 2 — REJECTED",
+                 "data = tl.descriptor_gather(desc, x_offsets, y_offset)",
+                 "# 'descriptor block must have exactly 1 row'",
+                 "# Workaround: keep block_shape[0]=1; pair blocks via",
+                 "# block_shape=[1, 2*16, 128] with a paired index buffer,",
                  "# OR issue two gathers and concatenate.",
              ])
     def test_gather_3d_block_dim0_not_one_fails(self, capfd):
@@ -1567,11 +1573,15 @@ class TestDescriptorGatherNDLimits(LowerDescMemoryTester):
 
     @pattern("descriptor-gather-2d-indices", category="memory", negative=True,
              example=[
-                 "# REJECTED: 2-D index tensor.",
-                 "#   x_offsets : tensor<8x4xi32>  →  'x offsets must be a 1D tensor'",
-                 "# Workaround: reshape to tensor<32xi32> and (if the original",
-                 "# 2-D structure mattered) recover it post-gather by reshaping",
-                 "# the result tensor.",
+                 "# REJECTED: 2-D index tensor — x_offsets must be rank-1.",
+                 "x_offsets = tl.descriptor_load(idx_desc, [0, 0])  # tensor<8x4xi32> — REJECTED",
+                 "data = tl.descriptor_gather(desc, x_offsets, y_offset)",
+                 "# 'x offsets must be a 1D tensor'",
+                 "# Workaround: flatten before the gather, reshape after if",
+                 "# the 2-D grid structure mattered.",
+                 "x_offsets_1d = tl.reshape(x_offsets, [32])           # rank-1",
+                 "data = tl.descriptor_gather(desc, x_offsets_1d, y_offset)",
+                 "data_2d = tl.reshape(data, [8, 4, BLOCK_COLS])       # recover grid",
              ])
     def test_gather_2d_indices_rejected(self, capfd):
         """2-D index tensor: the index buffer must be 1-D.

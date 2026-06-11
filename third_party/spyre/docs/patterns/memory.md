@@ -44,10 +44,15 @@ kernels always pass index buffers as ``!tt.ptr<i32>`` +
 misuse.
 
 ```python
-# x_offsets as a function argument is REJECTED post-fallback-removal
-# Spyre kernels must stage indices via tt.descriptor_load from a !tt.ptr<i32>
-# arg; a tensor-typed kernel arg has no traceable provenance, so the gather
-# pattern returns failure() and applyPartialConversion errors out.
+# NOT supported: x_offsets passed in as a tensor-typed kernel arg.
+# Spyre kernels must stage indices via tl.make_tensor_descriptor +
+# .load() from a !tt.ptr<i32> arg so the gather pattern can trace
+# the index buffer's provenance.
+@triton.jit
+def k(ptr, x_offsets, y_offset):  # x_offsets: tensor<32xi32> arg — REJECTED
+    desc = tl.make_tensor_descriptor(ptr, shape=[M, K], strides=[K, 1],
+                                     block_shape=[1, 64])
+    data = tl.descriptor_gather(desc, x_offsets, y_offset)
 ```
 
 Expected diagnostics:
@@ -94,18 +99,22 @@ Pinned at rank-3 (descriptor side) so the failure is
 unambiguously about the index tensor, not anything trailing.
 
 ```python
-# REJECTED: 2-D index tensor.
-#   x_offsets : tensor<8x4xi32>  →  'x offsets must be a 1D tensor'
-# Workaround: reshape to tensor<32xi32> and (if the original
-# 2-D structure mattered) recover it post-gather by reshaping
-# the result tensor.
+# REJECTED: 2-D index tensor — x_offsets must be rank-1.
+x_offsets = tl.descriptor_load(idx_desc, [0, 0])  # tensor<8x4xi32> — REJECTED
+data = tl.descriptor_gather(desc, x_offsets, y_offset)
+# 'x offsets must be a 1D tensor'
+# Workaround: flatten before the gather, reshape after if
+# the 2-D grid structure mattered.
+x_offsets_1d = tl.reshape(x_offsets, [32])           # rank-1
+data = tl.descriptor_gather(desc, x_offsets_1d, y_offset)
+data_2d = tl.reshape(data, [8, 4, BLOCK_COLS])       # recover grid
 ```
 
 Expected diagnostics:
 
 - `x offsets must be a 1D tensor`
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1568` (`TestDescriptorGatherNDLimits.test_gather_2d_indices_rejected`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1577` (`TestDescriptorGatherNDLimits.test_gather_2d_indices_rejected`)</sup>
 
 ## descriptor-gather-4d
 
@@ -132,7 +141,7 @@ src_desc = tl.make_tensor_descriptor(
 result = tl.descriptor_gather(src_desc, indices, group_idx)
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1019` (`TestDescriptorGatherND.test_gather_4d_lowered`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1024` (`TestDescriptorGatherND.test_gather_4d_lowered`)</sup>
 
 ## descriptor-gather-5d
 
@@ -158,7 +167,7 @@ src_desc = tl.make_tensor_descriptor(
 result = tl.descriptor_gather(src_desc, indices, group_idx)
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1082` (`TestDescriptorGatherND.test_gather_5d_lowered`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1087` (`TestDescriptorGatherND.test_gather_5d_lowered`)</sup>
 
 ## descriptor-gather-nd
 
@@ -189,7 +198,7 @@ result = tl.descriptor_gather(src_desc, indices, 0)
 #                                                two direct dims with no offset)
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:954` (`TestDescriptorGatherND.test_gather_3d_lowered`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:959` (`TestDescriptorGatherND.test_gather_3d_lowered`)</sup>
 
 ## descriptor-gather-nd-block-dim0
 
@@ -208,12 +217,16 @@ must be 1 (e.g. "any dim that's 1 is fine") — it didn't.  Dim
 0 specifically.
 
 ```python
-# REJECTED: rank-3 block whose leading dim is not 1.
-#   block_shape=[2, 16, 128]  →  'descriptor block must have
-#                                 exactly 1 row'
-# Workaround: split the leading dim out of the block. To
-# gather two blocks per index, use block_shape=[1, 2*16, 128]
-# and an index buffer that already accounts for the pairing,
+# REJECTED: leading dim of block_shape is not 1.
+# The N-D relaxation widened the rank rule but kept the
+# leading-1 rule — dim 0 specifically must be 1.
+desc = tl.make_tensor_descriptor(ptr, shape=[P, B, D],
+                                 strides=[B*D, D, 1],
+                                 block_shape=[2, 16, 128])  # leading 2 — REJECTED
+data = tl.descriptor_gather(desc, x_offsets, y_offset)
+# 'descriptor block must have exactly 1 row'
+# Workaround: keep block_shape[0]=1; pair blocks via
+# block_shape=[1, 2*16, 128] with a paired index buffer,
 # OR issue two gathers and concatenate.
 ```
 
@@ -221,7 +234,7 @@ Expected diagnostics:
 
 - `descriptor block must have exactly 1 row`
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1526` (`TestDescriptorGatherNDLimits.test_gather_3d_block_dim0_not_one_fails`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1531` (`TestDescriptorGatherNDLimits.test_gather_3d_block_dim0_not_one_fails`)</sup>
 
 ## descriptor-gather-nd-permuted-strides
 
@@ -271,7 +284,7 @@ operands would surface as a wrong view shape here.
 # `descriptor_gather(idx, y)` gathers over the block id.
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1344` (`TestDescriptorGatherND.test_gather_3d_inner_axis_via_stride_permutation`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1349` (`TestDescriptorGatherND.test_gather_3d_inner_axis_via_stride_permutation`)</sup>
 
 ## descriptor-gather-nd-subscripts
 
@@ -310,7 +323,7 @@ only check ``num_dims`` / ``num_constraints`` on
 # carry y_offset. Trailing dims always read the full block extent.
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1187` (`TestDescriptorGatherND.test_gather_3d_subscript_kinds_pin_offset_axis`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1192` (`TestDescriptorGatherND.test_gather_3d_subscript_kinds_pin_offset_axis`)</sup>
 
 ## descriptor-gather-nd-trailing-one
 
@@ -350,7 +363,7 @@ src_desc = tl.make_tensor_descriptor(src_ptr, ..., block_shape=[1, 1, 128])
 result = tl.descriptor_gather(src_desc, indices, y_offset)
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1431` (`TestDescriptorGatherND.test_gather_3d_inner_dim_one_lowered`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1436` (`TestDescriptorGatherND.test_gather_3d_inner_dim_one_lowered`)</sup>
 
 ## descriptor-load-dynamic
 
@@ -464,7 +477,7 @@ Expected diagnostics:
 - `must be ptr`
 - `got 'index'`
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2008` (`TestAddptrIntoDescriptor.test_addptr_into_descriptor_fails`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2021` (`TestAddptrIntoDescriptor.test_addptr_into_descriptor_fails`)</sup>
 
 ## descriptor-placement-conditional
 
@@ -500,7 +513,7 @@ if cond:
     tile = tl.descriptor_load(desc, [off])
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1914` (`TestDescriptorPlacement.test_descriptor_inside_scf_if_view_inside_branch`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1927` (`TestDescriptorPlacement.test_descriptor_inside_scf_if_view_inside_branch`)</sup>
 
 ## descriptor-placement-nested
 
@@ -529,7 +542,7 @@ for i in range(0, N, BLOCK):
     tile = tl.descriptor_load(desc, [i])
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1863` (`TestDescriptorPlacement.test_nested_descriptor_view_inside_loop`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1876` (`TestDescriptorPlacement.test_nested_descriptor_view_inside_loop`)</sup>
 
 ## descriptor-placement-top-level
 
@@ -559,7 +572,7 @@ for off in range(0, N, BLOCK):
     tile = tl.descriptor_load(desc, [off])  # inside the loop
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1808` (`TestDescriptorPlacement.test_top_level_descriptor_view_outside_loop`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1821` (`TestDescriptorPlacement.test_top_level_descriptor_view_outside_loop`)</sup>
 
 ## descriptor-rank-reduce
 
@@ -600,7 +613,7 @@ to writes.
 tl.descriptor_scatter(dst_desc, indices, y_offset, value)
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1142` (`TestDescriptorGatherND.test_scatter_3d_lowered`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1147` (`TestDescriptorGatherND.test_scatter_3d_lowered`)</sup>
 
 ## descriptor-store-dynamic
 
