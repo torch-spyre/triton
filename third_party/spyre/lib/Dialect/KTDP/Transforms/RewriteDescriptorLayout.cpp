@@ -532,6 +532,9 @@ struct RewriteDescriptorLayoutPass
   // Forward-retype the elementwise op chain: replace oldVal with newVal
   // everywhere and update result types of single-result ops that still carry
   // the old (logical-rank) type.
+  // Stops at multi-tensor-operand ops (contractions: linalg.matmul, reduce,
+  // etc.) whose result shape is determined by their own semantics, not by the
+  // physical shape of one input.
   void retypeChain(Value oldVal, Value newVal) {
     oldVal.replaceAllUsesWith(newVal);
     SmallVector<Operation *> worklist(newVal.getUsers().begin(),
@@ -539,6 +542,14 @@ struct RewriteDescriptorLayoutPass
     while (!worklist.empty()) {
       Operation *op = worklist.pop_back_val();
       if (op->getNumResults() != 1)
+        continue;
+      // Stop at contraction ops: more than one tensor-typed operand means the
+      // result shape is not simply inherited from one input.
+      int tensorOperandCount = 0;
+      for (auto operand : op->getOperands())
+        if (isa<RankedTensorType>(operand.getType()))
+          ++tensorOperandCount;
+      if (tensorOperandCount > 1)
         continue;
       auto resTy  = dyn_cast<RankedTensorType>(op->getResult(0).getType());
       auto opndTy = op->getNumOperands() > 0
