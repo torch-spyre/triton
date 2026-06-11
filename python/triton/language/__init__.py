@@ -34,6 +34,7 @@ from .core import (
     load_tensor_descriptor,
     store_tensor_descriptor,
     make_tensor_descriptor,
+    spyre_tensor_layout,  # --- added for spyre
     tensor_descriptor,
     tensor_descriptor_type,
     add,
@@ -144,6 +145,7 @@ __all__ = [
     "load_tensor_descriptor",
     "store_tensor_descriptor",
     "make_tensor_descriptor",
+    "spyre_tensor_layout",  # --- added for spyre
     "tensor_descriptor",
     "abs",
     "add",
