@@ -524,7 +524,11 @@ struct LowerComputeOpsPass
     //   arith/math (constants, index casts, cloned combiner body ops)
     target.addLegalDialect<linalg::LinalgDialect, tensor::TensorDialect,
                            arith::ArithDialect, math::MathDialect>();
-    target.addLegalOp<ModuleOp, UnrealizedConversionCastOp>();
+    // --- added for spyre: keep the tt.spyre_tensor_layout marker legal so it
+    // survives this pass; the v2 RewriteDescriptorLayout (run after this) reads
+    // and erases it. See LowerDescriptorMemory for the same marking.
+    target.addLegalOp<ModuleOp, UnrealizedConversionCastOp,
+                      triton::SpyreTensorLayoutOp>();
 
     RewritePatternSet patterns(ctx);
     patterns.add<ConvertTTSplat, ConvertTTReshape,          // Group A
