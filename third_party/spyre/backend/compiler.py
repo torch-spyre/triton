@@ -42,6 +42,7 @@ class SpyreBackend(BaseBackend):
 
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
+        self.binary_ext = "ktir"
 
     def hash(self) -> str:
         return f"spyre-{self.target.arch}"
@@ -92,6 +93,9 @@ class SpyreBackend(BaseBackend):
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}
 
+    def pack_metadata(self, metadata):
+        return ()
+
     def _make_ttir(self, mod, metadata, options):
         """Run standard Triton TTIR optimization passes."""
         from triton._C.libtriton import ir, passes
@@ -105,6 +109,7 @@ class SpyreBackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         pm.run(mod, "make_ttir")
 
+        metadata["name"] = mod.get_entry_func_name()
         metadata["stage"] = "ttir"
         return mod
 
