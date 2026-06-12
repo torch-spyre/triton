@@ -109,7 +109,6 @@ class SpyreBackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         pm.run(mod, "make_ttir")
 
-        metadata["name"] = mod.get_entry_func_name()
         metadata["stage"] = "ttir"
         return mod
 
@@ -136,5 +135,6 @@ class SpyreBackend(BaseBackend):
         passes.common.add_cse(pm)
         pm.run(mod, "make_ktir")
 
+        metadata["name"] = mod.get_entry_func_name()
         metadata["stage"] = "ktir"
         return mod
