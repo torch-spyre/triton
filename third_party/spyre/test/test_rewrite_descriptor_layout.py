@@ -338,13 +338,19 @@ class TestMatmulSingleStick(RewriteLayoutTester):
         self.assert_result_type("ktdp.load", "1x128x64xf16")
 
 
-class TestMatmulKSplitNotYetSupported(RewriteLayoutTester):
-    """Annotated matmul: K-split case not yet implemented.
+class TestMatmulKSplit(RewriteLayoutTester):
+    """Annotated matmul: K-split case (scf.for over K-sticks).
 
     A[M,K] stick-on-K: physical A = [K//64, M, 64] — the contraction dim K is
     split across sticks. B[K,N] stick-on-N: physical B = [N//64, K, 64] — N
-    split, K flat. The K-split case requires an scf.for over K-sticks with an
-    accumulator (Increment 3).
+    split, K flat. An scf.for loops over A's K-sticks, offsetting into B's
+    K-flat dim by ks * KA each iteration and accumulating into [M, N].
+
+    Shapes used:
+      M=256, K=128, N=256
+      block A = [64, 64]  -> phys A = [64//64, 64, 64] = [1, 64, 64]
+      block B = [64, 64]  -> phys B = [64//64, 128, 64] = [1, 128, 64]
+      C = [64, 64] (logical output tile, unchanged)
     """
 
     # A[M,K] stick-on-K: phys_src=[1,0,1] => dim0=K//64, dim1=M, dim2=K%64
@@ -354,46 +360,54 @@ class TestMatmulKSplitNotYetSupported(RewriteLayoutTester):
     _B_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
                  "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
 
-    @pattern("physical-layout-matmul-k-split", category="memory", negative=True, example=[
-        "# NOT yet supported: K-split in A (contraction dim stick-split).",
-        "# Requires scf.for over K-sticks with accumulator (Increment 3).",
+    _KERNEL = """
+        module {{
+          tt.func @mm(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f16>,
+                      %m: i32, %k: i32, %n: i32) {{
+            %M = arith.constant 256 : i32
+            %K = arith.constant 128 : i32
+            %N = arith.constant 256 : i32
+            %sK = arith.constant 128 : i64
+            %sN = arith.constant 256 : i64
+            %sM = arith.constant 256 : i64
+            %one = arith.constant 1 : i64
+            %adesc = tt.make_tensor_descriptor %a, [%M, %K], [%sK, %one]
+                : <f16>, <64x64xf16>
+            %bdesc = tt.make_tensor_descriptor %b, [%K, %N], [%sN, %one]
+                : <f16>, <64x64xf16>
+            %cdesc = tt.make_tensor_descriptor %c, [%M, %N], [%sM, %one]
+                : <f16>, <64x64xf16>
+            tt.spyre_tensor_layout %adesc {a_layout} : <64x64xf16>
+            tt.spyre_tensor_layout %bdesc {b_layout} : <64x64xf16>
+            %at = tt.descriptor_load %adesc[%m, %k]
+                : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
+            %bt = tt.descriptor_load %bdesc[%k, %n]
+                : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
+            %acc = arith.constant dense<0.0> : tensor<64x64xf32>
+            %d = tt.dot %at, %bt, %acc
+                : tensor<64x64xf16> * tensor<64x64xf16> -> tensor<64x64xf32>
+            %dh = arith.truncf %d : tensor<64x64xf32> to tensor<64x64xf16>
+            tt.descriptor_store %cdesc[%m, %n], %dh
+                : !tt.tensordesc<64x64xf16>, tensor<64x64xf16>
+            tt.return
+          }}
+        }}
+        """
+
+    @pattern("physical-layout-matmul-k-split", category="memory", example=[
+        "# A stick-on-K: scf.for over K-sticks, accumulating [M,N] result.",
         "a_desc = tl.make_tensor_descriptor(a_ptr, shape=[M,K], strides=[K,1],",
         "                                   block_shape=[M, 64])",
         "tl.spyre_tensor_layout(a_desc, [(1,'floordiv',64), 0, (1,'mod',64)])",
-        "acc = tl.dot(a_tile, b_tile, acc)   # ❌ K-split not yet handled",
+        "acc = tl.dot(a_tile, b_tile, acc)   # K-stick loop synthesized by pass",
     ])
-    def test_matmul_k_split_rejected(self):
-        with pytest.raises(RuntimeError, match="PassManager::run failed"):
-            self.run(f"""
-            module {{
-              tt.func @mm(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>,
-                          %m: i32, %k: i32, %n: i32) {{
-                %M = arith.constant 256 : i32
-                %K = arith.constant 128 : i32
-                %N = arith.constant 256 : i32
-                %sK = arith.constant 128 : i64
-                %sN = arith.constant 256 : i64
-                %one = arith.constant 1 : i64
-                %adesc = tt.make_tensor_descriptor %a, [%M, %K], [%sK, %one]
-                    : <f16>, <64x64xf16>
-                %bdesc = tt.make_tensor_descriptor %b, [%K, %N], [%sN, %one]
-                    : <f16>, <64x64xf16>
-                tt.spyre_tensor_layout %adesc {self._A_LAYOUT} : <64x64xf16>
-                tt.spyre_tensor_layout %bdesc {self._B_LAYOUT} : <64x64xf16>
-                %at = tt.descriptor_load %adesc[%m, %k]
-                    : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
-                %bt = tt.descriptor_load %bdesc[%k, %n]
-                    : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
-                %acc = arith.constant dense<0.0> : tensor<64x64xf32>
-                %d = tt.dot %at, %bt, %acc
-                    : tensor<64x64xf16> * tensor<64x64xf16> -> tensor<64x64xf32>
-                %dh = arith.truncf %d : tensor<64x64xf32> to tensor<64x64xf16>
-                tt.descriptor_store %bdesc[%m, %n], %dh
-                    : !tt.tensordesc<64x64xf16>, tensor<64x64xf16>
-                tt.return
-              }}
-            }}
-            """)
+    def test_matmul_k_split_lowers(self):
+        self.run(self._KERNEL.format(
+            a_layout=self._A_LAYOUT, b_layout=self._B_LAYOUT))
+        self.assert_absent("tt.spyre_tensor_layout")
+        self.assert_absent("linalg.generic")
+        self.assert_present("linalg.matmul")
+        self.assert_present("scf.for")
 
 
 # =========================================================================

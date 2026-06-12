@@ -333,13 +333,6 @@ struct RewriteDescriptorLayoutPass
     buildDimRoles(aC, /*kLogicalSrc=*/1, /*parallelRole=*/0, dimRoleA);
     buildDimRoles(bC, /*kLogicalSrc=*/0, /*parallelRole=*/1, dimRoleB);
 
-    // Inc 3: K-stick loop (role -2) not yet supported.
-    bool hasKStickLoopA = llvm::any_of(dimRoleA, [](int64_t r) { return r == -2; });
-    bool hasKStickLoopB = llvm::any_of(dimRoleB, [](int64_t r) { return r == -2; });
-    if (hasKStickLoopA || hasKStickLoopB)
-      return mm.emitError(
-          "spyre_tensor_layout: K-stick reduction loop not yet supported (Inc 3)");
-
     return synthesizeCase1(mm, dimRoleA, dimRoleB, aPhysShape, bPhysShape);
   }
 
@@ -391,12 +384,15 @@ struct RewriteDescriptorLayoutPass
     for (int p = 0; p < bRank; ++p)
       if (isOuterDim(bC, dimRoleB, p)) bOuterDims.push_back(p);
 
-    // Inner dims of A and B (non-outer), in ascending physical order.
+    // Inner dims of A and B: non-outer and non-K-stick (role != -2),
+    // in ascending physical order. These form the 2D slice.
     SmallVector<int> aInnerDims, bInnerDims;
     for (int p = 0; p < aRank; ++p)
-      if (!isOuterDim(aC, dimRoleA, p)) aInnerDims.push_back(p);
+      if (!isOuterDim(aC, dimRoleA, p) && dimRoleA[p] != -2)
+        aInnerDims.push_back(p);
     for (int p = 0; p < bRank; ++p)
-      if (!isOuterDim(bC, dimRoleB, p)) bInnerDims.push_back(p);
+      if (!isOuterDim(bC, dimRoleB, p) && dimRoleB[p] != -2)
+        bInnerDims.push_back(p);
 
     // Each operand must have exactly 2 inner dims (the 2D slice).
     if (aInnerDims.size() != 2 || bInnerDims.size() != 2)
@@ -448,18 +444,25 @@ struct RewriteDescriptorLayoutPass
           b.getDenseI64ArrayAttr({1, 0})).getResult()[0];
     };
 
-    // Build extract_slice for an operand given outer IVs (one per outer dim).
+    // Build extract_slice for an operand given outer IVs (one per outer dim)
+    // and optional extra indexed dims (e.g. K-stick dims, each with its own IV).
     // Produces a rank-reduced tensor in physical-dim order.
     auto buildExtract = [&](Value operand, ArrayRef<int> outerDims,
                             ArrayRef<int> innerDims,
                             ArrayRef<int64_t> physShape,
                             ArrayRef<Value> outerIVs,
-                            RankedTensorType resultTy) -> Value {
+                            RankedTensorType resultTy,
+                            ArrayRef<int> extraDims = {},
+                            ArrayRef<Value> extraIVs = {}) -> Value {
       int rank = (int)physShape.size();
       SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
       for (int i = 0; i < (int)outerDims.size(); ++i) {
         offsets[outerDims[i]] = outerIVs[i];
         sizes[outerDims[i]]   = idx(1);
+      }
+      for (int i = 0; i < (int)extraDims.size(); ++i) {
+        offsets[extraDims[i]] = extraIVs[i];
+        sizes[extraDims[i]]   = idx(1);
       }
       for (int p : innerDims) {
         offsets[p] = idx(0);
@@ -469,75 +472,110 @@ struct RewriteDescriptorLayoutPass
           b, loc, resultTy, operand, offsets, sizes, strides);
     };
 
-    // Build the loop nest over all outer (stick) dims.
-    // Outer dims of A are M-sticks; outer dims of B are N-sticks.
-    // We loop over all of them, with acc as the single iter_arg.
-    // For the common single-stick case (Ks=Ns=1) these are trip-1 loops.
+    // K-stick dims of A (role -2): reduction loops innermost.
+    // For each K-stick iv `ks`, A is indexed at aKStickDim=ks and B's K-flat
+    // dim is offset by ks * KA (chunking B's contraction dim).
+    SmallVector<int> aKStickDims;
+    for (int p = 0; p < aRank; ++p)
+      if (dimRoleA[p] == -2) aKStickDims.push_back(p);
 
-    // Collect all outer loops: B's outer dims drive the N-stick loop;
-    // A's outer dims drive M-stick loops (if any).
-    // We emit B's outer loops outermost, then A's, then the inner matmul.
-    // All share the same acc iter_arg accumulating into accTy2D.
-
-    // Recursive lambda to emit nested scf.for loops for outer dims.
-    // outerDimsAll: concatenation [bOuterDims..., aOuterDims...]
-    // operands: [bVal, aVal] for indexing
-    // physShapes: [bPhysShape, aPhysShape]
-    // returns the final acc value.
-    SmallVector<int> allOuterDimsB(bOuterDims), allOuterDimsA(aOuterDims);
+    // Find B's K-flat dim (role -1, Identity op) — the dim we stride into.
+    int bKFlatDim = -1;
+    for (int p = 0; p < bRank; ++p)
+      if (dimRoleB[p] == -1 &&
+          static_cast<CoordOp>(bC.op[p]) == CoordOp::Identity)
+        bKFlatDim = p;
 
     // Collect outer IVs as we descend into the loop nest.
     SmallVector<Value> bOuterIVs, aOuterIVs;
+    // K-stick IVs accumulate for the B offset computation.
+    SmallVector<Value> aKStickIVs;
 
-    // Helper: emit nested loops and return the innermost acc.
-    // We use a std::function to allow recursion.
-    std::function<Value(int, int, Value)> emitLoops =
-        [&](int bIdx, int aIdx, Value acc) -> Value {
-      // Still have B outer loops to emit.
-      if (bIdx < (int)allOuterDimsB.size()) {
-        int dim = allOuterDimsB[bIdx];
-        int64_t trip = bPhysShape[dim];
-        Value cTrip = arith::ConstantIndexOp::create(b, loc, trip);
-        auto loop = scf::ForOp::create(b, loc, c0, cTrip, c1,
-                                       ValueRange{acc});
+    // Build extract for B with optional K-flat offset from K-stick IVs.
+    // If there are K-sticks, B's K-flat offset = sum(ks_i * KA) per K-stick dim.
+    auto buildBExtractWithKOffset = [&]() -> Value {
+      int rank = (int)bPhysShape.size();
+      SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
+      for (int i = 0; i < (int)bOuterDims.size(); ++i) {
+        offsets[bOuterDims[i]] = bOuterIVs[i];
+        sizes[bOuterDims[i]]   = idx(1);
+      }
+      for (int p : bInnerDims) {
+        // K-flat dim gets offset ks * KA if there are K-sticks.
+        if (p == bKFlatDim && !aKStickIVs.empty()) {
+          // For a single K-stick dim: offset = ks * KA.
+          // (Multiple K-stick dims would be composed similarly but are rare.)
+          Value ksOffset = arith::MulIOp::create(
+              b, loc, aKStickIVs.back(),
+              arith::ConstantIndexOp::create(b, loc, KA));
+          offsets[p] = ksOffset;
+          sizes[p]   = idx(KA);
+        } else {
+          offsets[p] = idx(0);
+          sizes[p]   = idx(bPhysShape[p]);
+        }
+      }
+      return tensor::ExtractSliceOp::create(
+          b, loc, sliceBPhysTy, bVal, offsets, sizes, strides);
+    };
+
+    // Recursive lambda: emit B outer loops, then A outer loops, then K-stick
+    // reduction loops, then the inner matmul.
+    std::function<Value(int, int, int, Value)> emitLoops =
+        [&](int bIdx, int aIdx, int ksIdx, Value acc) -> Value {
+      if (bIdx < (int)bOuterDims.size()) {
+        int dim = bOuterDims[bIdx];
+        Value cTrip = arith::ConstantIndexOp::create(b, loc, bPhysShape[dim]);
+        auto loop = scf::ForOp::create(b, loc, c0, cTrip, c1, ValueRange{acc});
         OpBuilder::InsertionGuard g(b);
         b.setInsertionPointToStart(loop.getBody());
         bOuterIVs.push_back(loop.getInductionVar());
-        Value innerAcc = emitLoops(bIdx + 1, aIdx,
-                                   loop.getRegionIterArgs()[0]);
+        Value inner = emitLoops(bIdx + 1, aIdx, ksIdx,
+                                loop.getRegionIterArgs()[0]);
         bOuterIVs.pop_back();
-        scf::YieldOp::create(b, loc, ValueRange{innerAcc});
+        scf::YieldOp::create(b, loc, ValueRange{inner});
         return loop.getResult(0);
       }
-      // Still have A outer loops to emit.
-      if (aIdx < (int)allOuterDimsA.size()) {
-        int dim = allOuterDimsA[aIdx];
-        int64_t trip = aPhysShape[dim];
-        Value cTrip = arith::ConstantIndexOp::create(b, loc, trip);
-        auto loop = scf::ForOp::create(b, loc, c0, cTrip, c1,
-                                       ValueRange{acc});
+      if (aIdx < (int)aOuterDims.size()) {
+        int dim = aOuterDims[aIdx];
+        Value cTrip = arith::ConstantIndexOp::create(b, loc, aPhysShape[dim]);
+        auto loop = scf::ForOp::create(b, loc, c0, cTrip, c1, ValueRange{acc});
         OpBuilder::InsertionGuard g(b);
         b.setInsertionPointToStart(loop.getBody());
         aOuterIVs.push_back(loop.getInductionVar());
-        Value innerAcc = emitLoops(bIdx, aIdx + 1,
-                                   loop.getRegionIterArgs()[0]);
+        Value inner = emitLoops(bIdx, aIdx + 1, ksIdx,
+                                loop.getRegionIterArgs()[0]);
         aOuterIVs.pop_back();
-        scf::YieldOp::create(b, loc, ValueRange{innerAcc});
+        scf::YieldOp::create(b, loc, ValueRange{inner});
+        return loop.getResult(0);
+      }
+      // K-stick reduction loops (innermost before matmul).
+      if (ksIdx < (int)aKStickDims.size()) {
+        int dim = aKStickDims[ksIdx];
+        Value cTrip = arith::ConstantIndexOp::create(b, loc, aPhysShape[dim]);
+        auto loop = scf::ForOp::create(b, loc, c0, cTrip, c1, ValueRange{acc});
+        OpBuilder::InsertionGuard g(b);
+        b.setInsertionPointToStart(loop.getBody());
+        aKStickIVs.push_back(loop.getInductionVar());
+        Value inner = emitLoops(bIdx, aIdx, ksIdx + 1,
+                                loop.getRegionIterArgs()[0]);
+        aKStickIVs.pop_back();
+        scf::YieldOp::create(b, loc, ValueRange{inner});
         return loop.getResult(0);
       }
       // Innermost body: extract slices, transpose if needed, matmul.
+      // K-stick dims (aKStickDims) are also indexed dims for A (one per IV).
       Value aSlicePhys = buildExtract(aVal, aOuterDims, aInnerDims,
-                                      aPhysShape, aOuterIVs, sliceAPhysTy);
-      Value bSlicePhys = buildExtract(bVal, bOuterDims, bInnerDims,
-                                      bPhysShape, bOuterIVs, sliceBPhysTy);
+                                      aPhysShape, aOuterIVs, sliceAPhysTy,
+                                      aKStickDims, aKStickIVs);
+      Value bSlicePhys = buildBExtractWithKOffset();
       Value aSlice = transposeA ? emitTranspose2D(aSlicePhys, aElemTy) : aSlicePhys;
       Value bSlice = transposeB ? emitTranspose2D(bSlicePhys, bElemTy) : bSlicePhys;
-      // acc += a_slice @ b_slice  ([M,K] x [K,N] -> [M,N])
       return linalg::MatmulOp::create(b, loc, accTy2D,
           ValueRange{aSlice, bSlice}, ValueRange{acc}).getResult(0);
     };
 
-    Value result = emitLoops(0, 0, zeroAcc);
+    Value result = emitLoops(0, 0, 0, zeroAcc);
     mm.getResult(0).replaceAllUsesWith(result);
     mm.erase();
     return success();
