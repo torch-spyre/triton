@@ -40,7 +40,7 @@
 //
 //   Coord helpers (free functions):
 //     applyStatic  : compile-time extent (shape / block_shape)
-//     applyIndex   : SSA load/store offset (identity | divsi | const 0)
+//     applyIndex   : SSA load/store offset (identity | divsi | remsi)
 //
 //===----------------------------------------------------------------------===//
 
@@ -95,9 +95,9 @@ static std::optional<int64_t> applyStatic(int64_t logical, CoordOp op,
     return logical;
   case CoordOp::FloorDiv:
     if (logical == ShapedType::kDynamic)
-      return std::nullopt; // dynamic; emit SSA divsi at build time
+      return std::nullopt; // dynamic; emit SSA ceildivsi at build time
     return arg == 0 ? std::optional<int64_t>(std::nullopt)
-                    : std::optional<int64_t>(logical / arg);
+                    : std::optional<int64_t>((logical + arg - 1) / arg);
   case CoordOp::Mod:
     // Physical extent of a mod (lane) dim is the modulus itself — always static.
     return arg;
@@ -108,7 +108,7 @@ static std::optional<int64_t> applyStatic(int64_t logical, CoordOp op,
 /// Apply one coordinate op to an SSA index value.
 ///   identity -> the value unchanged
 ///   floordiv -> arith.divsi(value, arg)
-///   mod      -> a constant 0 (aligned tile always starts at lane 0)
+///   mod      -> arith.remsi(value, arg)
 static Value applyIndex(OpBuilder &builder, Location loc, Value logicalIdx,
                         CoordOp op, int64_t arg) {
   switch (op) {
@@ -119,10 +119,11 @@ static Value applyIndex(OpBuilder &builder, Location loc, Value logicalIdx,
         builder, loc, builder.getI32IntegerAttr(static_cast<int32_t>(arg)));
     return arith::DivSIOp::create(builder, loc, logicalIdx, c).getResult();
   }
-  case CoordOp::Mod:
-    return arith::ConstantOp::create(builder, loc,
-                                     builder.getI32IntegerAttr(0))
-        .getResult();
+  case CoordOp::Mod: {
+    Value c = arith::ConstantOp::create(
+        builder, loc, builder.getI32IntegerAttr(static_cast<int32_t>(arg)));
+    return arith::RemSIOp::create(builder, loc, logicalIdx, c).getResult();
+  }
   }
   llvm_unreachable("unhandled CoordOp");
 }
@@ -292,7 +293,7 @@ struct RewriteDescriptorLayoutPass
             Value argIdx = arith::ConstantOp::create(
                 b, loc, b.getIndexAttr(arg));
             physDynSizes.push_back(
-                arith::DivSIOp::create(b, loc, logDynSize, argIdx).getResult());
+                arith::CeilDivSIOp::create(b, loc, logDynSize, argIdx).getResult());
           } else {
             // Identity with dynamic extent
             if (logDynIdx[src] < 0)
@@ -474,10 +475,12 @@ struct RewriteDescriptorLayoutPass
             arith::DivSIOp::create(b, loc, logI, c).getResult());
         break;
       }
-      case CoordOp::Mod:
-        physIdx.push_back(arith::ConstantOp::create(b, loc, b.getIndexAttr(0))
-                              .getResult());
+      case CoordOp::Mod: {
+        Value c = arith::ConstantOp::create(b, loc, b.getIndexAttr(arg));
+        physIdx.push_back(
+            arith::RemSIOp::create(b, loc, logI, c).getResult());
         break;
+      }
       }
     }
 
@@ -552,9 +555,5 @@ struct RewriteDescriptorLayoutPass
 };
 
 } // namespace
-
-std::unique_ptr<OperationPass<ModuleOp>> createRewriteDescriptorLayoutPass() {
-  return std::make_unique<RewriteDescriptorLayoutPass>();
-}
 
 } // namespace mlir::triton::ktdp
