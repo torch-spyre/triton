@@ -1,3 +1,5 @@
+import hashlib
+
 from triton.backends.compiler import BaseBackend, GPUTarget
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -23,6 +25,10 @@ class SpyreOptions:
         if isinstance(self.grid, list):
             self.grid = tuple(self.grid)
 
+    def hash(self):
+        key = "_".join(f"{name}-{val}" for name, val in sorted(self.__dict__.items()))
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
 
 class SpyreBackend(BaseBackend):
     """Spyre AI accelerator backend for Triton.
@@ -36,6 +42,7 @@ class SpyreBackend(BaseBackend):
 
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
+        self.binary_ext = "ktir"
 
     def hash(self) -> str:
         return f"spyre-{self.target.arch}"
@@ -86,6 +93,9 @@ class SpyreBackend(BaseBackend):
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}
 
+    def pack_metadata(self, metadata):
+        return ()
+
     def _make_ttir(self, mod, metadata, options):
         """Run standard Triton TTIR optimization passes."""
         from triton._C.libtriton import ir, passes
@@ -125,5 +135,6 @@ class SpyreBackend(BaseBackend):
         passes.common.add_cse(pm)
         pm.run(mod, "make_ktir")
 
+        metadata["name"] = mod.get_entry_func_name()
         metadata["stage"] = "ktir"
         return mod
