@@ -2617,26 +2617,31 @@ def spyre_tensor_layout(desc, layout, _semantic=None):
     """(Spyre only) Annotate a tensor descriptor with its physical device layout.
 
     ``layout`` is a list of per-physical-dim coordinate entries giving the
-    OpSpec ``device_coordinates`` map from the descriptor's logical dims to its
-    physical (stick-tiled) ``device_size``. Each entry is either:
+    OpSpec ``device_coordinates`` map. Each entry describes how to compute a
+    **physical index** from the logical access indices:
 
-    - ``src`` (a bare int) — identity: physical dim = logical dim ``src``.
-    - ``(src, "floordiv", div)`` — physical dim = ``logical[src] // div``.
-    - ``(src, "mod", mod)`` — physical dim = ``logical[src] % mod``.
+    - ``src`` (a bare int) — identity: ``phys_idx = logical_idx[src]``.
+    - ``(src, "floordiv", div)`` — ``phys_idx = logical_idx[src] // div``.
+    - ``(src, "mod", mod)`` — ``phys_idx = logical_idx[src] % mod``.
 
     (``(src, "identity")`` is also accepted as the explicit form of a bare int.)
 
-    e.g. an ``[M, N]`` tensor stick-tiled on ``N`` — ``device_size``
-    ``[N // 64, M, N % 64]``::
+    The physical **extent** of each dim follows from the coordinate op:
+    identity and mod dims have a fixed extent (the logical extent or the
+    modulus); floordiv dims have extent ``ceil(logical_extent[src] / div)``
+    so that partial tiles at the boundary are covered.
+
+    e.g. an ``[M, N]`` tensor stick-tiled on ``N`` — physical layout
+    ``[ceil(N/64), M, 64]``, indices ``[N//64, M, N%64]``::
 
         tl.spyre_tensor_layout(desc, [
-            (1, "floordiv", 64),   # phys dim 0: N // 64  (stick index)
-            0,                     # phys dim 1: M        (identity on logical dim 0)
-            (1, "mod", 64),        # phys dim 2: N % 64   (stick lane)
+            (1, "floordiv", 64),   # phys dim 0: stick index = N // 64
+            0,                     # phys dim 1: row index   = M  (identity on logical dim 0)
+            (1, "mod", 64),        # phys dim 2: lane index  = N % 64
         ])
 
-    The stick dim appears twice — once ``floordiv`` (stick index), once ``mod``
-    (lane) — matching OpSpec ``[floor(c/64), …, c%64]``.
+    The N dim appears twice — ``floordiv`` gives the stick index, ``mod`` gives
+    the lane offset within the stick — matching OpSpec ``[floor(c/64), …, c%64]``.
 
     Carried as *attributes* (not SSA values) so the layout survives constant
     folding — a static ``[N//64, M, N%64]`` written as live values would fold to
