@@ -8,7 +8,8 @@
 | S2   | DONE   | `-2` role deleted. `classify` rewritten right-to-left (R-c). New `reduceDims` field. `reduceInner` added to `opSliceDims` during walk so 2D-tile machinery unchanged. Golden diff empty. Commit: `07f4e0846`. |
 | S3   | DONE   | `buildExtract` + hand-rolled B extract + `ks*KA` deleted. Unified `extractOpSlice` lambda: A's `reduceLoop` dims indexed by their own IVs; B's `reduceInner` (K-flat) offset by reduction IV, size=1 stick. Golden diff empty. Commit: `0e73345e9`. |
 | S4   | DONE   | `strides`/`sizes` (`SmallVector<OpFoldResult>`) added to `OperandPlan`. `getMemViewForOperand` + `threadStridesAndSizes` helpers added. Wired into `dispatchMatmul`. Not yet consumed (S5 flips switch). Golden diff empty. Commit: `2748a1fa5`. Note: no consistency assert between `plan.sizes` (full descriptor extents) and `coords.physShape` (block extents) — see TODO(S5) comment in `threadStridesAndSizes`. |
-| S5   | TODO   | Switch `extractOpSlice` to use `plan.strides` for extract strides; use `plan.sizes` for dynamic trip counts in `collectLoops`. Remove last `coords.op` reads from classify floor/lane detection. Static golden diff empty; dynamic diff expected non-empty (offsets become threaded SSA). |
+| S5   | PARTIAL | Replaced ad-hoc `reduceInnerIsSliced`/`reduceIV` flags with per-dim `SliceKind` (StickIndex/SlicedStick/Full) recorded in `OperandPlan` by `classify()` from local geometry; added `stickSize`. `extractOpSlice` + slice-type calc are now pure lookups. Fixed multi-stick B K-flat (BLOCK_K>stick): size=stickSize not full extent, offset=k*stickSize, and (owner,physDim) IV lookup stops A's reduction IV leaking into B's floor dim. Retuned `spyre_stick_k_dynamic` → BLOCK_K=128 (2 K-sticks) to exercise it. Commit `48e632b5f`. **NOT done this step** (deferred — see notes): (a) `plan.strides` in extract strides — wrong for `tensor.extract_slice` (those are element strides, always 1; physical strides live on the memView). (b) `plan.sizes` for trip counts in `collectLoops` — wrong source (full descriptor extent, not block extent); `Loop::trip` stays `int64_t` from `physShape[p]` (block size, always static — tile sizes are constexpr). (c) removing `coords.op` from classify floor detection — no positional rule replaces it (floordiv can sit at any phys position); needs `coords.op`. |
+| S5-blocker | ktir-cpu | `spyre_stick_k_dynamic` numerical needs ktir-cpu to resolve dynamic `tensor.extract_slice`/`insert_slice` offsets (the B K-flat offset is a runtime `k*stickSize`). The interpreter reads only the static offset array and uses the kDynamic sentinel → empty slice. Documented in ktir-cpu's `DYNAMIC_SLICE_OFFSET_PROBLEM.md`; fixed separately on the ktir-cpu side. Structural tests are green. |
 | S6   | TODO   | Home-level accumulator (R-e): parallel loops carry nothing; `acc0` init inside parallel leaf; reduction loops carry acc. Replaces `cVal` mechanism. IR shape changes for `spyre_stick_k`. |
 | S7   | TODO   | Unify parallel nest into `emitNest`; delete `emitParallelNest`. Only if parallel loops carry nothing after S6. |
 | S8   | TODO   | Apply S2-S5 to `emitStoreStage` (same `-2`-free model + `iv*laneSize` R-a violation at :1022). |
@@ -137,22 +138,57 @@ Internal; prepares to delete `physShape` math. (#3)
 
 ---
 
-## Step S5 — switch extract/insert to threaded strides; drop op-code reads (full R-a)
+## Step S5 — per-dim SliceKind; multi-stick B K-flat (commit `48e632b5f`)
 
-Now flip consumers to the threaded values and remove floordiv/mod from the hot
-path. (#2 remainder)
+The original S5 framing ("switch to `plan.strides`, trips from `plan.sizes`,
+drop `coords.op` positionally") was based on assumptions that did not survive
+contact with the code. What S5 actually delivered, and what was rejected:
 
-- `extractOpSlice` / sink `insertOpSlice`: use `plan.strides` for the
-  `extract/insert_slice` strides; trips from `plan.sizes` (ceildiv already baked
-  for dynamic floor dims). Remove `iv*laneSize` (sink, :1022) and `physShape[p]`
-  size math in favor of threaded extents.
-- `classify`: remove the last `coords.op` reads — floor/lane/reduce located
-  positionally + by role only.
-- Golden diff now **expected non-empty** for the *dynamic* fixtures (offsets
-  become threaded SSA instead of recomputed) but must stay **empty for static**
-  (strides fold to the same constants). Numerical tests are the real gate here.
+### Delivered
 
-**Green check.** Static golden diff empty; dynamic diff reviewed.
+- **Per-dim `SliceKind`** (`StickIndex` / `SlicedStick` / `Full`) added to
+  `OperandPlan`, assigned in `classify()` from local geometry. `extractOpSlice`
+  and the 2D slice-type computation switch on it — pure lookups, no loop-set
+  inspection or cross-operand reasoning at slice time. Replaces the ad-hoc
+  `reduceInnerIsSliced` bool + separate `reduceIV` parameter.
+- **`stickSize`** field (= `physShape[lane]`, the Mod/lane extent). The slice
+  width for stick-width dims; distinct from `physShape[dim]` (full extent =
+  n_sticks × stickSize when BLOCK > stick).
+- **Multi-stick B K-flat fix** (the real bug, exposed by retuning
+  `spyre_stick_k_dynamic` to BLOCK_K=128, stick 64 → 2 K-sticks):
+  - `SlicedStick` ⇔ `reduceInner` extent > `stickSize` (decided in classify).
+  - size = `stickSize` (one stick), not `physShape[reduceInner]` (full K-flat).
+  - offset = `reduceIV * stickSize` (was the raw stick index).
+  - IV lookup matches `(owner, physDim)` so A's single reduction IV no longer
+    leaks into B's floor dim when they share a physical index.
+
+### Rejected (do NOT re-attempt without re-deriving)
+
+- **`plan.strides` for `extract_slice` strides** — wrong. `tensor.extract_slice`
+  strides are *element* strides within the tensor (always 1); physical memory
+  strides live on the `construct_memory_view` (Phase 1). Threading `plan.strides`
+  into the extract caused OOB (`4032 >= 64`). Kept stride-1.
+- **`plan.sizes` for trip counts in `collectLoops`** — wrong source.
+  `plan.sizes` (from the memViewOp) is the *full descriptor extent* (all
+  K-sticks); the loop trip is the *block extent* (`physShape[p]`, = sticks per
+  access tile). Using `plan.sizes` double-counted with the outer Triton K-loop.
+  `Loop::trip` stays `int64_t` from `physShape[p]`; tile/block sizes are
+  constexpr so it is always static (a genuinely dynamic block size would need
+  the trip threaded from the *access tile* shape, not the memView — not needed
+  by any fixture).
+- **Removing `coords.op` from `classify` floor detection** — no positional rule
+  replaces it. A floordiv (floor) dim can sit at any physical position; the
+  current fixtures only *happen* to put it first. Distinguishing floor from
+  opSlice still needs `coords.op[p] == FloorDiv`.
+
+### Blocker for the dynamic numerical gate
+
+`spyre_stick_k_dynamic`'s numerical test needs the **ktir-cpu** interpreter to
+resolve dynamic `tensor.extract_slice` offsets — the B K-flat offset is a
+runtime `k*stickSize`, and the interpreter currently reads only the static
+offset array (using the kDynamic sentinel → empty slice). The emitted KTIR is
+correct. Documented in ktir-cpu `DYNAMIC_SLICE_OFFSET_PROBLEM.md`; fixed on the
+ktir-cpu side, not here. Structural tests pass; static numerical tests pass.
 
 ---
 
