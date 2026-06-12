@@ -436,24 +436,27 @@ VARIANTS = {
         ),
     },
     "spyre_stick_k_dynamic": {
-        # Dynamic-shape variant of spyre_stick_k: same A stick-on-K split-K
-        # layout, but M/K/N are runtime i32. The physical descriptors lower to
-        # memref<?x?x64xf32> with runtime strides, and the synthesized K-stick
-        # reduction loop's trip count becomes a runtime ceildiv value
-        # (exercises the Loop.trip dynamic-SSA branch on the reduction path).
+        # Dynamic-shape variant of spyre_stick_k: A stick-on-K with BLOCK_K=128
+        # and stick size 64, so A's K-stick dim spans 2 sticks and
+        # RewriteDescriptorLayout emits a 2-iteration K-stick reduction loop.
+        # B's K-flat dim (extent 128 > stickSize 64) is therefore SlicedStick:
+        # advanced one 64-wide stick per reduction iteration at offset k*64.
+        # The B slice offset is a runtime SSA value, exercising the dynamic-
+        # offset path in tensor.extract_slice.
         "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot",
                  "program-id-1d", "spyre-tensor-layout"],
         "summary": (
-            "Dynamic-shape variant of spyre_stick_k: M/K/N runtime, so the "
-            "synthesized K-stick reduction loop uses a runtime trip count."
+            "Dynamic-shape variant of spyre_stick_k: BLOCK_K=128 with stick "
+            "size 64 forces a 2-iteration K-stick reduction loop whose trip "
+            "count is a runtime ceildiv value (exercises Loop.trip dynamic path)."
         ),
         "kernel_fn":    kernel.matmul_kernel,
         "SIGNATURE":    _SIG_SPYRE,
         "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N",
                          "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
         "params":       {
-            "M": [64], "K": [64], "N": [64],
-            "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
+            "M": [64], "K": [128], "N": [64],
+            "BLOCK_M": [64], "BLOCK_K": [128], "BLOCK_N": [64],
             "A_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
             "B_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
             "C_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
