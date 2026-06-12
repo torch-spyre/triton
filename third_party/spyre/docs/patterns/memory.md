@@ -143,6 +143,10 @@ result = tl.descriptor_gather(src_desc, indices, group_idx)
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1024` (`TestDescriptorGatherND.test_gather_4d_lowered`)</sup>
 
+**Round-trip evidence**
+
+- `gather::4d` — NUM_BLOCKS=64, NUM_GROUPS=4, BLOCK_SIZE=16, INNER_DIM=64, K_INDICES=32, group_idx=1
+
 ## descriptor-gather-5d
 
 ### Supported
@@ -199,6 +203,11 @@ result = tl.descriptor_gather(src_desc, indices, 0)
 ```
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:959` (`TestDescriptorGatherND.test_gather_3d_lowered`)</sup>
+
+**Round-trip evidence**
+
+- `gather::3d` — M=256, BLOCK_SIZE=16, HEAD_DIM=64, K_INDICES=32
+- `gather::3d_group` — M=256, NUM_GROUPS=8, HEAD_DIM=64, K_INDICES=32, group_idx=3
 
 ## descriptor-gather-nd-block-dim0
 
@@ -612,6 +621,10 @@ tl.descriptor_scatter(dst_desc, indices, y_offset, value)
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1147` (`TestDescriptorGatherND.test_scatter_3d_lowered`)</sup>
 
+**Round-trip evidence**
+
+- `gather::scatter_3d` — M=256, BLOCK_SIZE=16, HEAD_DIM=64, K_INDICES=32
+
 ## descriptor-store-dynamic
 
 ### Supported
@@ -662,4 +675,4 @@ _+ 7 more variants_
 
 ---
 
-_Patterns without round-trip evidence: `descriptor-gather-4d`, `descriptor-gather-5d`, `descriptor-gather-nd`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`, `descriptor-scatter-nd`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`. Add a tagged fixture variant to verify end-to-end._

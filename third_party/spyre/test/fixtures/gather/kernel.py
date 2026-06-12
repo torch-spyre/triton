@@ -1,10 +1,11 @@
 """Gather kernels: indirect row-indexed load via tl.descriptor_gather.
 
-This is the core pattern behind paged KV-cache attention and embedding
-lookups: given a 1D index tensor of row positions, read those rows from
-a 2D source matrix into a contiguous output tile.
+This is the core pattern behind block-indexed gather operations such as
+KV-cache block fetch and embedding lookups: given a 1D index tensor of
+row positions, read those rows from a source tensor into a contiguous
+output tile.
 
-Two ``@triton.jit`` functions:
+Two ``@triton.jit`` functions for rank-2 sources:
 
 - :func:`gather_kernel`    — single-program: one kernel invocation
                               consumes the whole index array and writes
@@ -15,6 +16,18 @@ Two ``@triton.jit`` functions:
                               Adds a ``BLOCK_ROWS`` constexpr; gathers
                               the full row width by column-tiling
                               instead of taking a fixed slice.
+
+Four ``@triton.jit`` functions for rank-N (N ≥ 3) sources:
+
+- :func:`gather_3d_kernel`       — rank-3 source ``[M, BLOCK_SIZE, HEAD_DIM]``;
+                                    block-fetch gather shape.
+- :func:`gather_3d_group_kernel` — rank-3 source ``[M, NUM_GROUPS, HEAD_DIM]``
+                                    with non-trivial ``y_offset`` selecting the
+                                    group dimension.
+- :func:`gather_4d_kernel`       — rank-4 source
+                                    ``[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM]``;
+                                    group dim permuted to physical dim 1.
+- :func:`scatter_3d_kernel`      — write-back mirror of :func:`gather_3d_kernel`.
 """
 
 import triton
@@ -61,9 +74,12 @@ def gather_kernel(
     Constraints baked in by ``tt.descriptor_gather``:
       * The source descriptor's ``block_shape`` must have **exactly one row**
         — the gather is what fans the load out across many rows.
-      * ``K_INDICES`` must be at least 8 (verifier).
-      * ``BLOCK_COLS`` must be at least ``32 / bitwidth * 8`` (verifier);
-        for ``f32`` that is 8 columns.
+      * ``K_INDICES`` must be at least 8 (verifier; both backends).
+      * ``BLOCK_COLS`` minimum depends on backend. On TMA/NVIDIA the
+        verifier requires ``block_shape[1] >= 32 / bitwidth * 8`` (for
+        ``f32`` that is 8 columns). On Spyre this check is skipped, so
+        ``block_shape[1]`` may be as small as 1 — the rank-N variants
+        rely on this (e.g. ``[1, 1, HEAD_DIM]``).
 
     Why the index array is loaded via a descriptor:
       The upstream Triton/GPU pattern ``tl.load(idx_ptr + tl.arange(...))``
@@ -196,3 +212,245 @@ def gather_2d_kernel(
             idx = idx_desc.load([offset_m])
             tile = in_desc.gather(idx, offset_n)
             out_desc.store([offset_m, offset_n], tile)
+
+
+# ---------------------------------------------------------------------------
+# Rank-N (N ≥ 3) gather / scatter kernels
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def gather_3d_kernel(
+    in_ptr,
+    out_ptr,
+    idx_ptr,
+    M: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    K_INDICES: tl.constexpr,
+):
+    """Single-program 3D gather: pull K_INDICES blocks from [M, BLOCK_SIZE, HEAD_DIM].
+
+    Implements::
+
+        for i in range(K_INDICES):
+            out[i, :, :] = in[idx[i], :, :]
+
+    Source ``in[M, BLOCK_SIZE, HEAD_DIM]`` is a block-indexed KV-cache where
+    each block is a ``[BLOCK_SIZE, HEAD_DIM]`` tile.  The index array
+    ``idx[K_INDICES]`` names which blocks to fetch; the result is
+    ``out[K_INDICES, BLOCK_SIZE, HEAD_DIM]``.
+
+    Block shape ``[1, BLOCK_SIZE, HEAD_DIM]``: the leading 1 satisfies the
+    ``tt.descriptor_gather`` requirement (one block per gather template).
+    ``y_offset=0`` because dim 1 covers the full ``BLOCK_SIZE`` extent —
+    no sub-block slicing.
+
+    Constraints:
+      - ``K_INDICES >= 8`` (verifier minimum on ``x_offsets.shape[0]``).
+      - ``HEAD_DIM`` is a power of two.
+    """
+    idx_desc = tl.make_tensor_descriptor(
+        idx_ptr,
+        shape=[K_INDICES],
+        strides=[1],
+        block_shape=[K_INDICES],
+    )
+    idx = idx_desc.load([0])
+
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[M, BLOCK_SIZE, HEAD_DIM],
+        strides=[BLOCK_SIZE * HEAD_DIM, HEAD_DIM, 1],
+        block_shape=[1, BLOCK_SIZE, HEAD_DIM],
+    )
+    result = in_desc.gather(idx, 0)
+
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[K_INDICES, BLOCK_SIZE, HEAD_DIM],
+        strides=[BLOCK_SIZE * HEAD_DIM, HEAD_DIM, 1],
+        block_shape=[K_INDICES, BLOCK_SIZE, HEAD_DIM],
+    )
+    out_desc.store([0, 0, 0], result)
+
+
+@triton.jit
+def gather_3d_group_kernel(
+    in_ptr,
+    out_ptr,
+    idx_ptr,
+    group_idx,
+    M: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    K_INDICES: tl.constexpr,
+):
+    """Single-program 3D gather with a non-trivial group selector.
+
+    Source ``in[M, NUM_GROUPS, HEAD_DIM]``.  Each gathered block selects one
+    group via the runtime scalar ``group_idx``, passed as ``y_offset`` to
+    ``descriptor_gather``.  Block shape ``[1, 1, HEAD_DIM]``: the leading 1
+    is the indirect dim, the second 1 means only the selected group slice
+    is read per gather.
+
+    Implements::
+
+        for i in range(K_INDICES):
+            out[i, 0, :] = in[idx[i], group_idx, :]
+
+    Result shape: ``[K_INDICES, 1, HEAD_DIM]``.
+
+    ``group_idx`` is non-zero in the default variant so the ``c_y`` capture
+    on dim 1 is load-bearing, not a trivial zero — a regression that dropped
+    ``c_y`` from the subscript would pass with ``group_idx=0`` but fail here.
+
+    Note: this variant does NOT demonstrate the
+    ``descriptor-gather-nd-subscripts`` pattern. That pattern pins the
+    dim 1 (partial extent + ``y_offset``) vs. dim ≥ 2 (full extent, no
+    offset) role split, which requires block dim 1 > 1. Here block dim 1
+    is 1, so the role contrast is not visible. A separate fixture with
+    block shape e.g. ``[1, TOKEN_DIM, HEAD_DIM]`` is needed to cover that
+    pattern end-to-end.
+
+    Constraints:
+      - ``K_INDICES >= 8``.
+      - ``HEAD_DIM`` is a power of two.
+      - ``0 <= group_idx < NUM_GROUPS``.
+    """
+    idx_desc = tl.make_tensor_descriptor(
+        idx_ptr,
+        shape=[K_INDICES],
+        strides=[1],
+        block_shape=[K_INDICES],
+    )
+    idx = idx_desc.load([0])
+
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[M, NUM_GROUPS, HEAD_DIM],
+        strides=[NUM_GROUPS * HEAD_DIM, HEAD_DIM, 1],
+        block_shape=[1, 1, HEAD_DIM],
+    )
+    result = in_desc.gather(idx, group_idx)
+
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[K_INDICES, 1, HEAD_DIM],
+        strides=[HEAD_DIM, HEAD_DIM, 1],
+        block_shape=[K_INDICES, 1, HEAD_DIM],
+    )
+    out_desc.store([0, 0, 0], result)
+
+
+@triton.jit
+def gather_4d_kernel(
+    in_ptr,
+    out_ptr,
+    idx_ptr,
+    group_idx,
+    NUM_BLOCKS: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    INNER_DIM: tl.constexpr,
+    K_INDICES: tl.constexpr,
+):
+    """Single-program 4D gather: block_id × group × BLOCK_SIZE × INNER_DIM.
+
+    Source ``in[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM]``.  Block
+    shape ``[1, 1, BLOCK_SIZE, INNER_DIM]``: two leading 1s for the indirect
+    and group dims; trailing two dims cover the full block extent.
+
+    Implements::
+
+        for i in range(K_INDICES):
+            out[i, 0, :, :] = in[idx[i], group_idx, :, :]
+
+    ``y_offset = group_idx`` selects dim 1 (NUM_GROUPS); dims 2 and 3 are
+    direct with no offset.  Result shape:
+    ``[K_INDICES, 1, BLOCK_SIZE, INNER_DIM]``.
+
+    Constraints:
+      - ``K_INDICES >= 8``.
+      - ``INNER_DIM`` is a power of two.
+      - ``0 <= group_idx < NUM_GROUPS``.
+    """
+    idx_desc = tl.make_tensor_descriptor(
+        idx_ptr,
+        shape=[K_INDICES],
+        strides=[1],
+        block_shape=[K_INDICES],
+    )
+    idx = idx_desc.load([0])
+
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM],
+        strides=[NUM_GROUPS * BLOCK_SIZE * INNER_DIM,
+                 BLOCK_SIZE * INNER_DIM, INNER_DIM, 1],
+        block_shape=[1, 1, BLOCK_SIZE, INNER_DIM],
+    )
+    result = in_desc.gather(idx, group_idx)
+
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[K_INDICES, 1, BLOCK_SIZE, INNER_DIM],
+        strides=[BLOCK_SIZE * INNER_DIM, BLOCK_SIZE * INNER_DIM, INNER_DIM, 1],
+        block_shape=[K_INDICES, 1, BLOCK_SIZE, INNER_DIM],
+    )
+    out_desc.store([0, 0, 0, 0], result)
+
+
+@triton.jit
+def scatter_3d_kernel(
+    dst_ptr,
+    data_ptr,
+    idx_ptr,
+    M: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    K_INDICES: tl.constexpr,
+):
+    """Single-program 3D scatter: write K_INDICES blocks into [M, BLOCK_SIZE, HEAD_DIM].
+
+    Write-back mirror of :func:`gather_3d_kernel`.  Reads a
+    ``[K_INDICES, BLOCK_SIZE, HEAD_DIM]`` data tile from ``data_ptr`` and
+    scatters it into the destination ``dst[M, BLOCK_SIZE, HEAD_DIM]`` at
+    the row positions named by ``idx_ptr``.
+
+    Implements::
+
+        for i in range(K_INDICES):
+            dst[idx[i], :, :] = data[i, :, :]
+
+    The scatter descriptor block shape ``[1, BLOCK_SIZE, HEAD_DIM]`` mirrors
+    the gather descriptor: the leading 1 is the indirect dim, and the
+    trailing dims cover the full block extent.
+
+    Constraints:
+      - ``K_INDICES >= 8``.
+      - ``HEAD_DIM`` is a power of two.
+    """
+    idx_desc = tl.make_tensor_descriptor(
+        idx_ptr,
+        shape=[K_INDICES],
+        strides=[1],
+        block_shape=[K_INDICES],
+    )
+    idx = idx_desc.load([0])
+
+    data_desc = tl.make_tensor_descriptor(
+        data_ptr,
+        shape=[K_INDICES, BLOCK_SIZE, HEAD_DIM],
+        strides=[BLOCK_SIZE * HEAD_DIM, HEAD_DIM, 1],
+        block_shape=[K_INDICES, BLOCK_SIZE, HEAD_DIM],
+    )
+    data = data_desc.load([0, 0, 0])
+
+    dst_desc = tl.make_tensor_descriptor(
+        dst_ptr,
+        shape=[M, BLOCK_SIZE, HEAD_DIM],
+        strides=[BLOCK_SIZE * HEAD_DIM, HEAD_DIM, 1],
+        block_shape=[1, BLOCK_SIZE, HEAD_DIM],
+    )
+    dst_desc.scatter(data, idx, 0)

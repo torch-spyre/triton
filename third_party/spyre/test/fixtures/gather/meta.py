@@ -201,6 +201,151 @@ def run_2d(inputs: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Rank-N (N ≥ 3) input makers and oracles
+# ---------------------------------------------------------------------------
+
+def _check_rank_n_preconditions(
+    K_INDICES: int, *, M: int,
+    group_idx: int = None, NUM_GROUPS: int = None,
+) -> None:
+    """Guard fixture-only preconditions that have no upstream backstop.
+
+    Two preconditions documented in the kernel docstrings — ``K_INDICES >= 8``
+    and inner dim is a power of two — are already enforced by the Triton
+    frontend (``descriptor_gather`` verifier in ``semantic.py`` and
+    ``validate_block_shape`` in ``_utils.py``), so a violating variant
+    fails at trace time with a clear message; we don't re-check them here.
+
+    The two below are not enforced anywhere else:
+
+    - ``K_INDICES <= M`` is needed because every rank-N input maker draws
+      indices via ``np.random.choice(M, size=K_INDICES, replace=False)``;
+      ``K_INDICES > M`` raises a generic numpy ``ValueError`` that does
+      not name the fixture-config mistake.
+    - ``0 <= group_idx < NUM_GROUPS`` has no backstop at all: ``group_idx``
+      flows straight through to ``tt.descriptor_gather``'s ``y_offset``
+      capture, with no verifier or lowering-pass bounds check. A violating
+      value silently reads out of bounds in the source tensor.
+    """
+    assert K_INDICES <= M, (
+        f"K_INDICES ({K_INDICES}) must be <= M ({M}) for unique-index "
+        f"sampling without replacement"
+    )
+    if group_idx is not None and NUM_GROUPS is not None:
+        assert 0 <= group_idx < NUM_GROUPS, (
+            f"group_idx must satisfy 0 <= group_idx < NUM_GROUPS; "
+            f"got group_idx={group_idx}, NUM_GROUPS={NUM_GROUPS}"
+        )
+
+
+def make_inputs_3d(
+    M: int, BLOCK_SIZE: int, HEAD_DIM: int, K_INDICES: int,
+    **_unused,
+) -> dict:
+    """Inputs for ``gather_3d_kernel``: source ``[M, BLOCK_SIZE, HEAD_DIM]``."""
+    _check_rank_n_preconditions(K_INDICES, M=M)
+    rng = np.random.default_rng(2001)
+    in_data = rng.standard_normal((M, BLOCK_SIZE, HEAD_DIM)).astype(np.float32)
+    idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
+    out_data = np.zeros((K_INDICES, BLOCK_SIZE, HEAD_DIM), dtype=np.float32)
+    return {"in_ptr": in_data, "out_ptr": out_data, "idx_ptr": idx_data}
+
+
+def run_3d(inputs: dict) -> np.ndarray:
+    """NumPy oracle for the 3D gather kernel: result[i] = in[idx[i], :, :]."""
+    return inputs["in_ptr"][inputs["idx_ptr"]]
+
+
+def make_inputs_3d_group(
+    M: int, NUM_GROUPS: int, HEAD_DIM: int, K_INDICES: int, group_idx: int,
+    **_unused,
+) -> dict:
+    """Inputs for ``gather_3d_group_kernel``: source ``[M, NUM_GROUPS, HEAD_DIM]``.
+
+    ``group_idx`` is stashed in the returned dict so the oracle can read it.
+    """
+    _check_rank_n_preconditions(
+        K_INDICES, M=M, group_idx=group_idx, NUM_GROUPS=NUM_GROUPS,
+    )
+    rng = np.random.default_rng(2002)
+    in_data = rng.standard_normal((M, NUM_GROUPS, HEAD_DIM)).astype(np.float32)
+    idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
+    out_data = np.zeros((K_INDICES, 1, HEAD_DIM), dtype=np.float32)
+    return {
+        "in_ptr":    in_data,
+        "out_ptr":   out_data,
+        "idx_ptr":   idx_data,
+        "group_idx": group_idx,
+    }
+
+
+def run_3d_group(inputs: dict) -> np.ndarray:
+    """NumPy oracle for the 3D group-gather kernel: result[i, 0, :] = in[idx[i], group_idx, :]."""
+    in_data = inputs["in_ptr"]
+    idx = inputs["idx_ptr"]
+    g = inputs["group_idx"]
+    return in_data[idx, g:g + 1, :]
+
+
+def make_inputs_4d(
+    NUM_BLOCKS: int, NUM_GROUPS: int, BLOCK_SIZE: int, INNER_DIM: int,
+    K_INDICES: int, group_idx: int,
+    **_unused,
+) -> dict:
+    """Inputs for ``gather_4d_kernel``:
+    source ``[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM]``."""
+    _check_rank_n_preconditions(
+        K_INDICES, M=NUM_BLOCKS,
+        group_idx=group_idx, NUM_GROUPS=NUM_GROUPS,
+    )
+    rng = np.random.default_rng(2003)
+    in_data = rng.standard_normal(
+        (NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM)
+    ).astype(np.float32)
+    idx_data = rng.choice(NUM_BLOCKS, size=K_INDICES, replace=False).astype(np.int32)
+    out_data = np.zeros((K_INDICES, 1, BLOCK_SIZE, INNER_DIM), dtype=np.float32)
+    return {
+        "in_ptr":    in_data,
+        "out_ptr":   out_data,
+        "idx_ptr":   idx_data,
+        "group_idx": group_idx,
+    }
+
+
+def run_4d(inputs: dict) -> np.ndarray:
+    """NumPy oracle for the 4D gather kernel: result[i, 0, :, :] = in[idx[i], group_idx, :, :]."""
+    in_data = inputs["in_ptr"]
+    idx = inputs["idx_ptr"]
+    g = inputs["group_idx"]
+    return in_data[idx, g:g + 1, :, :]
+
+
+def make_inputs_scatter_3d(
+    M: int, BLOCK_SIZE: int, HEAD_DIM: int, K_INDICES: int,
+    **_unused,
+) -> dict:
+    """Inputs for ``scatter_3d_kernel``.
+
+    ``dst_ptr`` is a zero-initialised destination buffer; ``data_ptr``
+    holds the blocks to scatter.  Unique indices so the oracle is
+    deterministic (no two blocks write the same destination row).
+    """
+    _check_rank_n_preconditions(K_INDICES, M=M)
+    rng = np.random.default_rng(2004)
+    dst_data = np.zeros((M, BLOCK_SIZE, HEAD_DIM), dtype=np.float32)
+    data_data = rng.standard_normal((K_INDICES, BLOCK_SIZE, HEAD_DIM)).astype(np.float32)
+    idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
+    return {"dst_ptr": dst_data, "data_ptr": data_data, "idx_ptr": idx_data}
+
+
+def run_scatter_3d(inputs: dict) -> np.ndarray:
+    """NumPy oracle for the 3D scatter kernel: dst[idx[i], :, :] = data[i, :, :] for each i."""
+    dst = inputs["dst_ptr"].copy()
+    dst[inputs["idx_ptr"]] = inputs["data_ptr"]
+    return dst
+
+
+# ---------------------------------------------------------------------------
 # SIGNATURE
 # ---------------------------------------------------------------------------
 
@@ -225,6 +370,50 @@ _SIG_2D = {
     "K_INDICES":  "i32",
     "BLOCK_ROWS": "i32",
     "BLOCK_COLS": "i32",
+}
+
+# Rank-N (N ≥ 3) kernel signatures.
+_SIG_3D = {
+    "in_ptr":     "*fp32",
+    "out_ptr":    "*fp32",
+    "idx_ptr":    "*i32",
+    "M":          "i32",
+    "BLOCK_SIZE": "i32",
+    "HEAD_DIM":   "i32",
+    "K_INDICES":  "i32",
+}
+
+_SIG_3D_GROUP = {
+    "in_ptr":     "*fp32",
+    "out_ptr":    "*fp32",
+    "idx_ptr":    "*i32",
+    "group_idx":  "i32",
+    "M":          "i32",
+    "NUM_GROUPS": "i32",
+    "HEAD_DIM":   "i32",
+    "K_INDICES":  "i32",
+}
+
+_SIG_4D = {
+    "in_ptr":     "*fp32",
+    "out_ptr":    "*fp32",
+    "idx_ptr":    "*i32",
+    "group_idx":  "i32",
+    "NUM_BLOCKS": "i32",
+    "NUM_GROUPS": "i32",
+    "BLOCK_SIZE": "i32",
+    "INNER_DIM":  "i32",
+    "K_INDICES":  "i32",
+}
+
+_SIG_SCATTER_3D = {
+    "dst_ptr":    "*fp32",
+    "data_ptr":   "*fp32",
+    "idx_ptr":    "*i32",
+    "M":          "i32",
+    "BLOCK_SIZE": "i32",
+    "HEAD_DIM":   "i32",
+    "K_INDICES":  "i32",
 }
 
 
@@ -277,11 +466,14 @@ VARIANTS = {
     # ------------------------------------------------------------------
     # Edge-case variants.  Each pins one specific bug class that the
     # default+embedding pair does not cover.  See README.md (the
-    # "Variants" and "Constraints" sections) for the rules these have
+    # "Variants" and "Preconditions" sections) for the rules these have
     # to obey:
-    #   * BLOCK_COLS is a power of two and >= 8 for f32
-    #   * K_INDICES >= 8
+    #   * BLOCK_COLS is a power of two (validate_block_shape)
+    #   * K_INDICES >= 8 (descriptor_gather verifier)
     #   * y_offset + BLOCK_COLS <= N (slice fits in the source row)
+    # The TMA-only ``BLOCK_COLS >= 32 / bitwidth * 8`` minimum does not
+    # apply on Spyre (see kernel.py docstring), but every rank-2
+    # variant below picks BLOCK_COLS >= 8 anyway for portability.
     # ------------------------------------------------------------------
     "y_offset_zero": {
         # y_offset=0 case.  The lowered indirect access tile uses
@@ -447,7 +639,8 @@ VARIANTS = {
         #   n_blocks=8 / grid[1]=8 = 1 col tile per core
         # x_offsets loaded from idx_desc has shape [BLOCK_ROWS]; Triton
         # frontend requires x_offsets.shape[0] >= 8 for tt.descriptor_gather
-        # (see python/triton/language/semantic.py:1144), so BLOCK_ROWS >= 8
+        # (see ``descriptor_gather`` in python/triton/language/semantic.py,
+        # the ``x_offsets.shape[0] >= 8`` assertion), so BLOCK_ROWS >= 8
         # here.
         #
         # ``parallel: True`` overrides the inherited ``False`` from the
@@ -560,6 +753,106 @@ VARIANTS = {
         "reference":    run_2d,
         "inputs":       make_inputs_2d_large_table,
         "output_key":   "out_ptr",
+        "extra_checks": _EXTRA_CHECKS,
+    },
+    # ------------------------------------------------------------------
+    # Rank-N (N ≥ 3) gather / scatter variants.
+    # ------------------------------------------------------------------
+    "3d": {
+        # Block-fetch gather: rank-3 source [M, BLOCK_SIZE, HEAD_DIM].
+        # Each index names a block (dim 0); the full [BLOCK_SIZE, HEAD_DIM]
+        # extent of that block is gathered.  y_offset=0 because dim 1 covers
+        # the full BLOCK_SIZE — no sub-block slicing.
+        #
+        # Chosen sizes: M=256 keeps the index pool large enough for
+        # K_INDICES=32 unique-index draws; BLOCK_SIZE=16 and HEAD_DIM=64
+        # are powers of two and match typical attention block dimensions.
+        "kernel_fn":    kernel.gather_3d_kernel,
+        "SIGNATURE":    _SIG_3D,
+        "constexpr":    ["M", "BLOCK_SIZE", "HEAD_DIM", "K_INDICES"],
+        "params": {
+            "M":          [256],
+            "BLOCK_SIZE": [16],
+            "HEAD_DIM":   [64],
+            "K_INDICES":  [32],
+        },
+        "tags":         ["descriptor-gather-nd"],
+        "grid":         [32],
+        "parallel":     False,
+        "reference":    run_3d,
+        "inputs":       make_inputs_3d,
+        "output_key":   "out_ptr",
+        "extra_checks": _EXTRA_CHECKS,
+    },
+    "3d_group": {
+        # Rank-3 with non-trivial y_offset: source [M, NUM_GROUPS, HEAD_DIM],
+        # block [1, 1, HEAD_DIM].  group_idx selects dim 1 (the group axis);
+        # result shape is [K_INDICES, 1, HEAD_DIM].
+        #
+        # group_idx=3 (non-zero) makes the c_y capture load-bearing — a bug
+        # that dropped c_y from the subscript would pass group_idx=0 but
+        # fail here.  Pins the descriptor-gather-nd-subscripts pattern.
+        "kernel_fn":    kernel.gather_3d_group_kernel,
+        "SIGNATURE":    _SIG_3D_GROUP,
+        "constexpr":    ["M", "NUM_GROUPS", "HEAD_DIM", "K_INDICES"],
+        "params": {
+            "M":          [256],
+            "NUM_GROUPS": [8],
+            "HEAD_DIM":   [64],
+            "K_INDICES":  [32],
+            "group_idx":  [3],
+        },
+        "tags":         ["descriptor-gather-nd"],
+        "grid":         [32],
+        "parallel":     False,
+        "reference":    run_3d_group,
+        "inputs":       make_inputs_3d_group,
+        "output_key":   "out_ptr",
+        "extra_checks": _EXTRA_CHECKS,
+    },
+    "4d": {
+        # Rank-4: source [NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM].
+        # Block [1, 1, BLOCK_SIZE, INNER_DIM] — two leading 1s for the
+        # indirect and group dims; trailing two dims at full extent.
+        # group_idx=1 (non-zero) for the same reason as 3d_group.
+        "kernel_fn":    kernel.gather_4d_kernel,
+        "SIGNATURE":    _SIG_4D,
+        "constexpr":    ["NUM_BLOCKS", "NUM_GROUPS", "BLOCK_SIZE", "INNER_DIM", "K_INDICES"],
+        "params": {
+            "NUM_BLOCKS": [64],
+            "NUM_GROUPS": [4],
+            "BLOCK_SIZE": [16],
+            "INNER_DIM":  [64],
+            "K_INDICES":  [32],
+            "group_idx":  [1],
+        },
+        "tags":         ["descriptor-gather-4d"],
+        "grid":         [32],
+        "parallel":     False,
+        "reference":    run_4d,
+        "inputs":       make_inputs_4d,
+        "output_key":   "out_ptr",
+        "extra_checks": _EXTRA_CHECKS,
+    },
+    "scatter_3d": {
+        # Write-back mirror of the "3d" variant.  Reads K_INDICES blocks from
+        # data_ptr and scatters them into dst_ptr[M, BLOCK_SIZE, HEAD_DIM].
+        # Uses unique indices (no aliasing) so the oracle is deterministic.
+        "kernel_fn":    kernel.scatter_3d_kernel,
+        "SIGNATURE":    _SIG_SCATTER_3D,
+        "constexpr":    ["M", "BLOCK_SIZE", "HEAD_DIM", "K_INDICES"],
+        "params": {
+            "M":          [256],
+            "BLOCK_SIZE": [16],
+            "HEAD_DIM":   [64],
+            "K_INDICES":  [32],
+        },
+        "tags":         ["descriptor-scatter-nd"],
+        "grid":         [32],
+        "parallel":     False,
+        "reference":    run_scatter_3d,
+        "inputs":       make_inputs_scatter_3d,
+        "output_key":   "dst_ptr",
         "extra_checks": _EXTRA_CHECKS,
     },
 }
