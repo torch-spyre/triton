@@ -420,6 +420,14 @@ struct RewriteDescriptorLayoutPass
     plan.sizes.resize(physRank);
     plan.strides.resize(physRank);
 
+    // TODO(S5): Revisit whether a consistency check between plan.sizes and
+    // coords.physShape is appropriate here. They serve different purposes:
+    // - plan.sizes[p] (from memViewOp) = full descriptor extent = trip count
+    //   for floor dims, or full physical extent for opSlice/lane dims.
+    // - coords.physShape[p] (from the load result tensor type) = block extent
+    //   = 1 for floor dims (one stick per block), physShape[p] for opSlice.
+    // They are NOT equal in general (e.g. floor dim: 1 vs N_sticks; M-row dim:
+    // BM vs M_total). A check needs to verify each dim category independently.
     int dynSzPos = 0, dynStPos = 0;
     for (int p = 0; p < physRank; ++p) {
       if (staticSizes[p] != ShapedType::kDynamic) {
