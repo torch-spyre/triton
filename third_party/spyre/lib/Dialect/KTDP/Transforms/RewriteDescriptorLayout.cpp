@@ -217,15 +217,17 @@ struct RewriteDescriptorLayoutPass
   // Walk all linalg.matmul ops; fix any whose operands are rank-3 (physical).
   // Phase 2 driver: walk contraction ops whose operands have been physicalized
   // to rank > 2 and synthesize the scf.for loop nest that produces a 2D result.
-  // Currently handles linalg.matmul; extend by adding a dispatch branch for
-  // other contraction ops (e.g. linalg.batch_matmul, linalg.reduce over a
-  // physical dim) — the loop-until-stable structure accommodates any op type.
-  // Traces operands back to their tt.spyre_tensor_layout markers (still live
-  // during Phase 2) to read the coord maps. Repeats until stable.
+  // Also walks ktdp.store ops whose output descriptor is annotated (data_tile
+  // is logical but access_tile is already physical from Phase 1) and calls
+  // dispatchStore to synthesize the scatter nest. Repeats until stable.
+  // Currently handles linalg.matmul + ktdp.store; extend by adding a dispatch
+  // branch for other contraction / sink ops as needed.
   LogicalResult synthesizeContractions(ModuleOp module) {
     bool changed = true;
     while (changed) {
       changed = false;
+
+      // --- matmul source stage ---
       SmallVector<linalg::MatmulOp> matmuls;
       module.walk([&](linalg::MatmulOp op) { matmuls.push_back(op); });
       for (auto mm : matmuls) {
@@ -236,6 +238,31 @@ struct RewriteDescriptorLayoutPass
         if (aType.getRank() == 2 && bType.getRank() == 2)
           continue;
         if (failed(dispatchMatmul(mm)))
+          return failure();
+        changed = true;
+      }
+
+      // --- store sink stage ---
+      SmallVector<mlir::ktdp::StoreOp> stores;
+      module.walk([&](mlir::ktdp::StoreOp op) { stores.push_back(op); });
+      for (auto st : stores) {
+        // Check for rank mismatch: data_tile is logical (rank 2) but access_tile
+        // is physical (rank 3). This mismatch is left by Phase 1 when the output
+        // descriptor carries a tt.spyre_tensor_layout marker.
+        auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
+        auto tileTy = dyn_cast<mlir::ktdp::AccessTileType>(
+            st.getAccessTile().getType());
+        if (!dataTy || !tileTy)
+          continue;
+        int dataRank = dataTy.getRank();
+        int tileRank = (int)tileTy.getShape().size();
+        if (dataRank == tileRank)
+          continue; // already consistent — unannotated path or already lowered
+        // Only proceed when there is a layout marker for the output descriptor.
+        auto marker = findMarkerForStore(st.getDataTile());
+        if (!marker)
+          continue;
+        if (failed(dispatchStore(st, marker)))
           return failure();
         changed = true;
       }
@@ -431,6 +458,47 @@ struct RewriteDescriptorLayoutPass
       }
     }
     return plan;
+  }
+
+  // Trace a logical value forward to its ktdp.store, then walk back through
+  // the store's access tile to the physical memView -> marker map.
+  //
+  // This is the mirror of findMarkerForOperand (which traces backward through
+  // loads). The forward walk finds any ktdp.store that consumes `value`
+  // (possibly through an elementwise chain). If the store's access tile
+  // was physicalized by Phase 1, its base is in physMemViewToMarker.
+  //
+  // Returns the marker, or a null SpyreTensorLayoutOp if not found.
+  triton::SpyreTensorLayoutOp findMarkerForStore(Value value) {
+    // Walk the forward use chain: value → elementwise ops → ktdp.store.
+    // We stop at any op that is not a single-tensor-result elementwise op.
+    SmallVector<Value> worklist = {value};
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      for (auto *user : v.getUsers()) {
+        if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
+          // Found the store. Trace its access tile to the marker.
+          auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
+              st.getAccessTile().getDefiningOp());
+          if (!tile)
+            continue;
+          auto it = physMemViewToMarker.find(tile.getBase());
+          if (it != physMemViewToMarker.end())
+            return it->second;
+        }
+        // Continue through single-tensor-result elementwise ops (e.g. truncf).
+        if (user->getNumResults() != 1)
+          continue;
+        int tensorOps = 0;
+        for (auto op : user->getOperands())
+          if (isa<RankedTensorType>(op.getType()))
+            ++tensorOps;
+        if (tensorOps != 1)
+          continue;
+        worklist.push_back(user->getResult(0));
+      }
+    }
+    return {};
   }
 
   // Per-matmul entry point for Phase 2: trace operands to markers, build
@@ -648,6 +716,190 @@ struct RewriteDescriptorLayoutPass
         emitNest(b, loc, c0, c1, loops, 0, ValueRange{zeroAcc}, matmulBody);
     mm.getResult(0).replaceAllUsesWith(results[0]);
     mm.erase();
+    return success();
+  }
+
+  // Per-store entry point for the sink stage: read the D coord map from the
+  // marker, build the OperandPlan for D (all dims parallel), and call
+  // emitStoreStage.
+  LogicalResult dispatchStore(mlir::ktdp::StoreOp st,
+                              triton::SpyreTensorLayoutOp marker) {
+    // The access tile shape IS the physical block shape of D.
+    auto tileTy = cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
+    ArrayRef<int64_t> physBlock = tileTy.getShape();
+
+    OperandCoords dC{marker.getPhysSrc(), marker.getPhysOp(),
+                     marker.getPhysArg(), 2, physBlock};
+
+    // D has no reduction dim: every physical dim's logical src is a parallel dim.
+    // Roles[p] = phys_src[p] — the logical dim index it derives from.
+    int physRank = (int)physBlock.size();
+    SmallVector<int64_t> dimRoleD(physRank);
+    for (int p = 0; p < physRank; ++p)
+      dimRoleD[p] = marker.getPhysSrc()[p]; // logical dim index; all parallel
+
+    OperandPlan dPlan = classify(st.getDataTile(), dC, dimRoleD);
+    return emitStoreStage(st, dPlan);
+  }
+
+  // Sink stage: consume the LOGICAL data_tile from the store, synthesize a
+  // scf.for nest that scatters it into a PHYSICAL D tensor matching the
+  // (already physical) access tile, then redirect the store's data_tile to
+  // the physical result.
+  //
+  // The store has NO reduction loop — every loop is parallel. The iter_arg
+  // carries the accumulating physical D tensor. At the leaf body:
+  //   1. Extract the logical C sub-slice for the current loop indices.
+  //   2. Insert it into the physical D accumulator via tensor.insert_slice.
+  //
+  // Placement (R-e): emitted at the block of the logical data_tile, after its
+  // last use. Since logicalC lives at the function body level (produced by the
+  // matmul stage or by retypeChain from a load), the builder is set there by
+  // OpBuilder(st) which positions before the store.
+  LogicalResult emitStoreStage(mlir::ktdp::StoreOp st,
+                               const OperandPlan &dPlan) {
+    Value logicalC = st.getDataTile(); // the LOGICAL input (rank-2)
+    OpBuilder b(st);
+    Location loc = st.getLoc();
+
+    auto logTy = cast<RankedTensorType>(logicalC.getType());
+    Type elemTy = logTy.getElementType();
+    ArrayRef<int64_t> logShape = logTy.getShape(); // [M, N_total]
+
+    ArrayRef<int64_t> physShape = dPlan.coords.physShape; // [Nstick, M, lane]
+    int physRank = (int)physShape.size();
+
+    // Verify assumptions: exactly one floor dim, rest are opSlice.
+    // The lane dim (innermost) and any identity parallel dims are opSliceDims.
+    if (dPlan.floorDims.empty())
+      return st.emitError(
+          "spyre_tensor_layout: store sink stage requires at least one "
+          "parallel floor dim in the output layout");
+    // reduceLoop must be empty for a store.
+    if (!dPlan.reduceLoop.empty())
+      return st.emitError(
+          "spyre_tensor_layout: store sink stage: unexpected reduction dim");
+
+    // The logical C slice is extracted in logical-dim order and inserted into
+    // D's opSlice dims directly (no transpose). This is only correct when D's
+    // opSlice dims are already in ascending logical-dim order. Guard against
+    // layouts that would need a transpose (the source stage handles that case
+    // via transposeA/transposeB; the sink stage does not yet).
+    {
+      int64_t prevLogDim = -1;
+      for (int p : dPlan.opSliceDims) {
+        int64_t logDim = dPlan.dimRoles[p];
+        if (logDim < prevLogDim)
+          return st.emitError(
+              "spyre_tensor_layout: store sink stage: output opSlice dims are "
+              "not in ascending logical-dim order (transpose not yet supported)");
+        prevLogDim = logDim;
+      }
+    }
+
+    // Logical C shape and the N-lane size from the physical plan.
+    // physShape[lane] is the stick-lane extent (e.g. 64); it equals the
+    // block-N of the logical C tile for a single-N-stick case. For multi-
+    // stick, logShape[1] = physShape[0] * physShape[lane].
+    int laneDim = dPlan.lane; // innermost phys dim of D (= physRank-1)
+    int64_t laneSize = physShape[laneDim]; // e.g. 64
+
+    // Build the loop list: one loop per floor dim, parallel only.
+    SmallVector<Loop> loops;
+    for (int p : dPlan.floorDims) {
+      loops.push_back({Loop::Parallel, /*owner=*/0, p,
+                       physShape[p], dPlan.dimRoles[p], {}});
+    }
+
+    // helpers
+    auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
+    Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
+    Value c1 = arith::ConstantIndexOp::create(b, loc, 1);
+
+    // Build the initial physical D accumulator (tensor.empty over physShape).
+    SmallVector<int64_t> dPhysShape(physShape.begin(), physShape.end());
+    Value dEmpty = tensor::EmptyOp::create(b, loc, dPhysShape, elemTy);
+
+    // Sink-stage leaf body: extract the logical C sub-slice for the current
+    // loop indices and insert it into the physical D accumulator.
+    auto storeBody = [&](MutableArrayRef<Loop> ls,
+                         ValueRange iterArgs) -> SmallVector<Value> {
+      Value dAcc = iterArgs[0];
+
+      // Collect loop IVs for each floor dim.
+      // Build a map from (physDim) -> IV for quick lookup.
+      SmallVector<Value> floorIVs(physRank, Value{});
+      for (auto &l : ls)
+        if (l.kind == Loop::Parallel)
+          floorIVs[l.physDim] = l.iv;
+
+      // --- Extract sub-slice from logical C ---
+      // The logical C has shape [M, N_total] (e.g. [64, 64] single-stick, or
+      // [64, 256] multi-stick). For each floor dim p (Nstick), the j-th
+      // iteration covers N-lane columns starting at j * laneSize.
+      // Map: logical dim 1 (N) → offset = j_iv * laneSize; dim 0 (M) → full.
+      //
+      // We derive offsets for each logical dim of C from the floor loop IVs.
+      // A logical dim d is "looped" if there is a floor dim p with role d.
+      int logRank = (int)logShape.size(); // = 2 for matmul output [M, N]
+      SmallVector<OpFoldResult> cOffsets(logRank), cSizes(logRank),
+          cStrides(logRank, idx(1));
+
+      // Initialize all logical dims to full-slice (no loop).
+      for (int d = 0; d < logRank; ++d) {
+        cOffsets[d] = idx(0);
+        cSizes[d]   = idx(logShape[d]);
+      }
+
+      // For each floor dim p of D, the loop IV covers one stick along logical
+      // dim dPlan.dimRoles[p]. The slice size along that logical dim is laneSize
+      // (one stick's worth). The offset is iv * laneSize.
+      SmallVector<int64_t> cSliceShape(logShape.begin(), logShape.end());
+      for (int p : dPlan.floorDims) {
+        int64_t logDim = dPlan.dimRoles[p];
+        if (logDim < 0 || logDim >= logRank)
+          continue; // should not happen for a valid store
+        Value iv = floorIVs[p];
+        // offset = iv * laneSize; use the lane size from the physical plan.
+        Value laneSizeVal = arith::ConstantIndexOp::create(b, loc, laneSize);
+        Value offset = arith::MulIOp::create(b, loc, iv, laneSizeVal).getResult();
+        cOffsets[logDim] = offset;
+        cSizes[logDim]   = idx(laneSize);
+        cSliceShape[logDim] = laneSize;
+      }
+
+      auto cSliceTy = RankedTensorType::get(cSliceShape, elemTy);
+      Value cSlice = tensor::ExtractSliceOp::create(
+          b, loc, cSliceTy, logicalC, cOffsets, cSizes, cStrides);
+
+      // --- Insert cSlice into the physical D accumulator ---
+      // offsets/sizes for each phys dim of D:
+      //   floor dims p : offset = iv (stick index), size = 1
+      //   opSlice dims p: offset = 0, size = physShape[p]
+      SmallVector<OpFoldResult> dOffsets(physRank), dSizes(physRank),
+          dStrides(physRank, idx(1));
+      for (int p = 0; p < physRank; ++p) {
+        bool isFloor = false;
+        for (int fp : dPlan.floorDims)
+          if (fp == p) { isFloor = true; break; }
+        if (isFloor) {
+          dOffsets[p] = floorIVs[p];
+          dSizes[p]   = idx(1);
+        } else {
+          dOffsets[p] = idx(0);
+          dSizes[p]   = idx(physShape[p]);
+        }
+      }
+      Value dNew = tensor::InsertSliceOp::create(
+          b, loc, cSlice, dAcc, dOffsets, dSizes, dStrides);
+      return {dNew};
+    };
+
+    SmallVector<Value> results =
+        emitNest(b, loc, c0, c1, loops, 0, ValueRange{dEmpty}, storeBody);
+
+    // Redirect the store's data_tile to the physical result.
+    st.getDataTileMutable().set(results[0]);
     return success();
   }
 

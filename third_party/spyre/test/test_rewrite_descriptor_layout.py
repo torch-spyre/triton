@@ -411,6 +411,138 @@ class TestMatmulKSplit(RewriteLayoutTester):
 
 
 # =========================================================================
+# Sink stage: annotated output (C/store) descriptor
+# =========================================================================
+
+class TestMatmulAnnotatedOutput(RewriteLayoutTester):
+    """Annotated output (C) descriptor: the store sink stage.
+
+    A[M,K] stick-on-M, B[K,N] stick-on-N (same as TestMatmulSingleStick),
+    and now C[M,N] is ALSO annotated stick-on-N:
+      phys C = [N//64, M, 64] = [1, 64, 64]  (N=64, M=64, one N-stick).
+
+    The source stage (matmul) leaves C as a LOGICAL tensor<64x64xf32>.
+    The sink stage scatters that into the physical [1,64,64] buffer via
+    tensor.insert_slice, then redirects the ktdp.store's data_tile to the
+    physical result.
+
+    Shapes used (same as TestMatmulSingleStick):
+      M=256, K=128, N=256
+      block A = [64,128] -> phys A = [1,128,64]
+      block B = [128,64] -> phys B = [1,128,64]
+      block C = [64,64]  -> phys C = [1,64,64]
+    """
+
+    # A[M,K] stick-on-M: phys_src=[0,1,0] => [M//64, K, M%64]
+    _A_LAYOUT = ("{phys_src = array<i64: 0, 1, 0>, "
+                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    # B[K,N] stick-on-N: phys_src=[1,0,1] => [N//64, K, N%64]
+    _B_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
+                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    # C[M,N] stick-on-N: phys_src=[1,0,1] => [N//64, M, N%64]
+    _C_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
+                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+
+    _KERNEL = """
+        module {{
+          tt.func @mm(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f16>,
+                      %m: i32, %k: i32, %n: i32) {{
+            %M = arith.constant 256 : i32
+            %K = arith.constant 128 : i32
+            %N = arith.constant 256 : i32
+            %sK = arith.constant 128 : i64
+            %sN = arith.constant 256 : i64
+            %sM = arith.constant 256 : i64
+            %one = arith.constant 1 : i64
+            %adesc = tt.make_tensor_descriptor %a, [%M, %K], [%sK, %one]
+                : <f16>, <64x128xf16>
+            %bdesc = tt.make_tensor_descriptor %b, [%K, %N], [%sN, %one]
+                : <f16>, <128x64xf16>
+            %cdesc = tt.make_tensor_descriptor %c, [%M, %N], [%sM, %one]
+                : <f16>, <64x64xf16>
+            tt.spyre_tensor_layout %adesc {a_layout} : <64x128xf16>
+            tt.spyre_tensor_layout %bdesc {b_layout} : <128x64xf16>
+            tt.spyre_tensor_layout %cdesc {c_layout} : <64x64xf16>
+            %at = tt.descriptor_load %adesc[%m, %k]
+                : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
+            %bt = tt.descriptor_load %bdesc[%k, %n]
+                : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16>
+            %acc = arith.constant dense<0.0> : tensor<64x64xf32>
+            %d = tt.dot %at, %bt, %acc
+                : tensor<64x128xf16> * tensor<128x64xf16> -> tensor<64x64xf32>
+            %dh = arith.truncf %d : tensor<64x64xf32> to tensor<64x64xf16>
+            tt.descriptor_store %cdesc[%m, %n], %dh
+                : !tt.tensordesc<64x64xf16>, tensor<64x64xf16>
+            tt.return
+          }}
+        }}
+        """
+
+    @pattern("physical-layout-store-annotated-output", category="memory", example=[
+        "# Annotated C/output: the sink stage scatters logical C into a",
+        "# physical [N//64, M, lane] buffer via tensor.insert_slice.",
+        "c_desc = tl.make_tensor_descriptor(c_ptr, shape=[M,N], strides=[N,1],",
+        "                                   block_shape=[BLOCK_M, BLOCK_N])",
+        "tl.spyre_tensor_layout(c_desc, [(1,'floordiv',64), 0, (1,'mod',64)])",
+        "# The store data_tile is replaced by a physical [N//64,M,64] tensor.",
+    ])
+    def test_annotated_output_lowers(self):
+        self.run(self._KERNEL.format(
+            a_layout=self._A_LAYOUT, b_layout=self._B_LAYOUT,
+            c_layout=self._C_LAYOUT))
+        # Markers are erased.
+        self.assert_absent("tt.spyre_tensor_layout")
+        # The sink stage synthesizes a tensor.insert_slice to scatter logical C
+        # into the physical output buffer.
+        self.assert_present("tensor.insert_slice")
+        # Physical output store access tile is rank-3: [1,64,64].
+        self.assert_result_type("ktdp.construct_access_tile", "access_tile<1x64x64xindex>")
+
+    def test_annotated_output_no_insert_slice_when_unannotated(self):
+        """Unannotated C: the fallback path is untouched, no insert_slice."""
+        # Reuse TestMatmulSingleStick's kernel (A and B annotated, C not).
+        kernel = """
+        module {{
+          tt.func @mm(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f16>,
+                      %m: i32, %k: i32, %n: i32) {{
+            %M = arith.constant 256 : i32
+            %K = arith.constant 128 : i32
+            %N = arith.constant 256 : i32
+            %sK = arith.constant 128 : i64
+            %sN = arith.constant 256 : i64
+            %sM = arith.constant 256 : i64
+            %one = arith.constant 1 : i64
+            %adesc = tt.make_tensor_descriptor %a, [%M, %K], [%sK, %one]
+                : <f16>, <64x128xf16>
+            %bdesc = tt.make_tensor_descriptor %b, [%K, %N], [%sN, %one]
+                : <f16>, <128x64xf16>
+            %cdesc = tt.make_tensor_descriptor %c, [%M, %N], [%sM, %one]
+                : <f16>, <64x64xf16>
+            tt.spyre_tensor_layout %adesc {a_layout} : <64x128xf16>
+            tt.spyre_tensor_layout %bdesc {b_layout} : <128x64xf16>
+            %at = tt.descriptor_load %adesc[%m, %k]
+                : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
+            %bt = tt.descriptor_load %bdesc[%k, %n]
+                : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16>
+            %acc = arith.constant dense<0.0> : tensor<64x64xf32>
+            %d = tt.dot %at, %bt, %acc
+                : tensor<64x128xf16> * tensor<128x64xf16> -> tensor<64x64xf32>
+            %dh = arith.truncf %d : tensor<64x64xf32> to tensor<64x64xf16>
+            tt.descriptor_store %cdesc[%m, %n], %dh
+                : !tt.tensordesc<64x64xf16>, tensor<64x64xf16>
+            tt.return
+          }}
+        }}
+        """.format(a_layout=self._A_LAYOUT, b_layout=self._B_LAYOUT)
+        self.run(kernel)
+        self.assert_absent("tt.spyre_tensor_layout")
+        # Unannotated C → no sink stage → no insert_slice.
+        self.assert_absent("tensor.insert_slice")
+        # Logical C store: access tile shape matches the logical block [64x64].
+        self.assert_result_type("ktdp.construct_access_tile", "access_tile<64x64xindex>")
+
+
+# =========================================================================
 # Negative (frontend): the layout list must be passed inline, not via a local
 # =========================================================================
 
