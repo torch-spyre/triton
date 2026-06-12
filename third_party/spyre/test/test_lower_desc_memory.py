@@ -834,10 +834,14 @@ class TestDescriptorGather(LowerDescMemoryTester):
                             "ktdp.load")
 
     @pattern("descriptor-gather", category="memory", negative=True, example=[
-        "# x_offsets as a function argument is REJECTED post-fallback-removal",
-        "# Spyre kernels must stage indices via tt.descriptor_load from a !tt.ptr<i32>",
-        "# arg; a tensor-typed kernel arg has no traceable provenance, so the gather",
+        "# REJECTED: x_offsets passed as a tensor-typed kernel argument.",
+        "# Spyre requires indices staged via tt.descriptor_load from a !tt.ptr<i32>",
+        "# argument — a tensor arg has no traceable provenance, so the gather",
         "# pattern returns failure() and applyPartialConversion errors out.",
+        "@triton.jit",
+        "def k(ptr, x_offsets, y_offset, M, K, stride_row, stride_col):",
+        "    desc = tl.make_tensor_descriptor(ptr, [M, K], [stride_row, stride_col], [1, 64])",
+        "    data = desc.gather(x_offsets, y_offset)  # x_offsets is a kernel arg — rejected",
     ])
     def test_gather_with_x_offsets_arg_fails_to_legalize(self, capfd):
         """An ``x_offsets`` that is a tensor-typed function argument is no

@@ -44,10 +44,14 @@ kernels always pass index buffers as ``!tt.ptr<i32>`` +
 misuse.
 
 ```python
-# x_offsets as a function argument is REJECTED post-fallback-removal
-# Spyre kernels must stage indices via tt.descriptor_load from a !tt.ptr<i32>
-# arg; a tensor-typed kernel arg has no traceable provenance, so the gather
+# REJECTED: x_offsets passed as a tensor-typed kernel argument.
+# Spyre requires indices staged via tt.descriptor_load from a !tt.ptr<i32>
+# argument — a tensor arg has no traceable provenance, so the gather
 # pattern returns failure() and applyPartialConversion errors out.
+@triton.jit
+def k(ptr, x_offsets, y_offset, M, K, stride_row, stride_col):
+    desc = tl.make_tensor_descriptor(ptr, [M, K], [stride_row, stride_col], [1, 64])
+    data = desc.gather(x_offsets, y_offset)  # x_offsets is a kernel arg — rejected
 ```
 
 Expected diagnostics:
@@ -93,7 +97,7 @@ Expected diagnostics:
 
 - `descriptor block must be a 2D tensor`
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:948` (`TestDescriptorGatherND.test_gather_nd_block_rejected`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:952` (`TestDescriptorGatherND.test_gather_nd_block_rejected`)</sup>
 
 ## descriptor-load-dynamic
 
@@ -207,7 +211,7 @@ Expected diagnostics:
 - `must be ptr`
 - `got 'index'`
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1374` (`TestAddptrIntoDescriptor.test_addptr_into_descriptor_fails`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1378` (`TestAddptrIntoDescriptor.test_addptr_into_descriptor_fails`)</sup>
 
 ## descriptor-placement-conditional
 
@@ -243,7 +247,7 @@ if cond:
     tile = tl.descriptor_load(desc, [off])
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1280` (`TestDescriptorPlacement.test_descriptor_inside_scf_if_view_inside_branch`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1284` (`TestDescriptorPlacement.test_descriptor_inside_scf_if_view_inside_branch`)</sup>
 
 ## descriptor-placement-nested
 
@@ -272,7 +276,7 @@ for i in range(0, N, BLOCK):
     tile = tl.descriptor_load(desc, [i])
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1229` (`TestDescriptorPlacement.test_nested_descriptor_view_inside_loop`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1233` (`TestDescriptorPlacement.test_nested_descriptor_view_inside_loop`)</sup>
 
 ## descriptor-placement-top-level
 
@@ -302,7 +306,7 @@ for off in range(0, N, BLOCK):
     tile = tl.descriptor_load(desc, [off])  # inside the loop
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1174` (`TestDescriptorPlacement.test_top_level_descriptor_view_outside_loop`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1178` (`TestDescriptorPlacement.test_top_level_descriptor_view_outside_loop`)</sup>
 
 ## descriptor-rank-reduce
 
