@@ -86,20 +86,14 @@ struct BufferDescriptorsOpConversion
     auto lengths = adaptor.getLengths();
     assert(offsets.size() == lengths.size() && "Mismatched descriptor arrays");
 
-    auto totalTensorType = cast<RankedTensorType>(op.getResult().getType());
-    // The totalEncoding is of shape [CTAs, Descriptors]
-    auto totalEncoding =
-        cast<ttg::DistributedEncodingTrait>(totalTensorType.getEncoding());
-    assert(totalTensorType.getRank() == 2 &&
-           "descriptor tables must have shape [cta, descriptor]");
+    auto tensorType = cast<RankedTensorType>(op.getResult().getType());
+    auto encoding =
+        cast<ttg::DistributedEncodingTrait>(tensorType.getEncoding());
+    assert(tensorType.getRank() == 1 &&
+           "descriptor tables must have shape [descriptor]");
     assert(static_cast<int64_t>(offsets.size()) ==
-               totalTensorType.getShape().back() &&
+               tensorType.getShape().back() &&
            "Descriptor data must match the descriptor dimension");
-    // Get a slice of shape [Descriptors] that will be broadcasted at the end
-    auto encoding = tti::getSingleDimSliceEncoding(totalEncoding, /*dim=*/1);
-    auto tensorType =
-        RankedTensorType::get({totalTensorType.getShape().back()},
-                              totalTensorType.getElementType(), encoding);
 
     SmallVector<uint64_t> offsetVals;
     offsetVals.reserve(offsets.size());
@@ -146,9 +140,6 @@ struct BufferDescriptorsOpConversion
     Value bufDescriptors =
         arith::OrIOp::create(rewriter, loc, trimmedPointers.getType(),
                              trimmedPointers, lengthTensor);
-    bufDescriptors = tti::expandOuterSlicedDim(rewriter, loc, bufDescriptors);
-    bufDescriptors = triton::BroadcastOp::create(rewriter, loc, totalTensorType,
-                                                 bufDescriptors);
     rewriter.replaceOp(op, bufDescriptors);
     return success();
   }
@@ -298,7 +289,7 @@ struct LockReleaseOpConversion
       auto *ptrOpr = ptx.newAddrOperand(adaptor.getLock(), "l");
       auto *valOpr = ptx.newOperand(zero, "r");
       auto &atom = *ptx.create("atom");
-      atom.global().o("acq_rel").o("gpu").o("exch").o("b32");
+      atom.global().o("release").o("gpu").o("exch").o("b32");
       atom(dstOpr, ptrOpr, valOpr).predicate(elect);
       ptx.launch(b, loc, i32);
     } else {
@@ -356,6 +347,51 @@ private:
   const TargetInfoBase &targetInfo;
 };
 
+struct LocalGatherOpConversion
+    : public ConvertOpToLLVMPattern<tti::ExperimentalLocalGatherOp> {
+  LocalGatherOpConversion(const LLVMTypeConverter &converter,
+                          const TargetInfoBase &targetInfo,
+                          PatternBenefit benefit = 1)
+      : ConvertOpToLLVMPattern<tti::ExperimentalLocalGatherOp>(converter,
+                                                               benefit),
+        targetInfo(targetInfo) {}
+
+  LogicalResult
+  matchAndRewrite(tti::ExperimentalLocalGatherOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto memDescTy = cast<ttg::MemDescType>(op.getSrc().getType());
+    auto regTy = cast<RankedTensorType>(op.getType());
+    auto typeConverter = getTypeConverter();
+
+    Type llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
+    auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
+                                                         llvmElemTy, rewriter);
+    auto idxValues = unpackLLElements(loc, adaptor.getIndices(), rewriter);
+    auto dstIndices =
+        emitIndices(loc, rewriter, targetInfo, regTy.getEncoding(), regTy,
+                    /*withCTAOffset=*/true);
+    SmallVector<Value> offsets(adaptor.getOffsets());
+
+    auto addrs =
+        computeLocalAddrs(loc, memDescTy, smemObj, llvmElemTy, idxValues,
+                          dstIndices, op.getAxis(), rewriter, offsets);
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    SmallVector<Value> results =
+        llvm::map_to_vector(addrs, [&](const LocalSharedMemoryAddress &addr) {
+          return targetInfo.loadDShared(rewriter, loc, addr.ptr, addr.ctaId,
+                                        llvmElemTy, b.true_val());
+        });
+    Value result = packLLElements(loc, typeConverter, results, rewriter, regTy);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+
+private:
+  const TargetInfoBase &targetInfo;
+};
+
 } // namespace
 
 void mlir::triton::populateInstrumentationToLLVMPatterns(
@@ -367,4 +403,5 @@ void mlir::triton::populateInstrumentationToLLVMPatterns(
   patterns.add<LockReleaseOpConversion>(typeConverter, targetInfo);
   patterns.add<MemDescToI32OpConversion>(typeConverter);
   patterns.add<ClusterCTAIdOpConversion>(typeConverter, targetInfo);
+  patterns.add<LocalGatherOpConversion>(typeConverter, targetInfo);
 }

@@ -24,7 +24,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 
 #include <numeric>
 
@@ -49,6 +49,8 @@ namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
 
+namespace {
+
 FailureOr<gpu::CGAEncodingAttr> parseCGALayoutRankTwo(AsmParser &parser) {
   Attribute attr;
   if (parser.parseAttribute(attr).failed())
@@ -61,6 +63,8 @@ FailureOr<gpu::CGAEncodingAttr> parseCGALayoutRankTwo(AsmParser &parser) {
 void printCGALayoutRankTwo(AsmPrinter &printer, gpu::CGAEncodingAttr cgaAttr) {
   gpu::printCGAAttr(printer, cgaAttr);
 }
+
+} // namespace
 
 TMemAllocation getTmemAllocSizes(MemDescType memDescType) {
   auto *ctx = memDescType.getContext();
@@ -202,7 +206,9 @@ getDistributedLayoutForTmemLdSt(const LinearLayout &ll, TMemAccessAtom atom,
       // Software padding with just one column
       return getDistributedLayoutForTmemLdSt(ll, atom, numWarps, 32);
     } else {
-      assert(false && "Should not happen");
+      // This can fail for fp4_padded layouts as we don't support implicit
+      // padding and unpadding upon load yet.
+      return std::nullopt;
     }
   }
   // getTileLayout returns the layout for a bitwidth of 32
@@ -411,11 +417,10 @@ bool isDistributedLayoutTMemCompatible(Operation *op,
   return succeeded(computeTMemLdStEncodingInfo(tensorType, memType, maxnreg));
 }
 
-LogicalResult
-TensorMemoryEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
-                                 unsigned blockM, unsigned blockN,
-                                 unsigned colStride,
-                                 gpu::CGAEncodingAttr cgaLayout, bool twoCTAs) {
+LogicalResult TensorMemoryEncodingAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, unsigned blockM,
+    unsigned blockN, unsigned colStride, gpu::CGAEncodingAttr cgaLayout,
+    bool twoCTAs, bool fp4Padded) {
   if (cgaLayout.getRank() != 2) {
     return emitError() << "CGALayout must have rank 2";
   }
@@ -441,6 +446,11 @@ TensorMemoryEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   if (!(colStride == 1 || colStride == 2 || colStride == 4)) {
     return emitError() << "colStride must be 1, 2, or 4 but got "
                        << "but got " << colStride;
+  }
+  if (fp4Padded && colStride != 1) {
+    return emitError() << "fp4Padded tensor memory layout requires colStride "
+                          "1 but got "
+                       << colStride;
   }
   return success();
 }
