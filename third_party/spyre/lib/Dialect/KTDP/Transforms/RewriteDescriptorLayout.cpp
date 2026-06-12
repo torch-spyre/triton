@@ -349,6 +349,17 @@ struct RewriteDescriptorLayoutPass
   // Slice extraction produces tensors in ascending physical dim order; a
   // linalg.transpose is emitted when the reduction dim precedes the parallel dim
   // (linalg.matmul requires [M,K] and [K,N]).
+  //
+  // TODO(generalize): the three arms of emitLoops (B-outer, A-outer, K-stick)
+  // are structurally identical — each recurses over a flat list of (dims,
+  // physShape, IV-bucket). Collapse them into a single loop over an ordered
+  // list of LoopGroup structs, and replace buildExtract's extraDims/extraIVs
+  // with a dim→(offset,size) override map so the K-flat offset on B is expressed
+  // the same way as any other per-dim override. That makes emitLoops op-agnostic:
+  // refactor to emitContractionLoops(loopGroups, buildInnerBody) where
+  // buildInnerBody is a callback — matmul passes (extract+transpose+matmul),
+  // future ops pass their own body. synthesizeContractions then calls it for
+  // each supported op type without touching the loop structure.
   LogicalResult synthesizeMatmulLoops(linalg::MatmulOp mm,
                                 ArrayRef<int64_t> dimRoleA,
                                 ArrayRef<int64_t> dimRoleB,
