@@ -11,14 +11,21 @@ A plain install builds Spyre-only — no `TRITON_BACKENDS` needed:
 
 ```bash
 uv pip install -e ".[spyre-test]"            # editable + test deps
+bash install-ktdp-mlir-bindings.sh           # install KTDP MLIR bindings (generated above)
 uv run pytest third_party/spyre/test         # run the suite
 ```
+
+The two-step install is intentional: `mlir_ktdp` (the KTIR MLIR Python bindings)
+must be compiled against Triton's own MLIR to avoid duplicate-MLIR-global-state
+crashes. `setup.py` generates `install-ktdp-mlir-bindings.sh` with the correct
+`MLIR_DIR` baked in during the first step.
 
 Faster iterative rebuilds (install build deps once, then skip isolation):
 
 ```bash
 uv pip install $(uv run python -c "import tomllib; print(' '.join(tomllib.load(open('pyproject.toml','rb'))['build-system']['requires']))")
 uv pip install -e ".[spyre-test]" --no-build-isolation
+bash install-ktdp-mlir-bindings.sh
 ```
 
 Use `UV_PROJECT_ENVIRONMENT=/path/to/venv` (Python 3.12+) so `uv` targets your

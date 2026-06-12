@@ -44,22 +44,19 @@ jobs:
         run: |
           uv venv .venv --python 3.12 --python-preference managed --seed
 
-      - name: Install build dependencies
-        run: |
-          uv pip install $(uv run python -c "import tomllib; print(' '.join(tomllib.load(open('pyproject.toml','rb'))['build-system']['requires']))")
-
       - name: Install Triton-Spyre
         env:
           TRITON_BACKENDS: spyre
           MAX_JOBS: "4"
-          # The built-in token has cross-repo actions:read for the MLIR
-          # artifacts published by torch-spyre/ktir-mlir-frontend. On a
-          # spyre-only build, setup.py invokes the submodule's setup_mlir.py,
-          # which reads GIT_PAT to download and cache them. Same pattern as
-          # torch-spyre/ktir-cpu's CI.
+          # GIT_PAT is used by setup_mlir.py to download the MLIR artifact on
+          # first run (cached in ~/.cache/ktir-mlir/ afterwards).
           GIT_PAT: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          uv pip install -e ".[spyre-test]" --no-build-isolation
+          uv pip install -v -e ".[spyre-test]"
+
+      - name: Install KTDP MLIR bindings
+        run: |
+          bash install-ktdp-mlir-bindings.sh
 
       - name: Run tests
         run: |

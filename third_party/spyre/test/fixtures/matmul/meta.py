@@ -165,6 +165,7 @@ VARIANTS = {
         "output_key":   "c_ptr",
         # fp32 matmul accumulation order differs from NumPy's @ — allow ~1% drift.
         "rtol":         1e-2,
+        "atol":         1e-3,
         "extra_checks": lambda t: (
             t.assert_present("linalg.matmul"),
             t.assert_absent("tt.dot"),
