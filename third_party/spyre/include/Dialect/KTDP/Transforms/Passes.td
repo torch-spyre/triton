@@ -48,7 +48,9 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
         (phys_src / phys_op / phys_arg i64 arrays, one entry per physical dim;
         op 0=identity, 1=floordiv, 2=mod).
 
-        Lowering (per annotated descriptor):
+        Runs in three phases (staged model):
+
+        Phase 1 — physicalize each annotated descriptor:
         - rebuild ktdp.construct_memory_view with physical shape/strides/memref
           type: floordiv dims get extent ceil(N/div) (covering partial boundary
           sticks), mod dims get extent = modulus, identity dims are unchanged
@@ -56,19 +58,26 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
         - rebuild each ktdp.construct_access_tile with physical block shape +
           remapped index operands (identity / divsi / remsi);
         - retype ktdp.load result tensors and forward-retype the elementwise
-          compute chain to the physical rank;
-        - redirect ktdp.store's access tile operand to the physical tile;
-        - erase the tt.spyre_tensor_layout marker and the now-dead
-          UnrealizedConversionCast bridge.
+          compute chain to the physical rank (stops at multi-tensor ops);
+        - redirect ktdp.store's access tile operand to the physical tile.
 
-        Output: physical ktdp.construct_memory_view + access_tile + load/store;
-        no tt.spyre_tensor_layout ops remain. Descriptors without an annotation
-        are left untouched.
+        Phase 2 — synthesize loop nests for ops whose physical dims need their
+        own iteration:
+        - source (matmul): physicalize INPUTS, emit an scf.for nest extracting
+          2-D slices + linalg.matmul (K-stick dims drive a reduction loop);
+          the matmul OUTPUT stays logical;
+        - sink (store, only when the output descriptor is annotated): consume the
+          logical value, emit an scf.for nest scattering it into the physical
+          output buffer via tensor.insert_slice.
 
-        Pointwise scope: physicalizes descriptor data and retypes the elementwise
-        compute chain. Does NOT synthesize loops or reductions for physical dims
-        that need their own iteration (e.g. matmul's contraction) -- see the
-        matmul loop synthesis extension below.
+        Phase 3 — erase the tt.spyre_tensor_layout markers and the now-dead
+        UnrealizedConversionCast bridges.
+
+        Output: physical ktdp.construct_memory_view + access_tile + load/store,
+        with scf.for / linalg.matmul / tensor.insert_slice loop nests where
+        required; no tt.spyre_tensor_layout ops remain. Descriptors without an
+        annotation are left untouched. A pure pointwise kernel exercises only
+        Phase 1.
     }];
 
     let dependentDialects = [

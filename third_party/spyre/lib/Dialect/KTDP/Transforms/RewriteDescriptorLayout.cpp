@@ -20,8 +20,12 @@
 // remains valid. Both intervening conversion passes mark SpyreTensorLayoutOp
 // legal so it is never flagged as unconverted.
 //
-// v1 scope (pointwise): pure stick-tiling. Does NOT synthesize scf.for loops
-// for matmul contraction -- deferred to Increment 2/3.
+// Staged model: each op-stage independently physicalizes the side that touches
+// memory and synthesizes its own scf.for nest. The source stage (matmul)
+// physicalizes its INPUTS and leaves the output LOGICAL; the sink stage (store)
+// consumes the LOGICAL value and physicalizes its OUTPUT. Stages share only a
+// logical SSA value + the placement rule (emit at the value's block, after its
+// uses); they share the classify / Loop / collectLoops / emitNest utilities.
 //
 // Call graph:
 //   runOnOperation
@@ -34,13 +38,18 @@
 //           mapIndices / applyIndex
 //         retypeLoad                -> physical ktdp.load + retypeChain
 //           retypeChain             propagate type (stops at multi-tensor ops)
-//         retypeStore               redirect access tile operand
+//         retypeStore               redirect access tile operand (output stays
+//                                   logical-typed; sink stage fixes it in Phase 2)
 //         (marker kept alive for Phase 2)
 //     Phase 2 — synthesizeContractions (loop-until-stable):
-//       dispatchMatmul(mm)
+//       source: dispatchMatmul(mm)
 //         findMarkerForOperand      trace load -> access tile -> memView -> marker
 //         classify                  build OperandPlan (dimRoles, floorDims, reduceLoop…)
 //         emitMatmulStage           emit scf.for nest + linalg.matmul slices; output logical
+//       sink:   dispatchStore(st)   (only when output descriptor is annotated)
+//         findMarkerForStore        trace store -> access tile -> memView -> marker
+//         classify / emitStoreStage emit scf.for nest scattering logical C into
+//                                   physical D via tensor.insert_slice
 //     Phase 3 — eraseMarker (marker + dead bridge cast)
 //
 //   Coord helpers (free functions):
@@ -316,7 +325,7 @@ struct RewriteDescriptorLayoutPass
   // Assign a role to each physical dim of an operand:
   //   >= 0  : parallel dim, maps to C dim [value]
   //   -1    : reduction (inner dot) dim — K-flat or K-lane
-  //   -2    : reduction loop dim — K-stick (not yet supported, Inc 3)
+  //   -2    : reduction loop dim — K-stick (drives an scf.for in emitMatmulStage)
   //
   // For A (logical dim0=M → C.dim0, dim1=K → reduction):
   //   phys_src[p]==0 → M → role 0
@@ -336,7 +345,7 @@ struct RewriteDescriptorLayoutPass
       if (coords.src[p] != kLogicalSrc) {
         roles[p] = parallelRole;
       } else if (static_cast<CoordOp>(coords.op[p]) == CoordOp::FloorDiv) {
-        roles[p] = -2; // K-stick: reduction loop (Inc 3)
+        roles[p] = -2; // K-stick: reduction loop
       } else {
         roles[p] = -1; // K-flat or K-lane: inner dot
       }
