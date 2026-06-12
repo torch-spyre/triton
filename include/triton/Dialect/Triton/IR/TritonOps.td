@@ -1008,6 +1008,53 @@ def TT_MakeTensorDescOp : TT_Op<"make_tensor_descriptor", [
 
 }
 
+// --- START --- added for spyre
+// Spyre-only marker op. Annotates a tt.make_tensor_descriptor with its physical
+// (stick-tiled) device layout as the OpSpec `device_coordinates` form: three
+// parallel i32 arrays, one entry per physical dim.
+//   phys_src[k] : which LOGICAL dim (= shape-operand index) physical dim k
+//                 derives from.
+//   phys_op[k]  : 0 = identity, 1 = floordiv, 2 = mod.
+//   phys_arg[k] : divisor (floordiv) / modulus (mod); ignored for identity.
+// e.g. stick on logical dim 1 (N) — coordinate map [N//64, M, N%64],
+//   physical extents [ceil(N/64), M, 64]:
+//   phys_src=[1,0,1]  phys_op=[1,0,2]  phys_arg=[64,0,64]
+//
+// The layout is carried as ATTRIBUTES (not SSA values) so it survives constant
+// folding -- a static shape like [N//64, M, N%64] with N constexpr would
+// otherwise fold to literal [4,512,0], destroying the stick identity. The Spyre
+// KTDP lowering reads these arrays + the descriptor's (still-live) shape
+// operands to build the physical memory view, then erases the op. Inert on GPU:
+// nothing emits it (the tl.spyre_tensor_layout builtin is guarded to the spyre
+// target) and nothing lowers it.
+//
+// NOTE: the op def is always tablegen'd (TableGen defs can't be #ifdef'd out of
+// a shared dialect); its pybind builder and pass consumer are guarded with
+// #ifdef TRITON_BUILD_TTIR_ONLY. See CLAUDE.md "Guarding Spyre-only additions".
+def TT_SpyreTensorLayoutOp : TT_Op<"spyre_tensor_layout", []> {
+  let summary = "Spyre: annotate a tensor descriptor with its physical device layout";
+
+  let description = [{
+    `tt.spyre_tensor_layout` carries the physical (stick-tiled) device layout for
+    a `tt.make_tensor_descriptor` as three parallel i32 array attributes
+    (`spyre.phys_src` / `spyre.phys_op` / `spyre.phys_arg`), one entry per
+    physical dim — the OpSpec `device_coordinates` form. The Spyre lowering reads
+    them together with the descriptor's logical shape operands to build the
+    physical device layout. No result; the op is a marker consumed and erased by
+    the lowering. Ignored by all other backends.
+  }];
+
+  let arguments = (ins
+    TT_TensorDescType:$desc,
+    DenseI64ArrayAttr:$phys_src,
+    DenseI64ArrayAttr:$phys_op,
+    DenseI64ArrayAttr:$phys_arg
+  );
+
+  let assemblyFormat = "$desc attr-dict `:` type($desc)";
+}
+// --- END --- added for spyre
+
 // The following ops, including `call`, `func`, and `return` are copied and modified from
 // https://github.com/llvm/llvm-project/blob/main/mlir/include/mlir/Dialect/Func/IR/FuncOps.td
 // We could revert it back once MLIR has a better inliner interface.

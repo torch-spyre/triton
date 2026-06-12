@@ -10,7 +10,9 @@ include "mlir/Pass/PassBase.td"
 //           └──────────────┬──────────────┘
 //                          ↓
 //                   LowerComputeOps
-//                          |
+//                          ↓
+//             RewriteDescriptorLayout   (spyre_tensor_layout-annotated
+//                          ↓             descriptors only; otherwise a no-op)
 //                   ConvertFunctions
 //                          |
 //                    DistributeWork
@@ -19,11 +21,61 @@ include "mlir/Pass/PassBase.td"
 //                          |
 //                        KTIR
 //
+// RewriteDescriptorLayout runs LAST (before ConvertFunctions) so that tt.dot
+// is already linalg.matmul before operands are physicalized. The marker
+// (tt.spyre_tensor_layout) persists through LowerDescriptorMemory +
+// LowerComputeOps via the UnrealizedConversionCast bridge left by Walk 1; both
+// passes mark the marker legal so it is never flagged as unconverted.
+//
 // Each pass declares its contract below:
 //   Input    — dialects/ops it expects to see
 //   Lowering — ops it converts and what they become
 //   Output   — what the IR looks like after this pass
 // ============================================================================
+
+def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"> {
+    let summary = "Rewrite logical tensor descriptors to physical (stick-tiled) "
+                  "layout from tt.spyre_tensor_layout annotations.";
+    let description = [{
+        Input: lowered KTDP IR (after LowerDescriptorMemory + LowerComputeOps).
+        Each annotated descriptor has been lowered to:
+          ktdp.construct_memory_view (logical shape/strides, wrapped in an
+          UnrealizedConversionCast bridging back to !tt.tensordesc so the
+          tt.spyre_tensor_layout marker's desc operand stays valid) →
+          ktdp.construct_access_tile (logical block shape) →
+          ktdp.load/store.
+        The marker holds the physical layout as the OpSpec device_coordinates form
+        (phys_src / phys_op / phys_arg i64 arrays, one entry per physical dim;
+        op 0=identity, 1=floordiv, 2=mod).
+
+        Lowering (per annotated descriptor):
+        - rebuild ktdp.construct_memory_view with physical shape/strides/memref
+          type: floordiv dims get extent ceil(N/div) (covering partial boundary
+          sticks), mod dims get extent = modulus, identity dims are unchanged
+          (e.g. [M,N] -> [ceil(N/64), M, 64]);
+        - rebuild each ktdp.construct_access_tile with physical block shape +
+          remapped index operands (identity / divsi / remsi);
+        - retype ktdp.load result tensors and forward-retype the elementwise
+          compute chain to the physical rank;
+        - redirect ktdp.store's access tile operand to the physical tile;
+        - erase the tt.spyre_tensor_layout marker and the now-dead
+          UnrealizedConversionCast bridge.
+
+        Output: physical ktdp.construct_memory_view + access_tile + load/store;
+        no tt.spyre_tensor_layout ops remain. Descriptors without an annotation
+        are left untouched.
+
+        Pointwise scope: physicalizes descriptor data and retypes the elementwise
+        compute chain. Does NOT synthesize loops or reductions for physical dims
+        that need their own iteration (e.g. matmul's contraction) -- see the
+        matmul loop synthesis extension below.
+    }];
+
+    let dependentDialects = [
+        "mlir::arith::ArithDialect",
+        "mlir::ktdp::KtdpDialect"
+    ];
+}
 
 def LowerDescriptorMemory : Pass<"lower-descriptor-memory", "mlir::ModuleOp"> {
     let summary = "Lower tt.descriptor_* ops to ktdp memory ops.";
