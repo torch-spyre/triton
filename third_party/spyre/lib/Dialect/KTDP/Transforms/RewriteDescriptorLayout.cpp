@@ -436,6 +436,22 @@ struct RewriteDescriptorLayoutPass
                               forOp.getResults().end());
   }
 
+  // Fill parallel Loop IVs and call body() at the current builder position.
+  // All current callers have parallelTrip == 1 (enforced by the guard above),
+  // so every parallel IV is a constant 0. No scf.for is emitted — the body
+  // runs inline, allowing its results to be used directly by the caller.
+  void emitParallelNest(OpBuilder &b, Location loc, Value c0, Value c1,
+                        MutableArrayRef<Loop> loops, size_t idx,
+                        llvm::function_ref<void()> body) {
+    if (idx == loops.size()) {
+      body();
+      return;
+    }
+    // Trip is always 1 (multi-output-stick is guarded above), so IV = 0.
+    loops[idx].iv = c0;
+    emitParallelNest(b, loc, c0, c1, loops, idx + 1, body);
+  }
+
   // Classify one operand's physical dims into OperandPlan fields.
   // `coords` carries phys_src/op/arg and physShape. `dimRoles` comes from
   // buildDimRoles. The resulting plan owns copies of the role vector.
@@ -564,24 +580,36 @@ struct RewriteDescriptorLayoutPass
     ArrayRef<int64_t> aPhysShape = aPlan.coords.physShape;
     ArrayRef<int64_t> bPhysShape = bPlan.coords.physShape;
 
-    // Unpack plan fields into the names used by the existing loop body.
-    // floorDims → outer (stick-index) dims that become parallel scf.for loops.
-    // reduceLoop → K-stick dims that become reduction scf.for loops.
-    // opSliceDims → inner dims that form the 2D slice fed to linalg.matmul.
-    const SmallVector<int> &aOuterDims   = aPlan.floorDims;
-    const SmallVector<int> &bOuterDims   = bPlan.floorDims;
-    const SmallVector<int> &aInnerDims   = aPlan.opSliceDims;
-    const SmallVector<int> &bInnerDims   = bPlan.opSliceDims;
-    const SmallVector<int> &aKStickDims  = aPlan.reduceLoop;
+    // Unpack plan fields into the names used by the existing loop body. Each
+    // physical dim of an operand plays exactly one role:
+    //   floorDims   → outer stick-index dims (FloorDiv, parallel role) that
+    //                 become parallel scf.for loops, one IV each, size-1 slice.
+    //   reduceLoop  → K-stick dims (FloorDiv, K role) that become reduction
+    //                 scf.for loops accumulating the contraction.
+    //   opSliceDims → the 2 dims left over, retained full-size to form the 2D
+    //                 [.,.] tile fed to linalg.matmul.
+    //
+    // Grounded by the two matmul fixtures (stick_size = 64):
+    //   spyre_stick_parallel (M=N=K=64, single stick everywhere):
+    //     A phys [1,64,64] = [M//64, K, M%64] → floorDims=[0], opSlice=[1,2],
+    //                                            reduceLoop=[]
+    //   spyre_stick_k (M=N=64, K=128 → 2 K-sticks, A stuck on K):
+    //     A phys [2,64,64] = [K//64, M, K%64] → floorDims=[], opSlice=[1,2],
+    //                                            reduceLoop=[0]
+    const SmallVector<int> &aFloorDims     = aPlan.floorDims;
+    const SmallVector<int> &bFloorDims     = bPlan.floorDims;
+    const SmallVector<int> &aOpSliceDims    = aPlan.opSliceDims;
+    const SmallVector<int> &bOpSliceDims    = bPlan.opSliceDims;
+    const SmallVector<int> &aKStickDims    = aPlan.reduceLoop;
 
-    // Each operand must have exactly 2 inner dims (the 2D slice).
-    if (aInnerDims.size() != 2 || bInnerDims.size() != 2)
+    // Each operand must have exactly 2 opSlice dims (the 2D matmul tile).
+    if (aOpSliceDims.size() != 2 || bOpSliceDims.size() != 2)
       return mm.emitError(
-          "spyre_tensor_layout: expected exactly 2 inner dims per operand");
+          "spyre_tensor_layout: expected exactly 2 opSlice dims per operand");
 
-    // Inner dims in ascending physical order: [lo, hi].
-    int aDimLo = aInnerDims[0], aDimHi = aInnerDims[1];
-    int bDimLo = bInnerDims[0], bDimHi = bInnerDims[1];
+    // opSlice dims in ascending physical order: [lo, hi].
+    int aDimLo = aOpSliceDims[0], aDimHi = aOpSliceDims[1];
+    int bDimLo = bOpSliceDims[0], bDimHi = bOpSliceDims[1];
 
     // Physical-order 2D slice types (what extract_slice actually produces).
     auto sliceAPhysTy = RankedTensorType::get(
@@ -611,9 +639,6 @@ struct RewriteDescriptorLayoutPass
     Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
     Value c1 = arith::ConstantIndexOp::create(b, loc, 1);
 
-    Value zeroAcc = arith::ConstantOp::create(
-        b, loc, DenseElementsAttr::get(accTy2D, b.getFloatAttr(accTy, 0.0)));
-
     // Emit a 2D linalg.transpose (permutation [1,0]) on src.
     auto emitTranspose2D = [&](Value src, Type elemT) -> Value {
       auto srcTy = cast<RankedTensorType>(src.getType());
@@ -628,7 +653,7 @@ struct RewriteDescriptorLayoutPass
     // and optional extra indexed dims (e.g. K-stick dims, each with its own IV).
     // Produces a rank-reduced tensor in physical-dim order.
     auto buildExtract = [&](Value operand, ArrayRef<int> outerDims,
-                            ArrayRef<int> innerDims,
+                            ArrayRef<int> opSliceDims,
                             ArrayRef<int64_t> physShape,
                             ArrayRef<Value> outerIVs,
                             RankedTensorType resultTy,
@@ -644,7 +669,7 @@ struct RewriteDescriptorLayoutPass
         offsets[extraDims[i]] = extraIVs[i];
         sizes[extraDims[i]]   = idx(1);
       }
-      for (int p : innerDims) {
+      for (int p : opSliceDims) {
         offsets[p] = idx(0);
         sizes[p]   = idx(physShape[p]);
       }
@@ -664,16 +689,36 @@ struct RewriteDescriptorLayoutPass
     // A-reduceLoop (reduction). IVs are null until emitNest fills them.
     SmallVector<Loop> loops = collectLoops(aPlan, bPlan);
 
-    // Matmul leaf body: extract A and B slices (using Loop IVs), transpose
-    // if needed, then call linalg.matmul and yield the result.
-    // B's K-flat offset = ks * KA when the K-stick reduction loop is present.
-    auto matmulBody = [&](MutableArrayRef<Loop> ls,
+    // Split loop list into a parallel prefix and a reduction suffix.
+    // collectLoops guarantees parallels come before reductions.
+    size_t split = 0;
+    while (split < loops.size() && loops[split].kind == Loop::Parallel)
+      ++split;
+    for (size_t i = split; i < loops.size(); ++i)
+      assert(loops[i].kind == Loop::Reduction &&
+             "parallel loop after reduction");
+    MutableArrayRef<Loop> parallelLoops(loops.data(), split);
+    MutableArrayRef<Loop> reduceLoops(loops.data() + split,
+                                      loops.size() - split);
+
+    // Matmul leaf body: given all loop IVs populated in `loops`, extract A
+    // and B slices, transpose if needed, compute linalg.matmul into a FRESH
+    // zero, and add to the loop-carried sub-block accumulator `acc`.
+    //
+    // Using fresh-zero matmul output (not the iter_arg directly) is essential:
+    // if the iter_arg were the matmul output, canonicalize would see that the
+    // iter_arg's init is zero and fold `iter_arg → zero` inside the loop,
+    // breaking K-stick accumulation (only the last stick would survive).
+    // The explicit `linalg.add(acc, prod)` form survives canonicalize because
+    // `prod` is a fresh temporary and `acc` is not the matmul output.
+    auto matmulBody = [&](MutableArrayRef<Loop> /*ls*/,
                           ValueRange iterArgs) -> SmallVector<Value> {
       Value acc = iterArgs[0];
 
-      // Collect IVs by (owner, physDim) for extract building.
+      // Collect IVs from the full loops array (both parallel and reduction IVs
+      // are populated at the time matmulBody is called).
       SmallVector<Value> aFloorIVs, bFloorIVs, aKStickIVs;
-      for (auto &l : ls) {
+      for (auto &l : loops) {
         if (l.kind == Loop::Parallel && l.owner == 1)
           bFloorIVs.push_back(l.iv);
         else if (l.kind == Loop::Parallel && l.owner == 0)
@@ -684,7 +729,7 @@ struct RewriteDescriptorLayoutPass
 
       // Extract A slice: floor dims indexed by aFloorIVs, K-stick indexed by
       // aKStickIVs, inner (opSlice) dims taken full.
-      Value aSlicePhys = buildExtract(aVal, aOuterDims, aInnerDims,
+      Value aSlicePhys = buildExtract(aVal, aFloorDims, aOpSliceDims,
                                       aPhysShape, aFloorIVs, sliceAPhysTy,
                                       aKStickDims, aKStickIVs);
 
@@ -693,11 +738,11 @@ struct RewriteDescriptorLayoutPass
       int bRankInt = (int)bPhysShape.size();
       SmallVector<OpFoldResult> bOffsets(bRankInt), bSizes(bRankInt),
           bStrides(bRankInt, idx(1));
-      for (int i = 0; i < (int)bOuterDims.size(); ++i) {
-        bOffsets[bOuterDims[i]] = bFloorIVs[i];
-        bSizes[bOuterDims[i]]   = idx(1);
+      for (int i = 0; i < (int)bFloorDims.size(); ++i) {
+        bOffsets[bFloorDims[i]] = bFloorIVs[i];
+        bSizes[bFloorDims[i]]   = idx(1);
       }
-      for (int p : bInnerDims) {
+      for (int p : bOpSliceDims) {
         if (p == bKFlatDim && !aKStickIVs.empty()) {
           // K-flat dim: offset = ks * KA (single K-stick dim; rare multi-dim
           // case would compose similarly via stride accumulation).
@@ -716,14 +761,117 @@ struct RewriteDescriptorLayoutPass
 
       Value aSlice = transposeA ? emitTranspose2D(aSlicePhys, aElemTy) : aSlicePhys;
       Value bSlice = transposeB ? emitTranspose2D(bSlicePhys, bElemTy) : bSlicePhys;
-      Value mmRes = linalg::MatmulOp::create(b, loc, accTy2D,
-          ValueRange{aSlice, bSlice}, ValueRange{acc}).getResult(0);
-      return {mmRes};
+
+      // Realize the contraction as the plan's "scf.for + accumulate" form:
+      // matmul this chunk into a FRESH zero to get the partial product, then
+      // ADD it to the loop-carried accumulator. We deliberately do NOT use the
+      // iter_arg as the matmul's outs (the natural accumulation): canonicalize
+      // sees the iter_arg's init is zero, rewrites the matmul's outs to a fresh
+      // in-loop zero-fill, and collapses the K-stick loop-carry — keeping only
+      // the last K-stick. The explicit add leaves no zero-init matmul to fold,
+      // so the reduction survives canonicalize. For the no-reduction case the
+      // loop runs once and this is just acc(=0) + A·B.
+      Value prodInit = arith::ConstantOp::create(
+          b, loc, DenseElementsAttr::get(accTy2D, b.getFloatAttr(accTy, 0.0)));
+      Value prod = linalg::MatmulOp::create(b, loc, accTy2D,
+          ValueRange{aSlice, bSlice}, ValueRange{prodInit}).getResult(0);
+      Value addOut = tensor::EmptyOp::create(b, loc, accTy2D.getShape(), accTy);
+      Value sum = linalg::AddOp::create(b, loc, accTy2D,
+          ValueRange{acc, prod}, ValueRange{addOut}).getResult(0);
+      return {sum};
     };
 
+    // The full logical C type comes from the matmul output operand.
+    // For single-output-stick this equals accTy2D; for multi-output-stick
+    // (e.g. A stick-on-M with M=128 and B stick-on-N with N=128) this is
+    // the full assembled output tensor (e.g. tensor<128x128xf32>).
+    auto fullCTy = cast<RankedTensorType>(cVal.getType());
+
+    // Initialize the full logical C to zero. The parallel loops carry this
+    // as their iter_arg; each (i,j) leaf inserts its computed sub-block via
+    // tensor.insert_slice. For single-output-stick the insert covers the
+    // entire tensor and canonicalize simplifies it to just the sub-result.
+    Value fullCInit = arith::ConstantOp::create(
+        b, loc, DenseElementsAttr::get(fullCTy, b.getFloatAttr(accTy, 0.0)));
+
+    // Parallel-leaf body: all parallel IVs are populated in `loops`. Compute
+    // the sub-block for this (i,j) output stick (via K-stick reduction or a
+    // single matmul if reduceLoops is empty), then insert the sub-block at
+    // the correct logical offset into the carried fullC assembly tensor.
+    //
+    // cVal (mm.getOutputs()[0]) is the matmul's current outs operand. When the
+    // linalg.matmul lives inside a Triton K-loop (lowered from `for k: acc +=
+    // dot(A[k], B[k])`), cVal is that K-loop's region iter_arg — the running
+    // accumulator across K-tiles. Using cVal as the K-stick accumulator init
+    // threads the outer K-tile accumulation through the K-stick reduction,
+    // ensuring the Triton K-loop's iter_arg is never disconnected from the add.
+    // Canonicalize cannot fold the K-stick iter_arg to zero because its init
+    // (cVal) is a block argument, not a constant.
+    auto parallelLeafBody = [&](MutableArrayRef<Loop> /*ls*/,
+                                ValueRange iterArgs) -> SmallVector<Value> {
+      Value fullC = iterArgs[0]; // assembly accumulator (full logical C)
+
+      Value subResult;
+      if (reduceLoops.empty()) {
+        // No K-stick reduction: single matmul into fresh zero, then add to the
+        // existing accumulator from the outer (Triton) K-loop.  cVal is the
+        // matmul's current outs operand — inside the Triton K-loop it is the
+        // K-loop's region iter_arg, so adding to it carries the accumulation
+        // across Triton K-tiles correctly.
+        subResult = matmulBody({}, ValueRange{cVal})[0];
+      } else {
+        // K-stick reduction loops carry cVal (the matmul's current outs =
+        // the outer Triton K-loop's iter_arg) as their initial accumulator.
+        // Each K-stick loop iteration adds one stick's matmul contribution.
+        // Using cVal (not a fresh zero) means prior K-tile accumulation from
+        // the Triton K-loop is threaded through correctly.
+        subResult = emitNest(b, loc, c0, c1, reduceLoops, 0,
+                             ValueRange{cVal},
+                             [&](MutableArrayRef<Loop>, ValueRange innerArgs) {
+                               return matmulBody({}, innerArgs);
+                             })[0];
+      }
+
+      // Single-output-stick fast path: subResult IS the full logical C; no
+      // assembly needed. The parallel loops' iter_arg (fullC) is unused here —
+      // the outer emitNest still threads it but canonicalize simplifies it away.
+      if (fullCTy == accTy2D)
+        return {subResult};
+
+      // Multi-output-stick: insert sub-block into the fullC assembly tensor at
+      // the logical offset derived from the parallel IVs.
+      // For each parallel loop with logicalDim d:
+      //   offset[d] = IV * floor_div_arg   (= IV * stick_size)
+      // Dims with no parallel loop contribute offset 0.
+      int fullRank = (int)fullCTy.getRank();
+      SmallVector<OpFoldResult> insOffsets(fullRank, idx(0));
+      SmallVector<OpFoldResult> insSizes(fullRank);
+      SmallVector<OpFoldResult> insStrides(fullRank, idx(1));
+      for (int d = 0; d < fullRank; ++d)
+        insSizes[d] = idx(accTy2D.getDimSize(d));
+      for (auto &l : parallelLoops) {
+        int d = (int)l.logicalDim;
+        if (d < 0 || d >= fullRank) continue;
+        int64_t floorArg = (l.owner == 0 ? aPlan.coords.arg[l.physDim]
+                                         : bPlan.coords.arg[l.physDim]);
+        Value argV = arith::ConstantIndexOp::create(b, loc, floorArg);
+        insOffsets[d] =
+            arith::MulIOp::create(b, loc, l.iv, argV).getResult();
+      }
+      Value newFullC = tensor::InsertSliceOp::create(
+          b, loc, subResult, fullC, insOffsets, insSizes, insStrides);
+      return {newFullC};
+    };
+
+    // Emit parallel loops carrying fullCInit as the assembly accumulator.
+    // Each (i,j) leaf inserts its computed sub-block; the outermost loop
+    // returns the fully assembled logical C.
     SmallVector<Value> results =
-        emitNest(b, loc, c0, c1, loops, 0, ValueRange{zeroAcc}, matmulBody);
-    mm.getResult(0).replaceAllUsesWith(results[0]);
+        emitNest(b, loc, c0, c1, parallelLoops, 0, ValueRange{fullCInit},
+                 parallelLeafBody);
+    Value assembledC = results[0];
+
+    mm.getResult(0).replaceAllUsesWith(assembledC);
     mm.erase();
     return success();
   }

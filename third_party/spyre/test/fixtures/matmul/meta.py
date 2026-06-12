@@ -331,13 +331,15 @@ VARIANTS = {
         "summary": (
             "Matmul with Spyre stick-tiling annotations: A stick-on-M, "
             "B/C stick-on-N. Exercises the source matmul stage (no reduction "
-            "loop) and the store sink stage."
+            "loop, single output stick) and the store sink stage."
         ),
         "kernel_fn":    kernel.matmul_kernel,
         "SIGNATURE":    _SIG_SPYRE,
         "constexpr":    ["M", "K", "N", "BLOCK_M", "BLOCK_K", "BLOCK_N",
                          "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
         "params":       {
+            # M=N=64 with stick size 64 → single output stick per dim.
+            # Multi-output-stick scatter is not yet implemented.
             "M": [64], "K": [64], "N": [64],
             "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
             # A[M,K] stick-on-M: [M//64, K, M%64]
@@ -359,6 +361,41 @@ VARIANTS = {
             t.assert_present("tensor.insert_slice"),  # store sink stage
         ),
     },
+    "spyre_stick_parallel_dynamic": {
+        # Dynamic-shape variant of spyre_stick_parallel: A stick-on-M, B/C
+        # stick-on-N, but M/K/N are runtime i32. The physical descriptors lower
+        # to memref<?x?x64xf32> with runtime strides; the source + sink loop
+        # nests use runtime ceildiv trip counts (exercises the Loop.trip
+        # dynamic-SSA branch on the no-reduction path).
+        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "Dynamic-shape variant of spyre_stick_parallel: M/K/N runtime, so "
+            "the source + sink loop nests use runtime trip counts."
+        ),
+        "kernel_fn":    kernel.matmul_kernel,
+        "SIGNATURE":    _SIG_SPYRE,
+        "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            "M": [64], "K": [64], "N": [64],
+            "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
+            "A_LAYOUT": [[(0, "floordiv", 64), 1, (0, "mod", 64)]],
+            "B_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            "C_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+        },
+        "grid":         [1],
+        "reference":    run,
+        "inputs":       make_inputs,
+        "output_key":   "c_ptr",
+        "rtol":         1e-2,
+        "atol":         1e-3,
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.matmul"),
+            t.assert_present("tensor.insert_slice"),
+        ),
+    },
     "spyre_stick_k": {
         # Case 2: A stick-on-K (split-K). A's K dim drives a reduction loop;
         # B's K-flat dim is offset per K-stick. B & C stick-on-N.
@@ -374,7 +411,9 @@ VARIANTS = {
         "constexpr":    ["M", "K", "N", "BLOCK_M", "BLOCK_K", "BLOCK_N",
                          "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
         "params":       {
-            "M": [64], "K": [64], "N": [64],
+            # K=128 with stick size 64 → 2 K-sticks, so the reduction loop has
+            # trip count 2 and the synthesized slice offsets are non-zero.
+            "M": [64], "K": [128], "N": [64],
             "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
             # A[M,K] stick-on-K: [K//64, M, K%64]
             "A_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
@@ -394,6 +433,42 @@ VARIANTS = {
             t.assert_present("linalg.matmul"),
             t.assert_present("scf.for"),               # K-stick reduction loop
             t.assert_present("tensor.insert_slice"),   # store sink stage
+        ),
+    },
+    "spyre_stick_k_dynamic": {
+        # Dynamic-shape variant of spyre_stick_k: same A stick-on-K split-K
+        # layout, but M/K/N are runtime i32. The physical descriptors lower to
+        # memref<?x?x64xf32> with runtime strides, and the synthesized K-stick
+        # reduction loop's trip count becomes a runtime ceildiv value
+        # (exercises the Loop.trip dynamic-SSA branch on the reduction path).
+        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "Dynamic-shape variant of spyre_stick_k: M/K/N runtime, so the "
+            "synthesized K-stick reduction loop uses a runtime trip count."
+        ),
+        "kernel_fn":    kernel.matmul_kernel,
+        "SIGNATURE":    _SIG_SPYRE,
+        "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            "M": [64], "K": [64], "N": [64],
+            "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
+            "A_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            "B_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            "C_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+        },
+        "grid":         [1],
+        "reference":    run,
+        "inputs":       make_inputs,
+        "output_key":   "c_ptr",
+        "rtol":         1e-2,
+        "atol":         1e-3,
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.matmul"),
+            t.assert_present("scf.for"),
+            t.assert_present("tensor.insert_slice"),
         ),
     },
     # --- BMM 3D grid variants ---
