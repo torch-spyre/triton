@@ -29,6 +29,9 @@ def matmul_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    A_LAYOUT: tl.constexpr,
+    B_LAYOUT: tl.constexpr,
+    C_LAYOUT: tl.constexpr,
 ):
     """2D tiled matmul: C[M,N] = A[M,K] @ B[K,N].
 
@@ -41,6 +44,14 @@ def matmul_kernel(
 
     One tensor descriptor per operand covers the full matrix; block_shape
     controls the tile granularity for loads and stores.
+
+    ``A_LAYOUT`` / ``B_LAYOUT`` / ``C_LAYOUT`` are optional Spyre physical
+    stick-tiling layouts (OpSpec ``device_coordinates`` form). When supplied
+    (as constexprs) they annotate the matching descriptor via
+    ``tl.spyre_tensor_layout`` so RewriteDescriptorLayout physicalizes it;
+    left ``0`` the kernel lowers logically (non-Spyre variants pass ``0``).
+    Passed as constexprs so the inline-literal requirement of
+    ``tl.spyre_tensor_layout`` is met without binding to a local.
     """
     pid = tl.program_id(0)
     num_cores = tl.num_programs(0)
@@ -54,6 +65,13 @@ def matmul_kernel(
     c_desc = tl.make_tensor_descriptor(
         c_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
     )
+
+    if A_LAYOUT is not None and A_LAYOUT != 0:
+        tl.spyre_tensor_layout(a_desc, A_LAYOUT)
+    if B_LAYOUT is not None and B_LAYOUT != 0:
+        tl.spyre_tensor_layout(b_desc, B_LAYOUT)
+    if C_LAYOUT is not None and C_LAYOUT != 0:
+        tl.spyre_tensor_layout(c_desc, C_LAYOUT)
 
     m_blocks = tl.cdiv(M, BLOCK_M)
     n_blocks = tl.cdiv(N, BLOCK_N)

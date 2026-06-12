@@ -1041,53 +1041,59 @@ struct RewriteDescriptorLayoutPass
         (void)logDynStrideIdx;
       }
 
-      // Compute row-major strides over physStaticSizes.
-      // For fully static shapes this is compile-time; mixed/dynamic falls back.
+      // Compute physical strides from the logical strides via the coord map.
+      //
+      // For each physical dim p with phys_src[p]=s and op:
+      //   Identity  → physStride[p] = logStride[s]
+      //   FloorDiv(arg) → physStride[p] = logStride[s] * arg
+      //                   (one stick-step = arg consecutive logical rows)
+      //   Mod(arg)  → physStride[p] = logStride[s]
+      //                   (one lane-step = 1 logical row)
+      //
+      // This is correct for any physical dim ordering and avoids the
+      // row-major-over-physShape assumption that breaks for stick-on-M.
       physStaticStrides.resize(physRank);
       physDynStrides.clear();
       {
-        // Walk right-to-left accumulating product.
-        // If we hit a kDynamic dim we need SSA multiplication.
         bool hasAnyDynStride = false;
-        for (int k = (int)physRank - 1; k >= 0; --k) {
-          if (k == (int)physRank - 1) {
-            physStaticStrides[k] = 1;
+        for (unsigned k = 0; k < physRank; ++k) {
+          int64_t s = physSrc[k];
+          auto op = static_cast<CoordOp>(physOp[k]);
+          int64_t arg = physArg[k];
+          int64_t logSt = logStaticStrides[s];
+
+          if (logSt == ShapedType::kDynamic) {
+            physStaticStrides[k] = ShapedType::kDynamic;
+            hasAnyDynStride = true;
+          } else if (op == CoordOp::FloorDiv) {
+            physStaticStrides[k] = logSt * arg;
           } else {
-            int64_t prevSz = physStaticSizes[k + 1];
-            int64_t prevSt = physStaticStrides[k + 1];
-            if (prevSz != ShapedType::kDynamic && prevSt != ShapedType::kDynamic) {
-              physStaticStrides[k] = prevSt * prevSz;
-            } else {
-              physStaticStrides[k] = ShapedType::kDynamic;
-              hasAnyDynStride = true;
-            }
+            // Identity or Mod: stride equals the logical stride of the source dim.
+            physStaticStrides[k] = logSt;
           }
         }
         if (hasAnyDynStride) {
-          // Build SSA stride values for dynamic dims: running product.
-          SmallVector<Value> strideVals(physRank);
-          Value running = arith::ConstantOp::create(
-              b, loc, b.getIndexAttr(1));
-          for (int k = (int)physRank - 1; k >= 0; --k) {
-            strideVals[k] = running;
-            // running *= physSize[k]
-            Value dimVal;
-            if (physStaticSizes[k] != ShapedType::kDynamic) {
-              dimVal = arith::ConstantOp::create(
-                  b, loc, b.getIndexAttr(physStaticSizes[k]));
-            } else {
-              // Find the matching physDynSize (positional).
-              int dynPos = 0;
-              for (unsigned j = 0; j < (unsigned)k; ++j)
-                if (physStaticSizes[j] == ShapedType::kDynamic)
-                  ++dynPos;
-              dimVal = physDynSizes[dynPos];
-            }
-            running = arith::MulIOp::create(b, loc, running, dimVal).getResult();
-          }
+          // Build SSA stride values for dynamic dims.
+          int dynPos = 0;
           for (unsigned k = 0; k < physRank; ++k) {
-            if (physStaticStrides[k] == ShapedType::kDynamic)
-              physDynStrides.push_back(strideVals[k]);
+            if (physStaticStrides[k] != ShapedType::kDynamic)
+              continue;
+            int64_t s = physSrc[k];
+            auto op = static_cast<CoordOp>(physOp[k]);
+            int64_t arg = physArg[k];
+            if (logDynStrideIdx[s] < 0)
+              return marker.emitError(
+                  "spyre_tensor_layout: expected dynamic stride for dim");
+            Value logDynSt = logDynStrides[logDynStrideIdx[s]];
+            if (op == CoordOp::FloorDiv) {
+              Value argVal = arith::ConstantOp::create(
+                  b, loc, b.getIndexAttr(arg));
+              physDynStrides.push_back(
+                  arith::MulIOp::create(b, loc, logDynSt, argVal).getResult());
+            } else {
+              physDynStrides.push_back(logDynSt);
+            }
+            (void)dynPos++;
           }
         }
       }
