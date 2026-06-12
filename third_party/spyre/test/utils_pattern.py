@@ -25,10 +25,13 @@ are unaffected.
 The ``gen_patterns_docs.py`` script harvests these attributes to build
 ``docs/patterns/{category}.md``.
 
-``example`` is optional.  Entries without one render prose-only (docstring +
-diagnostics for negatives).  For negative entries in particular, ``example``
-is important — it shows the Python pattern to avoid.  A missing ``example``
-on a negative entry is a reminder that it still needs one.
+``example`` is optional: omit it entirely for a prose-only entry (docstring
++ diagnostics for negatives).  Passing it explicitly as an empty value
+(``example=""`` or ``example=[]``) is treated as a typo and raises
+``PatternEmptyBlockError`` — the same guard that catches comment-only
+blocks.  For negative entries, ``example`` is especially valuable because
+it shows the Python pattern to avoid; omitting it is a reminder that one
+still needs to be added.
 """
 import textwrap
 
@@ -65,12 +68,15 @@ def pattern(tag: str, *, category: str, negative: bool = False,
         (dedented automatically).
     """
     def decorator(fn):
-        if isinstance(example, list):
-            ex = "\n".join(example)
+        # Distinguish "omitted" examples field from
+        # "provided but empty" (e.g. example="" or example=[] — we reject).
+        if example is None:
+            ex = None
         else:
-            ex = textwrap.dedent(example).strip() if example else None
-
-        if ex is not None:
+            if isinstance(example, list):
+                ex = "\n".join(example)
+            else:
+                ex = textwrap.dedent(example).strip()
             code_lines = [
                 line for line in ex.splitlines()
                 if line.strip() and not line.lstrip().startswith("#")

@@ -90,6 +90,10 @@ _EMPTY_BLOCK_CASES = [
     pytest.param(["# first comment", "# second comment"], id="multiple-comments"),
     pytest.param(["  # leading-space comment"], id="leading-space-comment"),
     pytest.param(["", "# blank-plus-comment"],  id="blank-plus-comment"),
+    # example= explicitly provided as empty: a typo, not a deliberate
+    # prose-only entry (which omits example= entirely → None).
+    pytest.param("",                            id="empty-string"),
+    pytest.param([],                            id="empty-list"),
 ]
 
 
