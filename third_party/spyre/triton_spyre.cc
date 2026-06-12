@@ -42,12 +42,12 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
     pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
     pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
     pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
-    pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayoutPass());
+    pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout());
     pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
   });
   // Individual pass bindings for debugging and testing.
   m.def("add_rewrite_descriptor_layout", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayoutPass());
+    pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout());
   });
   m.def("add_lower_descriptor_memory", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());

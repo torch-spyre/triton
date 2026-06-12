@@ -1016,7 +1016,8 @@ def TT_MakeTensorDescOp : TT_Op<"make_tensor_descriptor", [
 //                 derives from.
 //   phys_op[k]  : 0 = identity, 1 = floordiv, 2 = mod.
 //   phys_arg[k] : divisor (floordiv) / modulus (mod); ignored for identity.
-// e.g. device_size [N//64, M, N%64], stick on logical dim 1 (N):
+// e.g. stick on logical dim 1 (N) — coordinate map [N//64, M, N%64],
+//   physical extents [ceil(N/64), M, 64]:
 //   phys_src=[1,0,1]  phys_op=[1,0,2]  phys_arg=[64,0,64]
 //
 // The layout is carried as ATTRIBUTES (not SSA values) so it survives constant

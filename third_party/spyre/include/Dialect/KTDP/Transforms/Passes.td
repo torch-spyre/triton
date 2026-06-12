@@ -52,9 +52,11 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
 
         Lowering (per annotated descriptor):
         - rebuild ktdp.construct_memory_view with physical shape/strides/memref
-          type by applying the coordinate map (e.g. [M,N] -> [N//64, M, 64]);
+          type: floordiv dims get extent ceil(N/div) (covering partial boundary
+          sticks), mod dims get extent = modulus, identity dims are unchanged
+          (e.g. [M,N] -> [ceil(N/64), M, 64]);
         - rebuild each ktdp.construct_access_tile with physical block shape +
-          remapped index operands (identity / divsi / const-0);
+          remapped index operands (identity / divsi / remsi);
         - retype ktdp.load result tensors and forward-retype the elementwise
           compute chain to the physical rank;
         - redirect ktdp.store's access tile operand to the physical tile;
@@ -65,9 +67,10 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
         no tt.spyre_tensor_layout ops remain. Descriptors without an annotation
         are left untouched.
 
-        v1 scope: pure stick-tiling for pointwise kernels. Does NOT yet synthesize
-        scf.for loops or reductions for physical dims that need their own
-        iteration (e.g. matmul's contraction) -- deferred to v2.
+        Pointwise scope: physicalizes descriptor data and retypes the elementwise
+        compute chain. Does NOT synthesize loops or reductions for physical dims
+        that need their own iteration (e.g. matmul's contraction) -- see the
+        matmul loop synthesis extension below.
     }];
 
     let dependentDialects = [
