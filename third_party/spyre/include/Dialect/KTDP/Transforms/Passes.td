@@ -73,7 +73,10 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
 
     let dependentDialects = [
         "mlir::arith::ArithDialect",
-        "mlir::ktdp::KtdpDialect"
+        "mlir::ktdp::KtdpDialect",
+        "mlir::linalg::LinalgDialect",
+        "mlir::scf::SCFDialect",
+        "mlir::tensor::TensorDialect"
     ];
 }
 

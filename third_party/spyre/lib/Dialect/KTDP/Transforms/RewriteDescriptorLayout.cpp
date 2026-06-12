@@ -24,19 +24,24 @@
 // for matmul contraction -- deferred to Increment 2/3.
 //
 // Call graph:
-//   runOnOperation                  collect markers; for each:
-//     rewriteOne(marker)            rewrite one descriptor + all its users
-//       isLoweredDescriptor         check marker.desc -> cast -> memView chain
-//       getDescriptorMemView        unwrap cast -> ktdp.construct_memory_view
-//       buildPhysicalMemoryView     rebuild ConstructMemoryViewOp (physical)
-//         applyStatic               derive physical static extents
-//       rewriteAccessTile(tile)     rebuild ConstructAccessTilesOp (physical)
-//         mapIndices                logical -> physical index values
-//           applyIndex              per-dim: identity | divsi | const-0
-//       retypeLoad(load)            update ktdp.load result type + chain
-//         retypeChain               propagate new type through elementwise ops
-//       retypeStore(store)          update ktdp.store (no result, src accepted)
-//       erase marker + dead cast
+//   runOnOperation
+//     Phase 1 — for each marker:
+//       rewriteOnePhysicalize(marker)
+//         isLoweredDescriptor / getDescriptorMemView
+//         buildPhysicalMemoryView   -> physical ConstructMemoryViewOp
+//           applyStatic             derive physical static extents
+//         rewriteAccessTile(tile)   -> physical ConstructAccessTilesOp
+//           mapIndices / applyIndex
+//         retypeLoad                -> physical ktdp.load + retypeChain
+//           retypeChain             propagate type (stops at multi-tensor ops)
+//         retypeStore               redirect access tile operand
+//         (marker kept alive for Phase 2)
+//     Phase 2 — fixupMatmulOps (loop-until-stable):
+//       fixupMatmul(mm)
+//         findMarkerForOperand      trace load -> access tile -> memView -> marker
+//         analyzeMatmulCoords       read phys_src/op/arg -> MatmulDims
+//         synthesizeMatmulLoop      emit scf.for nest + linalg.matmul slices
+//     Phase 3 — eraseMarker (marker + dead bridge cast)
 //
 //   Coord helpers (free functions):
 //     applyStatic  : compile-time extent (shape / block_shape)
@@ -53,6 +58,9 @@
 #include "triton/Dialect/Triton/IR/Types.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -176,34 +184,388 @@ struct RewriteDescriptorLayoutPass
     : public mlir::triton::ktdp::impl::RewriteDescriptorLayoutBase<
           RewriteDescriptorLayoutPass> {
 
+  // Maps each physical ConstructMemoryViewOp result -> its source marker.
+  // Populated during Phase 1; read during Phase 2 (markers still live).
+  DenseMap<Value, triton::SpyreTensorLayoutOp> physMemViewToMarker;
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    // Collect markers up front; rewrite each (memView + access tiles +
-    // loads/stores) in place. Mutating while walking invalidates the cursor.
+    // Collect markers up front; mutating while walking invalidates the cursor.
     SmallVector<triton::SpyreTensorLayoutOp> markers;
     module.walk([&](triton::SpyreTensorLayoutOp op) { markers.push_back(op); });
 
+    // Phase 1: physicalize each annotated descriptor (memView + access tiles +
+    // loads). retypeChain propagates physical types elementwise but stops at
+    // multi-tensor ops (linalg.matmul etc.). Markers are NOT erased yet —
+    // Phase 2 needs to read their coord maps to drive matmul synthesis.
     for (auto marker : markers)
-      if (failed(rewriteOne(marker)))
+      if (failed(rewriteOnePhysicalize(marker)))
         return signalPassFailure();
+
+    // Phase 2: fixup linalg.matmul ops whose operands were retyped to rank-3
+    // by Phase 1. Walks back from each mismatched operand to its marker to
+    // read the coord map. Loop until stable (onion-peeling).
+    if (failed(fixupMatmulOps(module)))
+      return signalPassFailure();
+
+    // Phase 3: erase all markers (and their now-dead bridge casts).
+    for (auto marker : markers)
+      eraseMarker(marker);
   }
 
-  // Rewrite one annotated descriptor + all downstream KTDP ops, in place.
+  // Walk all linalg.matmul ops; fix any whose operands are rank-3 (physical).
+  // For each, traces operands back to their tt.spyre_tensor_layout markers
+  // (still live during Phase 2) to read the coord maps. Repeats until stable.
+  LogicalResult fixupMatmulOps(ModuleOp module) {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      SmallVector<linalg::MatmulOp> matmuls;
+      module.walk([&](linalg::MatmulOp op) { matmuls.push_back(op); });
+      for (auto mm : matmuls) {
+        auto aType = dyn_cast<RankedTensorType>(mm.getInputs()[0].getType());
+        auto bType = dyn_cast<RankedTensorType>(mm.getInputs()[1].getType());
+        if (!aType || !bType)
+          continue;
+        if (aType.getRank() == 2 && bType.getRank() == 2)
+          continue;
+        if (failed(fixupMatmul(mm)))
+          return failure();
+        changed = true;
+      }
+    }
+    return success();
+  }
+
+  // Walk back from a matmul operand through the elementwise chain to the
+  // ktdp.load, then look up the physical memView -> marker map populated
+  // during Phase 1.
+  triton::SpyreTensorLayoutOp findMarkerForOperand(Value operand) {
+    Value v = operand;
+    while (true) {
+      auto *defOp = v.getDefiningOp();
+      if (!defOp)
+        return {};
+      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(defOp)) {
+        auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
+            ld.getAccessTile().getDefiningOp());
+        if (!tile)
+          return {};
+        auto it = physMemViewToMarker.find(tile.getBase());
+        return it != physMemViewToMarker.end() ? it->second
+                                               : triton::SpyreTensorLayoutOp{};
+      }
+      // Step back through single-tensor-operand elementwise ops.
+      if (defOp->getNumResults() != 1 || defOp->getNumOperands() == 0)
+        return {};
+      int tensorOps = 0;
+      for (auto op : defOp->getOperands())
+        if (isa<RankedTensorType>(op.getType()))
+          ++tensorOps;
+      if (tensorOps != 1)
+        return {};
+      for (auto op : defOp->getOperands())
+        if (isa<RankedTensorType>(op.getType())) { v = op; break; }
+    }
+  }
+
+  // Per-operand coord-map info read from a still-live marker.
+  struct OperandCoords {
+    ArrayRef<int64_t> src; // phys_src
+    ArrayRef<int64_t> op;  // phys_op  (0=Identity,1=FloorDiv,2=Mod)
+    ArrayRef<int64_t> arg; // phys_arg
+    // Logical rank of the descriptor (= number of logical dims, e.g. 2 for MxK).
+    unsigned logicalRank;
+    // Physical shape of the load result tensor.
+    ArrayRef<int64_t> physShape;
+  };
+
+  // Assign a role to each physical dim of an operand:
+  //   >= 0  : parallel dim, maps to C dim [value]
+  //   -1    : reduction (inner dot) dim — K-flat or K-lane
+  //   -2    : reduction loop dim — K-stick (not yet supported, Inc 3)
   //
-  // What changes (logical -> physical, driven by the marker's coord map):
-  //   1. ktdp.construct_memory_view  : shape/strides/memref-type 2-D -> 3-D
-  //   2. ktdp.construct_access_tile  : block-shape + indices 2-D -> 3-D
+  // For A (logical dim0=M → C.dim0, dim1=K → reduction):
+  //   phys_src[p]==0 → M → role 0
+  //   phys_src[p]==1 AND op==FloorDiv → K-stick → role -2
+  //   phys_src[p]==1 otherwise → K-flat or K-lane → role -1
+  //
+  // For B (logical dim0=K → reduction, dim1=N → C.dim1):
+  //   phys_src[p]==1 → N → role 1
+  //   phys_src[p]==0 AND op==FloorDiv → K-stick → role -2
+  //   phys_src[p]==0 otherwise → K-flat or K-lane → role -1
+  static void buildDimRoles(const OperandCoords &coords, int64_t kLogicalSrc,
+                             int64_t parallelRole,
+                             SmallVectorImpl<int64_t> &roles) {
+    int n = (int)coords.src.size();
+    roles.resize(n);
+    for (int p = 0; p < n; ++p) {
+      if (coords.src[p] != kLogicalSrc) {
+        roles[p] = parallelRole;
+      } else if (static_cast<CoordOp>(coords.op[p]) == CoordOp::FloorDiv) {
+        roles[p] = -2; // K-stick: reduction loop (Inc 3)
+      } else {
+        roles[p] = -1; // K-flat or K-lane: inner dot
+      }
+    }
+  }
+
+  // Strategy dispatcher: trace operands to markers, build dim roles, synthesize.
+  LogicalResult fixupMatmul(linalg::MatmulOp mm) {
+    auto aMarker = findMarkerForOperand(mm.getInputs()[0]);
+    auto bMarker = findMarkerForOperand(mm.getInputs()[1]);
+    if (!aMarker || !bMarker)
+      return mm.emitError(
+          "spyre_tensor_layout: cannot find layout markers for matmul operands");
+
+    auto aPhysShape = cast<RankedTensorType>(mm.getInputs()[0].getType()).getShape();
+    auto bPhysShape = cast<RankedTensorType>(mm.getInputs()[1].getType()).getShape();
+
+    OperandCoords aC{aMarker.getPhysSrc(), aMarker.getPhysOp(),
+                     aMarker.getPhysArg(), 2, aPhysShape};
+    OperandCoords bC{bMarker.getPhysSrc(), bMarker.getPhysOp(),
+                     bMarker.getPhysArg(), 2, bPhysShape};
+
+    // A logical: dim0=M (src 0 → parallel), dim1=K (src 1 → reduction).
+    // B logical: dim0=K (src 0 → reduction), dim1=N (src 1 → parallel).
+    SmallVector<int64_t> dimRoleA, dimRoleB;
+    buildDimRoles(aC, /*kLogicalSrc=*/1, /*parallelRole=*/0, dimRoleA);
+    buildDimRoles(bC, /*kLogicalSrc=*/0, /*parallelRole=*/1, dimRoleB);
+
+    // Inc 3: K-stick loop (role -2) not yet supported.
+    bool hasKStickLoopA = llvm::any_of(dimRoleA, [](int64_t r) { return r == -2; });
+    bool hasKStickLoopB = llvm::any_of(dimRoleB, [](int64_t r) { return r == -2; });
+    if (hasKStickLoopA || hasKStickLoopB)
+      return mm.emitError(
+          "spyre_tensor_layout: K-stick reduction loop not yet supported (Inc 3)");
+
+    return synthesizeCase1(mm, dimRoleA, dimRoleB, aPhysShape, bPhysShape);
+  }
+
+  // Case 1: sticks are on parallel dims only (no K-stick reduction loop).
+  // Emits one scf.for per parallel stick dim, with a single inner linalg.matmul.
+  //
+  // Slice extraction produces tensors in physical dim order; a linalg.transpose
+  // is emitted when the reduction dim precedes the parallel dim in physical order
+  // (since linalg.matmul requires [M,K] and [K,N]).
+  LogicalResult synthesizeCase1(linalg::MatmulOp mm,
+                                ArrayRef<int64_t> dimRoleA,
+                                ArrayRef<int64_t> dimRoleB,
+                                ArrayRef<int64_t> aPhysShape,
+                                ArrayRef<int64_t> bPhysShape) {
+    OpBuilder b(mm);
+    Location loc = mm.getLoc();
+
+    Value aVal = mm.getInputs()[0];
+    Value bVal = mm.getInputs()[1];
+    Value cVal = mm.getOutputs()[0];
+
+    auto aElemTy = cast<RankedTensorType>(aVal.getType()).getElementType();
+    auto bElemTy = cast<RankedTensorType>(bVal.getType()).getElementType();
+    auto accTy   = cast<RankedTensorType>(cVal.getType()).getElementType();
+
+    int aRank = (int)dimRoleA.size();
+    int bRank = (int)dimRoleB.size();
+
+    // Identify outer (stick) dims and inner (lane/flat) dims for each operand.
+    // Outer = parallel (role>=0) AND FloorDiv. Inner = everything else.
+    auto isOuterDim = [](const OperandCoords &c, ArrayRef<int64_t> roles, int p) {
+      return roles[p] >= 0 &&
+             static_cast<CoordOp>(c.op[p]) == CoordOp::FloorDiv;
+    };
+
+    // We need the OperandCoords to check phys_op for isOuterDim.
+    // Re-create them from the markers (already checked non-null in fixupMatmul).
+    auto aMarker = findMarkerForOperand(aVal);
+    auto bMarker = findMarkerForOperand(bVal);
+    OperandCoords aC{aMarker.getPhysSrc(), aMarker.getPhysOp(),
+                     aMarker.getPhysArg(), 2, aPhysShape};
+    OperandCoords bC{bMarker.getPhysSrc(), bMarker.getPhysOp(),
+                     bMarker.getPhysArg(), 2, bPhysShape};
+
+    // Collect outer dims for A and B in physical order.
+    SmallVector<int> aOuterDims, bOuterDims;
+    for (int p = 0; p < aRank; ++p)
+      if (isOuterDim(aC, dimRoleA, p)) aOuterDims.push_back(p);
+    for (int p = 0; p < bRank; ++p)
+      if (isOuterDim(bC, dimRoleB, p)) bOuterDims.push_back(p);
+
+    // Inner dims of A and B (non-outer), in ascending physical order.
+    SmallVector<int> aInnerDims, bInnerDims;
+    for (int p = 0; p < aRank; ++p)
+      if (!isOuterDim(aC, dimRoleA, p)) aInnerDims.push_back(p);
+    for (int p = 0; p < bRank; ++p)
+      if (!isOuterDim(bC, dimRoleB, p)) bInnerDims.push_back(p);
+
+    // Each operand must have exactly 2 inner dims (the 2D slice).
+    if (aInnerDims.size() != 2 || bInnerDims.size() != 2)
+      return mm.emitError(
+          "spyre_tensor_layout: expected exactly 2 inner dims per operand");
+
+    // Inner dims in ascending physical order: [lo, hi].
+    int aDimLo = aInnerDims[0], aDimHi = aInnerDims[1];
+    int bDimLo = bInnerDims[0], bDimHi = bInnerDims[1];
+
+    // Physical-order 2D slice types (what extract_slice actually produces).
+    auto sliceAPhysTy = RankedTensorType::get(
+        {aPhysShape[aDimLo], aPhysShape[aDimHi]}, aElemTy);
+    auto sliceBPhysTy = RankedTensorType::get(
+        {bPhysShape[bDimLo], bPhysShape[bDimHi]}, bElemTy);
+
+    // Determine if A needs transpose: reduction dim (-1) at lo position means
+    // physical order is [K, M], but matmul needs [M, K].
+    bool transposeA = (dimRoleA[aDimLo] == -1);
+    bool transposeB = (dimRoleB[bDimLo] != -1); // B needs [K,N]; if lo is N, transpose
+
+    // After transpose the 2D slice types are [M, K_A] and [K_B, N].
+    int64_t M   = transposeA ? aPhysShape[aDimHi] : aPhysShape[aDimLo];
+    int64_t KA  = transposeA ? aPhysShape[aDimLo] : aPhysShape[aDimHi];
+    int64_t KB  = transposeB ? aPhysShape[aDimHi] : bPhysShape[bDimLo];
+    int64_t N   = transposeB ? bPhysShape[bDimLo] : bPhysShape[bDimHi];
+    (void)KB; // KB == KA for a valid matmul
+
+    auto sliceATy  = RankedTensorType::get({M, KA}, aElemTy);
+    auto sliceBTy  = RankedTensorType::get({KA, N}, bElemTy);
+    auto accTy2D   = RankedTensorType::get({M, N}, accTy);
+
+    // Helpers.
+    auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
+
+    Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
+    Value c1 = arith::ConstantIndexOp::create(b, loc, 1);
+
+    Value zeroAcc = arith::ConstantOp::create(
+        b, loc, DenseElementsAttr::get(accTy2D, b.getFloatAttr(accTy, 0.0)));
+
+    // Emit a 2D linalg.transpose (permutation [1,0]) on src.
+    auto emitTranspose2D = [&](Value src, Type elemT) -> Value {
+      auto srcTy = cast<RankedTensorType>(src.getType());
+      auto outTy = RankedTensorType::get(
+          {srcTy.getDimSize(1), srcTy.getDimSize(0)}, elemT);
+      Value empty = tensor::EmptyOp::create(b, loc, outTy.getShape(), elemT);
+      return linalg::TransposeOp::create(b, loc, src, empty,
+          b.getDenseI64ArrayAttr({1, 0})).getResult()[0];
+    };
+
+    // Build extract_slice for an operand given outer IVs (one per outer dim).
+    // Produces a rank-reduced tensor in physical-dim order.
+    auto buildExtract = [&](Value operand, ArrayRef<int> outerDims,
+                            ArrayRef<int> innerDims,
+                            ArrayRef<int64_t> physShape,
+                            ArrayRef<Value> outerIVs,
+                            RankedTensorType resultTy) -> Value {
+      int rank = (int)physShape.size();
+      SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
+      for (int i = 0; i < (int)outerDims.size(); ++i) {
+        offsets[outerDims[i]] = outerIVs[i];
+        sizes[outerDims[i]]   = idx(1);
+      }
+      for (int p : innerDims) {
+        offsets[p] = idx(0);
+        sizes[p]   = idx(physShape[p]);
+      }
+      return tensor::ExtractSliceOp::create(
+          b, loc, resultTy, operand, offsets, sizes, strides);
+    };
+
+    // Build the loop nest over all outer (stick) dims.
+    // Outer dims of A are M-sticks; outer dims of B are N-sticks.
+    // We loop over all of them, with acc as the single iter_arg.
+    // For the common single-stick case (Ks=Ns=1) these are trip-1 loops.
+
+    // Collect all outer loops: B's outer dims drive the N-stick loop;
+    // A's outer dims drive M-stick loops (if any).
+    // We emit B's outer loops outermost, then A's, then the inner matmul.
+    // All share the same acc iter_arg accumulating into accTy2D.
+
+    // Recursive lambda to emit nested scf.for loops for outer dims.
+    // outerDimsAll: concatenation [bOuterDims..., aOuterDims...]
+    // operands: [bVal, aVal] for indexing
+    // physShapes: [bPhysShape, aPhysShape]
+    // returns the final acc value.
+    SmallVector<int> allOuterDimsB(bOuterDims), allOuterDimsA(aOuterDims);
+
+    // Collect outer IVs as we descend into the loop nest.
+    SmallVector<Value> bOuterIVs, aOuterIVs;
+
+    // Helper: emit nested loops and return the innermost acc.
+    // We use a std::function to allow recursion.
+    std::function<Value(int, int, Value)> emitLoops =
+        [&](int bIdx, int aIdx, Value acc) -> Value {
+      // Still have B outer loops to emit.
+      if (bIdx < (int)allOuterDimsB.size()) {
+        int dim = allOuterDimsB[bIdx];
+        int64_t trip = bPhysShape[dim];
+        Value cTrip = arith::ConstantIndexOp::create(b, loc, trip);
+        auto loop = scf::ForOp::create(b, loc, c0, cTrip, c1,
+                                       ValueRange{acc});
+        OpBuilder::InsertionGuard g(b);
+        b.setInsertionPointToStart(loop.getBody());
+        bOuterIVs.push_back(loop.getInductionVar());
+        Value innerAcc = emitLoops(bIdx + 1, aIdx,
+                                   loop.getRegionIterArgs()[0]);
+        bOuterIVs.pop_back();
+        scf::YieldOp::create(b, loc, ValueRange{innerAcc});
+        return loop.getResult(0);
+      }
+      // Still have A outer loops to emit.
+      if (aIdx < (int)allOuterDimsA.size()) {
+        int dim = allOuterDimsA[aIdx];
+        int64_t trip = aPhysShape[dim];
+        Value cTrip = arith::ConstantIndexOp::create(b, loc, trip);
+        auto loop = scf::ForOp::create(b, loc, c0, cTrip, c1,
+                                       ValueRange{acc});
+        OpBuilder::InsertionGuard g(b);
+        b.setInsertionPointToStart(loop.getBody());
+        aOuterIVs.push_back(loop.getInductionVar());
+        Value innerAcc = emitLoops(bIdx, aIdx + 1,
+                                   loop.getRegionIterArgs()[0]);
+        aOuterIVs.pop_back();
+        scf::YieldOp::create(b, loc, ValueRange{innerAcc});
+        return loop.getResult(0);
+      }
+      // Innermost body: extract slices, transpose if needed, matmul.
+      Value aSlicePhys = buildExtract(aVal, aOuterDims, aInnerDims,
+                                      aPhysShape, aOuterIVs, sliceAPhysTy);
+      Value bSlicePhys = buildExtract(bVal, bOuterDims, bInnerDims,
+                                      bPhysShape, bOuterIVs, sliceBPhysTy);
+      Value aSlice = transposeA ? emitTranspose2D(aSlicePhys, aElemTy) : aSlicePhys;
+      Value bSlice = transposeB ? emitTranspose2D(bSlicePhys, bElemTy) : bSlicePhys;
+      // acc += a_slice @ b_slice  ([M,K] x [K,N] -> [M,N])
+      return linalg::MatmulOp::create(b, loc, accTy2D,
+          ValueRange{aSlice, bSlice}, ValueRange{acc}).getResult(0);
+    };
+
+    Value result = emitLoops(0, 0, zeroAcc);
+    mm.getResult(0).replaceAllUsesWith(result);
+    mm.erase();
+    return success();
+  }
+
+  // Erase a marker and its now-dead bridge cast. Called in Phase 3 after
+  // fixupMatmulOps has finished reading the coord maps.
+  void eraseMarker(triton::SpyreTensorLayoutOp marker) {
+    if (!marker->getBlock())
+      return;
+    Value desc = marker.getDesc();
+    auto castOp = desc.getDefiningOp<UnrealizedConversionCastOp>();
+    marker.erase();
+    if (castOp && castOp.use_empty())
+      castOp.erase();
+  }
+
+  // Phase 1: physicalize one annotated descriptor (memView + access tiles +
+  // loads). Does NOT erase the marker — Phase 2 still needs its coord map.
+  //
+  // What changes:
+  //   1. ktdp.construct_memory_view  : logical -> physical shape/strides/type
+  //   2. ktdp.construct_access_tile  : logical -> physical block + indices
   //   3. ktdp.load result tensor     : retyped to physical rank
-  //   4. ktdp.store src tensor       : accepted unchanged (already physical
-  //                                    after store side is retyped by retypeChain)
-  //   5. elementwise ops             : result tensors retyped to physical rank
-  //   6. tt.spyre_tensor_layout      : erased
-  //   7. UnrealizedConversionCast    : erased (was kept alive by marker use)
-  //
-  // What does NOT change in v1: scf.for loop structure. Loops traverse logical
-  // blocks; the physical rewrite happens inside each iteration.
-  LogicalResult rewriteOne(triton::SpyreTensorLayoutOp marker) {
+  //   4. ktdp.store src tensor       : access tile redirected to physical tile
+  //   5. elementwise ops downstream  : result tensors retyped (retypeChain)
+  //      (stops at multi-tensor ops like linalg.matmul)
+  LogicalResult rewriteOnePhysicalize(triton::SpyreTensorLayoutOp marker) {
     Value desc = marker.getDesc();
 
     // The marker's desc operand must be a lowered descriptor (the bridge cast
@@ -377,6 +739,9 @@ struct RewriteDescriptorLayoutPass
                       .getResult();
     }
 
+    // Record the physical memView -> marker mapping for Phase 2.
+    physMemViewToMarker[newMemView] = marker;
+
     // --- 2. Rebuild each ConstructAccessTilesOp that uses the old memView ---
     //   The access tile's base is the (logical) memView. We find access tiles
     //   that use the old memView, replace their base with the new physical view,
@@ -397,13 +762,8 @@ struct RewriteDescriptorLayoutPass
     //   (ktdp.load / ktdp.store) have been updated. Any remaining ktdp.loads
     //   that still use the bridge cast's memView for other purposes stay as-is.
 
-    // --- 6/7. Erase the marker and the now-dead bridge cast ---
-    auto castOp = desc.getDefiningOp<UnrealizedConversionCastOp>();
-    marker.erase();
-    // The cast is dead if the logical memView has no other uses.
-    if (castOp && castOp.use_empty())
-      castOp.erase();
-
+    // Marker and bridge cast are NOT erased here — Phase 2 (fixupMatmulOps)
+    // still needs to read the marker's coord map. Phase 3 calls eraseMarker.
     return success();
   }
 
