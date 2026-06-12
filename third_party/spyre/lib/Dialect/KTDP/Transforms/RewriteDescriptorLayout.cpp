@@ -324,31 +324,22 @@ struct RewriteDescriptorLayoutPass
 
   // Assign a role to each physical dim of an operand:
   //   >= 0  : parallel dim, maps to C dim [value]
-  //   -1    : reduction (inner dot) dim — K-flat or K-lane
-  //   -2    : reduction loop dim — K-stick (drives an scf.for in emitMatmulStage)
+  //   -1    : reduction dim — K-stick (loop), K-flat, or K-lane (inner dot)
   //
-  // For A (logical dim0=M → C.dim0, dim1=K → reduction):
-  //   phys_src[p]==0 → M → role 0
-  //   phys_src[p]==1 AND op==FloorDiv → K-stick → role -2
-  //   phys_src[p]==1 otherwise → K-flat or K-lane → role -1
-  //
-  // For B (logical dim0=K → reduction, dim1=N → C.dim1):
-  //   phys_src[p]==1 → N → role 1
-  //   phys_src[p]==0 AND op==FloorDiv → K-stick → role -2
-  //   phys_src[p]==0 otherwise → K-flat or K-lane → role -1
+  // All dims whose logical source is the K dimension get role -1 regardless of
+  // whether they are FloorDiv (K-stick) or not. classify() then splits them
+  // right-to-left: the rightmost -1 dim is reduceInner (consumed by the Op);
+  // the rest are reduceLoop (each becomes an scf.for reduction loop).
   static void buildDimRoles(const OperandCoords &coords, int64_t kLogicalSrc,
                              int64_t parallelRole,
                              SmallVectorImpl<int64_t> &roles) {
     int n = (int)coords.src.size();
     roles.resize(n);
     for (int p = 0; p < n; ++p) {
-      if (coords.src[p] != kLogicalSrc) {
+      if (coords.src[p] != kLogicalSrc)
         roles[p] = parallelRole;
-      } else if (static_cast<CoordOp>(coords.op[p]) == CoordOp::FloorDiv) {
-        roles[p] = -2; // K-stick: reduction loop
-      } else {
-        roles[p] = -1; // K-flat or K-lane: inner dot
-      }
+      else
+        roles[p] = -1; // all K dims: reduction (inner or loop, split by classify)
     }
   }
 
@@ -357,23 +348,24 @@ struct RewriteDescriptorLayoutPass
   // One operand classified by its Map(Op, X) roles and physical layout.
   // `classify` fills all derived fields from `coords` + `dimRoles`.
   //
-  // Field semantics (right-to-left traversal of the physical dims):
+  // Field semantics (right-to-left traversal of the physical dims, R-c):
   //   lane        = innermost phys dim (rank-1); always the stick lane — full slice
   //   floorDims   = parallel dims that are FloorDiv (stick-index dims) → loops
-  //   reduceLoop  = reduction loop dims (role -2, K-stick) → innermost loops
-  //   reduceInner = innermost reduction dim (role -1) → consumed by Op (opSlice)
-  //   opSliceDims = residual dims fed to the Op (non-floor, non-K-stick);
-  //                 these are the 2 dims of the rank-2 slice for matmul
+  //   reduceDims  = all -1 dims, right-to-left order
+  //   reduceInner = rightmost reduceDim → consumed by Op (inner dot)
+  //   reduceLoop  = remaining reduceDims (all but rightmost) → reduction loops
+  //   opSliceDims = residual >= 0 dims that are not floorDims (fed to Op as-is)
   struct OperandPlan {
     Value               value;      // SSA tensor (physical on memory side)
     OperandCoords       coords;     // coord map + shape (kept for op/arg lookups)
-    SmallVector<int64_t> dimRoles;  // per-phys-dim role (>= 0 | -1 | -2)
+    SmallVector<int64_t> dimRoles;  // per-phys-dim role (>= 0 | -1)
 
     int                lane;        // innermost phys dim = rank-1
     SmallVector<int>   floorDims;   // parallel stick-index dims → loops (role>=0, FloorDiv)
-    SmallVector<int>   reduceLoop;  // K-stick dims (role -2) → reduction loops
-    int                reduceInner; // innermost role-(-1) dim (consumed by Op); -1 if none
-    SmallVector<int>   opSliceDims; // residual dims: role != -2 AND !isFloor (the 2D slice)
+    SmallVector<int>   reduceDims;  // all -1 dims in right-to-left order
+    int                reduceInner; // rightmost reduceDim → consumed by Op; -1 if none
+    SmallVector<int>   reduceLoop;  // reduceDims minus reduceInner → reduction loops
+    SmallVector<int>   opSliceDims; // residual >= 0 non-floor dims (the 2D slice for matmul)
   };
 
   // One synthesized loop (per stage, per physical dim).
@@ -452,9 +444,17 @@ struct RewriteDescriptorLayoutPass
     emitParallelNest(b, loc, c0, c1, loops, idx + 1, body);
   }
 
-  // Classify one operand's physical dims into OperandPlan fields.
+  // Classify one operand's physical dims into OperandPlan fields (R-c).
   // `coords` carries phys_src/op/arg and physShape. `dimRoles` comes from
-  // buildDimRoles. The resulting plan owns copies of the role vector.
+  // buildDimRoles (values: >= 0 parallel, -1 reduction). The resulting plan
+  // owns copies of the role vector.
+  //
+  // Right-to-left pass:
+  //   - innermost dim (rank-1) → lane (always full inner slice)
+  //   - -1 dims → reduceDims (right-to-left); rightmost is reduceInner
+  //     (consumed by Op), the rest are reduceLoop (become scf.for loops)
+  //   - >= 0 FloorDiv dims → floorDims (parallel stick-index loops)
+  //   - residual >= 0 dims → opSliceDims (fed to Op as-is)
   static OperandPlan classify(Value val, const OperandCoords &coords,
                                ArrayRef<int64_t> dimRoles) {
     int rank = (int)dimRoles.size();
@@ -462,26 +462,39 @@ struct RewriteDescriptorLayoutPass
     plan.value     = val;
     plan.coords    = coords;
     plan.dimRoles  = SmallVector<int64_t>(dimRoles.begin(), dimRoles.end());
-    plan.lane      = rank - 1; // innermost physical dim is always the stick lane
+    plan.lane      = rank - 1;
+    plan.reduceInner = -1;
 
-    // Walk physical dims in ascending order (left-to-right = outermost first).
-    // floorDims, reduceLoop, opSliceDims are all collected in ascending order.
-    plan.reduceInner = -1; // sentinel: no role-(-1) dim found yet
-    for (int p = 0; p < rank; ++p) {
+    // Walk right-to-left (innermost first) per R-c.
+    // -1 dims: track reduceDims and split into reduceInner (rightmost, consumed
+    // by Op) and reduceLoop (outer, each becomes an scf.for reduction loop).
+    // reduceInner is also added to opSliceDims during the walk so the existing
+    // extraction machinery (which builds the 2D Op tile from opSliceDims) keeps
+    // working unchanged. S3-S5 will switch extraction to use reduceInner directly.
+    for (int p = rank - 1; p >= 0; --p) {
       int64_t role = dimRoles[p];
       bool isFloor = (role >= 0 &&
                       static_cast<CoordOp>(coords.op[p]) == CoordOp::FloorDiv);
-      if (isFloor) {
+      if (role == -1) {
+        plan.reduceDims.push_back(p);
+        if (plan.reduceInner == -1) {
+          plan.reduceInner = p; // first -1 seen right-to-left = rightmost
+          plan.opSliceDims.push_back(p); // consumed by Op — part of the 2D tile
+        } else {
+          plan.reduceLoop.push_back(p); // outer -1 dims → loops
+        }
+      } else if (isFloor) {
         plan.floorDims.push_back(p);
-      } else if (role == -2) {
-        plan.reduceLoop.push_back(p);
       } else {
-        // role >= 0 (identity parallel) or role == -1 (K-flat/K-lane)
+        // role >= 0, non-floor (identity parallel or lane)
         plan.opSliceDims.push_back(p);
-        if (role == -1)
-          plan.reduceInner = p; // last such dim seen is the rightmost (innermost)
       }
     }
+    // Reverse so dims appear in ascending physical order (left-to-right),
+    // matching the expectations of buildExtract and collectLoops callers.
+    std::reverse(plan.floorDims.begin(), plan.floorDims.end());
+    std::reverse(plan.reduceLoop.begin(), plan.reduceLoop.end());
+    std::reverse(plan.opSliceDims.begin(), plan.opSliceDims.end());
     return plan;
   }
 
@@ -582,10 +595,8 @@ struct RewriteDescriptorLayoutPass
 
     // Unpack plan fields into the names used by the existing loop body. Each
     // physical dim of an operand plays exactly one role:
-    //   floorDims   → outer stick-index dims (FloorDiv, parallel role) that
-    //                 become parallel scf.for loops, one IV each, size-1 slice.
-    //   reduceLoop  → K-stick dims (FloorDiv, K role) that become reduction
-    //                 scf.for loops accumulating the contraction.
+    //   floorDims   → parallel stick-index dims (FloorDiv) → scf.for loops
+    //   reduceLoop  → outer -1 reduction dims (K-sticks) → reduction scf.for loops
     //   opSliceDims → the 2 dims left over, retained full-size to form the 2D
     //                 [.,.] tile fed to linalg.matmul.
     //
