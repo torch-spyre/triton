@@ -215,8 +215,13 @@ struct RewriteDescriptorLayoutPass
   }
 
   // Walk all linalg.matmul ops; fix any whose operands are rank-3 (physical).
-  // For each, traces operands back to their tt.spyre_tensor_layout markers
-  // (still live during Phase 2) to read the coord maps. Repeats until stable.
+  // Phase 2 driver: walk contraction ops whose operands have been physicalized
+  // to rank > 2 and synthesize the scf.for loop nest that produces a 2D result.
+  // Currently handles linalg.matmul; extend by adding a dispatch branch for
+  // other contraction ops (e.g. linalg.batch_matmul, linalg.reduce over a
+  // physical dim) — the loop-until-stable structure accommodates any op type.
+  // Traces operands back to their tt.spyre_tensor_layout markers (still live
+  // during Phase 2) to read the coord maps. Repeats until stable.
   LogicalResult synthesizeContractions(ModuleOp module) {
     bool changed = true;
     while (changed) {
