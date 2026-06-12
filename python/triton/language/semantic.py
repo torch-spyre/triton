@@ -9,6 +9,9 @@ from triton.runtime import driver
 
 from .._C.libtriton import ir
 from . import core as tl
+# --- added for spyre
+from . import target_info
+# --- added for spyre
 
 T = TypeVar('T')
 TensorTy = TypeVar('TensorTy')
@@ -1134,8 +1137,13 @@ class TritonSemantic(Generic[TensorTy]):
         assert eviction_policy == "", "eviction policy is not supported yet"
 
         # Validate descriptor.
-        # --- changed for spyre: rank relaxed from ==2 to >=2 (N-D gather).
-        assert len(desc.block_shape) >= 2, f"descriptor must be at least 2D, but got {desc.block_shape}"
+        # --- START --- changed for spyre
+        if target_info.is_spyre():
+            # Spyre supports rank-N gather; only the outermost dim is indirect.
+            assert len(desc.block_shape) >= 2, f"descriptor must be at least 2D, but got {desc.block_shape}"
+        else:
+            assert len(desc.block_shape) == 2, f"descriptor must be 2D, but got {desc.block_shape}"
+        # --- END --- changed for spyre
         assert desc.block_shape[0] == 1, f"descriptor block must have 1 row, but got {desc.block_shape}"
 
         # Validate offsets.
@@ -1143,18 +1151,17 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Validate minimum block size.
         assert x_offsets.shape[0] >= 8, f"descriptor gather must have at least 8 rows, but got {x_offsets.shape}"
-        # --- changed for spyre: TMA min-cols check removed.
-        # The original assertion required `block_shape[1] >= 32 / bitwidth * 8`
-        # — an NVIDIA TMA-specific minimum that Spyre doesn't need.  For
-        # rank-N gather, dim 1 is also legitimately small (often 1, when
-        # y_offset selects a single trailing slice), so the check would
-        # reject valid Spyre kernels.
-        # dtype = desc.dtype
-        # min_cols = 32 // dtype.primitive_bitwidth * 8
-        # assert desc.block_shape[
-        #     1] >= min_cols, f"descriptor gather of {dtype} must have at least {min_cols} columns, but got {desc.block_shape[1]}"
+        # --- START --- changed for spyre
+        if not target_info.is_spyre():
+            # TMA (NVIDIA) requires block_shape[1] >= 32/bitwidth * 8 columns.
+            # Spyre omits this: for rank-N gather, dim 1 can legitimately be 1.
+            dtype = desc.dtype
+            min_cols = 32 // dtype.primitive_bitwidth * 8
+            assert desc.block_shape[1] >= min_cols, \
+                f"descriptor gather of {dtype} must have at least {min_cols} columns, but got {desc.block_shape[1]}"
+        # --- END --- changed for spyre
 
-        # --- changed for spyre: result type now carries every trailing block dim.
+        # Result type carries every trailing block dim (invariant at rank 2: same as desc.block_shape[1]).
         type = tl.block_type(desc.dtype, [x_offsets.shape[0], *desc.block_shape[1:]])
         y_offset = self._convert_to_ir_values((y_offset, ), require_i64=False)[0]
         x = self.builder.create_descriptor_gather(desc.handle, x_offsets.handle, y_offset, type.to_ir(self.builder))
@@ -1164,8 +1171,13 @@ class TritonSemantic(Generic[TensorTy]):
         assert isinstance(desc, tl.tensor_descriptor_base)
 
         # Validate descriptor.
-        # --- changed for spyre: rank relaxed from ==2 to >=2 (N-D scatter).
-        assert len(desc.block_shape) >= 2, f"descriptor must be at least 2D, but got {desc.block_shape}"
+        # --- START --- changed for spyre
+        if target_info.is_spyre():
+            # Spyre supports rank-N scatter; only the outermost dim is indirect.
+            assert len(desc.block_shape) >= 2, f"descriptor must be at least 2D, but got {desc.block_shape}"
+        else:
+            assert len(desc.block_shape) == 2, f"descriptor must be 2D, but got {desc.block_shape}"
+        # --- END --- changed for spyre
         assert desc.block_shape[0] == 1, f"descriptor block must have 1 row, but got {desc.block_shape}"
 
         # Validate offsets.
@@ -1173,12 +1185,14 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Validate minimum block size.
         assert x_offsets.shape[0] >= 8, f"descriptor scatter must have at least 8 rows, but got {x_offsets.shape}"
-        # --- changed for spyre: TMA min-cols check removed.
-        # Mirror of the gather path; see `descriptor_gather` above.
-        # dtype = desc.dtype
-        # min_cols = 32 // dtype.primitive_bitwidth * 8
-        # assert desc.block_shape[
-        #     1] >= min_cols, f"descriptor scatter of {dtype} must have at least {min_cols} columns, but got {desc.block_shape[1]}"
+        # --- START --- changed for spyre
+        if not target_info.is_spyre():
+            # Mirror of the gather TMA min-cols check; see descriptor_gather above.
+            dtype = desc.dtype
+            min_cols = 32 // dtype.primitive_bitwidth * 8
+            assert desc.block_shape[1] >= min_cols, \
+                f"descriptor scatter of {dtype} must have at least {min_cols} columns, but got {desc.block_shape[1]}"
+        # --- END --- changed for spyre
 
         y_offset = self._convert_to_ir_values((y_offset, ), require_i64=False)[0]
         self.builder.create_descriptor_scatter(desc.handle, value.handle, x_offsets.handle, y_offset)
