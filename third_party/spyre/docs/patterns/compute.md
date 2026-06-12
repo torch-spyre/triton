@@ -16,7 +16,7 @@ row = tl.expand_dims(row, axis=0)          # tensor<1 x N x f32>
 mat = tl.broadcast_to(row, [M, N])         # tensor<M x N x f32>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:228` (`TestBroadcast.test_expand_first_dim`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:268` (`TestBroadcast.test_expand_first_dim`)</sup>
 
 **Round-trip evidence**
 
@@ -37,7 +37,69 @@ for k in range(k_tiles):
     acc = tl.dot(a, b, acc)             # tensor<BM x BN x f32>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:685` (`TestDot.test_f32`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:725` (`TestDot.test_f32`)</sup>
+
+### Rejected
+
+#### ❌ `test_dot_4d_rejected`
+
+_Rank ≥ 4 ``tt.dot`` is rejected by the upstream Triton verifier_
+
+The verifier in ``OpInterfaces.cpp::DotOpInterface`` enforces
+``aShape.size() in {2, 3}``; rank 4+ is rejected at parse time
+with ``'tt.dot' op expected operands to be 2d or 3d``. The
+diagnostic fires during ``ir.parse_mlir_module``, before the
+``LowerComputeOps`` pass runs, so the raised exception is
+``"Parse MLIR file failed"``.
+
+Why pin this:
+
+* Documents the rank cap in the test suite — readers of
+  ``TestDot`` see only positive 2-D/3-D tests, so the cap is
+  otherwise invisible until a kernel author tries it.
+* Explains why an N-D gather feeding a matmul must first
+  reshape its rank-4 output down to rank-2: ``tl.dot`` cannot
+  consume rank-4 directly, so the kernel must collapse the
+  rank-4 ``[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM]``
+  tile to rank-2 ``[OUT_LEN, INNER_DIM]`` first. The companion
+  test ``TestReshape.test_4d_to_2d_collapse_three_leading_dims``
+  pins that reshape step.
+
+Note on the silent-fallthrough in ``ConvertTTDot``: the Spyre
+lowering pattern dispatches on ``aType.getRank()`` with
+branches for rank 2 (``linalg.matmul``) and rank 3
+(``linalg.batch_matmul``); rank ≥ 4 falls through to the rank-2
+branch and would build an invalid ``linalg.matmul``. That code
+path is dead today because the verifier rejects rank-4 first,
+but if the upstream verifier ever relaxed, the fallthrough
+would activate. A separate test pinning that the lowering
+rejects rank ≥ 4 with a Spyre-specific diagnostic — rather
+than silently building broken ``linalg.matmul`` IR — would
+close that gap.
+
+TODO: tighten ``ConvertTTDot`` to either handle rank ≥ 4 or
+explicitly emit ``failure()`` with a diagnostic, then add a
+positive test for the rejected-with-diagnostic path.
+
+```python
+# REJECTED: rank-4 tt.dot — verifier accepts only rank 2 or 3.
+# An N-D indirect-access gather produces rank-4 (or rank-5
+# stickified) tiles; those must be reshaped down to rank-2
+# BEFORE tl.dot — the dot op does not flatten its inputs.
+a4 = tl.descriptor_gather(a_desc, idx, y)   # tensor<NUM_BLOCKS x NUM_GROUPS x BLOCK x INNER xf32>
+b4 = tl.descriptor_gather(b_desc, idx, y)   # same rank-4 shape
+out = tl.dot(a4, b4)                         # 'tt.dot op expected operands to be 2d or 3d'
+# Workaround: collapse leading dims first.
+a2 = tl.reshape(a4, [OUT_LEN, INNER])       # rank-2
+b2 = tl.reshape(b4, [INNER, OUT_LEN])
+out = tl.dot(a2, b2)                         # accepted
+```
+
+Expected diagnostics:
+
+- `expected operands to be 2d or 3d`
+
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:788` (`TestDot.test_dot_4d_rejected`)</sup>
 
 **Round-trip evidence**
 
@@ -62,7 +124,7 @@ x = tl.load(x_ptr + offsets)          # tensor<BLOCK x f32>
 x = tl.expand_dims(x, axis=0)         # tensor<1 x BLOCK x f32>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:168` (`TestExpandDims.test_axis_0`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:208` (`TestExpandDims.test_axis_0`)</sup>
 
 ## join
 
@@ -76,7 +138,7 @@ imag = tl.load(imag_ptr + offsets)   # tensor<BLOCK x f32>
 pair = tl.join(real, imag)           # tensor<BLOCK x 2 x f32>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:355` (`TestJoin.test_1d`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:395` (`TestJoin.test_1d`)</sup>
 
 ## make-range
 
@@ -103,7 +165,7 @@ bh_idx    = bh_offset + tl.arange(0, BLOCK_BH)   # tt.make_range survives
 bh_active = bh_idx < BH                          # ... into arith.cmpi
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:456` (`TestMakeRange.test_make_range_in_arithmetic_survives`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:496` (`TestMakeRange.test_make_range_in_arithmetic_survives`)</sup>
 
 ## reduce
 
@@ -122,7 +184,7 @@ x = tl.load(x_ptr + offsets)       # tensor<BLOCK_M x BLOCK_N x f32>
 row_max = tl.max(x, axis=1)        # tensor<BLOCK_M x f32>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:547` (`TestReduce.test_max_f32`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:587` (`TestReduce.test_max_f32`)</sup>
 
 #### ✅ `test_multi_operand_reduce`
 
@@ -141,7 +203,7 @@ values, indices = tl.argmax(x, axis=1, return_indices=True)
 # index lane initialised with -1 as an invalid-index sentinel
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:640` (`TestReduce.test_multi_operand_reduce`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:680` (`TestReduce.test_multi_operand_reduce`)</sup>
 
 #### ✅ `test_sum_f32`
 
@@ -155,7 +217,7 @@ x = tl.load(x_ptr + offsets)       # tensor<BLOCK_M x BLOCK_N x f32>
 row_sum = tl.sum(x, axis=1)        # tensor<BLOCK_M x f32>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:521` (`TestReduce.test_sum_f32`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:561` (`TestReduce.test_sum_f32`)</sup>
 
 ### Rejected
 
@@ -178,7 +240,7 @@ Expected diagnostics:
 - `failed to legalize operation 'tt.reduce'`
 - `LowerComputeOps: failed to convert compute ops`
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:574` (`TestReduce.test_subf_combiner_fails`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:614` (`TestReduce.test_subf_combiner_fails`)</sup>
 
 **Round-trip evidence**
 
@@ -196,7 +258,38 @@ Expected diagnostics:
 x = tl.reshape(x, [BLOCK_M, BLOCK_N])  # reinterpret flat tile as 2D
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:101` (`TestReshape.test_1d_to_2d`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:102` (`TestReshape.test_1d_to_2d`)</sup>
+
+#### ✅ `test_4d_to_2d_collapse_three_leading_dims`
+
+_Rank-4 → rank-2 contiguous flatten that collapses three leading dims into one_
+
+``tt.dot`` accepts only rank-2 (``linalg.matmul``) and rank-3
+(``linalg.batch_matmul``) operands, so the rank-4 output of an
+N-D ``tt.descriptor_gather`` must be reshaped before it can
+feed a matmul.  The reshape collapses the three leading dims
+``[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE]`` into a single
+``OUT_LEN`` axis while preserving the trailing contiguous dim
+``INNER_DIM`` unchanged.
+
+The existing ``test_1d_to_2d`` / ``test_2d_to_1d`` /
+``test_2d_to_3d`` cases do not exercise a rank-4 input, so a
+regression in ``LowerComputeOps``'s rank-decreasing
+``tt.reshape`` lowering could otherwise pass unnoticed.
+
+Shape values: ``NUM_BLOCKS = 8``, ``NUM_GROUPS = 1``,
+``BLOCK_SIZE = 16``, ``INNER_DIM = 64`` →
+``OUT_LEN = NUM_BLOCKS * NUM_GROUPS * BLOCK_SIZE = 128``.
+
+```python
+# Collapse the rank-4 output of an N-D gather into a rank-2 tile
+# so tl.dot can consume it. OUT_LEN = NUM_BLOCKS * NUM_GROUPS * BLOCK_SIZE.
+gathered_4d = src_desc.gather(indices, group_idx)  # [NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM]
+gathered_2d = tl.reshape(gathered_4d, [OUT_LEN, INNER_DIM])
+out         = tl.dot(lhs, tl.trans(gathered_2d))   # 2-D dot
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:156` (`TestReshape.test_4d_to_2d_collapse_three_leading_dims`)</sup>
 
 ## splat
 
@@ -215,7 +308,7 @@ scalar = 1.0
 tensor = tl.broadcast(scalar, shape=[BLOCK_SIZE])  # tl.splat
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:37` (`TestSplat.test_f32_1d`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:38` (`TestSplat.test_f32_1d`)</sup>
 
 ## split
 
@@ -228,7 +321,7 @@ pair = tl.load(pair_desc, [pid * BLOCK])  # tensor<BLOCK x 2 x f32>
 real, imag = tl.split(pair)               # two tensor<BLOCK x f32>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:398` (`TestSplit.test_2d`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:438` (`TestSplit.test_2d`)</sup>
 
 ## transpose
 
@@ -241,7 +334,7 @@ a = tl.load(a_desc, [m * BM, k * BK])     # tensor<BM x BK x f32>
 a_t = tl.trans(a)                          # tensor<BK x BM x f32>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:313` (`TestTrans.test_2d_transpose`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_compute_ops.py:353` (`TestTrans.test_2d_transpose`)</sup>
 
 
 ---

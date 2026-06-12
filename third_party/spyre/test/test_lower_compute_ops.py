@@ -13,6 +13,7 @@ Negative tests use ``pytest.raises`` + ``assert_stderr(capfd, ...)``
 to verify both the RuntimeError and the MLIR diagnostic on stderr.
 """
 
+import pytest
 from conftest import SinglePassTester
 from utils_pattern import pattern
 
@@ -151,6 +152,45 @@ class TestReshape(LowerComputeOpsTester):
         """)
         self.assert_present("tensor.reshape")
         self.assert_absent("tt.reshape")
+
+    @pattern("reshape", category="compute", example=[
+        "# Collapse the rank-4 output of an N-D gather into a rank-2 tile",
+        "# so tl.dot can consume it. OUT_LEN = NUM_BLOCKS * NUM_GROUPS * BLOCK_SIZE.",
+        "gathered_4d = src_desc.gather(indices, group_idx)  # [NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM]",
+        "gathered_2d = tl.reshape(gathered_4d, [OUT_LEN, INNER_DIM])",
+        "out         = tl.dot(lhs, tl.trans(gathered_2d))   # 2-D dot",
+    ])
+    def test_4d_to_2d_collapse_three_leading_dims(self):
+        """Rank-4 → rank-2 contiguous flatten that collapses three leading dims into one.
+
+        ``tt.dot`` accepts only rank-2 (``linalg.matmul``) and rank-3
+        (``linalg.batch_matmul``) operands, so the rank-4 output of an
+        N-D ``tt.descriptor_gather`` must be reshaped before it can
+        feed a matmul.  The reshape collapses the three leading dims
+        ``[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE]`` into a single
+        ``OUT_LEN`` axis while preserving the trailing contiguous dim
+        ``INNER_DIM`` unchanged.
+
+        The existing ``test_1d_to_2d`` / ``test_2d_to_1d`` /
+        ``test_2d_to_3d`` cases do not exercise a rank-4 input, so a
+        regression in ``LowerComputeOps``'s rank-decreasing
+        ``tt.reshape`` lowering could otherwise pass unnoticed.
+
+        Shape values: ``NUM_BLOCKS = 8``, ``NUM_GROUPS = 1``,
+        ``BLOCK_SIZE = 16``, ``INNER_DIM = 64`` →
+        ``OUT_LEN = NUM_BLOCKS * NUM_GROUPS * BLOCK_SIZE = 128``.
+        """
+        self.run("""
+        module {
+          tt.func @k(%t: tensor<8x1x16x64xf16>) -> tensor<128x64xf16> {
+            %0 = tt.reshape %t : tensor<8x1x16x64xf16> -> tensor<128x64xf16>
+            tt.return %0 : tensor<128x64xf16>
+          }
+        }
+        """)
+        self.assert_present("tensor.reshape")
+        self.assert_absent("tt.reshape")
+        self.assert_result_type("tensor.reshape", "tensor<128x64xf16>")
 
 
 # =========================================================================
@@ -744,3 +784,68 @@ class TestDot(LowerComputeOpsTester):
         self.assert_present("linalg.batch_matmul")
         self.assert_absent("tt.dot")
         self.assert_result_type("linalg.batch_matmul", "tensor<4x16x8xf32>")
+
+    @pattern("dot", category="compute", negative=True, example=[
+        "# REJECTED: rank-4 tt.dot — verifier accepts only rank 2 or 3.",
+        "# An N-D indirect-access gather produces rank-4 (or rank-5",
+        "# stickified) tiles; those must be reshaped down to rank-2",
+        "# BEFORE tl.dot — the dot op does not flatten its inputs.",
+        "a4 = tl.descriptor_gather(a_desc, idx, y)   # tensor<NUM_BLOCKS x NUM_GROUPS x BLOCK x INNER xf32>",
+        "b4 = tl.descriptor_gather(b_desc, idx, y)   # same rank-4 shape",
+        "out = tl.dot(a4, b4)                         # 'tt.dot op expected operands to be 2d or 3d'",
+        "# Workaround: collapse leading dims first.",
+        "a2 = tl.reshape(a4, [OUT_LEN, INNER])       # rank-2",
+        "b2 = tl.reshape(b4, [INNER, OUT_LEN])",
+        "out = tl.dot(a2, b2)                         # accepted",
+    ])
+    def test_dot_4d_rejected(self, capfd):
+        """Rank ≥ 4 ``tt.dot`` is rejected by the upstream Triton verifier.
+
+        The verifier in ``OpInterfaces.cpp::DotOpInterface`` enforces
+        ``aShape.size() in {2, 3}``; rank 4+ is rejected at parse time
+        with ``'tt.dot' op expected operands to be 2d or 3d``. The
+        diagnostic fires during ``ir.parse_mlir_module``, before the
+        ``LowerComputeOps`` pass runs, so the raised exception is
+        ``"Parse MLIR file failed"``.
+
+        Why pin this:
+
+        * Documents the rank cap in the test suite — readers of
+          ``TestDot`` see only positive 2-D/3-D tests, so the cap is
+          otherwise invisible until a kernel author tries it.
+        * Explains why an N-D gather feeding a matmul must first
+          reshape its rank-4 output down to rank-2: ``tl.dot`` cannot
+          consume rank-4 directly, so the kernel must collapse the
+          rank-4 ``[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM]``
+          tile to rank-2 ``[OUT_LEN, INNER_DIM]`` first. The companion
+          test ``TestReshape.test_4d_to_2d_collapse_three_leading_dims``
+          pins that reshape step.
+
+        Note on the silent-fallthrough in ``ConvertTTDot``: the Spyre
+        lowering pattern dispatches on ``aType.getRank()`` with
+        branches for rank 2 (``linalg.matmul``) and rank 3
+        (``linalg.batch_matmul``); rank ≥ 4 falls through to the rank-2
+        branch and would build an invalid ``linalg.matmul``. That code
+        path is dead today because the verifier rejects rank-4 first,
+        but if the upstream verifier ever relaxed, the fallthrough
+        would activate. A separate test pinning that the lowering
+        rejects rank ≥ 4 with a Spyre-specific diagnostic — rather
+        than silently building broken ``linalg.matmul`` IR — would
+        close that gap.
+
+        TODO: tighten ``ConvertTTDot`` to either handle rank ≥ 4 or
+        explicitly emit ``failure()`` with a diagnostic, then add a
+        positive test for the rejected-with-diagnostic path.
+        """
+        with pytest.raises(RuntimeError, match="Parse MLIR file failed"):
+            self.run("""
+            module {
+              tt.func @k(%a: tensor<2x4x16x32xf32>, %b: tensor<2x4x32x8xf32>,
+                         %c: tensor<2x4x16x8xf32>) -> tensor<2x4x16x8xf32> {
+                %0 = tt.dot %a, %b, %c
+                    : tensor<2x4x16x32xf32> * tensor<2x4x32x8xf32> -> tensor<2x4x16x8xf32>
+                tt.return %0 : tensor<2x4x16x8xf32>
+              }
+            }
+            """)
+        self.assert_stderr(capfd, "expected operands to be 2d or 3d")

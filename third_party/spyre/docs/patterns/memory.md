@@ -44,14 +44,15 @@ kernels always pass index buffers as ``!tt.ptr<i32>`` +
 misuse.
 
 ```python
-# REJECTED: x_offsets passed as a tensor-typed kernel argument.
-# Spyre requires indices staged via tt.descriptor_load from a !tt.ptr<i32>
-# argument — a tensor arg has no traceable provenance, so the gather
-# pattern returns failure() and applyPartialConversion errors out.
+# NOT supported: x_offsets passed in as a tensor-typed kernel arg.
+# Spyre kernels must stage indices via tl.make_tensor_descriptor +
+# .load() from a !tt.ptr<i32> arg so the gather pattern can trace
+# the index buffer's provenance.
 @triton.jit
-def k(ptr, x_offsets, y_offset, M, K, stride_row, stride_col):
-    desc = tl.make_tensor_descriptor(ptr, [M, K], [stride_row, stride_col], [1, 64])
-    data = desc.gather(x_offsets, y_offset)  # x_offsets is a kernel arg — rejected
+def k(ptr, x_offsets, y_offset):  # x_offsets: tensor<32xi32> arg — REJECTED
+    desc = tl.make_tensor_descriptor(ptr, shape=[M, K], strides=[K, 1],
+                                     block_shape=[1, 64])
+    data = tl.descriptor_gather(desc, x_offsets, y_offset)
 ```
 
 Expected diagnostics:
@@ -70,34 +71,296 @@ Expected diagnostics:
 
 _+ 6 more variants_
 
-## descriptor-gather-nd
+## descriptor-gather-2d-indices
 
 ### Rejected
 
-#### ❌ `test_gather_nd_block_rejected`
+#### ❌ `test_gather_2d_indices_rejected`
 
-_3D block type is rejected by verifyGatherScatterOp_
+_2-D index tensor: the index buffer must be 1-D_
 
-``<1x16x128xf16>`` has rank 3; the verifier requires exactly rank 2.
-This is the gap that prevents paged-attention style N-D gather:
-the block table lookup could drive the outermost indirect dimension,
-with the remaining dims iterating over (block_size, head_dim).
-Caught during ``ir.parse_mlir_module`` (verifier runs at parse time).
+A kernel author who wants to gather a 2-D *grid* of pages
+(e.g. one page per (sequence, head) pair) cannot pass a 2-D
+``x_offsets`` directly.  The verifier in
+``verifyGatherScatterResultType`` requires
+``indicesType.getRank() == 1``.
+
+This is *not* a relaxation candidate: the lowering's indirect
+subscript is ``c_x + d_0`` with a single iteration variable,
+and ``buildIndirectAccessTile`` builds a single
+``construct_memory_view`` over the index tensor.  Allowing
+rank-2 indices would require either (a) flattening at the
+verifier — a no-op the kernel author can do themselves and
+which costs nothing, or (b) carrying a multi-D iteration
+space through ``buildGatherSubscriptMaps`` — substantially
+more invasive.
+
+Pinned at rank-3 (descriptor side) so the failure is
+unambiguously about the index tensor, not anything trailing.
 
 ```python
-# NOT supported: descriptor_gather with N-D block (rank > 2)
-# Paged attention pattern — block table drives the indirect dim,
-# remaining dims tile over (block_size, head_dim):
-k_desc = tl.make_tensor_descriptor(k_cache_ptr, [...], block_shape=[1, block_size, dim])
-result = tl.descriptor_gather(k_desc, BT_v, head_offset)
-# → tensor<num_pages x block_size x dim x f16>  (3D result, not yet supported)
+# REJECTED: 2-D index tensor — x_offsets must be rank-1.
+x_offsets = tl.descriptor_load(idx_desc, [0, 0])  # tensor<8x4xi32> — REJECTED
+data = tl.descriptor_gather(desc, x_offsets, y_offset)
+# 'x offsets must be a 1D tensor'
+# Workaround: flatten before the gather, reshape after if
+# the 2-D grid structure mattered.
+x_offsets_1d = tl.reshape(x_offsets, [32])           # rank-1
+data = tl.descriptor_gather(desc, x_offsets_1d, y_offset)
+data_2d = tl.reshape(data, [8, 4, BLOCK_COLS])       # recover grid
 ```
 
 Expected diagnostics:
 
-- `descriptor block must be a 2D tensor`
+- `x offsets must be a 1D tensor`
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:952` (`TestDescriptorGatherND.test_gather_nd_block_rejected`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1574` (`TestDescriptorGatherNDLimits.test_gather_2d_indices_rejected`)</sup>
+
+## descriptor-gather-4d
+
+### Supported
+
+#### ✅ `test_gather_4d_lowered`
+
+_Rank-4 gather: indirect dim plus a group dim that takes the y_offset_
+
+The descriptor's group axis is permuted to dim 1 so the single
+``y_offset = group_idx`` lands there; dims 2 and 3 (the inner
+``BLOCK_SIZE`` and ``INNER_DIM`` axes) are direct with no offset.
+Pins that the lowering handles a rank > 3 result block where the
+indirect axis is on dim 0 and exactly one direct axis carries an
+offset.
+
+```python
+# rank-4 N-D indirect-access gather with a group dim:
+src_desc = tl.make_tensor_descriptor(
+    src_ptr,
+    shape=[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM],   # groups at dim 1
+    strides=[..., INNER_DIM, NUM_GROUPS*INNER_DIM, 1],
+    block_shape=[1, 1, BLOCK_SIZE, INNER_DIM])
+result = tl.descriptor_gather(src_desc, indices, group_idx)
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1024` (`TestDescriptorGatherND.test_gather_4d_lowered`)</sup>
+
+## descriptor-gather-5d
+
+### Supported
+
+#### ✅ `test_gather_5d_lowered`
+
+_Rank-5 gather: indirect dim, group dim, and a split (stickified) inner dim_
+
+Group axis permuted to dim 1 (takes the ``y_offset = group_idx``);
+``BLOCK_SIZE`` at dim 2; the trailing contiguous dim is split
+across dim 3 (``NUM_STICKS``, the stick group) and dim 4
+(``STICK_SIZE``, the within-stick offset). Endpoint coverage for
+the relaxed rank range — a regression that silently dropped
+trailing dims would surface here.
+
+```python
+# rank-5 N-D indirect-access gather with a stickified inner dim:
+src_desc = tl.make_tensor_descriptor(
+    src_ptr,
+    shape=[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, NUM_STICKS, STICK_SIZE],
+    block_shape=[1, 1, BLOCK_SIZE, NUM_STICKS, STICK_SIZE])
+result = tl.descriptor_gather(src_desc, indices, group_idx)
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1087` (`TestDescriptorGatherND.test_gather_5d_lowered`)</sup>
+
+## descriptor-gather-nd
+
+### Supported
+
+#### ✅ `test_gather_3d_lowered`
+
+_Rank-3 ``tt.descriptor_gather`` lowers cleanly_
+
+Block shape ``<1 x BLOCK_SIZE x INNER_DIM>`` (the source tensor is
+``NUM_BLOCKS x BLOCK_SIZE x INNER_DIM``). Indices drive dim 0 (block id);
+``y_offset`` lands on dim 1 (in-block row); dim 2 (the contiguous inner
+dim) is direct with no offset.
+
+Subscript-map shape after lowering:
+  dim 0 (indirect): c_x + d_0
+  dim 1 (direct):   c_y + d_1
+  dim 2 (direct):           d_2
+
+The full iteration space is ``0 ≤ d_0 < 32, 0 ≤ d_1 < 16, 0 ≤ d_2 < 128``.
+
+```python
+# rank-3 N-D indirect-access gather (Spyre extension):
+src_desc = tl.make_tensor_descriptor(src_ptr, [NUM_BLOCKS, BLOCK_SIZE, INNER_DIM], ...,
+                                     block_shape=[1, BLOCK_SIZE, INNER_DIM])
+result = tl.descriptor_gather(src_desc, indices, 0)
+# → tensor<32 x BLOCK_SIZE x INNER_DIM x f16>  (3D result; one indirect axis,
+#                                                two direct dims with no offset)
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:959` (`TestDescriptorGatherND.test_gather_3d_lowered`)</sup>
+
+## descriptor-gather-nd-block-dim0
+
+### Rejected
+
+#### ❌ `test_gather_3d_block_dim0_not_one_fails`
+
+_Rank-3 block ``<2x16x128>``: the leading-1 rule still applies_
+
+The N-D relaxation widened the rank rule but kept the
+leading-1 rule.  At rank 2 the same rule is pinned by
+``test_gather_block_dim0_not_one_fails``; this rank-3 mirror
+exists because a kernel author writing their first N-D gather
+is likely to assume the relaxation also widened *which* dim
+must be 1 (e.g. "any dim that's 1 is fine") — it didn't.  Dim
+0 specifically.
+
+```python
+# REJECTED: leading dim of block_shape is not 1.
+# The N-D relaxation widened the rank rule but kept the
+# leading-1 rule — dim 0 specifically must be 1.
+desc = tl.make_tensor_descriptor(ptr, shape=[P, B, D],
+                                 strides=[B*D, D, 1],
+                                 block_shape=[2, 16, 128])  # leading 2 — REJECTED
+data = tl.descriptor_gather(desc, x_offsets, y_offset)
+# 'descriptor block must have exactly 1 row'
+# Workaround: keep block_shape[0]=1; pair blocks via
+# block_shape=[1, 2*16, 128] with a paired index buffer,
+# OR issue two gathers and concatenate.
+```
+
+Expected diagnostics:
+
+- `descriptor block must have exactly 1 row`
+
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1528` (`TestDescriptorGatherNDLimits.test_gather_3d_block_dim0_not_one_fails`)</sup>
+
+## descriptor-gather-nd-permuted-strides
+
+### Supported
+
+#### ✅ `test_gather_3d_inner_axis_via_stride_permutation`
+
+_Gathering a 'logically inner' physical axis via stride permutation_
+
+The lowering wires the index buffer onto dim 0 of the descriptor
+— there is no way to point it at any other dim.  Kernel authors
+whose physical tensor stores the gathered axis in the middle or
+at the end have one option: declare the descriptor's *shape*
+with the gathered axis at dim 0, then express the original
+physical layout through the *strides*.
+
+The example here is a tensor laid out as
+``[BLOCK_SIZE, NUM_BLOCKS, INNER_DIM]`` (block-row-major rather
+than block-id-major) but which the kernel still wants to
+*gather* by block id.  The descriptor's shape is declared
+``[NUM_BLOCKS, BLOCK_SIZE, INNER_DIM]`` and the stride list is
+``[INNER_DIM, NUM_BLOCKS*INNER_DIM, 1]`` — the block-id-stride
+is smaller than the block-row-stride, the inverse of the
+outermost-block-id case.
+
+From the lowering's perspective, nothing changes: it still
+fans index ``i`` onto dim 0.  The trick is purely on the
+kernel-author side, and the resulting access pattern is
+identical to the outermost-block-id rank-3 gather.
+
+Pins: lowering succeeds, view shape matches the *declared*
+descriptor shape (not the physical layout), result tile
+matches the gathered shape.  A regression that re-derived the
+memory view from anything other than the descriptor's shape
+operands would surface as a wrong view shape here.
+
+```python
+# Physical layout: [BLOCK_SIZE, NUM_BLOCKS, INNER_DIM] — block id is NOT dim 0.
+# Declare descriptor shape with the gathered axis at dim 0, fix up via strides:
+desc = tl.make_tensor_descriptor(
+    ptr,
+    shape=[NUM_BLOCKS, BLOCK_SIZE, INNER_DIM],
+    strides=[INNER_DIM, NUM_BLOCKS * INNER_DIM, 1],  # inverted stride order
+    block_shape=[1, BLOCK_SIZE, INNER_DIM])
+result = tl.descriptor_gather(desc, block_ids, y_offset)
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1348` (`TestDescriptorGatherND.test_gather_3d_inner_axis_via_stride_permutation`)</sup>
+
+## descriptor-gather-nd-subscripts
+
+### Supported
+
+#### ✅ `test_gather_3d_subscript_kinds_pin_offset_axis`
+
+_Pin the dim 0 / dim 1 / dim ≥ 2 role split — the headline N-D limitation_
+
+At every rank ≥ 2 the lowering encodes exactly two "movable"
+axes: dim 0 (indirect, fed by the index buffer) and dim 1
+(direct, offset by ``y_offset``).  Every dim ``i ≥ 2`` is a
+bare ``d_i`` — no offset, no capture, the kernel reads the
+block's full extent on that axis with no ability to slice.
+
+That asymmetry is the most kernel-author-visible consequence
+of the relaxed verifier: at rank 2 it didn't matter (there
+was no dim ≥ 2), at rank 3+ it constrains every kernel that
+wants more than one offset axis or wants to gather along
+anything other than the outermost axis.
+
+Without pinning the textual form of ``subscript_kinds`` and
+``subscript_maps`` here, a regression that emitted, say, a
+second indirect axis or a captured ``c_y`` on a trailing dim
+would slip past the existing rank-3 structural counts (which
+only check ``num_dims`` / ``num_constraints`` on
+``variables_space_set``).
+
+```python
+# Rank-3 subscript role split: dim 0 indirect, dim 1 y_offset, dim 2 full
+# desc block shape <1 x TOKEN_DIM x HEAD_DIM>
+result = tl.descriptor_gather(desc, x_offsets, y_offset)
+# lowers to: ind(idx[c_x + d0]), (c_y + d1), (d2)
+# Trailing dim 2 (HEAD_DIM): no offset — full block extent always read.
+# To slice dim 2, reshape the result after the gather.
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1192` (`TestDescriptorGatherND.test_gather_3d_subscript_kinds_pin_offset_axis`)</sup>
+
+## descriptor-gather-nd-trailing-one
+
+### Supported
+
+#### ✅ `test_gather_3d_inner_dim_one_lowered`
+
+_Block ``<1x1x128>``: a singleton at dim 1 is now legal_
+
+A natural shape for an N-D gather where each indirectly-addressed
+block contains exactly one row (so dim 1 collapses to size 1 and
+only the trailing contiguous dim has interior extent).  Before
+the rank-N relaxation, this was rejected for two unrelated
+reasons:
+
+* The descriptor was rank 3, and the verifier required rank 2.
+* Even after relaxing rank, the TMA min-cols rule required
+  ``block.shape[1] >= 32 / bitwidth * 8`` — for ``f16`` that's
+  ``>= 16``, so ``block.shape[1] = 1`` was rejected.
+
+Both rules are now gone for Spyre.  This test pins the
+smallest-possible interior dim so a regression that
+re-introduced the min-cols check (or that silently
+rank-reduced the trailing 1 inside the lowering) would surface
+immediately.
+
+Coverage handover: the rank-3/4/5 ``test_gather_*_lowered``
+tests already cover the structural shape of N-D gather; this
+test specifically probes the *boundary* where dim 1 = 1, which
+the old verifier would have rejected.
+
+```python
+# Block <1x1x128>: trailing dim 1 = 1 — newly legal.
+# Pre-relaxation rejected two ways: rank != 2 and
+# block.shape[1] < min_cols (TMA rule). Both gone.
+src_desc = tl.make_tensor_descriptor(src_ptr, ..., block_shape=[1, 1, 128])
+result = tl.descriptor_gather(src_desc, indices, y_offset)
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1433` (`TestDescriptorGatherND.test_gather_3d_inner_dim_one_lowered`)</sup>
 
 ## descriptor-load-dynamic
 
@@ -211,7 +474,7 @@ Expected diagnostics:
 - `must be ptr`
 - `got 'index'`
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1378` (`TestAddptrIntoDescriptor.test_addptr_into_descriptor_fails`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2018` (`TestAddptrIntoDescriptor.test_addptr_into_descriptor_fails`)</sup>
 
 ## descriptor-placement-conditional
 
@@ -247,7 +510,7 @@ if cond:
     tile = tl.descriptor_load(desc, [off])
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1284` (`TestDescriptorPlacement.test_descriptor_inside_scf_if_view_inside_branch`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1924` (`TestDescriptorPlacement.test_descriptor_inside_scf_if_view_inside_branch`)</sup>
 
 ## descriptor-placement-nested
 
@@ -276,7 +539,7 @@ for i in range(0, N, BLOCK):
     tile = tl.descriptor_load(desc, [i])
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1233` (`TestDescriptorPlacement.test_nested_descriptor_view_inside_loop`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1873` (`TestDescriptorPlacement.test_nested_descriptor_view_inside_loop`)</sup>
 
 ## descriptor-placement-top-level
 
@@ -306,7 +569,7 @@ for off in range(0, N, BLOCK):
     tile = tl.descriptor_load(desc, [off])  # inside the loop
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1178` (`TestDescriptorPlacement.test_top_level_descriptor_view_outside_loop`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1818` (`TestDescriptorPlacement.test_top_level_descriptor_view_outside_loop`)</sup>
 
 ## descriptor-rank-reduce
 
@@ -330,6 +593,24 @@ Expected diagnostics:
 - `access tile shape must match result tensor shape`
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:430` (`TestRankReducedDescriptorLoad.test_rank_reduced_load_fails`)</sup>
+
+## descriptor-scatter-nd
+
+### Supported
+
+#### ✅ `test_scatter_3d_lowered`
+
+_Rank-3 scatter mirror — same machinery via ``ConvertDescriptorScatter``_
+
+Confirms the lowering's N-D generalisation applies symmetrically
+to writes.
+
+```python
+# rank-3 scatter mirror of test_gather_3d_lowered.
+tl.descriptor_scatter(dst_desc, indices, y_offset, value)
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1147` (`TestDescriptorGatherND.test_scatter_3d_lowered`)</sup>
 
 ## descriptor-store-dynamic
 
@@ -381,4 +662,4 @@ _+ 7 more variants_
 
 ---
 
-_Patterns without round-trip evidence: `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `descriptor-gather-4d`, `descriptor-gather-5d`, `descriptor-gather-nd`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`, `descriptor-scatter-nd`. Add a tagged fixture variant to verify end-to-end._

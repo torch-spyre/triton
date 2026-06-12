@@ -340,24 +340,34 @@ resolveIndexView(Value xOffsets) {
 }
 
 /// Build the subscript kinds, subscript maps, variable space set, and
-/// variable space order for the gather pattern:
-///   result[d0, d1] = base[ x_offsets[x_offset + d0], y_offset + d1 ]
+/// variable space order for an N-D gather pattern:
+///   result[d_0, d_1, d_2, ..., d_{rank-1}]
+///       = base[ x_offsets[x_offset + d_0],
+///               y_offset + d_1,
+///               d_2,
+///               ...,
+///               d_{rank-1} ]
 ///
-/// `x_offset` is the descriptor_load offset into the index buffer (the
-/// `[offset]` argument to `idx_desc.load([offset])`); it is always
-/// captured because the only legal `x_offsets` provenance is a
+/// `x_offset` is the descriptor_load offset into the index buffer
+/// (the `[offset]` argument to `idx_desc.load([offset])`); it is
+/// always captured because the only legal `x_offsets` provenance is a
 /// descriptor_load (see resolveIndexView).
 ///
 /// Captured variable layout in the affine domain (left to right):
-///   c_x = x_offset, c_y = y_offset, then d0 (row) and d1 (col).
+///   c_x = x_offset, c_y = y_offset, then d_0 .. d_{rank-1}.
 ///
 /// Affine maps:
-///   dim 0 (indirect): (c_x, c_y, d0, d1) -> c_x + d0
-///   dim 1 (direct):   (c_x, c_y, d0, d1) -> c_y + d1
+///   dim 0  (indirect):     (c_x, c_y, d_0, ...) -> c_x + d_0
+///   dim 1  (direct, y_off): (c_x, c_y, d_0, ...) -> c_y + d_1
+///   dim i  (direct, plain, for i in [2, rank)):
+///                          (c_x, c_y, d_0, ...) -> d_i
 ///
-/// `variables_space_set` constrains (d0, d1) to
-/// [0, numIndices) × [0, blockCols); `variables_space_order` is the
-/// identity over (d0, d1).
+/// `variables_space_set` constrains each d_i to [0, resultShape[i]);
+/// `variables_space_order` is the identity over (d_0, ..., d_{rank-1}).
+///
+/// `numCaptured` is fixed at 2 regardless of rank: tt.descriptor_gather
+/// carries one descriptor, one 1-D index tensor, and one scalar y_offset
+/// at every rank, so the captured-variable list never grows.
 struct GatherSubscriptInfo {
   ArrayAttr subscriptKinds;
   ArrayAttr subscriptMaps;
@@ -366,45 +376,69 @@ struct GatherSubscriptInfo {
 };
 
 static GatherSubscriptInfo
-buildGatherSubscriptMaps(MLIRContext *ctx, int64_t numIndices,
-                         int64_t blockCols) {
+buildGatherSubscriptMaps(MLIRContext *ctx, ArrayRef<int64_t> resultShape) {
+  assert(resultShape.size() >= 2 &&
+         "gather subscript maps require rank >= 2");
+
   auto kindTrue = BoolAttr::get(ctx, true);
   auto kindFalse = BoolAttr::get(ctx, false);
 
-  // Two captured scalars (c_x, c_y) followed by two iteration
-  // variables (d0, d1) — total dim count for the affine maps is 4.
+  // Two captured scalars (c_x, c_y) followed by `rank` iteration
+  // variables (d_0 .. d_{rank-1}).
   constexpr unsigned numCaptured = 2u;
-  constexpr unsigned dimCount = numCaptured + 2u;
-  constexpr unsigned cxSlot = 0u;             // captured x_offset
-  constexpr unsigned cySlot = 1u;             // captured y_offset
-  constexpr unsigned d0Slot = numCaptured;    // row iteration variable
-  constexpr unsigned d1Slot = numCaptured + 1u; // col iteration variable
+  unsigned rank = resultShape.size();
+  unsigned dimCount = numCaptured + rank;
+  constexpr unsigned cxSlot = 0u;          // captured x_offset
+  constexpr unsigned cySlot = 1u;          // captured y_offset
+  unsigned d0Slot = numCaptured;           // first iteration variable
 
-  // Indirect (row) subscript: c_x + d0  →  x_offsets[x_offset + d0]
-  auto indirectMap = AffineMap::get(
+  SmallVector<Attribute> kinds;
+  SmallVector<Attribute> maps;
+  kinds.reserve(rank);
+  maps.reserve(rank);
+
+  // dim 0: indirect, c_x + d_0
+  kinds.push_back(kindTrue);
+  maps.push_back(AffineMapAttr::get(AffineMap::get(
       dimCount, /*symbolCount=*/0,
-      getAffineDimExpr(cxSlot, ctx) + getAffineDimExpr(d0Slot, ctx), ctx);
+      getAffineDimExpr(cxSlot, ctx) + getAffineDimExpr(d0Slot, ctx), ctx)));
 
-  // Direct (column) subscript: c_y + d1
-  auto directMap = AffineMap::get(
+  // dim 1: direct with y_offset, c_y + d_1
+  kinds.push_back(kindFalse);
+  maps.push_back(AffineMapAttr::get(AffineMap::get(
       dimCount, /*symbolCount=*/0,
-      getAffineDimExpr(cySlot, ctx) + getAffineDimExpr(d1Slot, ctx), ctx);
+      getAffineDimExpr(cySlot, ctx) + getAffineDimExpr(d0Slot + 1, ctx), ctx)));
 
-  // Intermediate-variable space (d0, d1).
+  // dims [2, rank): direct, no offset, d_i
+  for (unsigned i = 2; i < rank; ++i) {
+    kinds.push_back(kindFalse);
+    maps.push_back(AffineMapAttr::get(AffineMap::get(
+        dimCount, /*symbolCount=*/0,
+        getAffineDimExpr(d0Slot + i, ctx), ctx)));
+  }
+
+  // Intermediate-variable space: 0 <= d_i < resultShape[i] for each i.
+  SmallVector<AffineExpr> constraints;
+  SmallVector<bool> eqFlags;
+  constraints.reserve(2 * rank);
+  eqFlags.reserve(2 * rank);
+  for (unsigned i = 0; i < rank; ++i) {
+    // d_i >= 0
+    constraints.push_back(getAffineDimExpr(i, ctx));
+    eqFlags.push_back(false);
+    // resultShape[i] - 1 - d_i >= 0
+    constraints.push_back(getAffineConstantExpr(resultShape[i] - 1, ctx) -
+                          getAffineDimExpr(i, ctx));
+    eqFlags.push_back(false);
+  }
   auto spaceSet = IntegerSet::get(
-      /*dimCount=*/2, /*symbolCount=*/0,
-      {getAffineDimExpr(0, ctx),
-       getAffineConstantExpr(numIndices - 1, ctx) - getAffineDimExpr(0, ctx),
-       getAffineDimExpr(1, ctx),
-       getAffineConstantExpr(blockCols - 1, ctx) - getAffineDimExpr(1, ctx)},
-      {false, false, false, false});
+      /*dimCount=*/rank, /*symbolCount=*/0, constraints, eqFlags);
 
   return {
-      ArrayAttr::get(ctx, {kindTrue, kindFalse}),
-      ArrayAttr::get(ctx, {AffineMapAttr::get(indirectMap),
-                           AffineMapAttr::get(directMap)}),
+      ArrayAttr::get(ctx, kinds),
+      ArrayAttr::get(ctx, maps),
       spaceSet,
-      AffineMap::getMultiDimIdentityMap(2, ctx),
+      AffineMap::getMultiDimIdentityMap(rank, ctx),
   };
 }
 
@@ -418,20 +452,24 @@ buildGatherSubscriptMaps(MLIRContext *ctx, int64_t numIndices,
 ///     `yOffset` for the direct dimension.  Both `indexView` and
 ///     `xOffsetIndex` are produced by :func:`resolveIndexView` and are
 ///     non-null on the success path; this helper asserts that contract.
+///
+/// `resultShape` is the shape of the gather/scatter result tile (which
+/// for gather is also the access-tile shape: dim 0 is fanned out to
+/// the index count, and trailing dims mirror `block_shape[1:]` of the
+/// source descriptor). The helper supports any rank >= 2.
 static Value
 buildIndirectAccessTile(OpBuilder &builder, Location loc, Value memView,
                         Value indexView, Value xOffsetIndex,
-                        ArrayRef<int64_t> blockShape, Value yOffset) {
+                        ArrayRef<int64_t> resultShape, Value yOffset) {
   assert(xOffsetIndex && "x_offset must be present (resolveIndexView "
                          "returns failure() on trace miss)");
+  assert(resultShape.size() >= 2 &&
+         "indirect access tile requires rank >= 2");
   MLIRContext *ctx = builder.getContext();
   auto indexType = builder.getIndexType();
 
-  auto accessTileType = mlir::ktdp::AccessTileType::get(blockShape, indexType);
-  int64_t numIndices = blockShape[0];
-  int64_t blockCols = blockShape[1];
-
-  auto sub = buildGatherSubscriptMaps(ctx, numIndices, blockCols);
+  auto accessTileType = mlir::ktdp::AccessTileType::get(resultShape, indexType);
+  auto sub = buildGatherSubscriptMaps(ctx, resultShape);
 
   // Cast yOffset (i32 from Triton) to index, mirroring how direct casts
   // its `indices` operands.

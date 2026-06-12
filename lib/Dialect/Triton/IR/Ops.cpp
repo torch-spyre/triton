@@ -1488,9 +1488,16 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
   if (indicesType.getRank() != 1)
     return op->emitOpError("x offsets must be a 1D tensor, but got ")
            << indicesType;
+#ifdef TRITON_BUILD_TTIR_ONLY // --- added for spyre
+  // rank-2-exact check relaxed to rank >= 2 for Spyre
+  if (resultType.getRank() < 2)
+    return op->emitOpError("result must be at least 2D, but got ")
+           << resultType;
+#else
   if (resultType.getRank() != 2)
     return op->emitOpError("result must be a 2D tensor, but got ")
            << resultType;
+#endif
 
   // The swizzling of TMA accesses matches that of the MMAv3 shared memory
   // layouts. However, these have minimum size requirements.
@@ -1504,11 +1511,17 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
   if (dtype.getIntOrFloatBitWidth() > 32)
     return op->emitOpError("TMA dtype cannot be greater than 32 bits");
 
+#ifndef TRITON_BUILD_TTIR_ONLY
+  // TMA min-cols check: the original rule rejects result.shape[1] <
+  // 32/bitwidth*8 to enforce an NVIDIA TMA-specific minimum. Spyre does not
+  // lower through TMA, so this check is omitted under TRITON_BUILD_TTIR_ONLY.
   unsigned minCols = 32 / dtype.getIntOrFloatBitWidth() * 8;
   if (unsigned cols = resultType.getShape()[1]; cols < minCols) {
     return op->emitOpError("must have at least ")
            << minCols << " columns for " << dtype << ", but got " << cols;
   }
+#endif
+  // --- END --- added for spyre
 
   if (resultType.getShape()[0] != indicesType.getShape()[0]) {
     return op->emitOpError("result tensor must have as many rows as indices (")
@@ -1521,11 +1534,19 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
 LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
                                     ShapedType resultType,
                                     ShapedType indicesType) {
-  // Gather from `!tt.tensordesc<1xMxdtype>`.
+  // Gather from `!tt.tensordesc<1x...xdtype>`; leading 1 is always enforced.
+#ifdef TRITON_BUILD_TTIR_ONLY // --- added for spyre
+  // block rank-2-exact check relaxed to rank >= 2 for Spyre
+  if (blockType.getRank() < 2) {
+    return op->emitOpError("descriptor block must be at least 2D, but got ")
+           << blockType;
+  }
+#else
   if (blockType.getRank() != 2) {
     return op->emitOpError("descriptor block must be a 2D tensor, but got ")
            << blockType;
   }
+#endif
   if (blockType.getShape()[0] != 1) {
     return op->emitOpError("descriptor block must have exactly 1 row, but got ")
            << blockType;
@@ -1535,10 +1556,25 @@ LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
   if (failed(verifyGatherScatterResultType(op, resultType, indicesType)))
     return failure();
 
+#ifdef TRITON_BUILD_TTIR_ONLY // --- added for spyre
+  // cols-match generalised to a per-dim loop for rank-N under Spyre
+  if (blockType.getRank() != resultType.getRank()) {
+    return op->emitOpError("result tensor rank must match block rank (")
+           << blockType.getRank() << "), but got " << resultType;
+  }
+  for (int i = 1; i < blockType.getRank(); ++i) {
+    if (resultType.getShape()[i] != blockType.getShape()[i]) {
+      return op->emitOpError("result tensor dim ")
+             << i << " must match block (" << blockType.getShape()[i]
+             << "), but got " << resultType;
+    }
+  }
+#else
   if (resultType.getShape()[1] != blockType.getShape()[1]) {
     return op->emitOpError("result tensor number of columns must match block (")
            << blockType.getShape()[1] << "), but got " << resultType;
   }
+#endif
   if (resultType.getElementType() != blockType.getElementType()) {
     return op->emitOpError("result tensor element type must match block (")
            << blockType.getElementType() << "), but got " << resultType;
