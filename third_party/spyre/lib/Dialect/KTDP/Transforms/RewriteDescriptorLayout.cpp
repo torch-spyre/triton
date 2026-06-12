@@ -593,25 +593,8 @@ struct RewriteDescriptorLayoutPass
     ArrayRef<int64_t> aPhysShape = aPlan.coords.physShape;
     ArrayRef<int64_t> bPhysShape = bPlan.coords.physShape;
 
-    // Unpack plan fields into the names used by the existing loop body. Each
-    // physical dim of an operand plays exactly one role:
-    //   floorDims   → parallel stick-index dims (FloorDiv) → scf.for loops
-    //   reduceLoop  → outer -1 reduction dims (K-sticks) → reduction scf.for loops
-    //   opSliceDims → the 2 dims left over, retained full-size to form the 2D
-    //                 [.,.] tile fed to linalg.matmul.
-    //
-    // Grounded by the two matmul fixtures (stick_size = 64):
-    //   spyre_stick_parallel (M=N=K=64, single stick everywhere):
-    //     A phys [1,64,64] = [M//64, K, M%64] → floorDims=[0], opSlice=[1,2],
-    //                                            reduceLoop=[]
-    //   spyre_stick_k (M=N=64, K=128 → 2 K-sticks, A stuck on K):
-    //     A phys [2,64,64] = [K//64, M, K%64] → floorDims=[], opSlice=[1,2],
-    //                                            reduceLoop=[0]
-    const SmallVector<int> &aFloorDims     = aPlan.floorDims;
-    const SmallVector<int> &bFloorDims     = bPlan.floorDims;
-    const SmallVector<int> &aOpSliceDims    = aPlan.opSliceDims;
-    const SmallVector<int> &bOpSliceDims    = bPlan.opSliceDims;
-    const SmallVector<int> &aKStickDims    = aPlan.reduceLoop;
+    const SmallVector<int> &aOpSliceDims = aPlan.opSliceDims;
+    const SmallVector<int> &bOpSliceDims = bPlan.opSliceDims;
 
     // Each operand must have exactly 2 opSlice dims (the 2D matmul tile).
     if (aOpSliceDims.size() != 2 || bOpSliceDims.size() != 2)
@@ -660,42 +643,6 @@ struct RewriteDescriptorLayoutPass
           b.getDenseI64ArrayAttr({1, 0})).getResult()[0];
     };
 
-    // Build extract_slice for an operand given outer IVs (one per outer dim)
-    // and optional extra indexed dims (e.g. K-stick dims, each with its own IV).
-    // Produces a rank-reduced tensor in physical-dim order.
-    auto buildExtract = [&](Value operand, ArrayRef<int> outerDims,
-                            ArrayRef<int> opSliceDims,
-                            ArrayRef<int64_t> physShape,
-                            ArrayRef<Value> outerIVs,
-                            RankedTensorType resultTy,
-                            ArrayRef<int> extraDims = {},
-                            ArrayRef<Value> extraIVs = {}) -> Value {
-      int rank = (int)physShape.size();
-      SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
-      for (int i = 0; i < (int)outerDims.size(); ++i) {
-        offsets[outerDims[i]] = outerIVs[i];
-        sizes[outerDims[i]]   = idx(1);
-      }
-      for (int i = 0; i < (int)extraDims.size(); ++i) {
-        offsets[extraDims[i]] = extraIVs[i];
-        sizes[extraDims[i]]   = idx(1);
-      }
-      for (int p : opSliceDims) {
-        offsets[p] = idx(0);
-        sizes[p]   = idx(physShape[p]);
-      }
-      return tensor::ExtractSliceOp::create(
-          b, loc, resultTy, operand, offsets, sizes, strides);
-    };
-
-    // Find B's K-flat dim (role -1, Identity op) — the dim we stride into
-    // when the K-stick reduction loop advances.
-    int bKFlatDim = -1;
-    for (int p = 0, bRank = (int)bPlan.dimRoles.size(); p < bRank; ++p)
-      if (bPlan.dimRoles[p] == -1 &&
-          static_cast<CoordOp>(bPlan.coords.op[p]) == CoordOp::Identity)
-        bKFlatDim = p;
-
     // Build the ordered loop list: B-floor (parallel) → A-floor (parallel) →
     // A-reduceLoop (reduction). IVs are null until emitNest fills them.
     SmallVector<Loop> loops = collectLoops(aPlan, bPlan);
@@ -712,9 +659,74 @@ struct RewriteDescriptorLayoutPass
     MutableArrayRef<Loop> reduceLoops(loops.data() + split,
                                       loops.size() - split);
 
+    // Extract a one-stick slice for `plan` given all loop IVs populated in
+    // `loops`. Per PLAN_DATA_STRUCTURES §extractOpSlice:
+    //   floor/reduceLoop dim p of this operand → offset = its loop IV, size = 1
+    //   plan.reduceInner (the dim consumed by Op on this side, also the dim
+    //     sliced by the other operand's reduction IV when reductions are active)
+    //     → for A: full slice (it IS the K-lane, taken whole as part of the 2D tile)
+    //     → for B: offset = reduction loop IV, size = 1 stick (B's K-flat is
+    //       advanced one stick per K-stick iteration)
+    //   lane / opSliceDims → offset = 0, size = physShape[p]
+    //
+    // `planOwner` is 0 for A, 1 for B (matches Loop::owner).
+    // `reduceInnerIsSliced` is true for B (its reduceInner is driven by the
+    // K-stick loop IV), false for A (its reduceInner is taken full).
+    // `reduceIV` is the reduction loop IV (non-null when reduceLoops non-empty).
+    auto extractOpSlice = [&](const OperandPlan &plan, int planOwner,
+                               bool reduceInnerIsSliced,
+                               Value reduceIV,
+                               ArrayRef<int64_t> physShape,
+                               RankedTensorType resultTy) -> Value {
+      int rank = (int)physShape.size();
+      SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
+
+      // Build physDim → loop IV map for this operand's own floor/reduceLoop dims.
+      SmallVector<Value> dimIV(rank, Value{});
+      for (auto &l : loops) {
+        if (l.kind == Loop::Parallel && l.owner == planOwner)
+          dimIV[l.physDim] = l.iv;
+        else if (l.kind == Loop::Reduction)
+          dimIV[l.physDim] = l.iv; // reduceLoop belongs to A (owner=0)
+      }
+
+      auto inList = [](int p, ArrayRef<int> list) {
+        for (int x : list) if (x == p) return true;
+        return false;
+      };
+
+      for (int p = 0; p < rank; ++p) {
+        if (inList(p, plan.floorDims) || inList(p, plan.reduceLoop)) {
+          // This operand's loop dims: indexed by their own loop IV, size 1.
+          offsets[p] = dimIV[p];
+          sizes[p]   = idx(1);
+        } else if (p == plan.reduceInner && plan.reduceInner != -1 &&
+                   reduceInnerIsSliced) {
+          // B's K-flat dim: advanced one stick per K-stick iteration.
+          offsets[p] = reduceIV;
+          sizes[p]   = idx(physShape[p]); // one stick wide (R-b)
+        } else {
+          // Lane, opSliceDim, or A's reduceInner (K-lane taken full): full slice.
+          offsets[p] = idx(0);
+          sizes[p]   = idx(physShape[p]);
+        }
+      }
+      return tensor::ExtractSliceOp::create(
+          b, loc, resultTy, plan.value, offsets, sizes, strides);
+    };
+
+    // Collect the reduction IV (the last/only K-stick loop IV) once so
+    // extractOpSlice can use it for B's K-flat dim. Null when no reduction loops.
+    auto getReduceIV = [&]() -> Value {
+      for (auto it = loops.rbegin(); it != loops.rend(); ++it)
+        if (it->kind == Loop::Reduction)
+          return it->iv;
+      return {};
+    };
+
     // Matmul leaf body: given all loop IVs populated in `loops`, extract A
-    // and B slices, transpose if needed, compute linalg.matmul into a FRESH
-    // zero, and add to the loop-carried sub-block accumulator `acc`.
+    // and B slices via the unified extractOpSlice, transpose if needed, compute
+    // linalg.matmul into a FRESH zero, and add to the loop-carried accumulator.
     //
     // Using fresh-zero matmul output (not the iter_arg directly) is essential:
     // if the iter_arg were the matmul output, canonicalize would see that the
@@ -725,50 +737,19 @@ struct RewriteDescriptorLayoutPass
     auto matmulBody = [&](MutableArrayRef<Loop> /*ls*/,
                           ValueRange iterArgs) -> SmallVector<Value> {
       Value acc = iterArgs[0];
+      Value reduceIV = getReduceIV();
 
-      // Collect IVs from the full loops array (both parallel and reduction IVs
-      // are populated at the time matmulBody is called).
-      SmallVector<Value> aFloorIVs, bFloorIVs, aKStickIVs;
-      for (auto &l : loops) {
-        if (l.kind == Loop::Parallel && l.owner == 1)
-          bFloorIVs.push_back(l.iv);
-        else if (l.kind == Loop::Parallel && l.owner == 0)
-          aFloorIVs.push_back(l.iv);
-        else if (l.kind == Loop::Reduction)
-          aKStickIVs.push_back(l.iv);
-      }
+      // A: floor/reduceLoop dims indexed by their own IVs; K-lane (reduceInner)
+      // taken full (it is part of the 2D matmul tile on A's side).
+      Value aSlicePhys = extractOpSlice(aPlan, /*planOwner=*/0,
+                                        /*reduceInnerIsSliced=*/false,
+                                        reduceIV, aPhysShape, sliceAPhysTy);
 
-      // Extract A slice: floor dims indexed by aFloorIVs, K-stick indexed by
-      // aKStickIVs, inner (opSlice) dims taken full.
-      Value aSlicePhys = buildExtract(aVal, aFloorDims, aOpSliceDims,
-                                      aPhysShape, aFloorIVs, sliceAPhysTy,
-                                      aKStickDims, aKStickIVs);
-
-      // Extract B slice: floor dims indexed by bFloorIVs; K-flat dim offset
-      // by ks * KA when K-sticks are present (chunking B's contraction dim).
-      int bRankInt = (int)bPhysShape.size();
-      SmallVector<OpFoldResult> bOffsets(bRankInt), bSizes(bRankInt),
-          bStrides(bRankInt, idx(1));
-      for (int i = 0; i < (int)bFloorDims.size(); ++i) {
-        bOffsets[bFloorDims[i]] = bFloorIVs[i];
-        bSizes[bFloorDims[i]]   = idx(1);
-      }
-      for (int p : bOpSliceDims) {
-        if (p == bKFlatDim && !aKStickIVs.empty()) {
-          // K-flat dim: offset = ks * KA (single K-stick dim; rare multi-dim
-          // case would compose similarly via stride accumulation).
-          Value ksOffset = arith::MulIOp::create(
-              b, loc, aKStickIVs.back(),
-              arith::ConstantIndexOp::create(b, loc, KA));
-          bOffsets[p] = ksOffset;
-          bSizes[p]   = idx(KA);
-        } else {
-          bOffsets[p] = idx(0);
-          bSizes[p]   = idx(bPhysShape[p]);
-        }
-      }
-      Value bSlicePhys = tensor::ExtractSliceOp::create(
-          b, loc, sliceBPhysTy, bVal, bOffsets, bSizes, bStrides);
+      // B: floor dims indexed by their own IVs; K-flat (reduceInner) advanced
+      // one stick per K-stick iteration via the reduction IV (R-b: size = 1 stick).
+      Value bSlicePhys = extractOpSlice(bPlan, /*planOwner=*/1,
+                                        /*reduceInnerIsSliced=*/!reduceLoops.empty(),
+                                        reduceIV, bPhysShape, sliceBPhysTy);
 
       Value aSlice = transposeA ? emitTranspose2D(aSlicePhys, aElemTy) : aSlicePhys;
       Value bSlice = transposeB ? emitTranspose2D(bSlicePhys, bElemTy) : bSlicePhys;
