@@ -11,14 +11,21 @@ A plain install builds Spyre-only — no `TRITON_BACKENDS` needed:
 
 ```bash
 uv pip install -e ".[spyre-test]"            # editable + test deps
+bash install-ktdp-mlir-bindings.sh           # install KTDP MLIR bindings (generated above)
 uv run pytest third_party/spyre/test         # run the suite
 ```
+
+The two-step install is intentional: `mlir_ktdp` (the KTIR MLIR Python bindings)
+must be compiled against Triton's own MLIR to avoid duplicate-MLIR-global-state
+crashes. `setup.py` generates `install-ktdp-mlir-bindings.sh` with the correct
+`MLIR_DIR` baked in during the first step.
 
 Faster iterative rebuilds (install build deps once, then skip isolation):
 
 ```bash
 uv pip install $(uv run python -c "import tomllib; print(' '.join(tomllib.load(open('pyproject.toml','rb'))['build-system']['requires']))")
 uv pip install -e ".[spyre-test]" --no-build-isolation
+bash install-ktdp-mlir-bindings.sh
 ```
 
 Use `UV_PROJECT_ENVIRONMENT=/path/to/venv` (Python 3.12+) so `uv` targets your
@@ -84,6 +91,20 @@ build when those backends are selected. Search markers when rebasing/auditing:
 # --- added for spyre
 ```
 
+Two guard mechanisms, picked by *when* the code runs:
+
+- **Compile-time (C++)** — `#ifdef TRITON_BUILD_TTIR_ONLY` (auto-defined for the
+  Spyre build). Use for anything in the C++ library: dialect verifiers, LLVM-pin
+  shims. See `Dialect.h`, `LLVMDIUtils.cpp`, `Ops.cpp`.
+- **Runtime (Python frontend)** — `TRITON_BUILD_TTIR_ONLY` is meaningless in the
+  frontend, which runs op construction before any pass. Detect the backend at
+  runtime via `triton.language.target_info` (next to `is_cuda`/`is_hip`):
+  `is_spyre()` for behavior that *forks* by backend
+  (`if is_spyre(): <relaxed> else: <strict>`), and `@requires_backend("spyre")`
+  for ops that *only exist* for Spyre (raises on any other backend; resolves at
+  call time). Prefer these over open-coding
+  `driver.active.get_current_target().backend`.
+
 Current upstream touch points:
 
 | File | What was added |
@@ -93,6 +114,7 @@ Current upstream touch points:
 | `python/src/main.cc` | Register empty `gluon_ir` / `linear_layout` pybind modules so `import triton` works in TTIR-only builds |
 | `python/triton/experimental/gluon/__init__.py`, `.../language/__init__.py` | Guard GPU-only arch shim imports absent from a Spyre-only wheel |
 | `include/triton/Dialect/Triton/IR/Dialect.h`, `lib/Target/LLVMIR/LLVMDIUtils.cpp` | Source compatibility with the Spyre LLVM pin |
+| `python/triton/language/target_info.py` | Runtime frontend backend guards: `is_spyre()` predicate + `requires_backend()` decorator |
 
 ## Where the Spyre code lives
 
