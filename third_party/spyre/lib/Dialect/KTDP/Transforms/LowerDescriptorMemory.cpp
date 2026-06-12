@@ -715,7 +715,12 @@ struct LowerDescriptorMemoryPass
     //
     // Marking it legal here prevents `applyPartialConversion` from
     // treating either cast as an unconverted op and failing the pass.
-    target.addLegalOp<ModuleOp, UnrealizedConversionCastOp>();
+    // --- added for spyre: tt.spyre_tensor_layout is an annotation marker that
+    // must survive (legal, pass-through) until the v2 RewriteDescriptorLayout
+    // pass consumes it after LowerComputeOps. Its desc operand auto-re-points at
+    // the UnrealizedConversionCast built in walk 1, so it stays valid.
+    target.addLegalOp<ModuleOp, UnrealizedConversionCastOp,
+                      triton::SpyreTensorLayoutOp>();
 
     RewritePatternSet patterns(ctx);
     patterns.add<ConvertDescriptorLoad, ConvertDescriptorStore,
