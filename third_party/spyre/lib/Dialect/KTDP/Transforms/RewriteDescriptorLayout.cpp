@@ -39,8 +39,8 @@
 //     Phase 2 — synthesizeContractions (loop-until-stable):
 //       dispatchMatmul(mm)
 //         findMarkerForOperand      trace load -> access tile -> memView -> marker
-//         buildDimRoles             phys_src/op/arg -> dimRole per physical dim
-//         synthesizeMatmulLoops     emit scf.for nest + linalg.matmul slices
+//         classify                  build OperandPlan (dimRoles, floorDims, reduceLoop…)
+//         emitMatmulStage           emit scf.for nest + linalg.matmul slices; output logical
 //     Phase 3 — eraseMarker (marker + dead bridge cast)
 //
 //   Coord helpers (free functions):
@@ -316,8 +316,125 @@ struct RewriteDescriptorLayoutPass
     }
   }
 
-  // Per-matmul entry point for Phase 2: trace operands to markers, build dim
-  // roles, and call synthesizeMatmulLoops.
+  // ---- Shared utilities (staged model) ----
+
+  // One operand classified by its Map(Op, X) roles and physical layout.
+  // `classify` fills all derived fields from `coords` + `dimRoles`.
+  //
+  // Field semantics (right-to-left traversal of the physical dims):
+  //   lane        = innermost phys dim (rank-1); always the stick lane — full slice
+  //   floorDims   = parallel dims that are FloorDiv (stick-index dims) → loops
+  //   reduceLoop  = reduction loop dims (role -2, K-stick) → innermost loops
+  //   reduceInner = innermost reduction dim (role -1) → consumed by Op (opSlice)
+  //   opSliceDims = residual dims fed to the Op (non-floor, non-K-stick);
+  //                 these are the 2 dims of the rank-2 slice for matmul
+  struct OperandPlan {
+    Value               value;      // SSA tensor (physical on memory side)
+    OperandCoords       coords;     // coord map + shape (kept for op/arg lookups)
+    SmallVector<int64_t> dimRoles;  // per-phys-dim role (>= 0 | -1 | -2)
+
+    int                lane;        // innermost phys dim = rank-1
+    SmallVector<int>   floorDims;   // parallel stick-index dims → loops (role>=0, FloorDiv)
+    SmallVector<int>   reduceLoop;  // K-stick dims (role -2) → reduction loops
+    int                reduceInner; // innermost role-(-1) dim (consumed by Op); -1 if none
+    SmallVector<int>   opSliceDims; // residual dims: role != -2 AND !isFloor (the 2D slice)
+  };
+
+  // One synthesized loop (per stage, per physical dim).
+  // Identity is (owner, physDim): the dim its IV indexes.
+  // logicalDim is PROVENANCE (grouping/ordering), NOT a dedup key.
+  struct Loop {
+    enum Kind { Parallel, Reduction } kind;
+    int          owner;      // which operand: 0=A, 1=B
+    int          physDim;    // IDENTITY: phys dim the IV indexes
+    int64_t      trip;       // # iterations (stick count for this phys dim)
+    int64_t      logicalDim; // PROVENANCE: logical dim served; -1 for Reduction
+    Value        iv;         // induction variable (filled by emitNest)
+  };
+
+  // Plan the loop list for a matmul stage. Order: B-floor (parallel) outermost,
+  // then A-floor (parallel), then A-reduceLoop (reduction) innermost.
+  // IVs are null until emitNest fills them.
+  static SmallVector<Loop> collectLoops(const OperandPlan &aPlan,
+                                        const OperandPlan &bPlan) {
+    SmallVector<Loop> loops;
+    for (int p : bPlan.floorDims) {
+      int64_t logDim = bPlan.dimRoles[p]; // the parallel logical dim this indexes
+      loops.push_back({Loop::Parallel, /*owner=*/1, p,
+                       bPlan.coords.physShape[p], logDim, {}});
+    }
+    for (int p : aPlan.floorDims) {
+      int64_t logDim = aPlan.dimRoles[p];
+      loops.push_back({Loop::Parallel, /*owner=*/0, p,
+                       aPlan.coords.physShape[p], logDim, {}});
+    }
+    for (int p : aPlan.reduceLoop) {
+      loops.push_back({Loop::Reduction, /*owner=*/0, p,
+                       aPlan.coords.physShape[p], /*logicalDim=*/-1, {}});
+    }
+    return loops;
+  }
+
+  // Emit one scf::ForOp per loop (recursively), fill Loop.iv, then call `body`
+  // at the leaf. `iterArgs` are the loop's iter_args at each level; `body`
+  // receives the populated loops and the innermost iter_args, and returns the
+  // values to yield (same arity). Returns the values produced by the outermost
+  // scf::ForOp (or by `body` directly when idx == loops.size()).
+  SmallVector<Value> emitNest(
+      OpBuilder &b, Location loc, Value c0, Value c1,
+      MutableArrayRef<Loop> loops, size_t idx,
+      ValueRange iterArgs,
+      llvm::function_ref<SmallVector<Value>(MutableArrayRef<Loop>, ValueRange)> body) {
+    if (idx == loops.size())
+      return body(loops, iterArgs);
+    Value tripVal = arith::ConstantIndexOp::create(b, loc, loops[idx].trip);
+    auto forOp = scf::ForOp::create(b, loc, c0, tripVal, c1, iterArgs);
+    loops[idx].iv = forOp.getInductionVar();
+    OpBuilder::InsertionGuard g(b);
+    b.setInsertionPointToStart(forOp.getBody());
+    SmallVector<Value> yields =
+        emitNest(b, loc, c0, c1, loops, idx + 1,
+                 forOp.getRegionIterArgs(), body);
+    scf::YieldOp::create(b, loc, yields);
+    return SmallVector<Value>(forOp.getResults().begin(),
+                              forOp.getResults().end());
+  }
+
+  // Classify one operand's physical dims into OperandPlan fields.
+  // `coords` carries phys_src/op/arg and physShape. `dimRoles` comes from
+  // buildDimRoles. The resulting plan owns copies of the role vector.
+  static OperandPlan classify(Value val, const OperandCoords &coords,
+                               ArrayRef<int64_t> dimRoles) {
+    int rank = (int)dimRoles.size();
+    OperandPlan plan;
+    plan.value     = val;
+    plan.coords    = coords;
+    plan.dimRoles  = SmallVector<int64_t>(dimRoles.begin(), dimRoles.end());
+    plan.lane      = rank - 1; // innermost physical dim is always the stick lane
+
+    // Walk physical dims in ascending order (left-to-right = outermost first).
+    // floorDims, reduceLoop, opSliceDims are all collected in ascending order.
+    plan.reduceInner = -1; // sentinel: no role-(-1) dim found yet
+    for (int p = 0; p < rank; ++p) {
+      int64_t role = dimRoles[p];
+      bool isFloor = (role >= 0 &&
+                      static_cast<CoordOp>(coords.op[p]) == CoordOp::FloorDiv);
+      if (isFloor) {
+        plan.floorDims.push_back(p);
+      } else if (role == -2) {
+        plan.reduceLoop.push_back(p);
+      } else {
+        // role >= 0 (identity parallel) or role == -1 (K-flat/K-lane)
+        plan.opSliceDims.push_back(p);
+        if (role == -1)
+          plan.reduceInner = p; // last such dim seen is the rightmost (innermost)
+      }
+    }
+    return plan;
+  }
+
+  // Per-matmul entry point for Phase 2: trace operands to markers, build
+  // OperandPlans, and call emitMatmulStage.
   LogicalResult dispatchMatmul(linalg::MatmulOp mm) {
     auto aMarker = findMarkerForOperand(mm.getInputs()[0]);
     auto bMarker = findMarkerForOperand(mm.getInputs()[1]);
@@ -339,78 +456,46 @@ struct RewriteDescriptorLayoutPass
     buildDimRoles(aC, /*kLogicalSrc=*/1, /*parallelRole=*/0, dimRoleA);
     buildDimRoles(bC, /*kLogicalSrc=*/0, /*parallelRole=*/1, dimRoleB);
 
-    return synthesizeMatmulLoops(mm, dimRoleA, dimRoleB, aPhysShape, bPhysShape);
+    OperandPlan aPlan = classify(mm.getInputs()[0], aC, dimRoleA);
+    OperandPlan bPlan = classify(mm.getInputs()[1], bC, dimRoleB);
+
+    return emitMatmulStage(mm, aPlan, bPlan);
   }
 
-  // Synthesize the scf.for loop nest for a linalg.matmul with physical operands.
-  // Handles both the parallel-stick case (no K-stick dims → no reduction loop)
-  // and the K-stick case (aKStickDims non-empty → innermost reduction scf.for).
+  // Source stage: physicalize A and B inputs, synthesize the scf.for loop nest,
+  // and leave C (the matmul output) LOGICAL. Handles both the parallel-stick
+  // case (aPlan.reduceLoop empty → no reduction loop) and the K-stick case
+  // (aPlan.reduceLoop non-empty → innermost reduction scf.for).
   //
   // Slice extraction produces tensors in ascending physical dim order; a
   // linalg.transpose is emitted when the reduction dim precedes the parallel dim
   // (linalg.matmul requires [M,K] and [K,N]).
-  //
-  // TODO(generalize): the three arms of emitLoops (B-outer, A-outer, K-stick)
-  // are structurally identical — each recurses over a flat list of (dims,
-  // physShape, IV-bucket). Collapse them into a single loop over an ordered
-  // list of LoopGroup structs, and replace buildExtract's extraDims/extraIVs
-  // with a dim→(offset,size) override map so the K-flat offset on B is expressed
-  // the same way as any other per-dim override. That makes emitLoops op-agnostic:
-  // refactor to emitContractionLoops(loopGroups, buildInnerBody) where
-  // buildInnerBody is a callback — matmul passes (extract+transpose+matmul),
-  // future ops pass their own body. synthesizeContractions then calls it for
-  // each supported op type without touching the loop structure.
-  LogicalResult synthesizeMatmulLoops(linalg::MatmulOp mm,
-                                ArrayRef<int64_t> dimRoleA,
-                                ArrayRef<int64_t> dimRoleB,
-                                ArrayRef<int64_t> aPhysShape,
-                                ArrayRef<int64_t> bPhysShape) {
+  LogicalResult emitMatmulStage(linalg::MatmulOp mm,
+                                      const OperandPlan &aPlan,
+                                      const OperandPlan &bPlan) {
     OpBuilder b(mm);
     Location loc = mm.getLoc();
 
-    Value aVal = mm.getInputs()[0];
-    Value bVal = mm.getInputs()[1];
+    Value aVal = aPlan.value;
+    Value bVal = bPlan.value;
     Value cVal = mm.getOutputs()[0];
 
     auto aElemTy = cast<RankedTensorType>(aVal.getType()).getElementType();
     auto bElemTy = cast<RankedTensorType>(bVal.getType()).getElementType();
     auto accTy   = cast<RankedTensorType>(cVal.getType()).getElementType();
 
-    int aRank = (int)dimRoleA.size();
-    int bRank = (int)dimRoleB.size();
+    ArrayRef<int64_t> aPhysShape = aPlan.coords.physShape;
+    ArrayRef<int64_t> bPhysShape = bPlan.coords.physShape;
 
-    // Identify outer (stick) dims and inner (lane/flat) dims for each operand.
-    // Outer = parallel (role>=0) AND FloorDiv. Inner = everything else.
-    auto isOuterDim = [](const OperandCoords &c, ArrayRef<int64_t> roles, int p) {
-      return roles[p] >= 0 &&
-             static_cast<CoordOp>(c.op[p]) == CoordOp::FloorDiv;
-    };
-
-    // We need the OperandCoords to check phys_op for isOuterDim.
-    // Re-create them from the markers (already checked non-null in dispatchMatmul).
-    auto aMarker = findMarkerForOperand(aVal);
-    auto bMarker = findMarkerForOperand(bVal);
-    OperandCoords aC{aMarker.getPhysSrc(), aMarker.getPhysOp(),
-                     aMarker.getPhysArg(), 2, aPhysShape};
-    OperandCoords bC{bMarker.getPhysSrc(), bMarker.getPhysOp(),
-                     bMarker.getPhysArg(), 2, bPhysShape};
-
-    // Collect outer dims for A and B in physical order.
-    SmallVector<int> aOuterDims, bOuterDims;
-    for (int p = 0; p < aRank; ++p)
-      if (isOuterDim(aC, dimRoleA, p)) aOuterDims.push_back(p);
-    for (int p = 0; p < bRank; ++p)
-      if (isOuterDim(bC, dimRoleB, p)) bOuterDims.push_back(p);
-
-    // Inner dims of A and B: non-outer and non-K-stick (role != -2),
-    // in ascending physical order. These form the 2D slice.
-    SmallVector<int> aInnerDims, bInnerDims;
-    for (int p = 0; p < aRank; ++p)
-      if (!isOuterDim(aC, dimRoleA, p) && dimRoleA[p] != -2)
-        aInnerDims.push_back(p);
-    for (int p = 0; p < bRank; ++p)
-      if (!isOuterDim(bC, dimRoleB, p) && dimRoleB[p] != -2)
-        bInnerDims.push_back(p);
+    // Unpack plan fields into the names used by the existing loop body.
+    // floorDims → outer (stick-index) dims that become parallel scf.for loops.
+    // reduceLoop → K-stick dims that become reduction scf.for loops.
+    // opSliceDims → inner dims that form the 2D slice fed to linalg.matmul.
+    const SmallVector<int> &aOuterDims   = aPlan.floorDims;
+    const SmallVector<int> &bOuterDims   = bPlan.floorDims;
+    const SmallVector<int> &aInnerDims   = aPlan.opSliceDims;
+    const SmallVector<int> &bInnerDims   = bPlan.opSliceDims;
+    const SmallVector<int> &aKStickDims  = aPlan.reduceLoop;
 
     // Each operand must have exactly 2 inner dims (the 2D slice).
     if (aInnerDims.size() != 2 || bInnerDims.size() != 2)
@@ -429,8 +514,8 @@ struct RewriteDescriptorLayoutPass
 
     // Determine if A needs transpose: reduction dim (-1) at lo position means
     // physical order is [K, M], but matmul needs [M, K].
-    bool transposeA = (dimRoleA[aDimLo] == -1);
-    bool transposeB = (dimRoleB[bDimLo] != -1); // B needs [K,N]; if lo is N, transpose
+    bool transposeA = (aPlan.dimRoles[aDimLo] == -1);
+    bool transposeB = (bPlan.dimRoles[bDimLo] != -1); // B needs [K,N]; if lo is N, transpose
 
     // After transpose the 2D slice types are [M, K_A] and [K_B, N].
     int64_t M   = transposeA ? aPhysShape[aDimHi] : aPhysShape[aDimLo];
@@ -490,111 +575,78 @@ struct RewriteDescriptorLayoutPass
           b, loc, resultTy, operand, offsets, sizes, strides);
     };
 
-    // K-stick dims of A (role -2): reduction loops innermost.
-    // For each K-stick iv `ks`, A is indexed at aKStickDim=ks and B's K-flat
-    // dim is offset by ks * KA (chunking B's contraction dim).
-    SmallVector<int> aKStickDims;
-    for (int p = 0; p < aRank; ++p)
-      if (dimRoleA[p] == -2) aKStickDims.push_back(p);
-
-    // Find B's K-flat dim (role -1, Identity op) — the dim we stride into.
+    // Find B's K-flat dim (role -1, Identity op) — the dim we stride into
+    // when the K-stick reduction loop advances.
     int bKFlatDim = -1;
-    for (int p = 0; p < bRank; ++p)
-      if (dimRoleB[p] == -1 &&
-          static_cast<CoordOp>(bC.op[p]) == CoordOp::Identity)
+    for (int p = 0, bRank = (int)bPlan.dimRoles.size(); p < bRank; ++p)
+      if (bPlan.dimRoles[p] == -1 &&
+          static_cast<CoordOp>(bPlan.coords.op[p]) == CoordOp::Identity)
         bKFlatDim = p;
 
-    // Collect outer IVs as we descend into the loop nest.
-    SmallVector<Value> bOuterIVs, aOuterIVs;
-    // K-stick IVs accumulate for the B offset computation.
-    SmallVector<Value> aKStickIVs;
+    // Build the ordered loop list: B-floor (parallel) → A-floor (parallel) →
+    // A-reduceLoop (reduction). IVs are null until emitNest fills them.
+    SmallVector<Loop> loops = collectLoops(aPlan, bPlan);
 
-    // Build extract for B with optional K-flat offset from K-stick IVs.
-    // If there are K-sticks, B's K-flat offset = sum(ks_i * KA) per K-stick dim.
-    auto buildBExtractWithKOffset = [&]() -> Value {
-      int rank = (int)bPhysShape.size();
-      SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
+    // Matmul leaf body: extract A and B slices (using Loop IVs), transpose
+    // if needed, then call linalg.matmul and yield the result.
+    // B's K-flat offset = ks * KA when the K-stick reduction loop is present.
+    auto matmulBody = [&](MutableArrayRef<Loop> ls,
+                          ValueRange iterArgs) -> SmallVector<Value> {
+      Value acc = iterArgs[0];
+
+      // Collect IVs by (owner, physDim) for extract building.
+      SmallVector<Value> aFloorIVs, bFloorIVs, aKStickIVs;
+      for (auto &l : ls) {
+        if (l.kind == Loop::Parallel && l.owner == 1)
+          bFloorIVs.push_back(l.iv);
+        else if (l.kind == Loop::Parallel && l.owner == 0)
+          aFloorIVs.push_back(l.iv);
+        else if (l.kind == Loop::Reduction)
+          aKStickIVs.push_back(l.iv);
+      }
+
+      // Extract A slice: floor dims indexed by aFloorIVs, K-stick indexed by
+      // aKStickIVs, inner (opSlice) dims taken full.
+      Value aSlicePhys = buildExtract(aVal, aOuterDims, aInnerDims,
+                                      aPhysShape, aFloorIVs, sliceAPhysTy,
+                                      aKStickDims, aKStickIVs);
+
+      // Extract B slice: floor dims indexed by bFloorIVs; K-flat dim offset
+      // by ks * KA when K-sticks are present (chunking B's contraction dim).
+      int bRankInt = (int)bPhysShape.size();
+      SmallVector<OpFoldResult> bOffsets(bRankInt), bSizes(bRankInt),
+          bStrides(bRankInt, idx(1));
       for (int i = 0; i < (int)bOuterDims.size(); ++i) {
-        offsets[bOuterDims[i]] = bOuterIVs[i];
-        sizes[bOuterDims[i]]   = idx(1);
+        bOffsets[bOuterDims[i]] = bFloorIVs[i];
+        bSizes[bOuterDims[i]]   = idx(1);
       }
       for (int p : bInnerDims) {
-        // K-flat dim gets offset ks * KA if there are K-sticks.
         if (p == bKFlatDim && !aKStickIVs.empty()) {
-          // For a single K-stick dim: offset = ks * KA.
-          // (Multiple K-stick dims would be composed similarly but are rare.)
+          // K-flat dim: offset = ks * KA (single K-stick dim; rare multi-dim
+          // case would compose similarly via stride accumulation).
           Value ksOffset = arith::MulIOp::create(
               b, loc, aKStickIVs.back(),
               arith::ConstantIndexOp::create(b, loc, KA));
-          offsets[p] = ksOffset;
-          sizes[p]   = idx(KA);
+          bOffsets[p] = ksOffset;
+          bSizes[p]   = idx(KA);
         } else {
-          offsets[p] = idx(0);
-          sizes[p]   = idx(bPhysShape[p]);
+          bOffsets[p] = idx(0);
+          bSizes[p]   = idx(bPhysShape[p]);
         }
       }
-      return tensor::ExtractSliceOp::create(
-          b, loc, sliceBPhysTy, bVal, offsets, sizes, strides);
-    };
+      Value bSlicePhys = tensor::ExtractSliceOp::create(
+          b, loc, sliceBPhysTy, bVal, bOffsets, bSizes, bStrides);
 
-    // Recursive lambda: emit B outer loops, then A outer loops, then K-stick
-    // reduction loops, then the inner matmul.
-    std::function<Value(int, int, int, Value)> emitLoops =
-        [&](int bIdx, int aIdx, int ksIdx, Value acc) -> Value {
-      if (bIdx < (int)bOuterDims.size()) {
-        int dim = bOuterDims[bIdx];
-        Value cTrip = arith::ConstantIndexOp::create(b, loc, bPhysShape[dim]);
-        auto loop = scf::ForOp::create(b, loc, c0, cTrip, c1, ValueRange{acc});
-        OpBuilder::InsertionGuard g(b);
-        b.setInsertionPointToStart(loop.getBody());
-        bOuterIVs.push_back(loop.getInductionVar());
-        Value inner = emitLoops(bIdx + 1, aIdx, ksIdx,
-                                loop.getRegionIterArgs()[0]);
-        bOuterIVs.pop_back();
-        scf::YieldOp::create(b, loc, ValueRange{inner});
-        return loop.getResult(0);
-      }
-      if (aIdx < (int)aOuterDims.size()) {
-        int dim = aOuterDims[aIdx];
-        Value cTrip = arith::ConstantIndexOp::create(b, loc, aPhysShape[dim]);
-        auto loop = scf::ForOp::create(b, loc, c0, cTrip, c1, ValueRange{acc});
-        OpBuilder::InsertionGuard g(b);
-        b.setInsertionPointToStart(loop.getBody());
-        aOuterIVs.push_back(loop.getInductionVar());
-        Value inner = emitLoops(bIdx, aIdx + 1, ksIdx,
-                                loop.getRegionIterArgs()[0]);
-        aOuterIVs.pop_back();
-        scf::YieldOp::create(b, loc, ValueRange{inner});
-        return loop.getResult(0);
-      }
-      // K-stick reduction loops (innermost before matmul).
-      if (ksIdx < (int)aKStickDims.size()) {
-        int dim = aKStickDims[ksIdx];
-        Value cTrip = arith::ConstantIndexOp::create(b, loc, aPhysShape[dim]);
-        auto loop = scf::ForOp::create(b, loc, c0, cTrip, c1, ValueRange{acc});
-        OpBuilder::InsertionGuard g(b);
-        b.setInsertionPointToStart(loop.getBody());
-        aKStickIVs.push_back(loop.getInductionVar());
-        Value inner = emitLoops(bIdx, aIdx, ksIdx + 1,
-                                loop.getRegionIterArgs()[0]);
-        aKStickIVs.pop_back();
-        scf::YieldOp::create(b, loc, ValueRange{inner});
-        return loop.getResult(0);
-      }
-      // Innermost body: extract slices, transpose if needed, matmul.
-      // K-stick dims (aKStickDims) are also indexed dims for A (one per IV).
-      Value aSlicePhys = buildExtract(aVal, aOuterDims, aInnerDims,
-                                      aPhysShape, aOuterIVs, sliceAPhysTy,
-                                      aKStickDims, aKStickIVs);
-      Value bSlicePhys = buildBExtractWithKOffset();
       Value aSlice = transposeA ? emitTranspose2D(aSlicePhys, aElemTy) : aSlicePhys;
       Value bSlice = transposeB ? emitTranspose2D(bSlicePhys, bElemTy) : bSlicePhys;
-      return linalg::MatmulOp::create(b, loc, accTy2D,
+      Value mmRes = linalg::MatmulOp::create(b, loc, accTy2D,
           ValueRange{aSlice, bSlice}, ValueRange{acc}).getResult(0);
+      return {mmRes};
     };
 
-    Value result = emitLoops(0, 0, 0, zeroAcc);
-    mm.getResult(0).replaceAllUsesWith(result);
+    SmallVector<Value> results =
+        emitNest(b, loc, c0, c1, loops, 0, ValueRange{zeroAcc}, matmulBody);
+    mm.getResult(0).replaceAllUsesWith(results[0]);
     mm.erase();
     return success();
   }
