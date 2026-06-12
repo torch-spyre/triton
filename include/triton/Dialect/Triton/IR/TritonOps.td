@@ -77,6 +77,7 @@ def TT_BitcastOp : TT_Op<"bitcast", [Elementwise,
     let results = (outs TT_Type:$result);
 
     let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+    let hasFolder = 1;
     let hasVerifier = 1;
 }
 
@@ -491,6 +492,8 @@ def TT_CatOp : TT_Op<"cat", [NoMemoryEffect,
     let results = (outs TT_Tensor:$result);
 
     let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `->` type($result)";
+
+    let hasVerifier = 1;
 }
 
 def TT_JoinOp : TT_Op<"join", [
@@ -735,7 +738,6 @@ def TT_ReduceOp: TT_Op<"reduce",
     let extraClassDeclaration = [{
       llvm::SmallVector<RankedTensorType> getInputTypes();
       llvm::SmallVector<Type> getElementTypes();
-      unsigned getNumOperands();
 
       // Returns the CombineOp iff this ReduceOp's region contains only
       // one CombineOp other than the return, or nullptr if not applicable.
@@ -771,7 +773,6 @@ def TT_ScanOp: TT_Op<"scan",
     let extraClassDeclaration = [{
       llvm::SmallVector<RankedTensorType> getInputTypes();
       llvm::SmallVector<Type> getElementTypes();
-      unsigned getNumOperands();
     }];
 }
 
@@ -1222,7 +1223,7 @@ def ReturnOp : TT_Op<"return", [Pure, HasParent<"FuncOp">, /*MemRefsNormalizable
 }
 
 
-def TT_DescriptorLoadOp : TT_Op<"descriptor_load", [TT_DescriptorOpInterface]> {
+def TT_DescriptorLoadOp : TT_Op<"descriptor_load", [TT_DescriptorLoadLikeOpInterface]> {
   let summary = "Load from descriptor";
   let description = [{
     This operation will be lowered to Nvidia TMA load operation on targets supporting it.
@@ -1291,7 +1292,7 @@ def TT_DescriptorReduceOp : TT_Op<"descriptor_reduce", [TT_DescriptorStoreLikeOp
   let hasVerifier = 1;
 }
 
-def TT_DescriptorGatherOp : TT_Op<"descriptor_gather", [TT_DescriptorOpInterface]> {
+def TT_DescriptorGatherOp : TT_Op<"descriptor_gather", [TT_DescriptorLoadLikeOpInterface]> {
   let summary = "gather multiple rows from a descriptor into a single tensor";
   let description = [{
     The `tt.descriptor_gather` op will be lowered to NVIDIA TMA
@@ -1304,7 +1305,7 @@ def TT_DescriptorGatherOp : TT_Op<"descriptor_gather", [TT_DescriptorOpInterface
 
   let arguments = (ins
     Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
-    RankedTensorOf<[I32]>:$x_offsets,
+    RankedTensorOf<[I16, I32]>:$x_offsets,
     I32:$y_offset
   );
   let results = (outs TT_Tensor:$result);
@@ -1330,7 +1331,7 @@ def TT_DescriptorScatterOp : TT_Op<"descriptor_scatter", [TT_DescriptorStoreLike
 
   let arguments = (ins
     Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$desc,
-    RankedTensorOf<[I32]>:$x_offsets,
+    RankedTensorOf<[I16, I32]>:$x_offsets,
     I32:$y_offset,
     TT_Tensor:$src
   );

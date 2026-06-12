@@ -88,7 +88,7 @@ SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
   auto rank = shape.size();
   // Early exit for batched matmul
   if (rank == 3)
-    return {(unsigned)numWarps, 1, 1};
+    return getMmaV2WarpsPerCTA(shape, numWarps);
 
   auto filter = [&dotOp](Operation *op) {
     return op->getParentRegion() == dotOp->getParentRegion() &&
@@ -117,33 +117,7 @@ SmallVector<unsigned> warpsPerTileV2(DotOpInterface dotOp,
     }
   }
 
-  assert(rank == 2);
-  SmallVector<int64_t> shapePerWarp = {16, 8};
-  SmallVector<int64_t> warps = {1, 1};
-  // Compute repM and repN
-  SmallVector<int64_t> reps = {ceil(shape[0], shapePerWarp[0]),
-                               ceil(shape[1], shapePerWarp[1])};
-  // The formula for the number of registers given the reps is
-  // repM * 4 * repK + repN * 2 * repK + regsC
-  // where regsC = repM * repN * 4, which does not depend on the warp shape
-  //
-  // As such, to minimize the register pressure, we need to balance
-  // repM and repN. We then untie towards M, as the lhs tile has 4 elements,
-  // and the rhs tile has just 2.
-  while (product(warps) < numWarps) {
-    if (reps[0] >= reps[1]) {
-      warps[0] *= 2;
-      // Too many warps for this mma (repM == repN == 1).
-      // We allocate the remaining warps to the left (arbitrary choice)
-      if (reps[0] != 1) {
-        reps[0] /= 2;
-      }
-    } else {
-      warps[1] *= 2;
-      reps[1] /= 2;
-    }
-  }
-  return {(unsigned)warps[0], (unsigned)warps[1]};
+  return getMmaV2WarpsPerCTA(shape, numWarps);
 }
 SmallVector<unsigned, 2>
 warpsPerTileV3(DotOpInterface dotOp, const ArrayRef<int64_t> shape,
@@ -264,8 +238,8 @@ getWarpsPerTile(DotOpInterface dotOp, const ArrayRef<int64_t> shape,
 static bool bwdFilter(Operation *op) {
   return (op->hasTrait<OpTrait::Elementwise>() && isMemoryEffectFree(op)) ||
          isView(op) ||
-         isa<Fp4ToFpOp, LoadOp, DescriptorLoadOp, BroadcastOp, ConvertLayoutOp>(
-             op);
+         isa<Fp4ToFpOp, LoadOp, DescriptorLoadLikeOpInterface, BroadcastOp,
+             ConvertLayoutOp>(op);
 }
 
 // Finds the bitwidth with which the value x is loaded
@@ -284,7 +258,7 @@ static int computeOrigBitWidth(Value x) {
 
   int origBitWidth = getElementTypeOrSelf(x).getIntOrFloatBitWidth();
   for (auto op : slice) {
-    if (isa<LoadOp, DescriptorLoadOp>(op)) {
+    if (isa<LoadOp, DescriptorLoadLikeOpInterface>(op)) {
       if (auto tensorTy =
               dyn_cast<RankedTensorType>(op->getResultTypes().front())) {
         origBitWidth =
@@ -401,12 +375,13 @@ public:
     auto oldBType = cast<RankedTensorType>(b.getType());
     auto oldRetType = cast<RankedTensorType>(dotOp.getType());
 
-    // Enable F64 MMA only on SM80/SM90 with high performance F64 tensorcore.
+    // Enable F64 MMA only on targets with high performance F64 tensor cores.
     // Otherwise, fallback to F64 FMA for better performance.
     if ((oldAType.getElementType().isF64() ||
          oldBType.getElementType().isF64() ||
          oldRetType.getElementType().isF64()) &&
-        !(computeCapability == 80 || computeCapability == 90)) {
+        !(computeCapability == 80 || computeCapability == 90 ||
+          (computeCapability >= 100 && computeCapability < 120))) {
       return failure();
     }
 
@@ -457,26 +432,6 @@ public:
   }
 };
 
-static bool canUseTwoCTAs(triton::DotOp dotOp) {
-  RankedTensorType retType = dotOp.getType();
-  auto retShapePerCTA = getShapePerCTA(retType);
-  // TODO: we could support 2 CTAs matmul with numCTAs > 2.
-  SmallVector<unsigned> splitNum = getCTASplitNum(retType.getEncoding());
-  if (splitNum.size() != 2 || splitNum[0] != 2 || splitNum[1] != 1)
-    return false;
-  int m = retShapePerCTA[0];
-  int n = retShapePerCTA[1];
-  // minimum size supported by 2CTAs mmav5.
-  if (m < 64 || n < 32)
-    return false;
-  Value b = dotOp.getB();
-  // Skip convert layouts.
-  while (auto cvtOp = b.getDefiningOp<ConvertLayoutOp>())
-    b = cvtOp.getSrc();
-  return llvm::isa_and_nonnull<triton::LoadOp, triton::DescriptorLoadOp,
-                               triton::DescriptorGatherOp>(b.getDefiningOp());
-}
-
 static DistributedEncodingTrait
 replaceCGALayout(DistributedEncodingTrait layout,
                  const triton::gpu::CGAEncodingAttr &newCGALayout) {
@@ -501,8 +456,7 @@ static Value splitBOperand(Value b, mlir::PatternRewriter &rewriter) {
   while (auto cvtOp = b.getDefiningOp<ConvertLayoutOp>())
     b = cvtOp.getSrc();
   auto loadOp = b.getDefiningOp();
-  assert((isa<triton::LoadOp, triton::DescriptorLoadOp,
-              triton::DescriptorGatherOp>(loadOp)) &&
+  assert((isa<triton::LoadOp, triton::DescriptorLoadLikeOpInterface>(loadOp)) &&
          "expected LoadOp");
   RankedTensorType bType = cast<RankedTensorType>(b.getType());
   auto currentLayout = cast<DistributedEncodingTrait>(bType.getEncoding());
@@ -627,7 +581,7 @@ Value addSmemStageToScaleLoad(Value scale, mlir::PatternRewriter &rewriter) {
   if (!op)
     return scale;
 
-  while (!isa<LoadOp, DescriptorLoadOp>(op)) {
+  while (!isa<LoadOp, DescriptorLoadLikeOpInterface>(op)) {
     if (auto reshape = dyn_cast<ReshapeOp>(op)) {
       op = reshape.getSrc().getDefiningOp();
       loadConsumer = reshape;
@@ -836,7 +790,7 @@ public:
     auto bitwidth = oldRetType.getElementType().getIntOrFloatBitWidth();
     unsigned colStride = 32 / bitwidth;
     Attribute accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-        context, m, n, colStride, CGALayout, false);
+        context, m, n, colStride, CGALayout);
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     MemDescType accMemDescType =

@@ -27,13 +27,14 @@ namespace triton {
 struct GlobalMemory : public SideEffects::Resource::Base<GlobalMemory> {
   // --- START --- added for spyre: signature differs by LLVM pin.
   // The spyre/TTIR-only build uses LLVM e9846648 (cmake/llvm-hash-spyre.txt),
-  // where Resource::getName() is non-const virtual; GPU builds use the older
-  // upstream pin (cmake/llvm-hash.txt) where it is `const`. Guard on
-  // TRITON_BUILD_TTIR_ONLY, which is auto-enabled exactly for the spyre path.
+  // where Resource::getName() is non-const virtual; upstream GPU builds use
+  // cmake/llvm-info.json, where it is `const` and getParent() is available.
+  // Guard on TRITON_BUILD_TTIR_ONLY, which is auto-enabled for the spyre path.
 #ifdef TRITON_BUILD_TTIR_ONLY
   StringRef getName() final { return "<GlobalMemory>"; }
 #else
   StringRef getName() const final { return "<GlobalMemory>"; }
+  SideEffects::Resource *getParent() const override { return nullptr; }
 #endif
   // --- END --- added for spyre
 };
@@ -69,10 +70,13 @@ public:
   // makes the reshape a "nop", i.e. the same GPU threads contain the same
   // elements as before the reshape using legacy layouts.  This is not always
   // possible (in which case we fallback to using LinearLayouts)
+  // If allowReorder is set, an existing value in dstEnc is preferred when it
+  // still yields a non-expensive view.
   // In the future we'll always use LinearLayouts
   virtual LogicalResult
   inferReshapeOpEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
                          ArrayRef<int64_t> dstShape, Attribute &dstEnc,
+                         bool allowReorder,
                          std::optional<Location> loc) const = 0;
 
   // Check if two layouts are structurally the same, even if their names are
@@ -97,6 +101,11 @@ public:
   verifyDotOpEncodingCompatibility(Operation *op, Attribute operandEncodingA,
                                    Attribute operandEncodingB) const = 0;
 
+  // Verify that the encodings are compatible to be used together in a cat
+  // operation.
+  virtual LogicalResult
+  verifyCatOpEncodingCompatibility(Operation *op) const = 0;
+
   virtual LogicalResult
   inferFp4ToFpOpEncoding(ArrayRef<int64_t> shape, int axis, Attribute inEnc,
                          Attribute &outEnc, bool fwdInference,
@@ -118,12 +127,23 @@ public:
 };
 
 // Descriptor gather and scatter have restrictions on the tile sizes.
+LogicalResult verifyGatherScatterResultType(Operation *op,
+                                            ShapedType resultType,
+                                            ShapedType indicesType);
 LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
                                     ShapedType resultType,
                                     ShapedType indicesType);
 LogicalResult verifyDescriptorLoadStoreOp(Operation *op,
                                           TensorDescInterface desc,
                                           ShapedType tensor);
+
+LogicalResult deduceScaleFactor(ArrayRef<int64_t> lhsShape,
+                                std::optional<ArrayRef<int64_t>> lhsScaleShape,
+                                ScaleDotElemType lhsFormat, bool lhsKPack,
+                                ArrayRef<int64_t> rhsShape,
+                                std::optional<ArrayRef<int64_t>> rhsScaleShape,
+                                ScaleDotElemType rhsFormat, bool rhsKPack,
+                                int32_t &scaleFactor, std::string &errMsg);
 
 } // namespace triton
 } // namespace mlir

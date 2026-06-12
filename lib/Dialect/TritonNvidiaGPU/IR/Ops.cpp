@@ -27,6 +27,7 @@
 #include "mlir/Support/LLVM.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
@@ -39,6 +40,7 @@
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir::triton::gpu;
@@ -50,7 +52,7 @@ namespace nvidia_gpu {
 // -- WarpGroupDotOp --
 LogicalResult WarpGroupDotOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   // type is the same as the accumulator
   auto accTy = cast<RankedTensorType>(operands[2].getType());
@@ -147,17 +149,10 @@ bool WarpGroupDotOp::needsPartialAccumulator() {
   return isFP8 && accFP32 && maxNumImpreciseAcc <= aTensorTy.getShape()[1];
 }
 
-bool WarpGroupDotOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
-}
-
 // -- WarpGroupDotWaitOp --
 LogicalResult WarpGroupDotWaitOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   for (Value operand : operands)
     inferredReturnTypes.push_back(operand.getType());
@@ -257,18 +252,59 @@ Type ArriveBarrierOp::getPredicateOperandTypeLike() {
   return IntegerType::get(getContext(), 1);
 }
 
-// -- FenceMBarrierInitReleaseClusterOp --
-LogicalResult FenceMBarrierInitReleaseClusterOp::verify() {
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-  if (numCTAs <= 1)
-    return emitOpError("requires ttg.num-ctas > 1");
+// -- AsyncSharedStoreOp --
+LogicalResult AsyncSharedStoreOp::verify() {
+  // PTX defines weak shared::cluster st.async as UB for a one-CTA cluster.
+  if (gpu::lookupNumCTAs(getOperation()) < 2)
+    return emitOpError("requires at least two CTAs in the cluster");
+  if (!getDst().getType().getMutableMemory())
+    return emitOpError("cannot store into immutable memory");
+  if (failed(triton::gpu::verifyMemoryOpTypes(*this, getSrc().getType(),
+                                              getDst().getType())))
+    return failure();
+  if (failed(verifyBarrierType(*this, getMbarrier().getType())))
+    return failure();
+
+  auto srcTy = getSrc().getType();
+  auto dstTy = getDst().getType();
+  unsigned bitwidth = getIntOrFloatOrPtrBitWidth(srcTy.getElementType());
+
+  auto regLayout = toLinearLayout(srcTy);
+  auto sharedLayout = isPaddedEncoding(dstTy.getEncoding())
+                          ? paddedLinearLayout(dstTy)
+                          : toLinearLayout(dstTy);
+  auto cvt = regLayout.invertAndCompose(sharedLayout);
+  std::optional<int> maybeMaxVecElems;
+  if (isPaddedEncoding(dstTy.getEncoding()))
+    maybeMaxVecElems = getMinInterval(dstTy.getEncoding());
+  auto vectorization =
+      largestVectorisation(getContext(), cvt, bitwidth, maybeMaxVecElems);
+  unsigned elemsPerVec = vectorization.first;
+  if (elemsPerVec * bitwidth < 32)
+    return emitOpError("requires a layout vectorizing stores to at least 32 "
+                       "bits");
   return success();
 }
 
-static LogicalResult verifyClusterSyncOp(Operation *op) {
+TypedValue<MemDescType> AsyncSharedStoreOp::getBarrier() {
+  return getMbarrier();
+}
+
+static LogicalResult verifyClusterIsMultiCTA(Operation *op) {
   int numCTAs = triton::gpu::lookupNumCTAs(op);
   if (numCTAs <= 1)
     return op->emitOpError("requires ttg.num-ctas > 1");
+  return success();
+}
+
+// -- FenceMBarrierInitReleaseClusterOp --
+LogicalResult FenceMBarrierInitReleaseClusterOp::verify() {
+  return verifyClusterIsMultiCTA(getOperation());
+}
+
+static LogicalResult verifyClusterSyncOp(Operation *op) {
+  if (failed(verifyClusterIsMultiCTA(op)))
+    return failure();
   if (op->getParentOfType<mlir::triton::gpu::WarpSpecializeOp>())
     return op->emitOpError("cannot be used inside `ttg.warp_specialize`");
   return success();
@@ -286,7 +322,21 @@ LogicalResult ClusterWaitOp::verify() {
 
 // -- ClusterBarrierOp --
 LogicalResult ClusterBarrierOp::verify() {
-  return verifyClusterSyncOp(getOperation());
+  if (failed(verifyClusterIsMultiCTA(getOperation())))
+    return failure();
+  auto func = getOperation()->getParentOfType<FunctionOpInterface>();
+  if (!func)
+    return emitOpError("must be inside a kernel function");
+  if (triton::isKernel(func))
+    return success();
+  // Inlineable Triton helpers are verified before the inliner moves their
+  // bodies into the kernel.
+  if (auto tritonFunc = dyn_cast<triton::FuncOp>(func.getOperation())) {
+    auto noinline = tritonFunc->getAttrOfType<BoolAttr>("noinline");
+    if (!noinline || !noinline.getValue())
+      return success();
+  }
+  return emitOpError("must be inside a kernel function");
 }
 
 // -- TMA operation verifiers --
@@ -333,17 +383,29 @@ static LogicalResult verifyTMABarrierLayout(Operation *op, Value barrier) {
 
   auto ctx = op->getContext();
   int numCTAs = gpu::lookupNumCTAs(op);
-  CGAEncodingAttr expectedCGALayout;
+  auto barrierTy = cast<MemDescType>(barrier.getType());
+  auto actualCGALayout = getCGALayout(barrierTy.getEncoding());
+  auto oneCTACGALayout = CGAEncodingAttr::get1DLayout(ctx, numCTAs);
+  if (actualCGALayout == oneCTACGALayout)
+    return success();
+
   if (twoCTAsAttr.getValue()) {
     auto kBlock = StringAttr::get(ctx, "block");
     auto dim = standardOutDimNames(ctx, /*rank=*/1)[0];
     auto layout = LinearLayout::zeros1D(2, kBlock, dim) *
                   LinearLayout::identity1D(numCTAs / 2, kBlock, dim);
-    expectedCGALayout = CGAEncodingAttr::get(ctx, std::move(layout));
-  } else {
-    expectedCGALayout = CGAEncodingAttr::get1DLayout(ctx, numCTAs);
+    auto twoCTACGALayout = CGAEncodingAttr::get(ctx, std::move(layout));
+    if (actualCGALayout == twoCTACGALayout)
+      return success();
+    return op->emitOpError() << "TMA barrier cga_layout must be "
+                             << formatCGALayout(oneCTACGALayout) << " or "
+                             << formatCGALayout(twoCTACGALayout) << ", got "
+                             << formatCGALayout(actualCGALayout);
   }
-  return verifyBarrierCGALayout(op, barrier, expectedCGALayout, "TMA barrier");
+
+  return op->emitOpError() << "TMA barrier cga_layout must be "
+                           << formatCGALayout(oneCTACGALayout) << ", got "
+                           << formatCGALayout(actualCGALayout);
 }
 
 static LogicalResult verifyTMAEncoding(Operation *op, TensorDescInterface desc,
@@ -392,6 +454,55 @@ static LogicalResult verifyAsyncTMAStoreOp(Operation *op,
   if (isFp4Padded(srcEnc))
     return op->emitOpError("does not support fp4_padded operands");
   return verifyTMAEncoding(op, desc.getType(), srcEnc);
+}
+
+static LogicalResult verifyAsyncTMAGatherScatterOp(Operation *op,
+                                                   ShapedType blockType,
+                                                   MemDescType memDescType,
+                                                   ShapedType indicesType) {
+  if (blockType.getRank() != 2)
+    return op->emitOpError("descriptor block must be a 2D tensor, but got ")
+           << blockType;
+  if (blockType.getShape()[0] != 1)
+    return op->emitOpError("descriptor block must have exactly 1 row, but got ")
+           << blockType;
+  if (failed(verifyGatherScatterResultType(op, memDescType, indicesType)))
+    return failure();
+
+  if (memDescType.getShape()[1] != blockType.getShape()[1])
+    return op->emitOpError("result tensor number of columns must match block (")
+           << blockType.getShape()[1] << "), but got " << memDescType;
+  if (memDescType.getElementType() != blockType.getElementType())
+    return op->emitOpError("result tensor element type must match block (")
+           << blockType.getElementType() << "), but got " << memDescType;
+
+  ArrayRef<int64_t> allocShape = memDescType.getAllocShape();
+  if (allocShape.size() < 2 ||
+      memDescType.getShape() != allocShape.take_back(2))
+    return op->emitOpError("memdesc shape must match alloc shape");
+
+  auto xOffsetsType = cast<RankedTensorType>(indicesType);
+  if (xOffsetsType.getEncoding()) {
+    auto xCoordsLayout = triton::gpu::toLinearLayout(xOffsetsType);
+    auto kLane = StringAttr::get(op->getContext(), "lane");
+    if (getContigPerThread(xOffsetsType).front() < 4)
+      return op->emitOpError(
+          "x offsets must have at least 4 contiguous elements per thread");
+    unsigned threadsPerWarp = xCoordsLayout.getInDimSize(kLane);
+    if (xCoordsLayout.getFreeVariableMasks()[kLane] != (threadsPerWarp - 1))
+      return op->emitOpError("x offsets must be broadcasted across each warp");
+    auto kBlock = StringAttr::get(op->getContext(), "block");
+    auto kDim0 = StringAttr::get(op->getContext(), "dim0");
+    auto rowsCGA = getCGALayout(memDescType.getEncoding())
+                       .getLinearLayout()
+                       .sublayout({kBlock}, {kDim0});
+    auto xOffsetsCGA =
+        getCGALayout(xOffsetsType.getEncoding()).getLinearLayout();
+    if (rowsCGA != xOffsetsCGA)
+      return op->emitOpError(
+          "x offsets must have the same row CGA layout as the memdesc");
+  }
+  return success();
 }
 
 // Helper to determine if the descriptor type is for im2col mode
@@ -450,6 +561,30 @@ static LogicalResult verifyTMAMode(Operation *op, bool isIm2Col,
   return success();
 }
 
+bool AsyncTMAReduceOp::isSupportedReduceKind(DescriptorReduceKind kind,
+                                             Type elementType) {
+  bool isInt32 = elementType.isInteger(32);
+  bool isInt32Or64 = isInt32 || elementType.isInteger(64);
+  bool isNotSignedInt64 =
+      elementType.isInteger(64) && !elementType.isSignedInteger();
+  bool isF16OrBF16 = elementType.isF16() || elementType.isBF16();
+  switch (kind) {
+  case DescriptorReduceKind::ADD:
+    return isInt32 || isNotSignedInt64 || elementType.isF32() || isF16OrBF16;
+  case DescriptorReduceKind::MIN:
+  case DescriptorReduceKind::MAX:
+    return isInt32Or64 || isF16OrBF16;
+  case DescriptorReduceKind::AND:
+  case DescriptorReduceKind::OR:
+  case DescriptorReduceKind::XOR:
+    return isInt32Or64;
+  case DescriptorReduceKind::INC:
+  case DescriptorReduceKind::DEC:
+    return false;
+  }
+  llvm_unreachable("unknown descriptor reduce kind");
+}
+
 // -- AsyncTMACopyGlobalToLocalOp --
 LogicalResult AsyncTMACopyGlobalToLocalOp::verify() {
   auto descType = getDesc().getType();
@@ -503,7 +638,14 @@ LogicalResult AsyncTMAReduceOp::verify() {
   MemDescType srcType = getSrc().getType();
   if (failed(verifyDescriptorLoadStoreOp(*this, getDesc().getType(), srcType)))
     return failure();
-  return verifyAsyncTMAStoreOp(*this, getDesc(), srcType);
+  if (failed(verifyAsyncTMAStoreOp(*this, getDesc(), srcType)))
+    return failure();
+  Type elementType = getDesc().getType().getElementType();
+  if (!isSupportedReduceKind(getKind(), elementType))
+    return emitOpError("unsupported reduce kind ")
+           << stringifyDescriptorReduceKind(getKind()) << " for element type "
+           << elementType;
+  return success();
 }
 
 // -- AsyncTMAGatherOp --
@@ -515,9 +657,12 @@ LogicalResult AsyncTMAGatherOp::verify() {
   // `tile::gather4` does not support fp4_padded operands.
   if (isFp4Padded(getResult().getType().getEncoding()))
     return emitOpError("does not support fp4_padded operands");
-  return verifyGatherScatterOp(*this,
-                               getDesc().getType().getSignlessBlockType(),
-                               resultType, getXOffsets().getType());
+  if (getMulticast() && !hasCGABroadcast(resultType))
+    return emitOpError(
+        "multicast requires the shared layout to broadcast across CTAs");
+  return verifyAsyncTMAGatherScatterOp(
+      *this, getDesc().getType().getSignlessBlockType(), resultType,
+      getXOffsets().getType());
 }
 
 Value AsyncTMAGatherOp::getPredicateOperand() { return getPred(); }
@@ -535,9 +680,9 @@ LogicalResult AsyncTMAScatterOp::verify() {
   auto srcType = getSrc().getType();
   if (failed(verifyAsyncTMAStoreOp(*this, getDesc(), srcType)))
     return failure();
-  return verifyGatherScatterOp(*this,
-                               getDesc().getType().getSignlessBlockType(),
-                               srcType, getXOffsets().getType());
+  return verifyAsyncTMAGatherScatterOp(
+      *this, getDesc().getType().getSignlessBlockType(), srcType,
+      getXOffsets().getType());
 }
 
 // -- TCGen5MMAOp --
@@ -693,11 +838,16 @@ LogicalResult TCGen5MMAOp::verify() {
   auto retEnc = dyn_cast<TensorMemoryEncodingAttr>(retType.getEncoding());
   if (!retEnc)
     return emitOpError("Return operand must have a TensorMemory encoding");
+  if (retEnc.getFp4Padded())
+    return emitOpError("Accumulator must not be fp4_padded");
 
   // Check colStride of TMEM operands
   if (auto tmem = dyn_cast<TensorMemoryEncodingAttr>(aEnc)) {
     if (tmem.getColStride() != 1)
       return emitOpError("The col stride of the LHS operand must be 1");
+    if (tmem.getFp4Padded())
+      return emitOpError(
+          "fp4_padded tensor memory LHS is only supported by scaled MMA");
   }
   if (retEnc.getColStride() != 32 / retType.getElementTypeBitWidth())
     return emitOpError("The col stride of the return operand must be 32 / ")
@@ -825,13 +975,6 @@ void TCGen5MMAOp::getEffects(
                          SharedMemory::get());
 }
 
-bool TCGen5MMAOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
-}
-
 Value TCGen5MMAOp::useAccumulator() { return getUseD(); }
 
 void TCGen5MMAOp::setUseAccumulator(Value flag) {
@@ -845,8 +988,7 @@ ValueRange TCGen5MMAOp::getCompletionBarrierPreds() {
 
 static void appendMulticastDesc(SmallVectorImpl<Value> &descs,
                                 TypedValue<MemDescType> desc) {
-  if (isa<SharedEncodingTrait>(desc.getType().getEncoding()))
-    descs.push_back(desc);
+  descs.push_back(desc);
 }
 
 SmallVector<Value> TCGen5MMAOp::getCompletionDescs() {
@@ -943,6 +1085,37 @@ static Type getScaledMMAOperandType(Type elementType,
   llvm_unreachable("Unsupported type.");
 };
 
+static LogicalResult verifyScaledLHSOperand(Operation *op, Type elementType,
+                                            TensorMemoryEncodingAttr encoding,
+                                            ScaleDotElemType aType,
+                                            ScaleDotElemType bType) {
+  if (aType == ScaleDotElemType::E2M1) {
+    if (!elementType.isInteger(8))
+      return op->emitOpError("expected e2m1 LHS operand to have i8 storage");
+    if (encoding.getFp4Padded() &&
+        !llvm::is_contained({ScaleDotElemType::E4M3, ScaleDotElemType::E5M2},
+                            bType))
+      return op->emitOpError("can only use fp4_padded LHS when RHS is float8");
+    if (llvm::is_contained({ScaleDotElemType::E4M3, ScaleDotElemType::E5M2},
+                           bType) &&
+        !encoding.getFp4Padded())
+      return op->emitOpError(
+          "expected e2m1 LHS operand to be fp4_padded when RHS is float8");
+    return success();
+  }
+
+  if (isa<Float8E4M3FNType, Float8E5M2Type>(elementType)) {
+    if (!llvm::is_contained({ScaleDotElemType::E4M3, ScaleDotElemType::E5M2},
+                            aType)) {
+      return op->emitOpError(
+          "expected float8 LHS operand to have e4m3 or e5m2 format");
+    }
+    return success();
+  }
+
+  return op->emitOpError("unsupported LHS operand type for scaled MMA");
+}
+
 LogicalResult TCGen5MMAScaledOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
@@ -966,8 +1139,17 @@ LogicalResult TCGen5MMAScaledOp::verify() {
     return emitOpError(
         "expected accumulator layout to be a TensorMemoryLayout");
   }
+  if (enc.getFp4Padded())
+    return emitOpError("accumulator layout must not be fp4_padded");
   if (enc.getBlockM() != 128)
     return emitOpError("only supports instruction shape blockM=128");
+  if (auto lhsEnc =
+          dyn_cast<TensorMemoryEncodingAttr>(getA().getType().getEncoding())) {
+    if (failed(verifyScaledLHSOperand(getOperation(),
+                                      getA().getType().getElementType(), lhsEnc,
+                                      getAType(), getBType())))
+      return failure();
+  }
   return success();
 }
 
@@ -1260,7 +1442,8 @@ LogicalResult TMEMLoadOp::verify() {
     // kReg bases along N then cross-warp/block reduction becomes needed.
     auto kReg = StringAttr::get(regTy.getContext(), "register");
     int dimM = 0, dimN = 1;
-    auto regDims = toLinearEncoding(regTy).basesPerDim(kReg);
+    auto regDims =
+        toLinearEncoding(regTy).basesPerDim(kReg, /*skipBroadcast=*/true);
     if (regDims[dimN] != toLinearLayout(regTy).getOutDimSizes().begin()[dimN] ||
         regDims[dimM] != 1) {
       return emitOpError("tmem_load reduction with N dimension sharded across "

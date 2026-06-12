@@ -72,7 +72,8 @@ def TTNG_FenceMBarrierInitReleaseClusterOp : TTNG_Op<
 
   let extraClassDeclaration = [{
     static bool isSupported(int computeCapability) {
-      return computeCapability >= 90;
+      return ::mlir::triton::nvidia_gpu::TargetFeatures(computeCapability)
+          .supportClusterOps();
     }
   }];
 }
@@ -95,8 +96,9 @@ def TTNG_ClusterBarrierOp : TTNG_Op<"cluster_barrier", []> {
     Lowers to a cluster arrive/wait pair.
 
     In warp-specialized kernels, lowering wraps the barrier in a synthetic
-    `ttg.warp_specialize` region so worker warps also execute the barrier.
-    This op cannot be placed inside an existing `ttg.warp_specialize`.
+    `ttg.warp_specialize` region so worker warps also execute a barrier outside
+    existing warp-specialized code. A barrier inside `ttg.warp_specialize`
+    lowers through a cluster-scoped mbarrier.
   }];
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;
@@ -122,8 +124,7 @@ def TTNG_CLCTryCancelOp : TTNG_Op<"clc_try_cancel", [
 
   let arguments = (ins
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$mbarrier,
-    I1Attr:$multicast
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$mbarrier
   );
 
   let assemblyFormat = [{
@@ -409,9 +410,40 @@ def TTNG_AsyncCopyMbarrierArriveOp : TTNG_Op<"async_copy_mbarrier_arrive", [
 }
 
 
+def TTNG_AsyncSharedStoreOp : TTNG_Op<"async_shared_store", [
+    DeclareOpInterfaceMethods<MBarrierOpInterface, ["getBarrier"]>]> {
+  let summary = "store a distributed tensor to shared memory asynchronously";
+
+  let description = [{
+    Store a distributed tensor into shared memory using PTX st.async.shared.
+    The store completion decrements the transaction count of `mbarrier`.
+    This op requires a CTA cluster with at least two CTAs.
+  }];
+
+  let arguments = (ins
+    TT_Tensor:$src,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$mbarrier
+  );
+
+  let assemblyFormat = [{
+    $src `,` $dst `,` $mbarrier attr-dict `:` type($src) `->`
+    qualified(type($dst)) `,` qualified(type($mbarrier))
+  }];
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    static bool isSupported(int computeCapability) {
+      return ::mlir::triton::nvidia_gpu::TargetFeatures(computeCapability)
+          .supportClusterOps();
+    }
+  }];
+}
+
+
 def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local", [
     AttrSizedOperandSegments, DeclareOpInterfaceMethods<MBarrierOpInterface>,
-    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
+    DeclareOpInterfaceMethods<PredicatedOpInterface>, TMALoadLikeOpInterface]> {
   let summary = "copy data based on descriptor from global memory to local memory asynchronously";
 
   let description = [{
@@ -474,7 +506,8 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local",
 
 }
 
-def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global"> {
+def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global", [
+    TMAStoreLikeOpInterface]> {
   let summary = "copy data based on descriptor from local memory to global memory asynchronously";
 
   let description = [{
@@ -498,7 +531,7 @@ def TTNG_AsyncTMACopyLocalToGlobalOp : TTNG_Op<"async_tma_copy_local_to_global">
   let hasVerifier = 1;
 }
 
-def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [MemoryEffects<[MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>]> {
+def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [TMAStoreLikeOpInterface]> {
   let summary = "reduce result in gmem based on a TMA descriptor";
 
   let description = [{
@@ -510,7 +543,7 @@ def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [MemoryEffects<[MemRead<
 
   let arguments = (ins
     TT_DescriptorReduceKindAttr:$kind,
-    Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>]>:$desc,
+    Arg<TT_TensorDescType, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$desc,
     Variadic<I32>:$coord,
     Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src
   );
@@ -519,12 +552,16 @@ def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [MemoryEffects<[MemRead<
     $kind `,` $desc `[` $coord `]` $src
     attr-dict `:` qualified(type($desc)) `,` qualified(type($src))
   }];
+  let extraClassDeclaration = [{
+    static bool isSupportedReduceKind(::mlir::triton::DescriptorReduceKind kind,
+                                      ::mlir::Type elementType);
+  }];
   let hasVerifier = 1;
 }
 
 def TTNG_AsyncTMAGatherOp : TTNG_Op<"async_tma_gather", [
     DeclareOpInterfaceMethods<MBarrierOpInterface>,
-    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
+    DeclareOpInterfaceMethods<PredicatedOpInterface>, TMALoadLikeOpInterface]> {
   let summary = "gather data based on descriptor from global memory to local memory asynchronously";
 
   let description = [{
@@ -539,7 +576,8 @@ def TTNG_AsyncTMAGatherOp : TTNG_Op<"async_tma_gather", [
     I32:$y_offset,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
-    I1:$pred
+    I1:$pred,
+    UnitAttr:$multicast
   );
 
   let assemblyFormat = [{
@@ -550,7 +588,8 @@ def TTNG_AsyncTMAGatherOp : TTNG_Op<"async_tma_gather", [
   let hasVerifier = 1;
 }
 
-def TTNG_AsyncTMAScatterOp : TTNG_Op<"async_tma_scatter"> {
+def TTNG_AsyncTMAScatterOp : TTNG_Op<"async_tma_scatter", [
+    TMAStoreLikeOpInterface]> {
   let summary = "scatter data from local memory into global memory based on a descriptor asynchronously";
 
   let description = [{
@@ -577,11 +616,12 @@ def TTNG_AsyncTMAScatterOp : TTNG_Op<"async_tma_scatter"> {
 }
 
 def TTNG_TMAStoreWaitOp : TTNG_Op<"async_tma_store_wait", [MemWaitOpTrait]> {
-  let summary = "wait until all the inputs are read.";
-  let arguments = (ins I32Attr:$pendings);
+  let summary = "wait for pending TMA store operations.";
+  let arguments = (ins I32Attr:$pendings, UnitAttr:$read_only);
   let description = [{
-    Wait until all the read operations are done from the associated store operations.
-    This is needed before the shared memory can be written to.
+    Wait for the associated store operations to complete. When `read_only` is
+    set, only wait until their reads from shared memory have completed. This is
+    needed before shared memory can be written to again.
   }];
 
   let assemblyFormat = "attr-dict";
