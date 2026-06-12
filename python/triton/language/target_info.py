@@ -1,7 +1,9 @@
+import functools
+
 from triton.runtime import driver
 from triton.runtime.jit import constexpr_function
 
-__all__ = ["current_target"]
+__all__ = ["current_target", "is_spyre", "requires_backend"]
 
 
 def current_target():
@@ -40,6 +42,41 @@ def cuda_capability_geq(major, minor=0):
 def is_hip():
     target = current_target()
     return target is not None and target.backend == "hip"
+
+
+# --- START --- added for spyre
+@constexpr_function
+def is_spyre():
+    target = current_target()
+    return target is not None and target.backend == "spyre"
+
+
+def requires_backend(name):
+    """Decorate a frontend op as ``name``-backend-only.
+
+    The wrapped function raises ``ValueError`` if invoked under any other
+    backend. The backend is resolved at *call* time (``current_target()``),
+    not at decoration time — there is no active driver when the class body is
+    evaluated. Use this for ops that only exist for one backend (e.g.
+    ``tl.spyre_tensor_layout``); for behavior that merely *diverges* by
+    backend, branch on the :func:`is_spyre`-style predicate instead.
+    """
+
+    def decorator(fn):
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            target = current_target()
+            backend = target.backend if target is not None else None
+            if backend != name:
+                raise ValueError(f"{fn.__name__} is only supported on the "
+                                 f"'{name}' backend, not '{backend}'")
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+# --- END --- added for spyre
 
 
 @constexpr_function
