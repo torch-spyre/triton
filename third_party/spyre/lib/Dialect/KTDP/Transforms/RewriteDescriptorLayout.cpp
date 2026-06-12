@@ -366,7 +366,75 @@ struct RewriteDescriptorLayoutPass
     int                reduceInner; // rightmost reduceDim → consumed by Op; -1 if none
     SmallVector<int>   reduceLoop;  // reduceDims minus reduceInner → reduction loops
     SmallVector<int>   opSliceDims; // residual >= 0 non-floor dims (the 2D slice for matmul)
+
+    // Threaded from the physical construct_memory_view (R-a). Populated by
+    // dispatchMatmul / dispatchStore after classify(); consumed by S5.
+    SmallVector<OpFoldResult> strides; // physical stride per dim (attr=static, Value=dynamic)
+    SmallVector<OpFoldResult> sizes;   // physical extent per dim (attr=static, Value=dynamic)
   };
+
+  // Same walk as findMarkerForOperand, but returns the physical
+  // ConstructMemoryViewOp rather than the marker. Used by dispatchMatmul to
+  // thread strides/sizes into the OperandPlan (S4).
+  mlir::ktdp::ConstructMemoryViewOp getMemViewForOperand(Value operand) {
+    Value v = operand;
+    while (true) {
+      auto *defOp = v.getDefiningOp();
+      if (!defOp)
+        return {};
+      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(defOp)) {
+        auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
+            ld.getAccessTile().getDefiningOp());
+        if (!tile)
+          return {};
+        return tile.getBase().getDefiningOp<mlir::ktdp::ConstructMemoryViewOp>();
+      }
+      if (defOp->getNumResults() != 1 || defOp->getNumOperands() == 0)
+        return {};
+      int tensorOps = 0;
+      for (auto op : defOp->getOperands())
+        if (isa<RankedTensorType>(op.getType()))
+          ++tensorOps;
+      if (tensorOps != 1)
+        return {};
+      for (auto op : defOp->getOperands())
+        if (isa<RankedTensorType>(op.getType())) { v = op; break; }
+    }
+  }
+
+  // Populate plan.strides and plan.sizes from the physical ConstructMemoryViewOp
+  // that backs the operand's load. Static dims become IndexAttr; dynamic dims
+  // become the SSA Value from the memViewOp's dynamic operand lists.
+  // Also asserts static consistency: sizes[p] == coords.physShape[p] for every
+  // statically-known dim (catches mismatches between the tensor type and the
+  // memView before S5 flips consumers to the threaded values).
+  static LogicalResult threadStridesAndSizes(
+      OperandPlan &plan, mlir::ktdp::ConstructMemoryViewOp memViewOp,
+      MLIRContext *ctx) {
+    ArrayRef<int64_t> staticSizes   = memViewOp.getStaticSizes();
+    ArrayRef<int64_t> staticStrides = memViewOp.getStaticStrides();
+    auto dynSizes   = memViewOp.getSizes();
+    auto dynStrides = memViewOp.getStrides();
+
+    int physRank = (int)staticSizes.size();
+    plan.sizes.resize(physRank);
+    plan.strides.resize(physRank);
+
+    int dynSzPos = 0, dynStPos = 0;
+    for (int p = 0; p < physRank; ++p) {
+      if (staticSizes[p] != ShapedType::kDynamic) {
+        plan.sizes[p] = IntegerAttr::get(IndexType::get(ctx), staticSizes[p]);
+      } else {
+        plan.sizes[p] = dynSizes[dynSzPos++];
+      }
+      if (staticStrides[p] != ShapedType::kDynamic) {
+        plan.strides[p] = IntegerAttr::get(IndexType::get(ctx), staticStrides[p]);
+      } else {
+        plan.strides[p] = dynStrides[dynStPos++];
+      }
+    }
+    return success();
+  }
 
   // One synthesized loop (per stage, per physical dim).
   // Identity is (owner, physDim): the dim its IV indexes.
@@ -564,6 +632,19 @@ struct RewriteDescriptorLayoutPass
 
     OperandPlan aPlan = classify(mm.getInputs()[0], aC, dimRoleA);
     OperandPlan bPlan = classify(mm.getInputs()[1], bC, dimRoleB);
+
+    // S4: thread physical strides/sizes from the construct_memory_view into
+    // the plans. Not yet consumed by emitMatmulStage (S5 flips the switch).
+    auto aMemView = getMemViewForOperand(mm.getInputs()[0]);
+    auto bMemView = getMemViewForOperand(mm.getInputs()[1]);
+    if (!aMemView || !bMemView)
+      return mm.emitError(
+          "spyre_tensor_layout: cannot locate physical memory view for matmul operands");
+    MLIRContext *ctx = mm.getContext();
+    if (failed(threadStridesAndSizes(aPlan, aMemView, ctx)))
+      return failure();
+    if (failed(threadStridesAndSizes(bPlan, bMemView, ctx)))
+      return failure();
 
     return emitMatmulStage(mm, aPlan, bPlan);
   }
