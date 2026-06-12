@@ -36,11 +36,11 @@
 //           retypeChain             propagate type (stops at multi-tensor ops)
 //         retypeStore               redirect access tile operand
 //         (marker kept alive for Phase 2)
-//     Phase 2 — fixupMatmulOps (loop-until-stable):
-//       fixupMatmul(mm)
+//     Phase 2 — synthesizeContractions (loop-until-stable):
+//       dispatchMatmul(mm)
 //         findMarkerForOperand      trace load -> access tile -> memView -> marker
-//         analyzeMatmulCoords       read phys_src/op/arg -> MatmulDims
-//         synthesizeMatmulLoop      emit scf.for nest + linalg.matmul slices
+//         buildDimRoles             phys_src/op/arg -> dimRole per physical dim
+//         synthesizeMatmulLoops     emit scf.for nest + linalg.matmul slices
 //     Phase 3 — eraseMarker (marker + dead bridge cast)
 //
 //   Coord helpers (free functions):
@@ -206,7 +206,7 @@ struct RewriteDescriptorLayoutPass
     // Phase 2: fixup linalg.matmul ops whose operands were retyped to rank-3
     // by Phase 1. Walks back from each mismatched operand to its marker to
     // read the coord map. Loop until stable (onion-peeling).
-    if (failed(fixupMatmulOps(module)))
+    if (failed(synthesizeContractions(module)))
       return signalPassFailure();
 
     // Phase 3: erase all markers (and their now-dead bridge casts).
@@ -217,7 +217,7 @@ struct RewriteDescriptorLayoutPass
   // Walk all linalg.matmul ops; fix any whose operands are rank-3 (physical).
   // For each, traces operands back to their tt.spyre_tensor_layout markers
   // (still live during Phase 2) to read the coord maps. Repeats until stable.
-  LogicalResult fixupMatmulOps(ModuleOp module) {
+  LogicalResult synthesizeContractions(ModuleOp module) {
     bool changed = true;
     while (changed) {
       changed = false;
@@ -230,7 +230,7 @@ struct RewriteDescriptorLayoutPass
           continue;
         if (aType.getRank() == 2 && bType.getRank() == 2)
           continue;
-        if (failed(fixupMatmul(mm)))
+        if (failed(dispatchMatmul(mm)))
           return failure();
         changed = true;
       }
@@ -311,8 +311,9 @@ struct RewriteDescriptorLayoutPass
     }
   }
 
-  // Strategy dispatcher: trace operands to markers, build dim roles, synthesize.
-  LogicalResult fixupMatmul(linalg::MatmulOp mm) {
+  // Per-matmul entry point for Phase 2: trace operands to markers, build dim
+  // roles, and call synthesizeMatmulLoops.
+  LogicalResult dispatchMatmul(linalg::MatmulOp mm) {
     auto aMarker = findMarkerForOperand(mm.getInputs()[0]);
     auto bMarker = findMarkerForOperand(mm.getInputs()[1]);
     if (!aMarker || !bMarker)
@@ -333,16 +334,17 @@ struct RewriteDescriptorLayoutPass
     buildDimRoles(aC, /*kLogicalSrc=*/1, /*parallelRole=*/0, dimRoleA);
     buildDimRoles(bC, /*kLogicalSrc=*/0, /*parallelRole=*/1, dimRoleB);
 
-    return synthesizeCase1(mm, dimRoleA, dimRoleB, aPhysShape, bPhysShape);
+    return synthesizeMatmulLoops(mm, dimRoleA, dimRoleB, aPhysShape, bPhysShape);
   }
 
-  // Case 1: sticks are on parallel dims only (no K-stick reduction loop).
-  // Emits one scf.for per parallel stick dim, with a single inner linalg.matmul.
+  // Synthesize the scf.for loop nest for a linalg.matmul with physical operands.
+  // Handles both the parallel-stick case (no K-stick dims → no reduction loop)
+  // and the K-stick case (aKStickDims non-empty → innermost reduction scf.for).
   //
-  // Slice extraction produces tensors in physical dim order; a linalg.transpose
-  // is emitted when the reduction dim precedes the parallel dim in physical order
-  // (since linalg.matmul requires [M,K] and [K,N]).
-  LogicalResult synthesizeCase1(linalg::MatmulOp mm,
+  // Slice extraction produces tensors in ascending physical dim order; a
+  // linalg.transpose is emitted when the reduction dim precedes the parallel dim
+  // (linalg.matmul requires [M,K] and [K,N]).
+  LogicalResult synthesizeMatmulLoops(linalg::MatmulOp mm,
                                 ArrayRef<int64_t> dimRoleA,
                                 ArrayRef<int64_t> dimRoleB,
                                 ArrayRef<int64_t> aPhysShape,
@@ -369,7 +371,7 @@ struct RewriteDescriptorLayoutPass
     };
 
     // We need the OperandCoords to check phys_op for isOuterDim.
-    // Re-create them from the markers (already checked non-null in fixupMatmul).
+    // Re-create them from the markers (already checked non-null in dispatchMatmul).
     auto aMarker = findMarkerForOperand(aVal);
     auto bMarker = findMarkerForOperand(bVal);
     OperandCoords aC{aMarker.getPhysSrc(), aMarker.getPhysOp(),
@@ -582,7 +584,7 @@ struct RewriteDescriptorLayoutPass
   }
 
   // Erase a marker and its now-dead bridge cast. Called in Phase 3 after
-  // fixupMatmulOps has finished reading the coord maps.
+  // synthesizeContractions has finished reading the coord maps.
   void eraseMarker(triton::SpyreTensorLayoutOp marker) {
     if (!marker->getBlock())
       return;
@@ -800,7 +802,7 @@ struct RewriteDescriptorLayoutPass
     //   (ktdp.load / ktdp.store) have been updated. Any remaining ktdp.loads
     //   that still use the bridge cast's memView for other purposes stay as-is.
 
-    // Marker and bridge cast are NOT erased here — Phase 2 (fixupMatmulOps)
+    // Marker and bridge cast are NOT erased here — Phase 2 (synthesizeContractions)
     // still needs to read the marker's coord map. Phase 3 calls eraseMarker.
     return success();
   }
