@@ -106,12 +106,26 @@ LLVM::DITypeAttr LLVMDIUtils::convertStructType(MLIRContext *context,
     elTypes.push_back(tyAttr);
   }
 
+  // --- START --- added for spyre: DICompositeTypeAttr::get() arg count differs
+  // by LLVM pin. The spyre/TTIR-only build uses LLVM e9846648
+  // (cmake/llvm-hash-spyre.txt), which predates identifier/discriminator.
+#ifdef TRITON_BUILD_TTIR_ONLY
   return LLVM::DICompositeTypeAttr::get(
       context, llvm::dwarf::DW_TAG_structure_type,
       mlir::StringAttr::get(context, "struct"), fileAttr, /*line=*/line,
       /*scope=*/fileAttr, /*baseType=*/nullptr, mlir::LLVM::DIFlags::Zero,
       sizeInBits, /*alignInBits=*/0, /*dataLocation=*/nullptr, /*rank=*/nullptr,
       /*allocated=*/nullptr, /*associated=*/nullptr, elTypes);
+#else
+  return LLVM::DICompositeTypeAttr::get(
+      context, llvm::dwarf::DW_TAG_structure_type,
+      mlir::StringAttr::get(context, "struct"), fileAttr, /*line=*/line,
+      /*scope=*/fileAttr, /*baseType=*/nullptr, mlir::LLVM::DIFlags::Zero,
+      sizeInBits, /*alignInBits=*/0, /*dataLocation=*/nullptr, /*rank=*/nullptr,
+      /*allocated=*/nullptr, /*associated=*/nullptr, /*identifier=*/nullptr,
+      /*discriminator=*/nullptr, elTypes);
+#endif
+  // --- END --- added for spyre
 }
 
 LLVM::DITypeAttr LLVMDIUtils::convertArrayType(MLIRContext *context,
@@ -126,12 +140,25 @@ LLVM::DITypeAttr LLVMDIUtils::convertArrayType(MLIRContext *context,
   SmallVector<LLVM::DINodeAttr> elTypes(arrayType.getNumElements(),
                                         convertType(context, elementType));
 
+  // --- START --- added for spyre: see convertStructType for the LLVM-pin
+  // compatibility rationale.
+#ifdef TRITON_BUILD_TTIR_ONLY
   return LLVM::DICompositeTypeAttr::get(
       context, llvm::dwarf::DW_TAG_array_type,
       mlir::StringAttr::get(context, "array"), fileAttr, /*line=*/line,
       /*scope=*/fileAttr, /*baseType=*/baseType, mlir::LLVM::DIFlags::Zero,
       sizeInBits, /*alignInBits=*/0, /*dataLocation=*/nullptr, /*rank=*/nullptr,
       /*allocated=*/nullptr, /*associated=*/nullptr, elTypes);
+#else
+  return LLVM::DICompositeTypeAttr::get(
+      context, llvm::dwarf::DW_TAG_array_type,
+      mlir::StringAttr::get(context, "array"), fileAttr, /*line=*/line,
+      /*scope=*/fileAttr, /*baseType=*/baseType, mlir::LLVM::DIFlags::Zero,
+      sizeInBits, /*alignInBits=*/0, /*dataLocation=*/nullptr, /*rank=*/nullptr,
+      /*allocated=*/nullptr, /*associated=*/nullptr, /*identifier=*/nullptr,
+      /*discriminator=*/nullptr, elTypes);
+#endif
+  // --- END --- added for spyre
 }
 
 std::optional<unsigned> LLVMDIUtils::calcBitWidth(mlir::Type type) {
