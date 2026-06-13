@@ -370,6 +370,7 @@ class TestMatmulKSplit(RewriteLayoutTester):
             %num_k = arith.constant 2 : i32
             %c0 = arith.constant 0 : i32
             %c1 = arith.constant 1 : i32
+            %c64 = arith.constant 64 : i32
             %sK = arith.constant 128 : i64
             %sN = arith.constant 256 : i64
             %sM = arith.constant 256 : i64
@@ -385,7 +386,7 @@ class TestMatmulKSplit(RewriteLayoutTester):
             %acc_init = arith.constant dense<0.0> : tensor<64x64xf32>
             %result = scf.for %k = %c0 to %num_k step %c1
                 iter_args(%acc = %acc_init) -> (tensor<64x64xf32>) : i32 {{
-              %k64 = arith.muli %k, %c1 : i32
+              %k64 = arith.muli %k, %c64 : i32
               %at = tt.descriptor_load %adesc[%m, %k64]
                   : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
               %bt = tt.descriptor_load %bdesc[%k64, %n]

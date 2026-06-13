@@ -1440,6 +1440,12 @@ struct RewriteDescriptorLayoutPass
           // factor = logStride / stickSize: how many sticks the loop IV advances
           // per iteration.
           int64_t stickSize = stickSizeForLogSrc[src];
+          if (stickSize > 0 && logStride < stickSize)
+            return tileOp.emitError(
+                "spyre_tensor_layout: block size (")
+                << logStride << ") is smaller than stick size (" << stickSize
+                << ") on logical dim " << src
+                << " — BLOCK must be >= stickSize for stickified dims";
           int64_t factor    = (stickSize > 0) ? (logStride / stickSize) : 1;
           Type ivTy = iv.getType();
           // Rescale: ub *= factor, step = factor. IV values are 0, factor,
