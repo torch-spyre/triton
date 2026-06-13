@@ -55,10 +55,15 @@ Fixes, in order of preference:
 """
 
 import importlib.util
+import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+import pytest
 
 # ---------------------------------------------------------------------------
 # sys.path setup — must happen before any triton / backend imports
@@ -550,3 +555,69 @@ class SinglePassTester(StructuralAssertions):
         self.ops = walk_module(self.mod)
         self._def_map = None
         return self.ops
+
+
+# ---------------------------------------------------------------------------
+# FileCheck-based verification infrastructure
+# ---------------------------------------------------------------------------
+
+
+def _find_triton_obj_path() -> Path | None:
+    """Locate the directory holding the ``FileCheck`` binary.
+
+    Reads ``triton_obj_root`` from a generated ``lit.site.cfg.py`` if present;
+    otherwise falls back to ``python/build/cmake*`` or ``python/triton``.
+    """
+    repo = Path(__file__).resolve().parents[3]
+    # 1. look for generated lit.site.cfg.py
+    for site_cfg in repo.rglob("lit.site.cfg.py"):
+        text = site_cfg.read_text()
+        m = re.search(r'triton_obj_root\s*=\s*["\']([^"\']+)["\']', text)
+        if m:
+            return Path(m.group(1)) / "bin"
+    # 2. look under the build directory
+    for cand in (repo / "python" / "build").glob("cmake*"):
+        if (cand / "bin" / "FileCheck").exists():
+            return cand / "bin"
+    if (repo / "python" / "triton" / "FileCheck").exists():
+        return repo / "python" / "triton"
+    return None
+
+
+@pytest.fixture(scope="session")
+def filecheck() -> str:
+    # env var has the first priority
+    if p := os.environ.get("FILECHECK_PATH"):
+        return p
+    obj_path = _find_triton_obj_path()
+    if obj_path:
+        fc = obj_path / "FileCheck"
+        if fc.exists():
+            return str(fc)
+    if p := shutil.which("FileCheck"):
+        return p
+    pytest.skip("FileCheck not found; set FILECHECK_PATH")
+
+
+@pytest.fixture
+def check_ir(filecheck):
+    def _check(produced_ir: str, check_file: Path, check_prefix: str | None = None):
+        env = os.environ.copy()
+        # exact match with lit.cfg.py : only --enable-var-scope
+        env["FILECHECK_OPTS"] = "--enable-var-scope"
+
+        cmd = [filecheck, str(check_file), "--dump-input=fail"]
+        if check_prefix:
+            cmd.append(f"--check-prefix={check_prefix}")
+
+        r = subprocess.run(
+            cmd, input=produced_ir,
+            capture_output=True, text=True, env=env,
+        )
+        if r.returncode != 0:
+            pytest.fail(
+                f"FileCheck failed: {check_file.name}\n"
+                f"--- produced IR ---\n{produced_ir}\n"
+                f"--- FileCheck stderr ---\n{r.stderr}"
+            )
+    return _check
