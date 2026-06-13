@@ -560,84 +560,81 @@ struct RewriteDescriptorLayoutPass
   // Phase 1 stored the (index-cast) loop IV directly as the coord operand of
   // the construct_access_tile for each FloorDiv dim; we recover it by tracing
   // each coord operand back through index_cast to its BlockArgument.
-  static void collectExistingLoopIVs(Operation *op,
-                                     const OperandPlan &aPlan,
-                                     const OperandPlan &bPlan,
-                                     SmallVectorImpl<Loop> &loops) {
-    // Helper: get the construct_access_tile backing a plan's load chain.
-    auto getTile = [](const OperandPlan &plan)
-        -> mlir::ktdp::ConstructAccessTilesOp {
-      Value v = plan.value;
-      if (!v) return {};
-      while (true) {
-        auto *defOp = v.getDefiningOp();
-        if (!defOp) return {};
-        if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(defOp))
-          return dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
-              ld.getAccessTile().getDefiningOp());
-        if (defOp->getNumResults() != 1 || defOp->getNumOperands() == 0)
-          return {};
-        int cnt = 0;
-        for (auto o : defOp->getOperands())
-          if (isa<RankedTensorType>(o.getType())) ++cnt;
-        if (cnt != 1) return {};
-        for (auto o : defOp->getOperands())
-          if (isa<RankedTensorType>(o.getType())) { v = o; break; }
-      }
-    };
+  // Trace an index Value through index_cast to a BlockArgument that is the
+  // induction variable (arg #0) of an enclosing scf.for.
+  static Value traceToForIV(Value v) {
+    while (true) {
+      if (auto ba = dyn_cast<BlockArgument>(v))
+        return (isa<scf::ForOp>(ba.getOwner()->getParentOp()) &&
+                ba.getArgNumber() == 0)
+                   ? ba
+                   : Value{};
+      auto *op = v.getDefiningOp();
+      if (!op) return {};
+      if (isa<arith::IndexCastOp, arith::IndexCastUIOp>(op))
+        { v = op->getOperand(0); continue; }
+      return {};
+    }
+  }
 
-    // Helper: trace an index Value through index_cast to a BlockArgument; check
-    // it is the induction var of an enclosing scf.for (arg #0 of body block).
-    auto traceToForIV = [](Value v) -> Value {
-      while (true) {
-        if (auto ba = dyn_cast<BlockArgument>(v))
-          return (isa<scf::ForOp>(ba.getOwner()->getParentOp()) &&
-                  ba.getArgNumber() == 0)
-                     ? ba
-                     : Value{};
-        auto *op = v.getDefiningOp();
-        if (!op) return {};
-        if (isa<arith::IndexCastOp, arith::IndexCastUIOp>(op))
-          { v = op->getOperand(0); continue; }
+  // Trace a plan's tensor value back through single-tensor ops to the
+  // ktdp.load that produced it, then return the ConstructAccessTilesOp
+  // feeding that load.
+  static mlir::ktdp::ConstructAccessTilesOp
+  tileForPlan(const OperandPlan &plan) {
+    Value v = plan.value;
+    if (!v) return {};
+    while (true) {
+      auto *defOp = v.getDefiningOp();
+      if (!defOp) return {};
+      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(defOp))
+        return dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
+            ld.getAccessTile().getDefiningOp());
+      if (defOp->getNumResults() != 1 || defOp->getNumOperands() == 0)
         return {};
-      }
-    };
+      int cnt = 0;
+      for (auto o : defOp->getOperands())
+        if (isa<RankedTensorType>(o.getType())) ++cnt;
+      if (cnt != 1) return {};
+      for (auto o : defOp->getOperands())
+        if (isa<RankedTensorType>(o.getType())) { v = o; break; }
+    }
+  }
 
-    auto aTile = getTile(aPlan);
-    auto bTile = getTile(bPlan);
+  // Scan one access tile's coord operands and record which enclosing scf.for
+  // IVs drive each physical dim. Populates ivToPhysDim for use by
+  // collectLoopIVsForTile.
+  static void scanTileIVs(
+      mlir::ktdp::ConstructAccessTilesOp tile,
+      DenseMap<Value, int /*physDim*/> &ivToPhysDim) {
+    if (!tile) return;
+    auto indices = tile.getIndices();
+    for (unsigned k = 0; k < indices.size(); ++k) {
+      Value forIV = traceToForIV(indices[k]);
+      if (forIV && !ivToPhysDim.count(forIV))
+        ivToPhysDim[forIV] = (int)k;
+    }
+  }
 
-    // For the store stage, also scan the store's own access tile if present.
-    mlir::ktdp::ConstructAccessTilesOp storeTile;
-    if (auto st = dyn_cast<mlir::ktdp::StoreOp>(op))
-      storeTile = dyn_cast_or_null<mlir::ktdp::ConstructAccessTilesOp>(
-          st.getAccessTile().getDefiningOp());
+  // Walk the enclosing scf.for nest of `op` and collect Loop entries for
+  // every IV that drives a physical dim of `tile`. `owner` is stored on
+  // each Loop for the caller's use. `reduceLoop` dims (if any) are marked
+  // Loop::Reduction; all others are Loop::Parallel.
+  static void collectLoopIVsForTile(
+      Operation *op, mlir::ktdp::ConstructAccessTilesOp tile, int owner,
+      ArrayRef<int> reduceLoop, SmallVectorImpl<Loop> &loops) {
+    DenseMap<Value, int> ivToPhysDim;
+    scanTileIVs(tile, ivToPhysDim);
 
-    // For each tile, build a map physDim -> forIV from its coord operands.
-    DenseMap<Value, std::pair<int /*owner*/, int /*physDim*/>> ivToOwnerDim;
-    auto scanTile = [&](mlir::ktdp::ConstructAccessTilesOp tile, int owner) {
-      if (!tile) return;
-      auto indices = tile.getIndices();
-      for (unsigned k = 0; k < indices.size(); ++k) {
-        Value forIV = traceToForIV(indices[k]);
-        if (forIV && !ivToOwnerDim.count(forIV))
-          ivToOwnerDim[forIV] = {owner, (int)k};
-      }
-    };
-    scanTile(aTile, 0);
-    scanTile(bTile, 1);
-    scanTile(storeTile, 0); // store: owner=0, physDim=coord index
-
-    // Walk enclosing scf.for ops and emit Loop entries for matched IVs.
     Operation *cur = op->getParentOp();
     while (cur) {
       if (auto forOp = dyn_cast<scf::ForOp>(cur)) {
         Value iv = forOp.getInductionVar();
-        auto it = ivToOwnerDim.find(iv);
-        if (it != ivToOwnerDim.end()) {
-          auto [owner, physDim] = it->second;
-          // Determine kind: reduction if physDim is in aPlan.reduceLoop.
+        auto it = ivToPhysDim.find(iv);
+        if (it != ivToPhysDim.end()) {
+          int physDim = it->second;
           Loop::Kind kind = Loop::Parallel;
-          for (int p : aPlan.reduceLoop)
+          for (int p : reduceLoop)
             if (p == physDim) { kind = Loop::Reduction; break; }
           loops.push_back({kind, owner, physDim, iv});
         }
@@ -877,7 +874,8 @@ struct RewriteDescriptorLayoutPass
 
     // Collect IVs from the existing enclosing scf.for loops (wired by Phase 1).
     SmallVector<Loop> loops;
-    collectExistingLoopIVs(mm, aPlan, bPlan, loops);
+    collectLoopIVsForTile(mm, tileForPlan(aPlan), 0, aPlan.reduceLoop, loops);
+    collectLoopIVsForTile(mm, tileForPlan(bPlan), 1, aPlan.reduceLoop, loops);
 
     // Determine if a StickifiedBlock dim exists and what factor it has.
     // factor > 1 means each loaded tile spans factor sticks; Phase 2 emits
@@ -1055,9 +1053,10 @@ struct RewriteDescriptorLayoutPass
 
     // Collect IVs from existing enclosing loops (wired by Phase 1).
     // For floor dims with physBlock[p]==1 the IV is always 0 (trip-1, no loop).
-    OperandPlan dummy; // bPlan unused for store; pass dummy
     SmallVector<Loop> loops;
-    collectExistingLoopIVs(st, dPlan, dummy, loops);
+    auto storeTile = dyn_cast_or_null<mlir::ktdp::ConstructAccessTilesOp>(
+        st.getAccessTile().getDefiningOp());
+    collectLoopIVsForTile(st, storeTile, 0, /*reduceLoop=*/{}, loops);
 
     // Build floorIVs[physDim] → IV or c0 for trip-1 dims.
     Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
@@ -1090,47 +1089,52 @@ struct RewriteDescriptorLayoutPass
       dSizes[p] = isFloor ? idx(1) : idx(physBlock[p]);
     }
 
-    // For each floor dim, scatter `factor` stick-slices of logical C into the
-    // physical D accumulator.
+    // For each floor dim, lift logical C into the physical D shape.
     //   factor  = logShape[logDim] / stickSize   (BLOCK_N / 64)
-    //   C-extract offset on logDim = s * stickSize
-    //   D-insert offset on physDim = s   (within-block index; dEmpty is always
-    //                                      physBlock-sized, floor dim = factor)
+    //
+    // factor==1 (BLOCK_N == stickSize): logicalC is exactly one stick wide.
+    //   Use tensor.expand_shape to insert the size-1 floor dim — no copy,
+    //   no loop. Reassociation: split logDim into [floorDim, logDim] in phys.
+    //
+    // factor>1 (BLOCK_N > stickSize): logicalC spans multiple sticks.
+    //   Loop s=0..factor-1: extract the s-th stickSize slice of C on logDim,
+    //   insert into position s of dEmpty on the floor dim.
     // `n` (enclosing N-block IV) is NOT used here — the access tile already
     // encodes the global N position. We only fill the local dEmpty buffer.
-    // For factor==1 (BLOCK_N == stickSize), emitStickLoop elides the loop
-    // (s=0), giving: cOffset=0 (whole tile), dOffset=0 — copy the whole tile.
     Value acc = dEmpty;
     for (int p : dPlan.floorDims) {
       int64_t logDim = dPlan.dimRoles[p];
       if (logDim < 0 || logDim >= logRank) continue;
 
       int64_t factor = logShape[logDim] / stickSize;
-      Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
 
-      // Slice shape: stickSize on logDim, full extent elsewhere.
-      SmallVector<int64_t> slShape(logShape.begin(), logShape.end());
-      slShape[logDim] = stickSize;
-      auto slTy = RankedTensorType::get(slShape, elemTy);
+      {
+        Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
 
-      acc = emitStickLoop(b, loc, factor, acc,
-          [&](OpBuilder &bb, Value s, Value dAcc) -> Value {
-            // C-extract: s-th stick-slice of the tile on logDim.
-            SmallVector<OpFoldResult> cOff = cOffsetsBase;
-            SmallVector<OpFoldResult> cSz  = cSizesBase;
-            cOff[logDim] =
-                arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
-            cSz[logDim] = idx(stickSize);
-            Value cSlice = tensor::ExtractSliceOp::create(
-                bb, loc, slTy, logicalC, cOff, cSz, cStrides);
+        // Slice shape: stickSize on logDim, full extent elsewhere.
+        SmallVector<int64_t> slShape(logShape.begin(), logShape.end());
+        slShape[logDim] = stickSize;
+        auto slTy = RankedTensorType::get(slShape, elemTy);
 
-            // D-insert: position s within the local dEmpty buffer.
-            SmallVector<OpFoldResult> dOff = dOffsetsBase;
-            Value dStick = s; // within-block index (0..factor-1)
-            dOff[p] = dStick;
-            return tensor::InsertSliceOp::create(
-                bb, loc, cSlice, dAcc, dOff, dSizes, dStrides);
-          });
+        acc = emitStickLoop(b, loc, factor, acc,
+            [&](OpBuilder &bb, Value s, Value dAcc) -> Value {
+              // C-extract: s-th stick-slice of the tile on logDim.
+              SmallVector<OpFoldResult> cOff = cOffsetsBase;
+              SmallVector<OpFoldResult> cSz  = cSizesBase;
+              cOff[logDim] =
+                  arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
+              cSz[logDim] = idx(stickSize);
+              Value cSlice = tensor::ExtractSliceOp::create(
+                  bb, loc, slTy, logicalC, cOff, cSz, cStrides);
+
+              // D-insert: position s within the local dEmpty buffer.
+              SmallVector<OpFoldResult> dOff = dOffsetsBase;
+              Value dStick = s; // within-block index (0..factor-1)
+              dOff[p] = dStick;
+              return tensor::InsertSliceOp::create(
+                  bb, loc, cSlice, dAcc, dOff, dSizes, dStrides);
+            });
+      }
     }
     Value result = acc;
 
