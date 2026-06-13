@@ -319,7 +319,7 @@ struct RewriteDescriptorLayoutPass
     // Logical rank of the descriptor (= number of logical dims, e.g. 2 for MxK).
     unsigned logicalRank;
     // Physical shape of the load result tensor.
-    ArrayRef<int64_t> physShape;
+    ArrayRef<int64_t> physBlock;
   };
 
   // Assign a role to each physical dim of an operand:
@@ -350,12 +350,12 @@ struct RewriteDescriptorLayoutPass
   // (and the slice-type computation) as a pure lookup — no loop-set inspection
   // or cross-operand reasoning at slice time.
   enum class SliceKind {
-    StickIndex,  // floor/reduceLoop dim: offset = this operand's own loop IV,
-                 // size = 1 (selects one stick along a stick-index dim).
-    SlicedStick, // reduceInner spanning >1 stick (B's K-flat): offset =
-                 // reduction IV * stickSize, size = stickSize (one stick, R-b).
-    Full,        // lane / opSlice / single-stick reduceInner: offset = 0,
-                 // size = physShape[p] (taken whole as part of the 2D tile).
+    StickIndex,       // floor/reduceLoop dim: offset = this operand's own loop IV,
+                      // size = 1 (selects one stick along a stick-index dim).
+    StickifiedBlock,  // reduceInner spanning >1 stick (B's K-flat): offset =
+                      // reduction IV * stickSize, size = stickSize (one stick, R-b).
+    WholeBlock,       // lane / opSlice / single-stick reduceInner: offset = 0,
+                      // size = physBlock[p] (taken whole as part of the 2D tile).
   };
 
   // One operand classified by its Map(Op, X) roles and physical layout.
@@ -374,10 +374,10 @@ struct RewriteDescriptorLayoutPass
     SmallVector<int64_t> dimRoles;  // per-phys-dim role (>= 0 | -1)
 
     int                lane;        // innermost phys dim = rank-1
-    int64_t            stickSize;   // stick/lane width = physShape[lane] (e.g. 64).
+    int64_t            stickSize;   // stick/lane width = physBlock[lane] (e.g. 64).
                                     // The slice extent for any stick-width dim
                                     // (the lane, and a sliced reduceInner). Distinct
-                                    // from physShape[dim], which is the full dim
+                                    // from physBlock[dim], which is the full dim
                                     // extent (= n_sticks * stickSize when BLOCK > stick).
     SmallVector<int>   floorDims;   // parallel stick-index dims → loops (role>=0, FloorDiv)
     SmallVector<int>   reduceDims;  // all -1 dims in right-to-left order
@@ -424,7 +424,7 @@ struct RewriteDescriptorLayoutPass
   // Populate plan.strides and plan.sizes from the physical ConstructMemoryViewOp
   // that backs the operand's load. Static dims become IndexAttr; dynamic dims
   // become the SSA Value from the memViewOp's dynamic operand lists.
-  // Also asserts static consistency: sizes[p] == coords.physShape[p] for every
+  // Also asserts static consistency: sizes[p] == coords.physBlock[p] for every
   // statically-known dim (catches mismatches between the tensor type and the
   // memView before S5 flips consumers to the threaded values).
   static LogicalResult threadStridesAndSizes(
@@ -440,11 +440,11 @@ struct RewriteDescriptorLayoutPass
     plan.strides.resize(physRank);
 
     // TODO(S5): Revisit whether a consistency check between plan.sizes and
-    // coords.physShape is appropriate here. They serve different purposes:
+    // coords.physBlock is appropriate here. They serve different purposes:
     // - plan.sizes[p] (from memViewOp) = full descriptor extent = trip count
     //   for floor dims, or full physical extent for opSlice/lane dims.
-    // - coords.physShape[p] (from the load result tensor type) = block extent
-    //   = 1 for floor dims (one stick per block), physShape[p] for opSlice.
+    // - coords.physBlock[p] (from the load result tensor type) = block extent
+    //   = 1 for floor dims (one stick per block), physBlock[p] for opSlice.
     // They are NOT equal in general (e.g. floor dim: 1 vs N_sticks; M-row dim:
     // BM vs M_total). A check needs to verify each dim category independently.
     int dynSzPos = 0, dynStPos = 0;
@@ -484,16 +484,16 @@ struct RewriteDescriptorLayoutPass
     for (int p : bPlan.floorDims) {
       int64_t logDim = bPlan.dimRoles[p];
       loops.push_back({Loop::Parallel, /*owner=*/1, p,
-                       bPlan.coords.physShape[p], logDim, {}});
+                       bPlan.coords.physBlock[p], logDim, {}});
     }
     for (int p : aPlan.floorDims) {
       int64_t logDim = aPlan.dimRoles[p];
       loops.push_back({Loop::Parallel, /*owner=*/0, p,
-                       aPlan.coords.physShape[p], logDim, {}});
+                       aPlan.coords.physBlock[p], logDim, {}});
     }
     for (int p : aPlan.reduceLoop) {
       loops.push_back({Loop::Reduction, /*owner=*/0, p,
-                       aPlan.coords.physShape[p], /*logicalDim=*/-1, {}});
+                       aPlan.coords.physBlock[p], /*logicalDim=*/-1, {}});
     }
     return loops;
   }
@@ -540,7 +540,7 @@ struct RewriteDescriptorLayoutPass
   }
 
   // Classify one operand's physical dims into OperandPlan fields (R-c).
-  // `coords` carries phys_src/op/arg and physShape. `dimRoles` comes from
+  // `coords` carries phys_src/op/arg and physBlock. `dimRoles` comes from
   // buildDimRoles (values: >= 0 parallel, -1 reduction). The resulting plan
   // owns copies of the role vector.
   //
@@ -558,7 +558,7 @@ struct RewriteDescriptorLayoutPass
     plan.coords    = coords;
     plan.dimRoles  = SmallVector<int64_t>(dimRoles.begin(), dimRoles.end());
     plan.lane      = rank - 1;
-    plan.stickSize = coords.physShape[rank - 1]; // lane extent = stick width
+    plan.stickSize = coords.physBlock[rank - 1]; // lane extent = stick width
     plan.reduceInner = -1;
 
     // Walk right-to-left (innermost first) per R-c.
@@ -594,11 +594,11 @@ struct RewriteDescriptorLayoutPass
 
     // Assign the per-dim slice behavior from local geometry (R-c + R-b):
     //   floor / reduceLoop dim       → StickIndex (one stick by its own IV)
-    //   reduceInner spanning >1 stick → SlicedStick (B's K-flat; one stick per
+    //   reduceInner spanning >1 stick → StickifiedBlock (B's K-flat; one stick per
     //     reduction iter). Detected purely by extent > stickSize, so a single-
-    //     stick reduceInner (incl. the case where reduceInner IS the lane) is Full.
-    //   everything else (lane, opSlice) → Full (taken whole in the 2D tile)
-    plan.sliceKind.assign(rank, SliceKind::Full);
+    //     stick reduceInner (incl. the case where reduceInner IS the lane) is WholeBlock.
+    //   everything else (lane, opSlice) → WholeBlock (taken whole in the 2D tile)
+    plan.sliceKind.assign(rank, SliceKind::WholeBlock);
     auto markList = [&](ArrayRef<int> dims) {
       for (int p : dims)
         plan.sliceKind[p] = SliceKind::StickIndex;
@@ -606,8 +606,8 @@ struct RewriteDescriptorLayoutPass
     markList(plan.floorDims);
     markList(plan.reduceLoop);
     if (plan.reduceInner != -1 &&
-        coords.physShape[plan.reduceInner] > plan.stickSize)
-      plan.sliceKind[plan.reduceInner] = SliceKind::SlicedStick;
+        coords.physBlock[plan.reduceInner] > plan.stickSize)
+      plan.sliceKind[plan.reduceInner] = SliceKind::StickifiedBlock;
     return plan;
   }
 
@@ -652,6 +652,20 @@ struct RewriteDescriptorLayoutPass
     return {};
   }
 
+  // Cross-operand SliceKind fix-up: StickifiedBlock is only valid when a
+  // reduction loop exists (aPlan.reduceLoop non-empty). When neither operand
+  // has a reduceLoop, K is contracted whole in one tile — demote any
+  // StickifiedBlock to WholeBlock so extractOpSlice never calls getReduceIV()
+  // on a null IV.
+  static void reconcilePlans(OperandPlan &aPlan, OperandPlan &bPlan) {
+    if (!aPlan.reduceLoop.empty() || !bPlan.reduceLoop.empty())
+      return;
+    for (auto *plan : {&aPlan, &bPlan})
+      for (auto &sk : plan->sliceKind)
+        if (sk == SliceKind::StickifiedBlock)
+          sk = SliceKind::WholeBlock;
+  }
+
   // Per-matmul entry point for Phase 2: trace operands to markers, build
   // OperandPlans, and call emitMatmulStage.
   LogicalResult dispatchMatmul(linalg::MatmulOp mm) {
@@ -677,6 +691,8 @@ struct RewriteDescriptorLayoutPass
 
     OperandPlan aPlan = classify(mm.getInputs()[0], aC, dimRoleA);
     OperandPlan bPlan = classify(mm.getInputs()[1], bC, dimRoleB);
+
+    reconcilePlans(aPlan, bPlan);
 
     // S4: thread physical strides/sizes from the construct_memory_view into
     // the plans. Not yet consumed by emitMatmulStage (S5 flips the switch).
@@ -716,8 +732,8 @@ struct RewriteDescriptorLayoutPass
     auto bElemTy = cast<RankedTensorType>(bVal.getType()).getElementType();
     auto accTy   = cast<RankedTensorType>(cVal.getType()).getElementType();
 
-    ArrayRef<int64_t> aPhysShape = aPlan.coords.physShape;
-    ArrayRef<int64_t> bPhysShape = bPlan.coords.physShape;
+    ArrayRef<int64_t> aPhysShape = aPlan.coords.physBlock;
+    ArrayRef<int64_t> bPhysShape = bPlan.coords.physBlock;
 
     const SmallVector<int> &aOpSliceDims = aPlan.opSliceDims;
     const SmallVector<int> &bOpSliceDims = bPlan.opSliceDims;
@@ -733,12 +749,12 @@ struct RewriteDescriptorLayoutPass
 
     // Physical-order 2D slice types (what extract_slice actually produces).
     // Mirrors extractOpSlice's size rule so the declared result type matches the
-    // emitted slice: a SlicedStick dim yields one stick (plan.stickSize); every
+    // emitted slice: a StickifiedBlock dim yields one stick (plan.stickSize); every
     // other opSlice dim yields its full extent.
     auto opSliceExtent = [](const OperandPlan &plan, int p) -> int64_t {
-      if (plan.sliceKind[p] == SliceKind::SlicedStick)
+      if (plan.sliceKind[p] == SliceKind::StickifiedBlock)
         return plan.stickSize; // one stick wide (R-b)
-      return plan.coords.physShape[p];
+      return plan.coords.physBlock[p];
     };
     auto sliceAPhysTy = RankedTensorType::get(
         {opSliceExtent(aPlan, aDimLo), opSliceExtent(aPlan, aDimHi)}, aElemTy);
@@ -808,14 +824,14 @@ struct RewriteDescriptorLayoutPass
     // classify from local geometry (see SliceKind):
     //   StickIndex  → offset = this operand's own loop IV for (planOwner, p),
     //                 size = 1
-    //   SlicedStick → offset = reduction IV * stickSize, size = stickSize (R-b)
-    //   Full        → offset = 0, size = physShape[p]
+    //   StickifiedBlock → offset = reduction IV * stickSize, size = stickSize (R-b)
+    //   WholeBlock  → offset = 0, size = physBlock[p]
     // The (owner, physDim) lookup keeps A's reduction IV from leaking into B's
     // floor dim when they share a physical index.
     auto extractOpSlice = [&](const OperandPlan &plan, int planOwner,
-                               ArrayRef<int64_t> physShape,
+                               ArrayRef<int64_t> physBlock,
                                RankedTensorType resultTy) -> Value {
-      int rank = (int)physShape.size();
+      int rank = (int)physBlock.size();
       SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
 
       // Find this operand's own loop IV for phys dim p (Parallel matched by
@@ -838,7 +854,7 @@ struct RewriteDescriptorLayoutPass
           offsets[p] = ivForDim(p);
           sizes[p]   = idx(1);
           break;
-        case SliceKind::SlicedStick: {
+        case SliceKind::StickifiedBlock: {
           // Advance one stick per reduction iteration: offset = k * stickSize.
           Value stickSz = arith::ConstantIndexOp::create(b, loc, plan.stickSize);
           offsets[p] = arith::MulIOp::create(b, loc, getReduceIV(), stickSz)
@@ -846,9 +862,9 @@ struct RewriteDescriptorLayoutPass
           sizes[p]   = idx(plan.stickSize); // one stick wide (R-b)
           break;
         }
-        case SliceKind::Full:
+        case SliceKind::WholeBlock:
           offsets[p] = idx(0);
-          sizes[p]   = idx(physShape[p]);
+          sizes[p]   = idx(physBlock[p]);
           break;
         }
       }
@@ -1044,8 +1060,8 @@ struct RewriteDescriptorLayoutPass
     Type elemTy = logTy.getElementType();
     ArrayRef<int64_t> logShape = logTy.getShape(); // [M, N_total]
 
-    ArrayRef<int64_t> physShape = dPlan.coords.physShape; // [Nstick, M, lane]
-    int physRank = (int)physShape.size();
+    ArrayRef<int64_t> physBlock = dPlan.coords.physBlock; // [Nstick, M, lane]
+    int physRank = (int)physBlock.size();
 
     // Verify assumptions: exactly one floor dim, rest are opSlice.
     // The lane dim (innermost) and any identity parallel dims are opSliceDims.
@@ -1076,17 +1092,17 @@ struct RewriteDescriptorLayoutPass
     }
 
     // Logical C shape and the N-lane size from the physical plan.
-    // physShape[lane] is the stick-lane extent (e.g. 64); it equals the
+    // physBlock[lane] is the stick-lane extent (e.g. 64); it equals the
     // block-N of the logical C tile for a single-N-stick case. For multi-
-    // stick, logShape[1] = physShape[0] * physShape[lane].
+    // stick, logShape[1] = physBlock[0] * physBlock[lane].
     int laneDim = dPlan.lane; // innermost phys dim of D (= physRank-1)
-    int64_t laneSize = physShape[laneDim]; // e.g. 64
+    int64_t laneSize = physBlock[laneDim]; // e.g. 64
 
     // Build the loop list: one loop per floor dim, parallel only.
     SmallVector<Loop> loops;
     for (int p : dPlan.floorDims) {
       loops.push_back({Loop::Parallel, /*owner=*/0, p,
-                       physShape[p], dPlan.dimRoles[p], {}});
+                       physBlock[p], dPlan.dimRoles[p], {}});
     }
 
     // helpers
@@ -1094,8 +1110,8 @@ struct RewriteDescriptorLayoutPass
     Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
     Value c1 = arith::ConstantIndexOp::create(b, loc, 1);
 
-    // Build the initial physical D accumulator (tensor.empty over physShape).
-    SmallVector<int64_t> dPhysShape(physShape.begin(), physShape.end());
+    // Build the initial physical D accumulator (tensor.empty over physBlock).
+    SmallVector<int64_t> dPhysShape(physBlock.begin(), physBlock.end());
     Value dEmpty = tensor::EmptyOp::create(b, loc, dPhysShape, elemTy);
 
     // Sink-stage leaf body: extract the logical C sub-slice for the current
@@ -1153,7 +1169,7 @@ struct RewriteDescriptorLayoutPass
       // --- Insert cSlice into the physical D accumulator ---
       // offsets/sizes for each phys dim of D:
       //   floor dims p : offset = iv (stick index), size = 1
-      //   opSlice dims p: offset = 0, size = physShape[p]
+      //   opSlice dims p: offset = 0, size = physBlock[p]
       SmallVector<OpFoldResult> dOffsets(physRank), dSizes(physRank),
           dStrides(physRank, idx(1));
       for (int p = 0; p < physRank; ++p) {
@@ -1165,7 +1181,7 @@ struct RewriteDescriptorLayoutPass
           dSizes[p]   = idx(1);
         } else {
           dOffsets[p] = idx(0);
-          dSizes[p]   = idx(physShape[p]);
+          dSizes[p]   = idx(physBlock[p]);
         }
       }
       Value dNew = tensor::InsertSliceOp::create(
@@ -1320,7 +1336,7 @@ struct RewriteDescriptorLayoutPass
       //                   (one lane-step = 1 logical row)
       //
       // This is correct for any physical dim ordering and avoids the
-      // row-major-over-physShape assumption that breaks for stick-on-M.
+      // row-major-over-physBlock assumption that breaks for stick-on-M.
       physStaticStrides.resize(physRank);
       physDynStrides.clear();
       {
