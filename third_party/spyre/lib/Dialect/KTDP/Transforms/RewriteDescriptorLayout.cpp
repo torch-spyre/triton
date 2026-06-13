@@ -122,6 +122,32 @@ static std::optional<int64_t> applyStatic(int64_t logical, CoordOp op,
   return std::nullopt;
 }
 
+/// Walk a def-chain of index arithmetic back to the single BlockArgument it
+/// derives from.  Handles index_cast, muli-by-constant, divsi/remsi-by-constant,
+/// and addi-with-constant.  Returns the BlockArgument if the chain leads to
+/// exactly one, or nullptr otherwise.
+static BlockArgument traceToMLIRBlockArg(Value v) {
+  while (true) {
+    if (auto ba = dyn_cast<BlockArgument>(v))
+      return ba;
+    auto *op = v.getDefiningOp();
+    if (!op)
+      return nullptr;
+    // index_cast / trunci / extsi / extui: single operand chains
+    if (isa<arith::IndexCastOp, arith::IndexCastUIOp,
+            arith::TruncIOp, arith::ExtSIOp, arith::ExtUIOp>(op)) {
+      v = op->getOperand(0);
+      continue;
+    }
+    // muli / divsi / remsi / addi with a constant second operand
+    if (isa<arith::MulIOp, arith::DivSIOp, arith::RemSIOp, arith::AddIOp>(op)) {
+      if (op->getNumOperands() == 2 && getConstantInt(op->getOperand(1)))
+        { v = op->getOperand(0); continue; }
+    }
+    return nullptr;
+  }
+}
+
 /// Apply one coordinate op to an SSA index value.
 ///   identity -> the value unchanged
 ///   floordiv -> arith.divsi(value, arg)
@@ -873,15 +899,13 @@ struct RewriteDescriptorLayoutPass
     };
 
     // Matmul leaf body: given all loop IVs populated in `loops`, extract A
-    // and B slices via the unified extractOpSlice, transpose if needed, compute
-    // linalg.matmul into a FRESH zero, and add to the loop-carried accumulator.
+    // and B slices via the unified extractOpSlice, transpose if needed, then
+    // compute linalg.matmul(outs=acc) directly into the loop-carried accumulator.
     //
-    // Using fresh-zero matmul output (not the iter_arg directly) is essential:
-    // if the iter_arg were the matmul output, canonicalize would see that the
-    // iter_arg's init is zero and fold `iter_arg → zero` inside the loop,
-    // breaking K-stick accumulation (only the last stick would survive).
-    // The explicit `linalg.add(acc, prod)` form survives canonicalize because
-    // `prod` is a fresh temporary and `acc` is not the matmul output.
+    // S6: linalg.matmul semantics are result = outs + ins[0]@ins[1], so passing
+    // the iter_arg as outs IS the accumulation. The iter_arg's init is cVal (a
+    // block argument from the outer Triton K-loop), not a constant zero, so
+    // canonicalize cannot fold it away. No linalg.add; no fresh-zero matmul.
     auto matmulBody = [&](MutableArrayRef<Loop> /*ls*/,
                           ValueRange iterArgs) -> SmallVector<Value> {
       Value acc = iterArgs[0];
@@ -899,23 +923,10 @@ struct RewriteDescriptorLayoutPass
       Value aSlice = transposeA ? emitTranspose2D(aSlicePhys, aElemTy) : aSlicePhys;
       Value bSlice = transposeB ? emitTranspose2D(bSlicePhys, bElemTy) : bSlicePhys;
 
-      // Realize the contraction as the plan's "scf.for + accumulate" form:
-      // matmul this chunk into a FRESH zero to get the partial product, then
-      // ADD it to the loop-carried accumulator. We deliberately do NOT use the
-      // iter_arg as the matmul's outs (the natural accumulation): canonicalize
-      // sees the iter_arg's init is zero, rewrites the matmul's outs to a fresh
-      // in-loop zero-fill, and collapses the K-stick loop-carry — keeping only
-      // the last K-stick. The explicit add leaves no zero-init matmul to fold,
-      // so the reduction survives canonicalize. For the no-reduction case the
-      // loop runs once and this is just acc(=0) + A·B.
-      Value prodInit = arith::ConstantOp::create(
-          b, loc, DenseElementsAttr::get(accTy2D, b.getFloatAttr(accTy, 0.0)));
-      Value prod = linalg::MatmulOp::create(b, loc, accTy2D,
-          ValueRange{aSlice, bSlice}, ValueRange{prodInit}).getResult(0);
-      Value addOut = tensor::EmptyOp::create(b, loc, accTy2D.getShape(), accTy);
-      Value sum = linalg::AddOp::create(b, loc, accTy2D,
-          ValueRange{acc, prod}, ValueRange{addOut}).getResult(0);
-      return {sum};
+      // Accumulate directly: matmul(outs=acc) = acc + aSlice @ bSlice.
+      Value result = linalg::MatmulOp::create(b, loc, accTy2D,
+          ValueRange{aSlice, bSlice}, ValueRange{acc}).getResult(0);
+      return {result};
     };
 
     // The full logical C type comes from the matmul output operand.
@@ -1477,8 +1488,21 @@ struct RewriteDescriptorLayoutPass
     // by buildDirectAccessTile in LowerDescriptorMemory).
     SmallVector<Value> logIdx(tileOp.getIndices().begin(),
                                tileOp.getIndices().end());
-    // applyIndex expects i32 inputs; these are index-typed. Rebuild using index
-    // arithmetic directly (all the same: identity / divsi / const-0).
+    // For FloorDiv (stick-index) dims: trace the logical index back to its
+    // enclosing scf.for IV. If found, rescale the loop's trip by
+    // factor = BLOCK_d // stickSize (= arg for FloorDiv / arg for the Mod lane
+    // dim sharing the same logical src) and wire the IV directly. This discards
+    // the muli(%iv, BLOCK_d) + divsi chain that Phase 1 previously emitted.
+    // For Mod (lane) dims: always emit remsi (lane is never iterated).
+    // For Identity: pass through.
+    //
+    // stickSize for each logical src dim = physArg[lane_k] where lane_k is the
+    // Mod dim sharing that src. We collect it per logical src below.
+    SmallVector<int64_t> stickSizeForLogSrc(logBlock.size(), 0);
+    for (unsigned k = 0; k < physRank; ++k)
+      if (static_cast<CoordOp>(physOp[k]) == CoordOp::Mod)
+        stickSizeForLogSrc[physSrc[k]] = physArg[k];
+
     SmallVector<Value> physIdx;
     for (unsigned k = 0; k < physRank; ++k) {
       int64_t src = physSrc[k];
@@ -1490,9 +1514,51 @@ struct RewriteDescriptorLayoutPass
         physIdx.push_back(logI);
         break;
       case CoordOp::FloorDiv: {
-        Value c = arith::ConstantOp::create(b, loc, b.getIndexAttr(arg));
-        physIdx.push_back(
-            arith::DivSIOp::create(b, loc, logI, c).getResult());
+        // S6 Phase 1: attempt to trace logI back to an enclosing scf.for IV
+        // and rescale that loop to stick granularity.
+        BlockArgument iv = traceToMLIRBlockArg(logI);
+        scf::ForOp forOp = iv ? dyn_cast_or_null<scf::ForOp>(
+                                    iv.getOwner()->getParentOp())
+                              : nullptr;
+        if (forOp && forOp.getInductionVar() == iv) {
+          // Rescale: new_trip = old_trip * factor, step = 1.
+          // All bounds/step must have the same type (matches the IV type).
+          int64_t stickSize = stickSizeForLogSrc[src];
+          int64_t factor    = (stickSize > 0) ? (arg / stickSize) : 1;
+          Type ivTy = iv.getType();
+          if (factor > 1) {
+            // Emit the new upper bound BEFORE the loop (it must dominate the
+            // loop header). Use a separate builder positioned before forOp.
+            OpBuilder bBefore(forOp);
+            Location forLoc = forOp.getLoc();
+            Value oldUb = forOp.getUpperBound();
+            Value factorV = arith::ConstantOp::create(
+                bBefore, forLoc, bBefore.getIntegerAttr(ivTy, factor));
+            Value newUb = arith::MulIOp::create(bBefore, forLoc, oldUb, factorV)
+                              .getResult();
+            forOp.setUpperBound(newUb);
+          }
+          // Ensure step is 1.
+          {
+            OpBuilder bBefore(forOp);
+            Value c1v = arith::ConstantOp::create(
+                bBefore, forOp.getLoc(), bBefore.getIntegerAttr(ivTy, 1));
+            forOp.setStep(c1v);
+          }
+          // Wire the (now stick-granular) IV directly as the stick-index coord.
+          // construct_access_tiles requires index-typed operands; cast if needed.
+          // The cast is inserted before tileOp (inside the loop body).
+          Value ivIdx = ivTy.isIndex()
+                            ? iv
+                            : arith::IndexCastOp::create(b, loc,
+                                  b.getIndexType(), iv).getResult();
+          physIdx.push_back(ivIdx);
+        } else {
+          // No enclosing loop found (trip-1 / inline dim): fall back to divsi.
+          Value c = arith::ConstantOp::create(b, loc, b.getIndexAttr(arg));
+          physIdx.push_back(
+              arith::DivSIOp::create(b, loc, logI, c).getResult());
+        }
         break;
       }
       case CoordOp::Mod: {
