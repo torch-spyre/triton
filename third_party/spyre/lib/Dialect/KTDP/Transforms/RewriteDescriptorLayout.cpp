@@ -284,6 +284,28 @@ struct RewriteDescriptorLayoutPass
       eraseMarker(marker);
   }
 
+  // Generic stick-loop helper: emits scf.for s=0..factor iter_args(acc) and
+  // calls body(builder, stickIV, acc). For factor<=1, calls body with the
+  // outer builder and a constant-0 IV (no loop emitted). Used by both the
+  // matmul source stage and the store sink scatter.
+  Value emitStickLoop(OpBuilder &b, Location loc, int64_t factor, Value acc,
+                      function_ref<Value(OpBuilder &, Value, Value)> body) {
+    if (factor <= 1) {
+      Value s0 = arith::ConstantIndexOp::create(b, loc, 0);
+      return body(b, s0, acc);
+    }
+    Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
+    Value c1 = arith::ConstantIndexOp::create(b, loc, 1);
+    Value ub = arith::ConstantIndexOp::create(b, loc, factor);
+    auto forOp = scf::ForOp::create(b, loc, c0, ub, c1, ValueRange{acc});
+    OpBuilder ib = OpBuilder::atBlockBegin(forOp.getBody());
+    Value stepped =
+        body(ib, forOp.getInductionVar(), forOp.getRegionIterArgs()[0]);
+    scf::YieldOp::create(ib, loc, ValueRange{stepped});
+    b.setInsertionPointAfter(forOp);
+    return forOp.getResult(0);
+  }
+
   // Walk all linalg.matmul ops; fix any whose operands are rank-3 (physical).
   // Phase 2 driver: walk contraction ops whose operands have been physicalized
   // to rank > 2 and synthesize the scf.for loop nest that produces a 2D result.
@@ -920,30 +942,7 @@ struct RewriteDescriptorLayoutPass
           b, loc, resultTy, plan.value, offsets, sizes, strides);
     };
 
-    // emitStickLoop: generic helper — emits scf.for s=0..factor iter_args(acc)
-    // and calls body(bodyBuilder, stickIV, acc) to get the next accumulator.
-    // For factor==1, calls body with the outer builder and a constant 0 IV.
-    // After the call, `b` is positioned after the for op (or unchanged for 1).
-    auto emitStickLoop = [&](int64_t factor, Value acc,
-                             function_ref<Value(OpBuilder &, Value, Value)> body)
-        -> Value {
-      if (factor <= 1) {
-        Value s0 = arith::ConstantIndexOp::create(b, loc, 0);
-        return body(b, s0, acc);
-      }
-      Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
-      Value c1 = arith::ConstantIndexOp::create(b, loc, 1);
-      Value ub = arith::ConstantIndexOp::create(b, loc, factor);
-      auto forOp = scf::ForOp::create(b, loc, c0, ub, c1, ValueRange{acc});
-      OpBuilder ib = OpBuilder::atBlockBegin(forOp.getBody());
-      Value stepped = body(ib, forOp.getInductionVar(),
-                           forOp.getRegionIterArgs()[0]);
-      scf::YieldOp::create(ib, loc, ValueRange{stepped});
-      b.setInsertionPointAfter(forOp);
-      return forOp.getResult(0);
-    };
-
-    Value result = emitStickLoop(stickFactor, cVal,
+    Value result = emitStickLoop(b, loc, stickFactor, cVal,
         [&](OpBuilder &bb, Value s, Value acc) {
       stickIV = s;
       // Temporarily redirect b so extractOpSlice / emitTranspose2D use bb.
@@ -1009,7 +1008,7 @@ struct RewriteDescriptorLayoutPass
 
     auto logTy = cast<RankedTensorType>(logicalC.getType());
     Type elemTy = logTy.getElementType();
-    ArrayRef<int64_t> logShape = logTy.getShape(); // [M, N_total]
+    ArrayRef<int64_t> logShape = logTy.getShape(); // [BLOCK_M, BLOCK_N] — per-block tile
 
     ArrayRef<int64_t> physBlock = dPlan.coords.physBlock; // [Nstick, M, lane]
     int physRank = (int)physBlock.size();
@@ -1042,12 +1041,10 @@ struct RewriteDescriptorLayoutPass
       }
     }
 
-    // Logical C shape and the N-lane size from the physical plan.
-    // physBlock[lane] is the stick-lane extent (e.g. 64); it equals the
-    // block-N of the logical C tile for a single-N-stick case. For multi-
-    // stick, logShape[1] = physBlock[0] * physBlock[lane].
+    // stickSize = lane extent (e.g. 64). factor = how many D sticks the logical
+    // C tile spans on the floor dim = logShape[logDim] / stickSize.
     int laneDim = dPlan.lane; // innermost phys dim of D (= physRank-1)
-    int64_t laneSize = physBlock[laneDim]; // e.g. 64
+    int64_t stickSize = physBlock[laneDim]; // e.g. 64
 
     // helpers
     auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
@@ -1075,48 +1072,67 @@ struct RewriteDescriptorLayoutPass
       }
     }
 
-    // --- Extract sub-slice from logical C ---
+    // Base C-extract parameters (offset 0, full size on every dim).
     int logRank = (int)logShape.size();
-    SmallVector<OpFoldResult> cOffsets(logRank), cSizes(logRank),
+    SmallVector<OpFoldResult> cOffsetsBase(logRank), cSizesBase(logRank),
         cStrides(logRank, idx(1));
-    SmallVector<int64_t> cSliceShape(logShape.begin(), logShape.end());
     for (int d = 0; d < logRank; ++d) {
-      cOffsets[d] = idx(0);
-      cSizes[d]   = idx(logShape[d]);
+      cOffsetsBase[d] = idx(0);
+      cSizesBase[d]   = idx(logShape[d]);
     }
-    for (int p : dPlan.floorDims) {
-      int64_t logDim = dPlan.dimRoles[p];
-      if (logDim < 0 || logDim >= logRank) continue;
-      Value iv = floorIVs[p];
-      Value laneSizeVal = arith::ConstantIndexOp::create(b, loc, laneSize);
-      Value offset = arith::MulIOp::create(b, loc, iv, laneSizeVal).getResult();
-      cOffsets[logDim] = offset;
-      cSizes[logDim]   = idx(laneSize);
-      cSliceShape[logDim] = laneSize;
-    }
-    auto cSliceTy = RankedTensorType::get(cSliceShape, elemTy);
-    Value cSlice = tensor::ExtractSliceOp::create(
-        b, loc, cSliceTy, logicalC, cOffsets, cSizes, cStrides);
 
-    // --- Insert cSlice into the physical D accumulator ---
-    SmallVector<OpFoldResult> dOffsets(physRank), dSizes(physRank),
+    // Base D-insert parameters (offset 0 / full size for non-floor dims).
+    SmallVector<OpFoldResult> dOffsetsBase(physRank), dSizes(physRank),
         dStrides(physRank, idx(1));
     for (int p = 0; p < physRank; ++p) {
       bool isFloor = llvm::is_contained(dPlan.floorDims, p);
-      if (isFloor) {
-        Value iv = floorIVs[p];
-        dOffsets[p] = iv.getType().isIndex()
-                          ? OpFoldResult(iv)
-                          : OpFoldResult(arith::IndexCastOp::create(
-                                b, loc, b.getIndexType(), iv).getResult());
-        dSizes[p] = idx(1);
-      } else {
-        dOffsets[p] = idx(0);
-        dSizes[p]   = idx(physBlock[p]);
-      }
+      dOffsetsBase[p] = idx(0);
+      dSizes[p] = isFloor ? idx(1) : idx(physBlock[p]);
     }
-    Value result = tensor::InsertSliceOp::create(
-        b, loc, cSlice, dEmpty, dOffsets, dSizes, dStrides);
+
+    // For each floor dim, scatter `factor` stick-slices of logical C into the
+    // physical D accumulator.
+    //   factor  = logShape[logDim] / stickSize   (BLOCK_N / 64)
+    //   C-extract offset on logDim = s * stickSize
+    //   D-insert offset on physDim = s   (within-block index; dEmpty is always
+    //                                      physBlock-sized, floor dim = factor)
+    // `n` (enclosing N-block IV) is NOT used here — the access tile already
+    // encodes the global N position. We only fill the local dEmpty buffer.
+    // For factor==1 (BLOCK_N == stickSize), emitStickLoop elides the loop
+    // (s=0), giving: cOffset=0 (whole tile), dOffset=0 — copy the whole tile.
+    Value acc = dEmpty;
+    for (int p : dPlan.floorDims) {
+      int64_t logDim = dPlan.dimRoles[p];
+      if (logDim < 0 || logDim >= logRank) continue;
+
+      int64_t factor = logShape[logDim] / stickSize;
+      Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
+
+      // Slice shape: stickSize on logDim, full extent elsewhere.
+      SmallVector<int64_t> slShape(logShape.begin(), logShape.end());
+      slShape[logDim] = stickSize;
+      auto slTy = RankedTensorType::get(slShape, elemTy);
+
+      acc = emitStickLoop(b, loc, factor, acc,
+          [&](OpBuilder &bb, Value s, Value dAcc) -> Value {
+            // C-extract: s-th stick-slice of the tile on logDim.
+            SmallVector<OpFoldResult> cOff = cOffsetsBase;
+            SmallVector<OpFoldResult> cSz  = cSizesBase;
+            cOff[logDim] =
+                arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
+            cSz[logDim] = idx(stickSize);
+            Value cSlice = tensor::ExtractSliceOp::create(
+                bb, loc, slTy, logicalC, cOff, cSz, cStrides);
+
+            // D-insert: position s within the local dEmpty buffer.
+            SmallVector<OpFoldResult> dOff = dOffsetsBase;
+            Value dStick = s; // within-block index (0..factor-1)
+            dOff[p] = dStick;
+            return tensor::InsertSliceOp::create(
+                bb, loc, cSlice, dAcc, dOff, dSizes, dStrides);
+          });
+    }
+    Value result = acc;
 
     // Redirect the store's data_tile to the physical result.
     st.getDataTileMutable().set(result);
