@@ -34,6 +34,7 @@ struct GlobalMemory : public SideEffects::Resource::Base<GlobalMemory> {
   StringRef getName() final { return "<GlobalMemory>"; }
 #else
   StringRef getName() const final { return "<GlobalMemory>"; }
+  SideEffects::Resource *getParent() const override { return nullptr; }
 #endif
   // --- END --- added for spyre
 };

@@ -15,12 +15,14 @@
 #include "triton/Target/LLVMIR/Passes.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Tools/PluginUtils.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <string>
 
 namespace py = pybind11;
+
+namespace {
 
 #ifndef TRITON_BUILD_TTIR_ONLY
 void init_triton_analysis(py::module &&m) {
@@ -153,6 +155,8 @@ void init_gluon_passes(py::module &&m) {
                      gluon::createGluonInferCoalescedEncodingsPass);
 }
 #endif
+
+} // namespace
 
 void init_triton_passes(py::module &&m) {
 #ifndef TRITON_BUILD_TTIR_ONLY
