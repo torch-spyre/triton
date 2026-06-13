@@ -9,8 +9,8 @@
 | S3   | DONE   | `buildExtract` + hand-rolled B extract + `ks*KA` deleted. Unified `extractOpSlice` lambda: A's `reduceLoop` dims indexed by their own IVs; B's `reduceInner` (K-flat) offset by reduction IV, size=1 stick. Golden diff empty. Commit: `0e73345e9`. |
 | S4   | DONE   | `strides`/`sizes` (`SmallVector<OpFoldResult>`) added to `OperandPlan`. `getMemViewForOperand` + `threadStridesAndSizes` helpers added. Wired into `dispatchMatmul`. Not yet consumed (S5 flips switch). Golden diff empty. Commit: `2748a1fa5`. Note: no consistency assert between `plan.sizes` (full descriptor extents) and `coords.physShape` (block extents) — see TODO(S5) comment in `threadStridesAndSizes`. |
 | S5   | DONE   | Per-dim `SliceKind` (now named `StickIndex`/`StickifiedBlock`/`WholeBlock`) + `stickSize` in `OperandPlan`. `extractOpSlice` + slice-type calc are pure lookups. Multi-stick B K-flat fix (size=stickSize, offset=k*stickSize, (owner,physDim) IV lookup). Renamed `physShape`→`physBlock` (it is always the block extent, never the full tensor shape). Cross-operand fix: `reconcilePlans()` demotes `StickifiedBlock`→`WholeBlock` when neither operand has a `reduceLoop` (single-stick matmul has K-block > stick but no reduction loop). Commit `a884007b5`. **Rejected (do not re-attempt):** (a) `plan.strides` in extract strides (element strides, always 1). (b) `plan.sizes` for `collectLoops` trips (wrong source — full descriptor extent). (c) removing `coords.op` from floor detection (floordiv can sit at any phys position). |
-| S5-blocker | ktir-cpu | `spyre_stick_k_dynamic` numerical needs ktir-cpu to resolve dynamic `tensor.extract_slice`/`insert_slice` offsets (the B K-flat offset is a runtime `k*stickSize`). The interpreter reads only the static offset array and uses the kDynamic sentinel → empty slice. Documented in ktir-cpu's `DYNAMIC_SLICE_OFFSET_PROBLEM.md`; fixed separately on the ktir-cpu side. Structural tests are green. |
-| S6   | IN PROGRESS | Rescale the EXISTING loops to physical stick granularity. **Phase 1** now rescales each enclosing logical loop (`new_trip = old_trip * (BLOCK_d // stickSize)`, step 1) and wires the IV straight into the physical stick-index coord operand, discarding the `muli`+`divsi`/`remsi` chain. **Phase 2** (`emitMatmulStage`) does 2D slicing + reconciles the accumulator: `matmul(outs=acc)` into the existing `%arg5` iter_arg directly (single output stick) or extract/insert a sub-block (multi output stick); no `linalg.add`; RAUW old `mm`→new result, erase `mm`. Keep ALL loops (erasing the M-loop kills the `descriptor_store` inside it). Old baseline (`a884007b5`) inits acc with `cVal` → resets each K-tile → `spyre_stick_k` numerically wrong. See S6 section + CONTINUATION_PROMPT.md. |
+| S5-blocker | ktir-cpu | `spyre_stick_k_dynamic` numerical needs ktir-cpu to resolve dynamic `tensor.extract_slice`/`insert_slice` offsets (the B K-flat offset is a runtime `k*stickSize`). Fixed in ktir-cpu worktree `missing-ops`. |
+| S6   | DONE | Phase 1: `traceToMLIRBlockArg` walks the def-chain back to the enclosing `scf.for` IV; loop trip rescaled by `factor = BLOCK_d // stickSize` (upper bound emitted before the loop); IV cast to index and wired directly as the stick-index coord operand — `muli`+`divsi` chain discarded. Phase 2: `linalg.matmul(outs=iter_arg)` replaces fresh-zero matmul + `linalg.add`; iter_arg init is `cVal` (outer K-loop block arg, not a constant), so canonicalize cannot fold it. 461 passed / 27 skipped. Commit `f38e79a34`. |
 | S7   | TODO   | Unify parallel nest into `emitNest`; delete `emitParallelNest`. Only if parallel loops carry nothing after S6. |
 | S8   | TODO   | Apply S2-S5 + S6 loop-replacement to `emitStoreStage` (same `-2`-free model + `iv*laneSize` R-a violation at :1022). |
 | S9   | TODO   | Factor the proven S6 loop-replacement machinery into an op-agnostic core; matmul + store as leaf-body instances. Deferred until concrete paths are green. |
@@ -307,27 +307,32 @@ stick-granular, carrying the **existing** `%arg5` (= `dense<0>` C tile).
 stage leaves behind (the existing reduction loop's result). No accumulator to
 manage. (Sink loop rescale is S8.)
 
-### Open implementation questions (resolve while coding)
+### What was implemented (commit `f38e79a34`)
 
-- Loop rescale API: mutate the existing `scf::ForOp` bounds/step in place
-  (`setLowerBound`/`setUpperBound`/`setStep`) vs. build a replacement loop. In
-  place is preferred — it keeps the iter_args, results, body, and the enclosing
-  M-loop + `descriptor_store` valid with no RAUW.
-- Single-output-stick keeps the existing `%arg5` iter_arg unchanged; only the
-  matmul `outs` wiring changes. Multi-output-stick adds extract/insert around it.
-- Parallel (M/N) loops are trip-1 for the current fixtures and already fold —
-  for them `factor==1` so the rescale is a no-op; do not special-case.
+**Phase 1 — `rewriteAccessTile`:**
+- `traceToMLIRBlockArg` helper walks a def-chain of `index_cast`/`muli`/`divsi`/
+  `remsi`/`addi`-with-const back to the single `BlockArgument` it derives from.
+- For each `FloorDiv` physical dim: trace `logIdx[src]` → IV → enclosing
+  `scf::ForOp`. If found: emit `old_ub * factor` BEFORE the loop (using a
+  separate `OpBuilder(forOp)` so the value dominates the loop header); set the
+  step to 1 (same type as the IV — `i32` in current fixtures); cast the IV to
+  `index` (required by `construct_access_tiles`) and wire it as the coord.
+  Falls back to `divsi` when no enclosing loop is found (trip-1/inline dims).
+- `factor = BLOCK_d // stickSize`; `stickSize` collected per logical src from
+  the Mod dim sharing that src in the same coord map.
 
-### IR shape change
+**Phase 2 — `emitMatmulStage` / `matmulBody`:**
+- Replaced `fresh-zero matmul + linalg.add` with
+  `linalg.matmul(ins={aSlice,bSlice}, outs=acc)` directly.
+- `acc` is the loop-carried iter_arg, initialized to `cVal` (the outer Triton
+  K-loop's block argument) — not a constant zero, so canonicalize cannot fold it.
+- `linalg.add` and `tensor::EmptyOp` for the add output are gone.
 
-For `spyre_stick_k`: trip unchanged (`factor==1`); `%arg4` feeds the physical
-stick-index coords directly; `%12 = muli %arg4, 64` and the `divsi`/`remsi` are
-gone. Post-canonicalize confirm the EXISTING K-loop now reads `%arg5` as the
-matmul `outs`:
-`scf.for %arg4 ... iter_args(%acc = <zero>) { ... linalg.matmul(..., outs=%acc) ... }`
-(not a bare `%cst`, not a `linalg.add`); the old `tt.dot`-derived matmul is DCE'd.
+**Numerical blocker resolved:** ktir-cpu worktree `missing-ops` adds
+`tensor.extract_slice` support; install with
+`uv pip install -e /Users/flim/AI/ktir-cpu.worktrees/missing-ops --no-build-isolation`.
 
-**Green check** including `spyre_stick_k` numerical; golden diff intentional.
+**Result:** 461 passed / 27 skipped. `spyre_stick_k` numerically correct.
 
 ---
 
