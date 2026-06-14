@@ -531,67 +531,7 @@ struct RewriteDescriptorLayoutPass
     int64_t  parallelOutputAxis; // output axis this operand contributes to (its parallelRole)
     int64_t  parallelExtent;     // post-transpose extent along that output axis
 
-    // Threaded from the physical construct_memory_view (R-a). Populated by
-    // dispatchMatmul / dispatchSink after classify(); consumed by S5.
-    SmallVector<OpFoldResult> strides; // physical stride per dim (attr=static, Value=dynamic)
-    SmallVector<OpFoldResult> sizes;   // physical extent per dim (attr=static, Value=dynamic)
   };
-
-  // Same walk as findMarkerForOperand, but returns the physical
-  // ConstructMemoryViewOp rather than the marker. Used by dispatchMatmul to
-  // thread strides/sizes into the OperandPlan (S4).
-  mlir::ktdp::ConstructMemoryViewOp getMemViewForOperand(Value operand) {
-    auto ld = walkToLoad(operand);
-    if (!ld)
-      return {};
-    auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
-        ld.getAccessTile().getDefiningOp());
-    if (!tile)
-      return {};
-    return tile.getBase().getDefiningOp<mlir::ktdp::ConstructMemoryViewOp>();
-  }
-
-  // Populate plan.strides and plan.sizes from the physical ConstructMemoryViewOp
-  // that backs the operand's load. Static dims become IndexAttr; dynamic dims
-  // become the SSA Value from the memViewOp's dynamic operand lists.
-  // Also asserts static consistency: sizes[p] == coords.physBlock[p] for every
-  // statically-known dim (catches mismatches between the tensor type and the
-  // memView before S5 flips consumers to the threaded values).
-  static LogicalResult threadStridesAndSizes(
-      OperandPlan &plan, mlir::ktdp::ConstructMemoryViewOp memViewOp,
-      MLIRContext *ctx) {
-    ArrayRef<int64_t> staticSizes   = memViewOp.getStaticSizes();
-    ArrayRef<int64_t> staticStrides = memViewOp.getStaticStrides();
-    auto dynSizes   = memViewOp.getSizes();
-    auto dynStrides = memViewOp.getStrides();
-
-    int physRank = (int)staticSizes.size();
-    plan.sizes.resize(physRank);
-    plan.strides.resize(physRank);
-
-    // TODO(S5): Revisit whether a consistency check between plan.sizes and
-    // coords.physBlock is appropriate here. They serve different purposes:
-    // - plan.sizes[p] (from memViewOp) = full descriptor extent = trip count
-    //   for floor dims, or full physical extent for opSlice/lane dims.
-    // - coords.physBlock[p] (from the load result tensor type) = block extent
-    //   = 1 for floor dims (one stick per block), physBlock[p] for opSlice.
-    // They are NOT equal in general (e.g. floor dim: 1 vs N_sticks; M-row dim:
-    // BM vs M_total). A check needs to verify each dim category independently.
-    int dynSzPos = 0, dynStPos = 0;
-    for (int p = 0; p < physRank; ++p) {
-      if (staticSizes[p] != ShapedType::kDynamic) {
-        plan.sizes[p] = IntegerAttr::get(IndexType::get(ctx), staticSizes[p]);
-      } else {
-        plan.sizes[p] = dynSizes[dynSzPos++];
-      }
-      if (staticStrides[p] != ShapedType::kDynamic) {
-        plan.strides[p] = IntegerAttr::get(IndexType::get(ctx), staticStrides[p]);
-      } else {
-        plan.strides[p] = dynStrides[dynStPos++];
-      }
-    }
-    return success();
-  }
 
   // One loop dim whose IV is needed by extractOpSlice / the store insert.
   // Collected from the existing scf.for nest by collectExistingLoopIVs.
@@ -834,7 +774,6 @@ struct RewriteDescriptorLayoutPass
   LogicalResult dispatchSource(OpT op, const SourceOpSpec &spec) {
     unsigned nOps = spec.operands.size();
     SmallVector<OperandPlan, 2> plans(nOps);
-    MLIRContext *ctx = op.getContext();
 
     for (unsigned i = 0; i < nOps; ++i) {
       auto marker = findMarkerForOperand(op.getInputs()[i]);
@@ -852,17 +791,6 @@ struct RewriteDescriptorLayoutPass
     }
 
     resolveAndReconcile(plans, spec);
-
-    // S4: thread physical strides/sizes from the construct_memory_view into
-    // the plans. Not yet consumed by emitSourceStage (S5 flips the switch).
-    for (unsigned i = 0; i < nOps; ++i) {
-      auto memView = getMemViewForOperand(op.getInputs()[i]);
-      if (!memView)
-        return op.emitError(
-            "spyre_tensor_layout: cannot locate physical memory view for source op operand");
-      if (failed(threadStridesAndSizes(plans[i], memView, ctx)))
-        return failure();
-    }
 
     return emitSourceStage(op, spec.emitOp, plans);
   }
@@ -1046,14 +974,6 @@ struct RewriteDescriptorLayoutPass
       return linalg::TransposeOp::create(b, loc, src, empty,
           b.getDenseI64ArrayAttr({1, 0})).getResult()[0];
     };
-
-    // Collect IVs from the existing enclosing scf.for loops (wired by Phase 1).
-    // Use the first plan's loopDims as the reduction-dim reference (all plans
-    // share the same reduction loop structure for a given contraction op).
-    SmallVector<Loop> loops;
-    for (unsigned i = 0; i < plans.size(); ++i)
-      collectLoopIVsForTile(op, tileForPlan(plans[i]), (int)i,
-                            plans[0].loopDims, loops);
 
     // Determine if a StickifiedBlock dim exists and what factor it has.
     int64_t stickFactor = 1;
