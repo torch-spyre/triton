@@ -43,16 +43,10 @@
 //                                   logical-typed; sink stage fixes it in Phase 2)
 //         (marker kept alive for Phase 2)
 //     Phase 2 — synthesizeContractions (loop-until-stable):
-//       source: dispatchMatmul(mm) → dispatchSource<MatmulOp>(mm, K-wiring)
-//         findMarkerForOperand / walkToLoad  trace load chain -> marker
-//         isSingleTensorElementwiseOp        shared predicate for all walks
-//         classify                  build OperandPlan (dimRoles, floorDims, loopDims…)
-//         emitSourceStage           extract slices + linalg.matmul; inner stick
-//                                   loop (emitStickLoop) for StickifiedBlock
-//       sink:   dispatchSink(st)   (only when output descriptor is annotated)
-//         findMarkerForStore        forward worklist walk -> marker
-//         classify / emitSinkStage  scatter inputTile into physicalSink
-//                                   via tensor.insert_slice
+//       single walk → dispatchOne per op type:
+//         linalg.MatmulOp → dispatchMatmul → dispatchSource (classify, emitSourceStage)
+//         ktdp.StoreOp    → dispatchSink   (classify, emitSinkStage)
+//       add new contraction/sink types to dispatchOne + a dispatchXxx helper
 //     Phase 3 — eraseMarker (marker + dead bridge cast)
 //
 //   Coord helpers (free functions):
@@ -71,6 +65,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineMap.h"
@@ -271,63 +266,55 @@ struct RewriteDescriptorLayoutPass
     return forOp.getResult(0);
   }
 
-  // Walk all linalg.matmul ops; fix any whose operands are rank-3 (physical).
-  // Phase 2 driver: walk contraction ops whose operands have been physicalized
-  // to rank > 2 and synthesize the scf.for loop nest that produces a 2D result.
-  // Also walks ktdp.store ops whose output descriptor is annotated (data_tile
-  // is logical but access_tile is already physical from Phase 1) and calls
-  // dispatchSink to synthesize the scatter nest. Repeats until stable.
-  // Currently handles linalg.matmul + ktdp.store; extend by adding a dispatch
-  // branch for other contraction / sink ops as needed.
+  // Return true and dispatch if `op` needs Phase 2 processing, false if not.
+  // Source ops (matmul, …): rank-mismatched inputs → dispatch, erase, RAUW.
+  // Sink ops (store): data/tile rank mismatch with a marker → redirect data_tile.
+  // Add new op types here; synthesizeContractions drives the loop generically.
+  LogicalResult dispatchOne(Operation *op, bool &changed) {
+    // Shared predicate for all linalg source ops: true if any input rank
+    // exceeds logicalRank, meaning Phase 1 has physicalized at least one input.
+    auto sourceNeedsDispatch = [](linalg::LinalgOp op, unsigned logicalRank) {
+      return llvm::any_of(op.getDpsInputOperands(), [logicalRank](OpOperand *operand) {
+        auto t = dyn_cast<RankedTensorType>(operand->get().getType());
+        return t && t.getRank() > (int)logicalRank;
+      });
+    };
+
+    if (auto mm = dyn_cast<linalg::MatmulOp>(op))
+      return sourceNeedsDispatch(mm, 2) ? (changed = true, dispatchMatmul(mm)) : success();
+
+    if (auto st = dyn_cast<mlir::ktdp::StoreOp>(op)) {
+      auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
+      auto tileTy = dyn_cast<mlir::ktdp::AccessTileType>(
+          st.getAccessTile().getType());
+      if (!dataTy || !tileTy ||
+          dataTy.getRank() == (int)tileTy.getShape().size())
+        return success();
+      auto marker = findMarkerForStore(st.getDataTile());
+      if (!marker)
+        return success();
+      changed = true;
+      return dispatchSink(st, marker);
+    }
+    return success();
+  }
+
+  // Phase 2 driver. Single walk collects all candidate ops; dispatchOne
+  // handles each by type. Repeats until no op triggers a dispatch (onion-peel
+  // for chained contractions). Terminates because each iteration strictly
+  // reduces the number of mismatched ops and the IR is finite.
   LogicalResult synthesizeContractions(ModuleOp module) {
-    // Onion-peeling: each iteration physicalizes one layer of the def chain.
-    // Terminates because each iteration strictly reduces the number of
-    // rank-mismatched ops (Phase 1 already handles single-tensor chains;
-    // Phase 2 handles multi-tensor ops whose inputs were retyped by Phase 1
-    // or by a prior Phase 2 iteration). The IR is finite so the loop converges.
     bool changed = true;
     while (changed) {
       changed = false;
-
-      // --- matmul source stage ---
-      SmallVector<linalg::MatmulOp> matmuls;
-      module.walk([&](linalg::MatmulOp op) { matmuls.push_back(op); });
-      for (auto mm : matmuls) {
-        auto aType = dyn_cast<RankedTensorType>(mm.getInputs()[0].getType());
-        auto bType = dyn_cast<RankedTensorType>(mm.getInputs()[1].getType());
-        if (!aType || !bType)
-          continue;
-        if (aType.getRank() == 2 && bType.getRank() == 2)
-          continue;
-        if (failed(dispatchMatmul(mm)))
+      SmallVector<Operation *> candidates;
+      module.walk([&](Operation *op) {
+        if (isa<linalg::MatmulOp, mlir::ktdp::StoreOp>(op))
+          candidates.push_back(op);
+      });
+      for (auto *op : candidates)
+        if (failed(dispatchOne(op, changed)))
           return failure();
-        changed = true;
-      }
-
-      // --- store sink stage ---
-      SmallVector<mlir::ktdp::StoreOp> stores;
-      module.walk([&](mlir::ktdp::StoreOp op) { stores.push_back(op); });
-      for (auto st : stores) {
-        // Check for rank mismatch: data_tile is logical (rank 2) but access_tile
-        // is physical (rank 3). This mismatch is left by Phase 1 when the output
-        // descriptor carries a tt.spyre_tensor_layout marker.
-        auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
-        auto tileTy = dyn_cast<mlir::ktdp::AccessTileType>(
-            st.getAccessTile().getType());
-        if (!dataTy || !tileTy)
-          continue;
-        int dataRank = dataTy.getRank();
-        int tileRank = (int)tileTy.getShape().size();
-        if (dataRank == tileRank)
-          continue; // already consistent — unannotated path or already lowered
-        // Only proceed when there is a layout marker for the output descriptor.
-        auto marker = findMarkerForStore(st.getDataTile());
-        if (!marker)
-          continue;
-        if (failed(dispatchSink(st, marker)))
-          return failure();
-        changed = true;
-      }
     }
     return success();
   }
@@ -469,11 +456,10 @@ struct RewriteDescriptorLayoutPass
 
     // Resolved fields — filled by resolveAndReconcile() after classify().
     // emitSourceStage reads these only; it does not re-derive from spec/dimRoles.
-    bool     needsTranspose;    // true iff the op-tile must be transposed before the op
-    int64_t  opExtentLo;        // extent of opTileDims[0] after slicing (pre-transpose)
-    int64_t  opExtentHi;        // extent of opTileDims[1] after slicing (pre-transpose)
-    int64_t  parallelOutputAxis; // output axis this operand contributes to (its parallelRole)
-    int64_t  parallelExtent;     // post-transpose extent along that output axis
+    bool                needsTranspose;    // true iff the op-tile must be transposed before the op
+    SmallVector<int64_t> opExtents;        // extent of each opTileDim after slicing (pre-transpose)
+    int64_t             parallelOutputAxis; // output axis this operand contributes to (its parallelRole)
+    int64_t             parallelExtent;     // post-transpose extent along that output axis
 
   };
 
@@ -616,7 +602,7 @@ struct RewriteDescriptorLayoutPass
   // Descriptor for one source contraction op (e.g. linalg.matmul).
   // `emitOp` receives all (possibly transposed) input slices + accumulator
   // and returns the updated accumulator. Acc shape is derived from each
-  // operand's resolved opExtentLo/Hi + needsTranspose fields by emitSourceStage.
+  // operand's resolved opExtents + needsTranspose fields by emitSourceStage.
   struct SourceOpSpec {
     SmallVector<SourceOperandSpec> operands;  // one per input
     unsigned logicalRank;
@@ -666,8 +652,8 @@ struct RewriteDescriptorLayoutPass
 
     // Resolved fields: no transpose; extents straight from shape.
     plan.needsTranspose     = false;
-    plan.opExtentLo         = tensorTy.getDimSize(0);
-    plan.opExtentHi         = tensorTy.getDimSize(rank - 1);
+    for (int p : plan.opTileDims)
+      plan.opExtents.push_back(tensorTy.getDimSize(p));
     plan.parallelOutputAxis = parallelRole(opSpec);
     plan.parallelExtent     = tensorTy.getDimSize(rank - 1);
     return plan;
@@ -703,7 +689,7 @@ struct RewriteDescriptorLayoutPass
       } else {
         // No load found. Scratchpad if produced by a contraction, error otherwise.
         auto *defOp = operand.getDefiningOp();
-        if (!defOp || !isa<linalg::MatmulOp>(defOp))
+        if (!defOp || !isContractionOp(defOp))
           return op.emitError(
               "spyre_tensor_layout: source op operand is neither a physical "
               "load nor a scratchpad contraction result");
@@ -782,7 +768,7 @@ struct RewriteDescriptorLayoutPass
   // 2. StickifiedBlock demotion: StickifiedBlock is only valid when some plan
   //    has loopDims. When none do, demote all StickifiedBlock to WholeBlock so
   //    extractOpSlice never uses a null IV. (Must run after resolution because
-  //    opExtentLo/Hi must reflect the demoted kind.)
+  //    opExtents must reflect the demoted kind.)
   // Resolve per-operand transpose, extents, and output-axis contribution. All
   // einsum knowledge (canonicalAxes) is consumed here; emitSourceStage works
   // from resolved fields only and never touches the spec again.
@@ -792,15 +778,19 @@ struct RewriteDescriptorLayoutPass
     for (unsigned i = 0; i < plans.size(); ++i) {
       OperandPlan &plan = plans[i];
       const SourceOperandSpec &opSpec = spec.operands[i];
-      int dimLo = plan.opTileDims[0], dimHi = plan.opTileDims[1];
+      int dimLo = plan.opTileDims[0];
       plan.needsTranspose = needsTranspose(opSpec, plan.dimRoles[dimLo]);
-      plan.opExtentLo = opSliceExtent(plan, dimLo);
-      plan.opExtentHi = opSliceExtent(plan, dimHi);
+      plan.opExtents.clear();
+      for (int p : plan.opTileDims)
+        plan.opExtents.push_back(opSliceExtent(plan, p));
       plan.parallelOutputAxis = parallelRole(opSpec);
+      // parallelExtent: extent of the unique non-reduction opTileDim after transpose.
       SmallVector<bool> redMask = isReduction(opSpec);
+      int64_t extLo = plan.opExtents[0];
+      int64_t extHi = plan.opExtents.size() > 1 ? plan.opExtents[1] : extLo;
       plan.parallelExtent = !redMask[0]
-                                ? (plan.needsTranspose ? plan.opExtentHi : plan.opExtentLo)
-                                : (plan.needsTranspose ? plan.opExtentLo : plan.opExtentHi);
+                                ? (plan.needsTranspose ? extHi : extLo)
+                                : (plan.needsTranspose ? extLo : extHi);
     }
 
     // Step 2 — StickifiedBlock demotion.
@@ -816,13 +806,15 @@ struct RewriteDescriptorLayoutPass
       for (unsigned i = 0; i < plans.size(); ++i) {
         OperandPlan &plan = plans[i];
         const SourceOperandSpec &opSpec = spec.operands[i];
-        int dimLo = plan.opTileDims[0], dimHi = plan.opTileDims[1];
-        plan.opExtentLo = opSliceExtent(plan, dimLo);
-        plan.opExtentHi = opSliceExtent(plan, dimHi);
+        plan.opExtents.clear();
+        for (int p : plan.opTileDims)
+          plan.opExtents.push_back(opSliceExtent(plan, p));
         SmallVector<bool> redMask = isReduction(opSpec);
+        int64_t extLo = plan.opExtents[0];
+        int64_t extHi = plan.opExtents.size() > 1 ? plan.opExtents[1] : extLo;
         plan.parallelExtent = !redMask[0]
-                                  ? (plan.needsTranspose ? plan.opExtentHi : plan.opExtentLo)
-                                  : (plan.needsTranspose ? plan.opExtentLo : plan.opExtentHi);
+                                  ? (plan.needsTranspose ? extHi : extLo)
+                                  : (plan.needsTranspose ? extLo : extHi);
       }
     }
   }
@@ -862,19 +854,12 @@ struct RewriteDescriptorLayoutPass
     Value cVal = op.getOutputs()[0];
     auto accElemTy = cast<RankedTensorType>(cVal.getType()).getElementType();
 
-    // Each operand must have exactly 2 opSlice dims (the op tile).
-    for (unsigned i = 0; i < plans.size(); ++i)
-      if (plans[i].opTileDims.size() != 2)
-        return op.emitError(
-            "spyre_tensor_layout: expected exactly 2 opSlice dims per operand");
-
     // Per-operand op-tile slice types — derived from resolved extents.
     SmallVector<RankedTensorType> sliceTys;
     for (unsigned i = 0; i < plans.size(); ++i) {
       const OperandPlan &plan = plans[i];
       auto elemTy = cast<RankedTensorType>(plan.value.getType()).getElementType();
-      sliceTys.push_back(RankedTensorType::get(
-          {plan.opExtentLo, plan.opExtentHi}, elemTy));
+      sliceTys.push_back(RankedTensorType::get(plan.opExtents, elemTy));
     }
 
     // Acc shape from resolved per-plan fields: each input plan contributes its
@@ -887,7 +872,10 @@ struct RewriteDescriptorLayoutPass
       accDims[plan.parallelOutputAxis] = plan.parallelExtent;
     auto accTy = RankedTensorType::get(accDims, accElemTy);
 
+    // Transpose helper — currently only 2D (matmul). N-D generalisation deferred.
     auto emitTranspose2D = [&](Value src, Type elemT) -> Value {
+      assert(cast<RankedTensorType>(src.getType()).getRank() == 2 &&
+             "transpose of non-2D op-tile not yet supported");
       auto srcTy = cast<RankedTensorType>(src.getType());
       auto outTy = RankedTensorType::get(
           {srcTy.getDimSize(1), srcTy.getDimSize(0)}, elemT);
@@ -1496,18 +1484,12 @@ struct RewriteDescriptorLayoutPass
     st.getAccessTileMutable().set(newTile);
   }
 
-  // True if the op is a contraction (matmul, reduce, etc.) whose result shape
-  // is determined by its own semantics rather than being inherited from a single
-  // physical input. retypeChain stops here and does not propagate through.
-  // NOTE: uses a tensor-operand-count heuristic (>1 tensor operand). This
-  // misclassifies elementwise ops with two tensor inputs (e.g. add) as
-  // contractions; replacing with an explicit op-type check is tracked as P1-2.
+  // True if the op is a contraction whose result shape is determined by its own
+  // semantics rather than being inherited from a single physical input.
+  // retypeChain stops here and does not propagate through.
   static bool isContractionOp(Operation *op) {
-    int tensorOperandCount = 0;
-    for (auto operand : op->getOperands())
-      if (isa<RankedTensorType>(operand.getType()))
-        ++tensorOperandCount;
-    return tensorOperandCount > 1;
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+    return linalgOp && linalg::isaContractionOpInterface(linalgOp);
   }
 
   // Forward-retype the elementwise op chain: replace oldVal with newVal
