@@ -525,9 +525,11 @@ struct RewriteDescriptorLayoutPass
 
     // Resolved fields — filled by resolveAndReconcile() after classify().
     // emitSourceStage reads these only; it does not re-derive from spec/dimRoles.
-    bool     needsTranspose; // true iff the op-tile must be transposed before the op
-    int64_t  opExtentLo;     // extent of opTileDims[0] after slicing (pre-transpose)
-    int64_t  opExtentHi;     // extent of opTileDims[1] after slicing (pre-transpose)
+    bool     needsTranspose;    // true iff the op-tile must be transposed before the op
+    int64_t  opExtentLo;        // extent of opTileDims[0] after slicing (pre-transpose)
+    int64_t  opExtentHi;        // extent of opTileDims[1] after slicing (pre-transpose)
+    int64_t  parallelOutputAxis; // output axis this operand contributes to (its parallelRole)
+    int64_t  parallelExtent;     // post-transpose extent along that output axis
 
     // Threaded from the physical construct_memory_view (R-a). Populated by
     // dispatchMatmul / dispatchSink after classify(); consumed by S5.
@@ -862,7 +864,7 @@ struct RewriteDescriptorLayoutPass
         return failure();
     }
 
-    return emitSourceStage(op, spec, plans);
+    return emitSourceStage(op, spec.emitOp, plans);
   }
 
   // Per-dim op-tile slice extent: stickSize for StickifiedBlock, full physBlock
@@ -932,15 +934,24 @@ struct RewriteDescriptorLayoutPass
   //    has loopDims. When none do, demote all StickifiedBlock to WholeBlock so
   //    extractOpSlice never uses a null IV. (Must run after resolution because
   //    opExtentLo/Hi must reflect the demoted kind.)
+  // Resolve per-operand transpose, extents, and output-axis contribution. All
+  // einsum knowledge (canonicalAxes) is consumed here; emitSourceStage works
+  // from resolved fields only and never touches the spec again.
   static void resolveAndReconcile(SmallVectorImpl<OperandPlan> &plans,
                                    const SourceOpSpec &spec) {
-    // Step 1 — resolve transpose + extents per operand.
+    // Step 1 — resolve per-operand fields.
     for (unsigned i = 0; i < plans.size(); ++i) {
       OperandPlan &plan = plans[i];
+      const SourceOperandSpec &opSpec = spec.operands[i];
       int dimLo = plan.opTileDims[0], dimHi = plan.opTileDims[1];
-      plan.needsTranspose = needsTranspose(spec.operands[i], plan.dimRoles[dimLo]);
+      plan.needsTranspose = needsTranspose(opSpec, plan.dimRoles[dimLo]);
       plan.opExtentLo = opSliceExtent(plan, dimLo);
       plan.opExtentHi = opSliceExtent(plan, dimHi);
+      plan.parallelOutputAxis = parallelRole(opSpec);
+      SmallVector<bool> redMask = isReduction(opSpec);
+      plan.parallelExtent = !redMask[0]
+                                ? (plan.needsTranspose ? plan.opExtentHi : plan.opExtentLo)
+                                : (plan.needsTranspose ? plan.opExtentLo : plan.opExtentHi);
     }
 
     // Step 2 — StickifiedBlock demotion.
@@ -952,12 +963,17 @@ struct RewriteDescriptorLayoutPass
         for (auto &sk : plan.sliceKind)
           if (sk == SliceKind::StickifiedBlock)
             sk = SliceKind::WholeBlock;
-      // Re-derive extents now that sliceKind has changed.
+      // Re-derive extents and parallelExtent now that sliceKind has changed.
       for (unsigned i = 0; i < plans.size(); ++i) {
         OperandPlan &plan = plans[i];
+        const SourceOperandSpec &opSpec = spec.operands[i];
         int dimLo = plan.opTileDims[0], dimHi = plan.opTileDims[1];
         plan.opExtentLo = opSliceExtent(plan, dimLo);
         plan.opExtentHi = opSliceExtent(plan, dimHi);
+        SmallVector<bool> redMask = isReduction(opSpec);
+        plan.parallelExtent = !redMask[0]
+                                  ? (plan.needsTranspose ? plan.opExtentHi : plan.opExtentLo)
+                                  : (plan.needsTranspose ? plan.opExtentLo : plan.opExtentHi);
       }
     }
   }
@@ -985,8 +1001,12 @@ struct RewriteDescriptorLayoutPass
   // wired the enclosing scf.for loops; Phase 2 reads their IVs via
   // collectExistingLoopIVs and emits only the slices + op — no new loops.
   template <typename OpT>
-  LogicalResult emitSourceStage(OpT op, const SourceOpSpec &spec,
-                                ArrayRef<OperandPlan> plans) {
+  LogicalResult emitSourceStage(
+      OpT op,
+      function_ref<Value(OpBuilder &, Location, ArrayRef<Value>, Value,
+                         RankedTensorType)>
+          emitOp,
+      ArrayRef<OperandPlan> plans) {
     OpBuilder b(op);
     Location loc = op.getLoc();
 
@@ -1008,34 +1028,14 @@ struct RewriteDescriptorLayoutPass
           {plan.opExtentLo, plan.opExtentHi}, elemTy));
     }
 
-    // Acc shape: each operand contributes its post-transpose parallel op-tile extent
-    // to the output-axis it carries (per canonicalAxes). The parallel dim is
-    // canonical lo (A-like) or hi (B-like); after transpose it occupies position 0.
-    // Parallel extent = needsTranspose ? opExtentHi : opExtentLo  (A-like, parallel=hi when transposed)
-    //                 = needsTranspose ? opExtentLo : opExtentHi  (B-like, parallel=lo when transposed)
-    SmallVector<int64_t> accDims; // one entry per output axis, in axis order
-    {
-      int maxAxis = -1;
-      for (auto &opSpec : spec.operands)
-        for (int64_t ax : opSpec.canonicalAxes)
-          if (ax > maxAxis) maxAxis = (int)ax;
-      if (maxAxis >= 0)
-        accDims.resize(maxAxis + 1, 0);
-      for (unsigned i = 0; i < plans.size(); ++i) {
-        const SourceOperandSpec &opSpec = spec.operands[i];
-        const OperandPlan &plan = plans[i];
-        // If canonical lo is parallel (A-like {M,K}): post-transpose parallel
-        // extent = needsTranspose ? opExtentHi : opExtentLo.
-        // If canonical lo is reduction (B-like {K,N}): post-transpose parallel
-        // extent = needsTranspose ? opExtentLo : opExtentHi.
-        SmallVector<bool> redMask = isReduction(opSpec);
-        int64_t parallelExt = !redMask[0]
-                                  ? (plan.needsTranspose ? plan.opExtentHi : plan.opExtentLo)
-                                  : (plan.needsTranspose ? plan.opExtentLo : plan.opExtentHi);
-        for (int64_t ax : opSpec.canonicalAxes)
-          if (ax >= 0) accDims[ax] = parallelExt;
-      }
-    }
+    // Acc shape from resolved per-plan fields: each input plan contributes its
+    // parallelExtent to its parallelOutputAxis.
+    int64_t maxAxis = -1;
+    for (auto &plan : plans)
+      if (plan.parallelOutputAxis > maxAxis) maxAxis = plan.parallelOutputAxis;
+    SmallVector<int64_t> accDims(maxAxis + 1, 0);
+    for (auto &plan : plans)
+      accDims[plan.parallelOutputAxis] = plan.parallelExtent;
     auto accTy = RankedTensorType::get(accDims, accElemTy);
 
     auto emitTranspose2D = [&](Value src, Type elemT) -> Value {
@@ -1081,7 +1081,7 @@ struct RewriteDescriptorLayoutPass
                              ? emitTranspose2D(slicePhys, elemTy)
                              : slicePhys);
       }
-      Value r = spec.emitOp(b, loc, slices, acc, accTy);
+      Value r = emitOp(b, loc, slices, acc, accTy);
       b = saved;
       return r;
     });
