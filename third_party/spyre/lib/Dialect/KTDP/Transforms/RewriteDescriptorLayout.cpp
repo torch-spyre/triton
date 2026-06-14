@@ -26,7 +26,7 @@
 // output LOGICAL; the sink stage (store) consumes the LOGICAL value and
 // physicalizes its OUTPUT. Stages share only a logical SSA value + the placement
 // rule (emit at the value's block, after its uses); they share the classify /
-// Loop / collectExistingLoopIVs utilities.
+// Loop / collectLoopIVsForTile utilities.
 //
 // Call graph:
 //   runOnOperation
@@ -36,7 +36,6 @@
 //         buildPhysicalMemoryView   -> physical ConstructMemoryViewOp
 //           applyStatic / applyCoordMap  derive physical static extents
 //         rewriteAccessTile(tile, coords) -> physical ConstructAccessTilesOp
-//           applyIndex              SSA index mapping per coord-op
 //           rescaleEnclosingLoop    rescale enclosing scf.for to stick granularity
 //         retypeLoad                -> physical ktdp.load + retypeChain
 //           retypeChain             propagate type (stops at isContractionOp)
@@ -48,19 +47,18 @@
 //         findMarkerForOperand / walkToLoad  trace load chain -> marker
 //         isSingleTensorElementwiseOp        shared predicate for all walks
 //         classify                  build OperandPlan (dimRoles, floorDims, loopDims…)
-//         emitSourceStage           walk existing loops (collectExistingLoopIVs),
-//                                   extract slices + linalg.matmul; inner stick
+//         emitSourceStage           extract slices + linalg.matmul; inner stick
 //                                   loop (emitStickLoop) for StickifiedBlock
 //       sink:   dispatchSink(st)   (only when output descriptor is annotated)
 //         findMarkerForStore        forward worklist walk -> marker
-//         classify / emitSinkStage  walk existing loops, scatter inputTile into
-//                                   physicalSink via tensor.insert_slice
+//         classify / emitSinkStage  recover enclosing loop IVs
+//                                   (collectLoopIVsForTile), scatter inputTile
+//                                   into physicalSink via tensor.insert_slice
 //     Phase 3 — eraseMarker (marker + dead bridge cast)
 //
 //   Coord helpers (free functions):
 //     applyStatic     : compile-time extent for one dim
 //     applyCoordMap   : compile-time extents for all physical dims
-//     applyIndex      : SSA load/store offset (identity | divsi | remsi)
 //
 //===----------------------------------------------------------------------===//
 
@@ -171,61 +169,6 @@ static BlockArgument traceToMLIRBlockArg(Value v) {
     }
     return nullptr;
   }
-}
-
-/// Like traceToMLIRBlockArg but also returns the product of all muli-by-constant
-/// multipliers encountered on the way.  Other ops (cast, divsi, remsi, addi) are
-/// treated as pass-through with multiplier 1.  Returns {nullptr, 1} if the chain
-/// does not lead to a single BlockArgument.
-static std::pair<BlockArgument, int64_t> traceToMLIRBlockArgWithStride(Value v) {
-  int64_t stride = 1;
-  while (true) {
-    if (auto ba = dyn_cast<BlockArgument>(v))
-      return {ba, stride};
-    auto *op = v.getDefiningOp();
-    if (!op)
-      return {nullptr, 1};
-    if (isa<arith::IndexCastOp, arith::IndexCastUIOp,
-            arith::TruncIOp, arith::ExtSIOp, arith::ExtUIOp>(op)) {
-      v = op->getOperand(0);
-      continue;
-    }
-    if (isa<arith::MulIOp>(op)) {
-      if (auto c = getConstantInt(op->getOperand(1))) {
-        stride *= *c;
-        v = op->getOperand(0);
-        continue;
-      }
-    }
-    if (isa<arith::DivSIOp, arith::RemSIOp, arith::AddIOp>(op)) {
-      if (op->getNumOperands() == 2 && getConstantInt(op->getOperand(1)))
-        { v = op->getOperand(0); continue; }
-    }
-    return {nullptr, 1};
-  }
-}
-
-/// Apply one coordinate op to an SSA index value.
-///   identity -> the value unchanged
-///   floordiv -> arith.divsi(value, arg)
-///   mod      -> arith.remsi(value, arg)
-static Value applyIndex(OpBuilder &builder, Location loc, Value logicalIdx,
-                        CoordOp op, int64_t arg) {
-  switch (op) {
-  case CoordOp::Identity:
-    return logicalIdx;
-  case CoordOp::FloorDiv: {
-    Value c = arith::ConstantOp::create(
-        builder, loc, builder.getI32IntegerAttr(static_cast<int32_t>(arg)));
-    return arith::DivSIOp::create(builder, loc, logicalIdx, c).getResult();
-  }
-  case CoordOp::Mod: {
-    Value c = arith::ConstantOp::create(
-        builder, loc, builder.getI32IntegerAttr(static_cast<int32_t>(arg)));
-    return arith::RemSIOp::create(builder, loc, logicalIdx, c).getResult();
-  }
-  }
-  llvm_unreachable("unhandled CoordOp");
 }
 
 // ---- helpers matching LowerDescriptorMemory's predicate / accessor ----
@@ -535,8 +478,8 @@ struct RewriteDescriptorLayoutPass
 
   };
 
-  // One loop dim whose IV is needed by extractOpSlice / the store insert.
-  // Collected from the existing scf.for nest by collectExistingLoopIVs.
+  // One loop dim whose IV is needed by the store insert.
+  // Collected from the existing scf.for nest by collectLoopIVsForTile.
   struct Loop {
     enum Kind { Parallel, Reduction } kind;
     int   owner;    // which operand (index into plans vector)
@@ -990,8 +933,8 @@ struct RewriteDescriptorLayoutPass
   // Source stage: for each operand in `plans`, extract its op slice from the
   // already-physicalized load, emit the contraction op (via spec.emitOp) at
   // op's position, RAUW the result, erase op. Phase 1 already rescaled and
-  // wired the enclosing scf.for loops; Phase 2 reads their IVs via
-  // collectExistingLoopIVs and emits only the slices + op — no new loops.
+  // wired the enclosing scf.for loops; the source stage emits only the slices
+  // + op using those existing loops — no new loops, no IV recovery needed.
   template <typename OpT>
   LogicalResult emitSourceStage(
       OpT op,
@@ -1488,18 +1431,6 @@ struct RewriteDescriptorLayoutPass
     // Marker and bridge cast are NOT erased here — Phase 2 (synthesizeContractions)
     // still needs to read the marker's coord map. Phase 3 calls eraseMarker.
     return success();
-  }
-
-  // Remap logical indices -> physical indices via the coordinate map.
-  SmallVector<Value> mapIndices(OpBuilder &builder, Location loc,
-                                ValueRange logIdx, ArrayRef<int64_t> physSrc,
-                                ArrayRef<int64_t> physOp,
-                                ArrayRef<int64_t> physArg) {
-    SmallVector<Value> physIdx;
-    for (unsigned k = 0; k < physSrc.size(); ++k)
-      physIdx.push_back(applyIndex(builder, loc, logIdx[physSrc[k]],
-                                   static_cast<CoordOp>(physOp[k]), physArg[k]));
-    return physIdx;
   }
 
   // Rescale an scf.for loop to stick granularity.
