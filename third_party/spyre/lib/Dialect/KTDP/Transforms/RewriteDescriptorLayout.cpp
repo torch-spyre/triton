@@ -780,17 +780,33 @@ struct RewriteDescriptorLayoutPass
   }
 
   // Per-operand descriptor for a source contraction op.
+  // canonicalAxes[i] = output-axis index for logical dim i, or -1 for reduction.
+  // e.g. matmul A=(m,k): {0,-1};  B=(k,n): {-1,1}.
   struct SourceOperandSpec {
-    SmallVector<int64_t> consumedLogicalDims; // reduction dims (≥1 for conv-ready)
-    int64_t              parallelRole;        // logical C dim index this input maps to
-    // Whether to transpose the physical slice before passing to the op.
-    // `reductionFirst` = true  → transpose when dimRoles[dimLo] == -1 (A-like)
-    // `reductionFirst` = false → transpose when dimRoles[dimLo] != -1 (B-like)
-    bool reductionFirst = false;
-    bool needsTranspose(int64_t dimLoRole) const {
-      return reductionFirst ? (dimLoRole == -1) : (dimLoRole != -1);
-    }
+    SmallVector<int64_t> canonicalAxes; // one entry per logical dim of this operand
   };
+
+  // Logical dims that are reduction (canonicalAxes entries == -1), by position.
+  static SmallVector<int64_t> reductionDims(const SourceOperandSpec &spec) {
+    SmallVector<int64_t> result;
+    for (int64_t i = 0; i < (int64_t)spec.canonicalAxes.size(); ++i)
+      if (spec.canonicalAxes[i] == -1) result.push_back(i);
+    return result;
+  }
+
+  // The unique parallel output-axis carried by this operand.
+  static int64_t parallelRole(const SourceOperandSpec &spec) {
+    for (int64_t v : spec.canonicalAxes)
+      if (v != -1) return v;
+    llvm_unreachable("SourceOperandSpec: no parallel axis");
+  }
+
+  // Transpose needed iff canonical low dim is reduction XOR physical low dim is.
+  static bool needsTranspose(const SourceOperandSpec &spec, int64_t dimLoRole) {
+    bool canonicalLowIsReduction = (spec.canonicalAxes[0] == -1);
+    bool physicalLowIsReduction  = (dimLoRole == -1);
+    return canonicalLowIsReduction != physicalLowIsReduction;
+  }
 
   // Descriptor for one source contraction op (e.g. linalg.matmul).
   // `emitOp` receives all (possibly transposed) input slices + accumulator
@@ -827,8 +843,8 @@ struct RewriteDescriptorLayoutPass
       OperandCoords coords = OperandCoords::fromMarker(marker, spec.logicalRank,
                                                        physShape);
       SmallVector<int64_t> dimRoles;
-      buildDimRoles(coords, spec.operands[i].consumedLogicalDims,
-                    spec.operands[i].parallelRole, dimRoles);
+      buildDimRoles(coords, reductionDims(spec.operands[i]),
+                    parallelRole(spec.operands[i]), dimRoles);
       plans[i] = classify(op.getInputs()[i], coords, dimRoles);
     }
 
@@ -863,14 +879,12 @@ struct RewriteDescriptorLayoutPass
   }
 
   // linalg.matmul instantiation:
-  //   A logical: dim0=M (src 0 → parallel=0), dim1=K (src 1 → reduction=-1).
-  //   B logical: dim0=K (src 0 → reduction=-1), dim1=N (src 1 → parallel=1).
+  //   A=(m,k): dim0=M (output 0), dim1=K (reduction).
+  //   B=(k,n): dim0=K (reduction), dim1=N (output 1).
   LogicalResult dispatchMatmul(linalg::MatmulOp mm) {
     SourceOpSpec spec;
-    // A: K is src 1, M is parallel=0, reductionFirst=true (transpose when K is low dim)
-    // B: K is src 0, N is parallel=1, reductionFirst=false (transpose when N is low dim)
-    spec.operands = {{{1}, 0, /*reductionFirst=*/true},
-                     {{0}, 1, /*reductionFirst=*/false}};
+    spec.operands = {SourceOperandSpec{{0, -1}},   // A=(m,k)
+                     SourceOperandSpec{{-1, 1}}};  // B=(k,n)
     spec.logicalRank = 2;
     spec.emitOp = [](OpBuilder &b, Location loc,
                      ArrayRef<Value> slices, Value acc,
@@ -878,17 +892,17 @@ struct RewriteDescriptorLayoutPass
       return linalg::MatmulOp::create(b, loc, accTy,
           ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
     };
+    // A=(m,k): canonical low=M(parallel) → transpose when physical low is K.
+    // B=(k,n): canonical low=K(reduction) → transpose when physical low is N.
     spec.computeAccShape = [](ArrayRef<OperandPlan> plans,
-                               Type accElemTy) -> RankedTensorType {
+                              Type accElemTy) -> RankedTensorType {
       const OperandPlan &aPlan = plans[0], &bPlan = plans[1];
       ArrayRef<int64_t> aPhys = aPlan.coords.physBlock;
       ArrayRef<int64_t> bPhys = bPlan.coords.physBlock;
       int aDimLo = aPlan.opTileDims[0], aDimHi = aPlan.opTileDims[1];
       int bDimLo = bPlan.opTileDims[0], bDimHi = bPlan.opTileDims[1];
-      // A: transpose when K is the low dim (reductionFirst=true)
-      bool transposeA = (aPlan.dimRoles[aDimLo] == -1);
-      // B: transpose when N is the low dim (reductionFirst=false)
-      bool transposeB = (bPlan.dimRoles[bDimLo] != -1);
+      bool transposeA = (aPlan.dimRoles[aDimLo] == -1); // K is physical low
+      bool transposeB = (bPlan.dimRoles[bDimLo] != -1); // N is physical low
       int64_t M = transposeA ? aPhys[aDimHi] : aPhys[aDimLo];
       int64_t N = transposeB ? bPhys[bDimLo] : bPhys[bDimHi];
       return RankedTensorType::get({M, N}, accElemTy);
@@ -936,7 +950,7 @@ struct RewriteDescriptorLayoutPass
       sliceTys.push_back(RankedTensorType::get(
           {opSliceExtent(plan, dimLo), opSliceExtent(plan, dimHi)}, elemTy));
       // Use the spec's per-operand transpose hint.
-      transposeFlags.push_back(spec.operands[i].needsTranspose(plan.dimRoles[dimLo]));
+      transposeFlags.push_back(needsTranspose(spec.operands[i], plan.dimRoles[dimLo]));
     }
 
     auto accTy = spec.computeAccShape(plans, accElemTy);
