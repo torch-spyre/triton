@@ -26,7 +26,7 @@
 // output LOGICAL; the sink stage (store) consumes the LOGICAL value and
 // physicalizes its OUTPUT. Stages share only a logical SSA value + the placement
 // rule (emit at the value's block, after its uses); they share the classify /
-// Loop / collectLoopIVsForTile utilities.
+// Loop / classify utilities.
 //
 // Call graph:
 //   runOnOperation
@@ -51,9 +51,8 @@
 //                                   loop (emitStickLoop) for StickifiedBlock
 //       sink:   dispatchSink(st)   (only when output descriptor is annotated)
 //         findMarkerForStore        forward worklist walk -> marker
-//         classify / emitSinkStage  recover enclosing loop IVs
-//                                   (collectLoopIVsForTile), scatter inputTile
-//                                   into physicalSink via tensor.insert_slice
+//         classify / emitSinkStage  scatter inputTile into physicalSink
+//                                   via tensor.insert_slice
 //     Phase 3 — eraseMarker (marker + dead bridge cast)
 //
 //   Coord helpers (free functions):
@@ -477,91 +476,6 @@ struct RewriteDescriptorLayoutPass
     int64_t  parallelExtent;     // post-transpose extent along that output axis
 
   };
-
-  // One loop dim whose IV is needed by the store insert.
-  // Collected from the existing scf.for nest by collectLoopIVsForTile.
-  struct Loop {
-    enum Kind { Parallel, Reduction } kind;
-    int   owner;    // which operand (index into plans vector)
-    int   physDim;  // phys dim the IV indexes
-    Value iv;       // induction variable
-  };
-
-  // Walk enclosing scf.for ops of `op` and populate `loops` with one entry per
-  // floor/loopDims dim in aPlan/bPlan whose IV was wired by Phase 1.
-  // Phase 1 stored the (index-cast) loop IV directly as the coord operand of
-  // the construct_access_tile for each FloorDiv dim; we recover it by tracing
-  // each coord operand back through index_cast to its BlockArgument.
-  // Trace an index Value through index_cast to a BlockArgument that is the
-  // induction variable (arg #0) of an enclosing scf.for.
-  static Value traceToForIV(Value v) {
-    while (true) {
-      if (auto ba = dyn_cast<BlockArgument>(v))
-        return (isa<scf::ForOp>(ba.getOwner()->getParentOp()) &&
-                ba.getArgNumber() == 0)
-                   ? ba
-                   : Value{};
-      auto *op = v.getDefiningOp();
-      if (!op) return {};
-      if (isa<arith::IndexCastOp, arith::IndexCastUIOp>(op))
-        { v = op->getOperand(0); continue; }
-      return {};
-    }
-  }
-
-  // Trace a plan's tensor value back through single-tensor ops to the
-  // ktdp.load that produced it, then return the ConstructAccessTilesOp
-  // feeding that load.
-  static mlir::ktdp::ConstructAccessTilesOp
-  tileForPlan(const OperandPlan &plan) {
-    if (!plan.value) return {};
-    auto ld = walkToLoad(plan.value);
-    if (!ld) return {};
-    return dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
-        ld.getAccessTile().getDefiningOp());
-  }
-
-  // Scan one access tile's coord operands and record which enclosing scf.for
-  // IVs drive each physical dim. Populates ivToPhysDim for use by
-  // collectLoopIVsForTile.
-  static void scanTileIVs(
-      mlir::ktdp::ConstructAccessTilesOp tile,
-      DenseMap<Value, int /*physDim*/> &ivToPhysDim) {
-    if (!tile) return;
-    auto indices = tile.getIndices();
-    for (unsigned k = 0; k < indices.size(); ++k) {
-      Value forIV = traceToForIV(indices[k]);
-      if (forIV && !ivToPhysDim.count(forIV))
-        ivToPhysDim[forIV] = (int)k;
-    }
-  }
-
-  // Walk the enclosing scf.for nest of `op` and collect Loop entries for
-  // every IV that drives a physical dim of `tile`. `owner` is stored on
-  // each Loop for the caller's use. `loopDims` dims (if any) are marked
-  // Loop::Reduction; all others are Loop::Parallel.
-  static void collectLoopIVsForTile(
-      Operation *op, mlir::ktdp::ConstructAccessTilesOp tile, int owner,
-      ArrayRef<int> loopDims, SmallVectorImpl<Loop> &loops) {
-    DenseMap<Value, int> ivToPhysDim;
-    scanTileIVs(tile, ivToPhysDim);
-
-    Operation *cur = op->getParentOp();
-    while (cur) {
-      if (auto forOp = dyn_cast<scf::ForOp>(cur)) {
-        Value iv = forOp.getInductionVar();
-        auto it = ivToPhysDim.find(iv);
-        if (it != ivToPhysDim.end()) {
-          int physDim = it->second;
-          Loop::Kind kind = Loop::Parallel;
-          for (int p : loopDims)
-            if (p == physDim) { kind = Loop::Reduction; break; }
-          loops.push_back({kind, owner, physDim, iv});
-        }
-      }
-      cur = cur->getParentOp();
-    }
-  }
 
   // Classify one operand's physical dims into OperandPlan fields (R-c).
   // `coords` carries phys_src/op/arg and physBlock. `dimRoles` comes from
@@ -1094,25 +1008,6 @@ struct RewriteDescriptorLayoutPass
     // Build the initial physical sink accumulator (tensor.empty over physBlock).
     SmallVector<int64_t> sinkShape(physBlock.begin(), physBlock.end());
     Value physicalSink = tensor::EmptyOp::create(b, loc, sinkShape, elemTy);
-
-    // Collect IVs from existing enclosing loops (wired by Phase 1).
-    SmallVector<Loop> loops;
-    auto storeTile = dyn_cast_or_null<mlir::ktdp::ConstructAccessTilesOp>(
-        st.getAccessTile().getDefiningOp());
-    collectLoopIVsForTile(st, storeTile, 0, /*loopDims=*/{}, loops);
-
-    // Build floorIVs[physDim] → IV or c0 for trip-1 floor dims.
-    Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
-    SmallVector<Value> floorIVs(physRank, c0);
-    for (auto &l : loops) {
-      if (l.kind == Loop::Parallel) {
-        Value iv = l.iv;
-        if (!iv.getType().isIndex())
-          iv = arith::IndexCastOp::create(b, loc, b.getIndexType(), iv)
-                   .getResult();
-        floorIVs[l.physDim] = iv;
-      }
-    }
 
     // Build extract/insert parameter base arrays from the physical plan.
     //
