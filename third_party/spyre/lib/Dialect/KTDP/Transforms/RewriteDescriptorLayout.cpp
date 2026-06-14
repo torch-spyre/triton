@@ -509,6 +509,8 @@ struct RewriteDescriptorLayoutPass
     Value               value;      // SSA tensor (physical on memory side)
     OperandCoords       coords;     // coord map + shape (kept for op/arg lookups)
     SmallVector<int64_t> dimRoles;  // per-phys-dim role (>= 0 | -1)
+    // Owned storage for coords.physBlock when there is no marker (scratchpad).
+    SmallVector<int64_t> physBlockStorage;
 
     int                lane;        // innermost phys dim = rank-1
     int64_t            stickSize;   // stick/lane width = physBlock[lane] (e.g. 64).
@@ -770,24 +772,86 @@ struct RewriteDescriptorLayoutPass
   // spec.operands to trace each input to its marker, build OperandPlans, and
   // call emitSourceStage. Op-specific wiring comes from the spec; add a new
   // dispatchXxx (batch_matmul, conv) by building a different SourceOpSpec.
+  // Build a plan for a scratchpad operand — a logical rank-2 tensor produced
+  // by a prior contraction (e.g. tl.dot(B, C)) that has no descriptor and no
+  // marker. The value is already in canonical op orientation (row-major [K, N])
+  // so no transpose is needed and every dim is WholeBlock.
+  //
+  // Dispatch rule (called from dispatchSource when walkToLoad returns null):
+  //   no load found + value is a contraction result → scratchpad (this path)
+  //   no load found + value is something else       → error
+  static OperandPlan classifyScratchpad(Value val,
+                                        const SourceOperandSpec &opSpec) {
+    auto tensorTy = cast<RankedTensorType>(val.getType());
+    int rank = (int)tensorTy.getRank();
+    OperandPlan plan;
+    plan.value = val;
+    plan.physBlockStorage.assign(tensorTy.getShape().begin(),
+                                 tensorTy.getShape().end());
+    // coords: src/op/arg unused (no marker); physBlock points at owned storage.
+    plan.coords.src        = {};
+    plan.coords.op         = {};
+    plan.coords.arg        = {};
+    plan.coords.logicalRank = (unsigned)rank;
+    plan.coords.physBlock   = plan.physBlockStorage;
+
+    plan.lane       = rank - 1;
+    plan.stickSize  = tensorTy.getDimSize(rank - 1);
+    plan.opInnerDim = -1;
+    // All dims are opTileDims (dims 0 … rank-1, ascending), all WholeBlock.
+    // dimRoles mirrors canonicalAxes so needsTranspose derives correctly:
+    //   canonical reduction dim → role -1, canonical parallel dim → its axis index.
+    for (int p = 0; p < rank; ++p) {
+      plan.opTileDims.push_back(p);
+      plan.dimRoles.push_back(opSpec.canonicalAxes[p]);
+    }
+    plan.sliceKind.assign(rank, SliceKind::WholeBlock);
+
+    // Resolved fields: no transpose; extents straight from shape.
+    plan.needsTranspose     = false;
+    plan.opExtentLo         = tensorTy.getDimSize(0);
+    plan.opExtentHi         = tensorTy.getDimSize(rank - 1);
+    plan.parallelOutputAxis = parallelRole(opSpec);
+    plan.parallelExtent     = tensorTy.getDimSize(rank - 1);
+    return plan;
+  }
+
+  // Classify one operand and populate plans[i]. Three outcomes:
+  //   physical  — walkToLoad finds a load with a marker → classify()
+  //   scratchpad — walkToLoad finds no load, value is a contraction →
+  //                classifyScratchpad() (no marker, pass value whole)
+  //   error     — load found but no marker, or no load and not a contraction
   template <typename OpT>
   LogicalResult dispatchSource(OpT op, const SourceOpSpec &spec) {
     unsigned nOps = spec.operands.size();
     SmallVector<OperandPlan, 2> plans(nOps);
 
     for (unsigned i = 0; i < nOps; ++i) {
-      auto marker = findMarkerForOperand(op.getInputs()[i]);
-      if (!marker)
-        return op.emitError(
-            "spyre_tensor_layout: cannot find layout marker for source op operand");
-      auto physShape =
-          cast<RankedTensorType>(op.getInputs()[i].getType()).getShape();
-      OperandCoords coords = OperandCoords::fromMarker(marker, spec.logicalRank,
-                                                       physShape);
-      SmallVector<int64_t> dimRoles;
-      buildDimRoles(coords, isReduction(spec.operands[i]),
-                    parallelRole(spec.operands[i]), dimRoles);
-      plans[i] = classify(op.getInputs()[i], coords, dimRoles);
+      Value operand = op.getInputs()[i];
+      auto ld = walkToLoad(operand);
+
+      if (ld) {
+        // Physical operand: load found — must have a marker.
+        auto marker = findMarkerForOperand(operand);
+        if (!marker)
+          return op.emitError(
+              "spyre_tensor_layout: physical operand load has no layout marker");
+        auto physShape = cast<RankedTensorType>(operand.getType()).getShape();
+        OperandCoords coords = OperandCoords::fromMarker(marker, spec.logicalRank,
+                                                         physShape);
+        SmallVector<int64_t> dimRoles;
+        buildDimRoles(coords, isReduction(spec.operands[i]),
+                      parallelRole(spec.operands[i]), dimRoles);
+        plans[i] = classify(operand, coords, dimRoles);
+      } else {
+        // No load found. Scratchpad if produced by a contraction, error otherwise.
+        auto *defOp = operand.getDefiningOp();
+        if (!defOp || !isa<linalg::MatmulOp>(defOp))
+          return op.emitError(
+              "spyre_tensor_layout: source op operand is neither a physical "
+              "load nor a scratchpad contraction result");
+        plans[i] = classifyScratchpad(operand, spec.operands[i]);
+      }
     }
 
     resolveAndReconcile(plans, spec);
@@ -1489,6 +1553,22 @@ struct RewriteDescriptorLayoutPass
     for (unsigned k = 0; k < physRank; ++k)
       if (physSrc[k] < 0 || physSrc[k] >= (int64_t)logRank)
         return tileOp.emitError("spyre_tensor_layout: phys_src out of range");
+
+    // Validate stick width: a Mod (lane) dim with modulus `arg` requires its
+    // source logical block extent to be at least `arg`. A sub-stick block
+    // (logBlock[src] < arg) would pad the data into a full-width lane, and a
+    // contraction over that dim would read garbage padding. Reject it here
+    // rather than silently mislay (see Step 8b chained-matmul fixture).
+    for (unsigned k = 0; k < physRank; ++k) {
+      if (static_cast<CoordOp>(physOp[k]) != CoordOp::Mod)
+        continue;
+      int64_t logExtent = logBlock[physSrc[k]];
+      if (logExtent != ShapedType::kDynamic && logExtent < physArg[k])
+        return tileOp.emitError(
+                   "spyre_tensor_layout: block extent of stick dim (")
+               << logExtent << ") is smaller than the stick size ("
+               << physArg[k] << "); a stick dim cannot be sub-stick";
+    }
 
     // Map the logical index operands to physical index operands.
     // The existing tile's index operands are already index-typed (cast from i32

@@ -552,6 +552,107 @@ class TestMatmulAnnotatedOutput(RewriteLayoutTester):
 
 
 # =========================================================================
+# Chained matmul: D = A @ (B @ C) — scratchpad intermediate (Step 8b)
+# =========================================================================
+
+class TestMatmulChainedScratchpad(RewriteLayoutTester):
+    """D = A @ (B @ C): all three input descriptors are annotated (physical).
+
+    The inner tt.dot(B_tile, C_tile) produces a logical [BLOCK_K1, BLOCK_N]
+    scratchpad tile bc.  The outer tt.dot(A_tile, bc, acc) has one physical
+    operand (A) and one scratchpad operand (bc) that has no descriptor and
+    no marker.  dispatchSource must recognise bc as a scratchpad (walkToLoad
+    returns null → not an error) and pass it through whole, while still
+    slicing + transposing A_tile normally.
+
+    Shapes:
+      A[M,K1] stick-on-M:  block [64,64]  -> phys [1,64,64]
+      B[K1,K2] stick-on-K2: block [64,32] -> phys [1,64,32]  (K2//32=1 stick)
+      C[K2,N]  stick-on-N:  block [32,64] -> phys [1,32,64]  (N//64=1 stick)
+      bc scratchpad: logical [64,64] (f16, result of inner dot)
+      D[M,N]   stick-on-N:  block [64,64] -> phys [1,64,64]
+    """
+
+    # A[M,K1] stick-on-M: phys_src=[0,1,0] => [M//64, K1, M%64]
+    _A_LAYOUT = ("{phys_src = array<i64: 0, 1, 0>, "
+                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    # B[K1,K2] stick-on-K2: phys_src=[1,0,1] => [K2//32, K1, K2%32]
+    _B_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
+                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>}")
+    # C[K2,N] stick-on-N: phys_src=[1,0,1] => [N//64, K2, N%64]
+    _C_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
+                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    # D[M,N] stick-on-N: phys_src=[1,0,1] => [N//64, M, N%64]
+    _D_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
+                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+
+    _KERNEL = """
+        module {{
+          tt.func @chained(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>,
+                           %c: !tt.ptr<f16>, %d: !tt.ptr<f16>,
+                           %m: i32, %n: i32, %k1: i32) {{
+            %M  = arith.constant 256 : i32
+            %K1 = arith.constant 64  : i32
+            %K2 = arith.constant 32  : i32
+            %N  = arith.constant 256 : i32
+            %sK1 = arith.constant 64  : i64
+            %sK2 = arith.constant 32  : i64
+            %sN  = arith.constant 256 : i64
+            %sM  = arith.constant 256 : i64
+            %one = arith.constant 1   : i64
+            %adesc = tt.make_tensor_descriptor %a, [%M, %K1], [%sK1, %one]
+                : <f16>, <64x64xf16>
+            %bdesc = tt.make_tensor_descriptor %b, [%K1, %K2], [%sK2, %one]
+                : <f16>, <64x32xf16>
+            %cdesc = tt.make_tensor_descriptor %c, [%K2, %N], [%sN, %one]
+                : <f16>, <32x64xf16>
+            %ddesc = tt.make_tensor_descriptor %d, [%M, %N], [%sN, %one]
+                : <f16>, <64x64xf16>
+            tt.spyre_tensor_layout %adesc {a_layout} : <64x64xf16>
+            tt.spyre_tensor_layout %bdesc {b_layout} : <64x32xf16>
+            tt.spyre_tensor_layout %cdesc {c_layout} : <32x64xf16>
+            tt.spyre_tensor_layout %ddesc {d_layout} : <64x64xf16>
+            %bt = tt.descriptor_load %bdesc[%k1, %n]
+                : !tt.tensordesc<64x32xf16> -> tensor<64x32xf16>
+            %ct = tt.descriptor_load %cdesc[%n, %n]
+                : !tt.tensordesc<32x64xf16> -> tensor<32x64xf16>
+            %bc_init = arith.constant dense<0.0> : tensor<64x64xf16>
+            %bc = tt.dot %bt, %ct, %bc_init
+                : tensor<64x32xf16> * tensor<32x64xf16> -> tensor<64x64xf16>
+            %at = tt.descriptor_load %adesc[%m, %k1]
+                : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
+            %acc_init = arith.constant dense<0.0> : tensor<64x64xf16>
+            %result = tt.dot %at, %bc, %acc_init
+                : tensor<64x64xf16> * tensor<64x64xf16> -> tensor<64x64xf16>
+            tt.descriptor_store %ddesc[%m, %n], %result
+                : !tt.tensordesc<64x64xf16>, tensor<64x64xf16>
+            tt.return
+          }}
+        }}
+        """
+
+    def test_chained_scratchpad_lowers(self):
+        self.run(self._KERNEL.format(
+            a_layout=self._A_LAYOUT, b_layout=self._B_LAYOUT,
+            c_layout=self._C_LAYOUT, d_layout=self._D_LAYOUT))
+        self.assert_absent("tt.spyre_tensor_layout")
+        self.assert_absent("tt.dot")
+        self.assert_present("linalg.matmul")
+        # The store sink stage scatters the logical [64,64] output into
+        # the physical [1,64,64] D buffer.
+        self.assert_present("tensor.insert_slice")
+
+    def test_chained_scratchpad_a_sliced(self):
+        # A is physical → ktdp.load produces rank-3 [1,64,64]; the source
+        # stage extracts a 2D slice before feeding linalg.matmul.
+        self.run(self._KERNEL.format(
+            a_layout=self._A_LAYOUT, b_layout=self._B_LAYOUT,
+            c_layout=self._C_LAYOUT, d_layout=self._D_LAYOUT))
+        # Physical loads for A and B/C all produce rank-3 results.
+        self.assert_result_type("ktdp.load", "1x64x64xf16")
+
+
+# =========================================================================
 # Negative (frontend): the layout list must be passed inline, not via a local
 # =========================================================================
 

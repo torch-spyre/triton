@@ -61,6 +61,21 @@ def run(inputs: dict) -> np.ndarray:
     return inputs["a_ptr"] @ inputs["b_ptr"]
 
 
+def make_inputs_chained(M: int, K1: int, K2: int, N: int, *, dtype=np.float16, **_unused) -> dict:
+    """Build [M,K1], [K1,K2], [K2,N], [M,N] buffers for chained_matmul_kernel."""
+    rng = np.random.default_rng(seed=0)
+    a = rng.standard_normal((M, K1)).astype(dtype)
+    b = rng.standard_normal((K1, K2)).astype(dtype)
+    c = rng.standard_normal((K2, N)).astype(dtype)
+    d = np.zeros((M, N), dtype=dtype)
+    return {"a_ptr": a, "b_ptr": b, "c_ptr": c, "d_ptr": d}
+
+
+def run_chained(inputs: dict) -> np.ndarray:
+    """NumPy oracle: A @ (B @ C)."""
+    return inputs["a_ptr"] @ (inputs["b_ptr"] @ inputs["c_ptr"])
+
+
 def make_inputs_bmm(B: int, M: int, K: int, N: int, *, dtype=np.float32, **_unused) -> dict:
     """Build ``[B,M,K]``, ``[B,K,N]``, ``[B,M,N]`` buffers for bmm_matmul_kernel."""
     rng = np.random.default_rng(seed=0)
@@ -161,6 +176,26 @@ _SIG_BMM_ADDPTR = {
     "BLOCK_K": "i32",
     "BLOCK_N": "i32",
 }
+
+_SIG_CHAINED = {
+    "a_ptr":    "*fp16",
+    "b_ptr":    "*fp16",
+    "c_ptr":    "*fp16",
+    "d_ptr":    "*fp16",
+    "M":        "i32",
+    "K1":       "i32",
+    "K2":       "i32",
+    "N":        "i32",
+    "BLOCK_M":  "i32",
+    "BLOCK_K1": "i32",
+    "BLOCK_K2": "i32",
+    "BLOCK_N":  "i32",
+    "A_LAYOUT": "constexpr",
+    "B_LAYOUT": "constexpr",
+    "C_LAYOUT": "constexpr",
+    "D_LAYOUT": "constexpr",
+}
+_SC = functools.partial(_sticksize, _SIG_CHAINED)
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +488,36 @@ VARIANTS = {
             t.assert_present("tensor.insert_slice"),   # store sink stage
         ),
     },
+    # AD-HOC: DESIGN.md Task-2 example exactly. M=64, K=128, N=256.
+    # A stick-on-K -> 2 K-sticks; B stick-on-N -> 4 N-sticks. The point is the
+    # mismatched stick counts on the matmul source side. C stick-on-N -> 4
+    # output sticks (probes whether multi-output-stick works numerically).
+    "spyre_design_task2": {
+        "tags": ["descriptor-load-static", "descriptor-store-static", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "kernel_fn":    kernel.matmul_kernel,
+        "SIGNATURE":    _SIG_SPYRE,
+        "constexpr":    ["M", "K", "N", "BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            "M": [64], "K": [128], "N": [256],
+            "BLOCK_M": [64], "BLOCK_K": [128], "BLOCK_N": [64],
+            "A_LAYOUT": [[(0, "floordiv", _SS("a_ptr")), 1, (0, "mod", _SS("a_ptr"))]],
+            "B_LAYOUT": [[(1, "floordiv", _SS("b_ptr")), 0, (1, "mod", _SS("b_ptr"))]],
+            "C_LAYOUT": [[(1, "floordiv", _SS("c_ptr")), 0, (1, "mod", _SS("c_ptr"))]],
+        },
+        "grid":         [1],
+        "reference":    run,
+        "inputs":       _make_inputs_fp16,
+        "output_key":   "c_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,  # fp16 ULP noise
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.matmul"),
+            t.assert_present("scf.for"),
+        ),
+    },
     "spyre_stick_k_dynamic": {
         # Dynamic-shape variant of spyre_stick_k: A stick-on-K with BLOCK_K=128
         # and stick size 64, so A's K-stick dim spans 2 sticks and
@@ -591,5 +656,49 @@ VARIANTS = {
             "tracking_test": "test_lower_desc_memory.py::"
                              "TestAddptrIntoDescriptor",
         },
+    },
+    # --- Chained matmul: D = A @ (B @ C) with physical annotations ---
+    # A[M,K1] stick-on-M, B[K1,K2] stick-on-K2, C[K2,N] stick-on-N,
+    # D[M,N] stick-on-N. The inner B@C loop produces a logical scratchpad
+    # tile bc[BLOCK_K1, BLOCK_N] that feeds the outer A@bc dot. This
+    # exercises the scratchpad operand path in dispatchSource (Step 8b).
+    # Every stick dim is exactly one stick (64 = 128B / 2B fp16): a sub-stick
+    # stick dim is rejected by RewriteDescriptorLayout (it would pad the lane).
+    "spyre_chained_scratchpad": {
+        "tags": ["descriptor-load-static", "descriptor-store-static", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "Chained matmul D = A @ (B @ C) with all physical layout "
+            "annotations. The inner B@C produces a logical scratchpad tile "
+            "that the outer dot consumes directly (Step 8b scratchpad path)."
+        ),
+        "kernel_fn":    kernel.chained_matmul_kernel,
+        "SIGNATURE":    _SIG_CHAINED,
+        "constexpr":    ["M", "K1", "K2", "N",
+                         "BLOCK_M", "BLOCK_K1", "BLOCK_K2", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT", "D_LAYOUT"],
+        "params":       {
+            "M":  [64], "K1": [64], "K2": [64], "N": [64],
+            "BLOCK_M": [64], "BLOCK_K1": [64], "BLOCK_K2": [64], "BLOCK_N": [64],
+            # A[M,K1] stick-on-M:  [M//S, K1, M%S]
+            "A_LAYOUT": [[(0, "floordiv", _SC("a_ptr")), 1, (0, "mod", _SC("a_ptr"))]],
+            # B[K1,K2] stick-on-K2 (N-dim of B): [K2//S, K1, K2%S]
+            "B_LAYOUT": [[(1, "floordiv", _SC("b_ptr")), 0, (1, "mod", _SC("b_ptr"))]],
+            # C[K2,N] stick-on-N:  [N//S, K2, N%S]
+            "C_LAYOUT": [[(1, "floordiv", _SC("c_ptr")), 0, (1, "mod", _SC("c_ptr"))]],
+            # D[M,N] stick-on-N:   [N//S, M, N%S]
+            "D_LAYOUT": [[(1, "floordiv", _SC("d_ptr")), 0, (1, "mod", _SC("d_ptr"))]],
+        },
+        "grid":         [1],
+        "reference":    run_chained,
+        "inputs":       make_inputs_chained,
+        "output_key":   "d_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,  # fp16 ULP noise
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.matmul"),
+            t.assert_present("tensor.insert_slice"),  # store sink stage
+        ),
     },
 }
