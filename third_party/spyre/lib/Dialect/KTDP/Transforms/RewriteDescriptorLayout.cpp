@@ -463,23 +463,20 @@ struct RewriteDescriptorLayoutPass
   //
   // `parallelRole` is the role assigned to non-consumed dims — typically the
   // logical C dim index they contribute to (0=M, 1=N, etc.).
+  // Build per-physical-dim roles from a per-logical-dim reduction predicate.
+  // reductionMask[logDim] = true → any physical dim whose src is that logical dim
+  // gets role -1 (reduction); others get `parallelRole`.
   static void buildDimRoles(const OperandCoords &coords,
-                             ArrayRef<int64_t> consumedLogicalDims,
+                             ArrayRef<bool> reductionMask,
                              int64_t parallelRole,
                              SmallVectorImpl<int64_t> &roles) {
     int n = (int)coords.src.size();
     roles.resize(n);
     for (int p = 0; p < n; ++p) {
-      bool isConsumed = llvm::is_contained(consumedLogicalDims, coords.src[p]);
-      roles[p] = isConsumed ? -1 : parallelRole;
+      int64_t logDim = coords.src[p];
+      bool isReduction = logDim < (int64_t)reductionMask.size() && reductionMask[logDim];
+      roles[p] = isReduction ? -1 : parallelRole;
     }
-  }
-
-  // Single-dim convenience overload for the common case (matmul: one K dim).
-  static void buildDimRoles(const OperandCoords &coords, int64_t kLogicalSrc,
-                             int64_t parallelRole,
-                             SmallVectorImpl<int64_t> &roles) {
-    buildDimRoles(coords, ArrayRef<int64_t>{kLogicalSrc}, parallelRole, roles);
   }
 
   // ---- Shared utilities (staged model) ----
@@ -499,6 +496,7 @@ struct RewriteDescriptorLayoutPass
 
   // One operand classified by its Map(Op, X) roles and physical layout.
   // `classify` fills all derived fields from `coords` + `dimRoles`.
+  // `resolveAndReconcile` fills the resolved fields after classify().
   //
   // Field semantics (right-to-left traversal of the physical dims, R-c):
   //   lane        = innermost phys dim (rank-1); always the stick lane — full slice
@@ -524,6 +522,12 @@ struct RewriteDescriptorLayoutPass
     SmallVector<int>   loopDims;    // reduceDims minus opInnerDim → reduction loops
     SmallVector<int>   opTileDims;  // residual >= 0 non-floor dims (the 2D slice for matmul)
     SmallVector<SliceKind> sliceKind; // per-phys-dim slice behavior (see SliceKind)
+
+    // Resolved fields — filled by resolveAndReconcile() after classify().
+    // emitSourceStage reads these only; it does not re-derive from spec/dimRoles.
+    bool     needsTranspose; // true iff the op-tile must be transposed before the op
+    int64_t  opExtentLo;     // extent of opTileDims[0] after slicing (pre-transpose)
+    int64_t  opExtentHi;     // extent of opTileDims[1] after slicing (pre-transpose)
 
     // Threaded from the physical construct_memory_view (R-a). Populated by
     // dispatchMatmul / dispatchSink after classify(); consumed by S5.
@@ -786,11 +790,11 @@ struct RewriteDescriptorLayoutPass
     SmallVector<int64_t> canonicalAxes; // one entry per logical dim of this operand
   };
 
-  // Logical dims that are reduction (canonicalAxes entries == -1), by position.
-  static SmallVector<int64_t> reductionDims(const SourceOperandSpec &spec) {
-    SmallVector<int64_t> result;
-    for (int64_t i = 0; i < (int64_t)spec.canonicalAxes.size(); ++i)
-      if (spec.canonicalAxes[i] == -1) result.push_back(i);
+  // Per-logical-dim reduction predicate: isReduction[i] = true iff dim i is reduction.
+  static SmallVector<bool> isReduction(const SourceOperandSpec &spec) {
+    SmallVector<bool> result;
+    for (int64_t ax : spec.canonicalAxes)
+      result.push_back(ax == -1);
     return result;
   }
 
@@ -803,24 +807,21 @@ struct RewriteDescriptorLayoutPass
 
   // Transpose needed iff canonical low dim is reduction XOR physical low dim is.
   static bool needsTranspose(const SourceOperandSpec &spec, int64_t dimLoRole) {
-    bool canonicalLowIsReduction = (spec.canonicalAxes[0] == -1);
+    bool canonicalLowIsReduction = isReduction(spec)[0];
     bool physicalLowIsReduction  = (dimLoRole == -1);
     return canonicalLowIsReduction != physicalLowIsReduction;
   }
 
   // Descriptor for one source contraction op (e.g. linalg.matmul).
   // `emitOp` receives all (possibly transposed) input slices + accumulator
-  // and returns the updated accumulator. `computeAccShape` derives the 2D
-  // accumulator type from the plan vector (called after classify()).
+  // and returns the updated accumulator. Acc shape is derived from each
+  // operand's resolved opExtentLo/Hi + needsTranspose fields by emitSourceStage.
   struct SourceOpSpec {
     SmallVector<SourceOperandSpec> operands;  // one per input
     unsigned logicalRank;
     function_ref<Value(OpBuilder &, Location, ArrayRef<Value> /*slices*/,
                        Value /*acc*/, RankedTensorType /*accTy*/)>
         emitOp;
-    function_ref<RankedTensorType(ArrayRef<OperandPlan> /*plans*/,
-                                  Type /*accElemTy*/)>
-        computeAccShape;
   };
 
   // Generic source-stage entry point for N-input contraction ops. Iterates
@@ -843,12 +844,12 @@ struct RewriteDescriptorLayoutPass
       OperandCoords coords = OperandCoords::fromMarker(marker, spec.logicalRank,
                                                        physShape);
       SmallVector<int64_t> dimRoles;
-      buildDimRoles(coords, reductionDims(spec.operands[i]),
+      buildDimRoles(coords, isReduction(spec.operands[i]),
                     parallelRole(spec.operands[i]), dimRoles);
       plans[i] = classify(op.getInputs()[i], coords, dimRoles);
     }
 
-    reconcilePlans(plans);
+    resolveAndReconcile(plans, spec);
 
     // S4: thread physical strides/sizes from the construct_memory_view into
     // the plans. Not yet consumed by emitSourceStage (S5 flips the switch).
@@ -864,18 +865,101 @@ struct RewriteDescriptorLayoutPass
     return emitSourceStage(op, spec, plans);
   }
 
-  // Cross-operand SliceKind fix-up (N-ary): StickifiedBlock is only valid when
-  // any plan has a loopDims. When none do, demote all StickifiedBlock to
-  // WholeBlock so extractOpSlice never calls getReduceIV() on a null IV.
-  static void reconcilePlans(SmallVectorImpl<OperandPlan> &plans) {
+  // Per-dim op-tile slice extent: stickSize for StickifiedBlock, full physBlock
+  // otherwise. This is the extent of the op-tile dim before any transpose.
+  static int64_t opSliceExtent(const OperandPlan &plan, int p) {
+    return plan.sliceKind[p] == SliceKind::StickifiedBlock
+               ? plan.stickSize
+               : plan.coords.physBlock[p];
+  }
+
+  // Extract an op-tile stick slice from `plan`. Offsets/sizes follow sliceKind:
+  //   StickIndex      → offset = stickIV (within-tile), size = 1
+  //                     (only when physBlock[p] > 1; else offset = 0)
+  //   StickifiedBlock → offset = stickIV * stickSize, size = stickSize
+  //   WholeBlock      → offset = 0, size = physBlock[p]
+  // `stickIV` is the current stick iteration variable (may be nullptr for
+  // the trivial stickFactor=1 case where emitStickLoop passes a const-0).
+  static Value extractOpSlice(OpBuilder &b, Location loc,
+                               const OperandPlan &plan,
+                               RankedTensorType resultTy, Value stickIV) {
+    auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
+    ArrayRef<int64_t> physBlock = plan.coords.physBlock;
+    int rank = (int)physBlock.size();
+    SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
+    for (int p = 0; p < rank; ++p) {
+      switch (plan.sliceKind[p]) {
+      case SliceKind::StickIndex: {
+        Value iv = (physBlock[p] > 1) ? stickIV : Value{};
+        if (!iv) {
+          offsets[p] = idx(0);
+        } else if (iv.getType().isIndex()) {
+          offsets[p] = iv;
+        } else {
+          offsets[p] = arith::IndexCastOp::create(b, loc,
+                           b.getIndexType(), iv).getResult();
+        }
+        sizes[p] = idx(1);
+        break;
+      }
+      case SliceKind::StickifiedBlock: {
+        Value sIdx = stickIV.getType().isIndex()
+                         ? stickIV
+                         : arith::IndexCastOp::create(b, loc,
+                               b.getIndexType(), stickIV).getResult();
+        Value stickSz = arith::ConstantIndexOp::create(b, loc, plan.stickSize);
+        offsets[p] = arith::MulIOp::create(b, loc, sIdx, stickSz).getResult();
+        sizes[p]   = idx(plan.stickSize);
+        break;
+      }
+      case SliceKind::WholeBlock:
+        offsets[p] = idx(0);
+        sizes[p]   = idx(physBlock[p]);
+        break;
+      }
+    }
+    return tensor::ExtractSliceOp::create(
+        b, loc, resultTy, plan.value, offsets, sizes, strides);
+  }
+
+  // Resolution + cross-operand fix-up for N operand plans.
+  //
+  // 1. Resolve per-operand transpose + op-tile extents from the classified plan
+  //    and the einsum spec, storing results into the plan's resolved fields so
+  //    emitSourceStage reads them without re-consulting the spec or dimRoles.
+  //
+  // 2. StickifiedBlock demotion: StickifiedBlock is only valid when some plan
+  //    has loopDims. When none do, demote all StickifiedBlock to WholeBlock so
+  //    extractOpSlice never uses a null IV. (Must run after resolution because
+  //    opExtentLo/Hi must reflect the demoted kind.)
+  static void resolveAndReconcile(SmallVectorImpl<OperandPlan> &plans,
+                                   const SourceOpSpec &spec) {
+    // Step 1 — resolve transpose + extents per operand.
+    for (unsigned i = 0; i < plans.size(); ++i) {
+      OperandPlan &plan = plans[i];
+      int dimLo = plan.opTileDims[0], dimHi = plan.opTileDims[1];
+      plan.needsTranspose = needsTranspose(spec.operands[i], plan.dimRoles[dimLo]);
+      plan.opExtentLo = opSliceExtent(plan, dimLo);
+      plan.opExtentHi = opSliceExtent(plan, dimHi);
+    }
+
+    // Step 2 — StickifiedBlock demotion.
     bool anyLoop = false;
     for (auto &p : plans)
       if (!p.loopDims.empty()) { anyLoop = true; break; }
-    if (anyLoop) return;
-    for (auto &plan : plans)
-      for (auto &sk : plan.sliceKind)
-        if (sk == SliceKind::StickifiedBlock)
-          sk = SliceKind::WholeBlock;
+    if (!anyLoop) {
+      for (auto &plan : plans)
+        for (auto &sk : plan.sliceKind)
+          if (sk == SliceKind::StickifiedBlock)
+            sk = SliceKind::WholeBlock;
+      // Re-derive extents now that sliceKind has changed.
+      for (unsigned i = 0; i < plans.size(); ++i) {
+        OperandPlan &plan = plans[i];
+        int dimLo = plan.opTileDims[0], dimHi = plan.opTileDims[1];
+        plan.opExtentLo = opSliceExtent(plan, dimLo);
+        plan.opExtentHi = opSliceExtent(plan, dimHi);
+      }
+    }
   }
 
   // linalg.matmul instantiation:
@@ -891,21 +975,6 @@ struct RewriteDescriptorLayoutPass
                      RankedTensorType accTy) -> Value {
       return linalg::MatmulOp::create(b, loc, accTy,
           ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
-    };
-    // A=(m,k): canonical low=M(parallel) → transpose when physical low is K.
-    // B=(k,n): canonical low=K(reduction) → transpose when physical low is N.
-    spec.computeAccShape = [](ArrayRef<OperandPlan> plans,
-                              Type accElemTy) -> RankedTensorType {
-      const OperandPlan &aPlan = plans[0], &bPlan = plans[1];
-      ArrayRef<int64_t> aPhys = aPlan.coords.physBlock;
-      ArrayRef<int64_t> bPhys = bPlan.coords.physBlock;
-      int aDimLo = aPlan.opTileDims[0], aDimHi = aPlan.opTileDims[1];
-      int bDimLo = bPlan.opTileDims[0], bDimHi = bPlan.opTileDims[1];
-      bool transposeA = (aPlan.dimRoles[aDimLo] == -1); // K is physical low
-      bool transposeB = (bPlan.dimRoles[bDimLo] != -1); // N is physical low
-      int64_t M = transposeA ? aPhys[aDimHi] : aPhys[aDimLo];
-      int64_t N = transposeB ? bPhys[bDimLo] : bPhys[bDimHi];
-      return RankedTensorType::get({M, N}, accElemTy);
     };
     return dispatchSource(mm, spec);
   }
@@ -930,32 +999,44 @@ struct RewriteDescriptorLayoutPass
         return op.emitError(
             "spyre_tensor_layout: expected exactly 2 opSlice dims per operand");
 
-    // Per-operand op-tile slice types and transpose flags.
-    // Transpose rule (per SourceOperandSpec.reductionFirst):
-    //   reductionFirst=true  (A-like): transpose when dimRoles[dimLo] == -1
-    //                                  (reduction dim is physically first)
-    //   reductionFirst=false (B-like): transpose when dimRoles[dimLo] != -1
-    //                                  (parallel dim is physically first)
-    auto opSliceExtent = [](const OperandPlan &plan, int p) -> int64_t {
-      return plan.sliceKind[p] == SliceKind::StickifiedBlock
-                 ? plan.stickSize
-                 : plan.coords.physBlock[p];
-    };
+    // Per-operand op-tile slice types — derived from resolved extents.
     SmallVector<RankedTensorType> sliceTys;
-    SmallVector<bool> transposeFlags;
     for (unsigned i = 0; i < plans.size(); ++i) {
       const OperandPlan &plan = plans[i];
-      int dimLo = plan.opTileDims[0], dimHi = plan.opTileDims[1];
       auto elemTy = cast<RankedTensorType>(plan.value.getType()).getElementType();
       sliceTys.push_back(RankedTensorType::get(
-          {opSliceExtent(plan, dimLo), opSliceExtent(plan, dimHi)}, elemTy));
-      // Use the spec's per-operand transpose hint.
-      transposeFlags.push_back(needsTranspose(spec.operands[i], plan.dimRoles[dimLo]));
+          {plan.opExtentLo, plan.opExtentHi}, elemTy));
     }
 
-    auto accTy = spec.computeAccShape(plans, accElemTy);
-
-    auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
+    // Acc shape: each operand contributes its post-transpose parallel op-tile extent
+    // to the output-axis it carries (per canonicalAxes). The parallel dim is
+    // canonical lo (A-like) or hi (B-like); after transpose it occupies position 0.
+    // Parallel extent = needsTranspose ? opExtentHi : opExtentLo  (A-like, parallel=hi when transposed)
+    //                 = needsTranspose ? opExtentLo : opExtentHi  (B-like, parallel=lo when transposed)
+    SmallVector<int64_t> accDims; // one entry per output axis, in axis order
+    {
+      int maxAxis = -1;
+      for (auto &opSpec : spec.operands)
+        for (int64_t ax : opSpec.canonicalAxes)
+          if (ax > maxAxis) maxAxis = (int)ax;
+      if (maxAxis >= 0)
+        accDims.resize(maxAxis + 1, 0);
+      for (unsigned i = 0; i < plans.size(); ++i) {
+        const SourceOperandSpec &opSpec = spec.operands[i];
+        const OperandPlan &plan = plans[i];
+        // If canonical lo is parallel (A-like {M,K}): post-transpose parallel
+        // extent = needsTranspose ? opExtentHi : opExtentLo.
+        // If canonical lo is reduction (B-like {K,N}): post-transpose parallel
+        // extent = needsTranspose ? opExtentLo : opExtentHi.
+        SmallVector<bool> redMask = isReduction(opSpec);
+        int64_t parallelExt = !redMask[0]
+                                  ? (plan.needsTranspose ? plan.opExtentHi : plan.opExtentLo)
+                                  : (plan.needsTranspose ? plan.opExtentLo : plan.opExtentHi);
+        for (int64_t ax : opSpec.canonicalAxes)
+          if (ax >= 0) accDims[ax] = parallelExt;
+      }
+    }
+    auto accTy = RankedTensorType::get(accDims, accElemTy);
 
     auto emitTranspose2D = [&](Value src, Type elemT) -> Value {
       auto srcTy = cast<RankedTensorType>(src.getType());
@@ -986,51 +1067,6 @@ struct RewriteDescriptorLayoutPass
     // stickIV: within-tile stick index used by StickIndex / StickifiedBlock.
     Value stickIV;
 
-    // Extract an op-tile stick slice from `plan`. Offsets/sizes follow sliceKind:
-    //   StickIndex      → offset = stickIV (within-tile), size = 1
-    //                     (only when physBlock[p] > 1; else offset = 0)
-    //   StickifiedBlock → offset = stickIV * stickSize, size = stickSize
-    //   WholeBlock      → offset = 0, size = physBlock[p]
-    auto extractOpSlice = [&](const OperandPlan &plan,
-                               RankedTensorType resultTy) -> Value {
-      ArrayRef<int64_t> physBlock = plan.coords.physBlock;
-      int rank = (int)physBlock.size();
-      SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
-      for (int p = 0; p < rank; ++p) {
-        switch (plan.sliceKind[p]) {
-        case SliceKind::StickIndex: {
-          Value iv = (physBlock[p] > 1) ? stickIV : Value{};
-          if (!iv) {
-            offsets[p] = idx(0);
-          } else if (iv.getType().isIndex()) {
-            offsets[p] = iv;
-          } else {
-            offsets[p] = arith::IndexCastOp::create(b, loc,
-                             b.getIndexType(), iv).getResult();
-          }
-          sizes[p] = idx(1);
-          break;
-        }
-        case SliceKind::StickifiedBlock: {
-          Value sIdx = stickIV.getType().isIndex()
-                           ? stickIV
-                           : arith::IndexCastOp::create(b, loc,
-                                 b.getIndexType(), stickIV).getResult();
-          Value stickSz = arith::ConstantIndexOp::create(b, loc, plan.stickSize);
-          offsets[p] = arith::MulIOp::create(b, loc, sIdx, stickSz).getResult();
-          sizes[p]   = idx(plan.stickSize);
-          break;
-        }
-        case SliceKind::WholeBlock:
-          offsets[p] = idx(0);
-          sizes[p]   = idx(physBlock[p]);
-          break;
-        }
-      }
-      return tensor::ExtractSliceOp::create(
-          b, loc, resultTy, plan.value, offsets, sizes, strides);
-    };
-
     Value result = emitStickLoop(b, loc, stickFactor, cVal,
         [&](OpBuilder &bb, Value s, Value acc) {
       stickIV = s;
@@ -1040,8 +1076,8 @@ struct RewriteDescriptorLayoutPass
       for (unsigned i = 0; i < plans.size(); ++i) {
         auto elemTy =
             cast<RankedTensorType>(plans[i].value.getType()).getElementType();
-        Value slicePhys = extractOpSlice(plans[i], sliceTys[i]);
-        slices.push_back(transposeFlags[i]
+        Value slicePhys = extractOpSlice(b, loc, plans[i], sliceTys[i], stickIV);
+        slices.push_back(plans[i].needsTranspose
                              ? emitTranspose2D(slicePhys, elemTy)
                              : slicePhys);
       }
