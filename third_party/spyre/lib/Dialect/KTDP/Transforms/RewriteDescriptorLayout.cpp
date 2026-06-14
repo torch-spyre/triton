@@ -584,7 +584,7 @@ struct RewriteDescriptorLayoutPass
   // Collected from the existing scf.for nest by collectExistingLoopIVs.
   struct Loop {
     enum Kind { Parallel, Reduction } kind;
-    int   owner;    // which operand: 0=A, 1=B
+    int   owner;    // which operand (index into plans vector)
     int   physDim;  // phys dim the IV indexes
     Value iv;       // induction variable
   };
@@ -772,128 +772,167 @@ struct RewriteDescriptorLayoutPass
     return {};
   }
 
-  // Cross-operand SliceKind fix-up: StickifiedBlock is only valid when a
-  // reduction loop exists (aPlan.loopDims non-empty). When neither operand
-  // has a loopDims, K is contracted whole in one tile — demote any
-  // StickifiedBlock to WholeBlock so extractOpSlice never calls getReduceIV()
-  // on a null IV.
-  static void reconcilePlans(OperandPlan &aPlan, OperandPlan &bPlan) {
-    if (!aPlan.loopDims.empty() || !bPlan.loopDims.empty())
-      return;
-    for (auto *plan : {&aPlan, &bPlan})
-      for (auto &sk : plan->sliceKind)
-        if (sk == SliceKind::StickifiedBlock)
-          sk = SliceKind::WholeBlock;
-  }
+  // Per-operand descriptor for a source contraction op.
+  struct SourceOperandSpec {
+    SmallVector<int64_t> consumedLogicalDims; // reduction dims (≥1 for conv-ready)
+    int64_t              parallelRole;        // logical C dim index this input maps to
+    // Whether to transpose the physical slice before passing to the op.
+    // `reductionFirst` = true  → transpose when dimRoles[dimLo] == -1 (A-like)
+    // `reductionFirst` = false → transpose when dimRoles[dimLo] != -1 (B-like)
+    bool reductionFirst = false;
+    bool needsTranspose(int64_t dimLoRole) const {
+      return reductionFirst ? (dimLoRole == -1) : (dimLoRole != -1);
+    }
+  };
 
-  // Generic source-stage entry point for 2-input contraction ops. Traces both
-  // operands to their markers, builds OperandPlans, and calls emitSourceStage.
-  // Matmul-specific wiring (K dim = A's src 1, B's src 0; logicalRank = 2) is
-  // passed by the concrete instantiation below. Add a second instantiation
-  // (batch_matmul, conv) by adding a new walk + dispatchSource call with
-  // different kLogicalSrc / parallelRole values.
+  // Descriptor for one source contraction op (e.g. linalg.matmul).
+  // `emitOp` receives all (possibly transposed) input slices + accumulator
+  // and returns the updated accumulator. `computeAccShape` derives the 2D
+  // accumulator type from the plan vector (called after classify()).
+  struct SourceOpSpec {
+    SmallVector<SourceOperandSpec> operands;  // one per input
+    unsigned logicalRank;
+    function_ref<Value(OpBuilder &, Location, ArrayRef<Value> /*slices*/,
+                       Value /*acc*/, RankedTensorType /*accTy*/)>
+        emitOp;
+    function_ref<RankedTensorType(ArrayRef<OperandPlan> /*plans*/,
+                                  Type /*accElemTy*/)>
+        computeAccShape;
+  };
+
+  // Generic source-stage entry point for N-input contraction ops. Iterates
+  // spec.operands to trace each input to its marker, build OperandPlans, and
+  // call emitSourceStage. Op-specific wiring comes from the spec; add a new
+  // dispatchXxx (batch_matmul, conv) by building a different SourceOpSpec.
   template <typename OpT>
-  LogicalResult dispatchSource(OpT op,
-                               int64_t aKLogicalSrc, int64_t bKLogicalSrc,
-                               int64_t aParallelRole, int64_t bParallelRole,
-                               unsigned logicalRank) {
-    auto aMarker = findMarkerForOperand(op.getInputs()[0]);
-    auto bMarker = findMarkerForOperand(op.getInputs()[1]);
-    if (!aMarker || !bMarker)
-      return op.emitError(
-          "spyre_tensor_layout: cannot find layout markers for source op operands");
+  LogicalResult dispatchSource(OpT op, const SourceOpSpec &spec) {
+    unsigned nOps = spec.operands.size();
+    SmallVector<OperandPlan, 2> plans(nOps);
+    MLIRContext *ctx = op.getContext();
 
-    auto aPhysShape =
-        cast<RankedTensorType>(op.getInputs()[0].getType()).getShape();
-    auto bPhysShape =
-        cast<RankedTensorType>(op.getInputs()[1].getType()).getShape();
+    for (unsigned i = 0; i < nOps; ++i) {
+      auto marker = findMarkerForOperand(op.getInputs()[i]);
+      if (!marker)
+        return op.emitError(
+            "spyre_tensor_layout: cannot find layout marker for source op operand");
+      auto physShape =
+          cast<RankedTensorType>(op.getInputs()[i].getType()).getShape();
+      OperandCoords coords{marker.getPhysSrc(), marker.getPhysOp(),
+                           marker.getPhysArg(), spec.logicalRank, physShape};
+      SmallVector<int64_t> dimRoles;
+      buildDimRoles(coords, spec.operands[i].consumedLogicalDims,
+                    spec.operands[i].parallelRole, dimRoles);
+      plans[i] = classify(op.getInputs()[i], coords, dimRoles);
+    }
 
-    OperandCoords aC{aMarker.getPhysSrc(), aMarker.getPhysOp(),
-                     aMarker.getPhysArg(), logicalRank, aPhysShape};
-    OperandCoords bC{bMarker.getPhysSrc(), bMarker.getPhysOp(),
-                     bMarker.getPhysArg(), logicalRank, bPhysShape};
-
-    SmallVector<int64_t> dimRoleA, dimRoleB;
-    buildDimRoles(aC, aKLogicalSrc, aParallelRole, dimRoleA);
-    buildDimRoles(bC, bKLogicalSrc, bParallelRole, dimRoleB);
-
-    OperandPlan aPlan = classify(op.getInputs()[0], aC, dimRoleA);
-    OperandPlan bPlan = classify(op.getInputs()[1], bC, dimRoleB);
-
-    reconcilePlans(aPlan, bPlan);
+    reconcilePlans(plans);
 
     // S4: thread physical strides/sizes from the construct_memory_view into
     // the plans. Not yet consumed by emitSourceStage (S5 flips the switch).
-    auto aMemView = getMemViewForOperand(op.getInputs()[0]);
-    auto bMemView = getMemViewForOperand(op.getInputs()[1]);
-    if (!aMemView || !bMemView)
-      return op.emitError(
-          "spyre_tensor_layout: cannot locate physical memory view for source op operands");
-    MLIRContext *ctx = op.getContext();
-    if (failed(threadStridesAndSizes(aPlan, aMemView, ctx)))
-      return failure();
-    if (failed(threadStridesAndSizes(bPlan, bMemView, ctx)))
-      return failure();
+    for (unsigned i = 0; i < nOps; ++i) {
+      auto memView = getMemViewForOperand(op.getInputs()[i]);
+      if (!memView)
+        return op.emitError(
+            "spyre_tensor_layout: cannot locate physical memory view for source op operand");
+      if (failed(threadStridesAndSizes(plans[i], memView, ctx)))
+        return failure();
+    }
 
-    return emitSourceStage(op, aPlan, bPlan);
+    return emitSourceStage(op, spec, plans);
+  }
+
+  // Cross-operand SliceKind fix-up (N-ary): StickifiedBlock is only valid when
+  // any plan has a loopDims. When none do, demote all StickifiedBlock to
+  // WholeBlock so extractOpSlice never calls getReduceIV() on a null IV.
+  static void reconcilePlans(SmallVectorImpl<OperandPlan> &plans) {
+    bool anyLoop = false;
+    for (auto &p : plans)
+      if (!p.loopDims.empty()) { anyLoop = true; break; }
+    if (anyLoop) return;
+    for (auto &plan : plans)
+      for (auto &sk : plan.sliceKind)
+        if (sk == SliceKind::StickifiedBlock)
+          sk = SliceKind::WholeBlock;
   }
 
   // linalg.matmul instantiation:
   //   A logical: dim0=M (src 0 → parallel=0), dim1=K (src 1 → reduction=-1).
   //   B logical: dim0=K (src 0 → reduction=-1), dim1=N (src 1 → parallel=1).
   LogicalResult dispatchMatmul(linalg::MatmulOp mm) {
-    return dispatchSource(mm,
-                          /*aKLogicalSrc=*/1, /*bKLogicalSrc=*/0,
-                          /*aParallelRole=*/0, /*bParallelRole=*/1,
-                          /*logicalRank=*/2);
+    SourceOpSpec spec;
+    // A: K is src 1, M is parallel=0, reductionFirst=true (transpose when K is low dim)
+    // B: K is src 0, N is parallel=1, reductionFirst=false (transpose when N is low dim)
+    spec.operands = {{{1}, 0, /*reductionFirst=*/true},
+                     {{0}, 1, /*reductionFirst=*/false}};
+    spec.logicalRank = 2;
+    spec.emitOp = [](OpBuilder &b, Location loc,
+                     ArrayRef<Value> slices, Value acc,
+                     RankedTensorType accTy) -> Value {
+      return linalg::MatmulOp::create(b, loc, accTy,
+          ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
+    };
+    spec.computeAccShape = [](ArrayRef<OperandPlan> plans,
+                               Type accElemTy) -> RankedTensorType {
+      const OperandPlan &aPlan = plans[0], &bPlan = plans[1];
+      ArrayRef<int64_t> aPhys = aPlan.coords.physBlock;
+      ArrayRef<int64_t> bPhys = bPlan.coords.physBlock;
+      int aDimLo = aPlan.opTileDims[0], aDimHi = aPlan.opTileDims[1];
+      int bDimLo = bPlan.opTileDims[0], bDimHi = bPlan.opTileDims[1];
+      // A: transpose when K is the low dim (reductionFirst=true)
+      bool transposeA = (aPlan.dimRoles[aDimLo] == -1);
+      // B: transpose when N is the low dim (reductionFirst=false)
+      bool transposeB = (bPlan.dimRoles[bDimLo] != -1);
+      int64_t M = transposeA ? aPhys[aDimHi] : aPhys[aDimLo];
+      int64_t N = transposeB ? bPhys[bDimLo] : bPhys[bDimHi];
+      return RankedTensorType::get({M, N}, accElemTy);
+    };
+    return dispatchSource(mm, spec);
   }
 
-  // Source stage: extract 2D A/B slices from the already-physicalized loads,
-  // emit linalg.matmul(outs=cVal) at mm's position, RAUW mm's result, erase mm.
-  // Phase 1 already rescaled and wired the enclosing scf.for loops; Phase 2
-  // reads their IVs via collectExistingLoopIVs and emits only the slices +
-  // matmul — no new loops.
-  LogicalResult emitSourceStage(linalg::MatmulOp mm,
-                                const OperandPlan &aPlan,
-                                const OperandPlan &bPlan) {
-    OpBuilder b(mm);
-    Location loc = mm.getLoc();
+  // Source stage: for each operand in `plans`, extract its op slice from the
+  // already-physicalized load, emit the contraction op (via spec.emitOp) at
+  // op's position, RAUW the result, erase op. Phase 1 already rescaled and
+  // wired the enclosing scf.for loops; Phase 2 reads their IVs via
+  // collectExistingLoopIVs and emits only the slices + op — no new loops.
+  template <typename OpT>
+  LogicalResult emitSourceStage(OpT op, const SourceOpSpec &spec,
+                                ArrayRef<OperandPlan> plans) {
+    OpBuilder b(op);
+    Location loc = op.getLoc();
 
-    Value cVal = mm.getOutputs()[0];
+    Value cVal = op.getOutputs()[0];
+    auto accElemTy = cast<RankedTensorType>(cVal.getType()).getElementType();
 
-    auto aElemTy = cast<RankedTensorType>(aPlan.value.getType()).getElementType();
-    auto bElemTy = cast<RankedTensorType>(bPlan.value.getType()).getElementType();
-    auto accTy   = cast<RankedTensorType>(cVal.getType()).getElementType();
+    // Each operand must have exactly 2 opSlice dims (the op tile).
+    for (unsigned i = 0; i < plans.size(); ++i)
+      if (plans[i].opTileDims.size() != 2)
+        return op.emitError(
+            "spyre_tensor_layout: expected exactly 2 opSlice dims per operand");
 
-    ArrayRef<int64_t> aPhysShape = aPlan.coords.physBlock;
-    ArrayRef<int64_t> bPhysShape = bPlan.coords.physBlock;
-
-    // Each operand must have exactly 2 opSlice dims (the 2D matmul tile).
-    if (aPlan.opTileDims.size() != 2 || bPlan.opTileDims.size() != 2)
-      return mm.emitError(
-          "spyre_tensor_layout: expected exactly 2 opSlice dims per operand");
-
-    int aDimLo = aPlan.opTileDims[0], aDimHi = aPlan.opTileDims[1];
-    int bDimLo = bPlan.opTileDims[0], bDimHi = bPlan.opTileDims[1];
-
-    // 2D slice result types (physical order).
+    // Per-operand op-tile slice types and transpose flags.
+    // Transpose rule (per SourceOperandSpec.reductionFirst):
+    //   reductionFirst=true  (A-like): transpose when dimRoles[dimLo] == -1
+    //                                  (reduction dim is physically first)
+    //   reductionFirst=false (B-like): transpose when dimRoles[dimLo] != -1
+    //                                  (parallel dim is physically first)
     auto opSliceExtent = [](const OperandPlan &plan, int p) -> int64_t {
       return plan.sliceKind[p] == SliceKind::StickifiedBlock
                  ? plan.stickSize
                  : plan.coords.physBlock[p];
     };
-    auto sliceAPhysTy = RankedTensorType::get(
-        {opSliceExtent(aPlan, aDimLo), opSliceExtent(aPlan, aDimHi)}, aElemTy);
-    auto sliceBPhysTy = RankedTensorType::get(
-        {opSliceExtent(bPlan, bDimLo), opSliceExtent(bPlan, bDimHi)}, bElemTy);
+    SmallVector<RankedTensorType> sliceTys;
+    SmallVector<bool> transposeFlags;
+    for (unsigned i = 0; i < plans.size(); ++i) {
+      const OperandPlan &plan = plans[i];
+      int dimLo = plan.opTileDims[0], dimHi = plan.opTileDims[1];
+      auto elemTy = cast<RankedTensorType>(plan.value.getType()).getElementType();
+      sliceTys.push_back(RankedTensorType::get(
+          {opSliceExtent(plan, dimLo), opSliceExtent(plan, dimHi)}, elemTy));
+      // Use the spec's per-operand transpose hint.
+      transposeFlags.push_back(spec.operands[i].needsTranspose(plan.dimRoles[dimLo]));
+    }
 
-    bool transposeA = (aPlan.dimRoles[aDimLo] == -1);
-    bool transposeB = (bPlan.dimRoles[bDimLo] != -1);
-
-    int64_t M  = transposeA ? aPhysShape[aDimHi] : aPhysShape[aDimLo];
-    int64_t KA = transposeA ? aPhysShape[aDimLo] : aPhysShape[aDimHi];
-    int64_t N  = transposeB ? bPhysShape[bDimLo] : bPhysShape[bDimHi];
-    auto accTy2D = RankedTensorType::get({M, N}, accTy);
+    auto accTy = spec.computeAccShape(plans, accElemTy);
 
     auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
 
@@ -907,36 +946,33 @@ struct RewriteDescriptorLayoutPass
     };
 
     // Collect IVs from the existing enclosing scf.for loops (wired by Phase 1).
+    // Use the first plan's loopDims as the reduction-dim reference (all plans
+    // share the same reduction loop structure for a given contraction op).
     SmallVector<Loop> loops;
-    collectLoopIVsForTile(mm, tileForPlan(aPlan), 0, aPlan.loopDims, loops);
-    collectLoopIVsForTile(mm, tileForPlan(bPlan), 1, aPlan.loopDims, loops);
+    for (unsigned i = 0; i < plans.size(); ++i)
+      collectLoopIVsForTile(op, tileForPlan(plans[i]), (int)i,
+                            plans[0].loopDims, loops);
 
     // Determine if a StickifiedBlock dim exists and what factor it has.
-    // factor > 1 means each loaded tile spans factor sticks; Phase 2 emits
-    // an inner stick loop 0..factor to iterate within the tile.
     int64_t stickFactor = 1;
-    for (auto *plan : {&aPlan, &bPlan}) {
-      for (int p = 0; p < (int)plan->sliceKind.size(); ++p) {
-        if (plan->sliceKind[p] == SliceKind::StickifiedBlock) {
-          int64_t f = plan->coords.physBlock[p] / plan->stickSize;
+    for (auto &plan : plans)
+      for (int p = 0; p < (int)plan.sliceKind.size(); ++p)
+        if (plan.sliceKind[p] == SliceKind::StickifiedBlock) {
+          int64_t f = plan.coords.physBlock[p] / plan.stickSize;
           if (f > stickFactor) stickFactor = f;
         }
-      }
-    }
 
-    // stickIV: the within-tile stick index used by StickIndex (when
-    // physBlock[p] > 1) and StickifiedBlock. For factor==1 it stays null
-    // (set below before extractOpSlice is called).
+    // stickIV: within-tile stick index used by StickIndex / StickifiedBlock.
     Value stickIV;
 
-    // Extract a 2D stick slice from `plan`. Offsets/sizes follow sliceKind:
+    // Extract an op-tile stick slice from `plan`. Offsets/sizes follow sliceKind:
     //   StickIndex      → offset = stickIV (within-tile), size = 1
     //                     (only when physBlock[p] > 1; else offset = 0)
     //   StickifiedBlock → offset = stickIV * stickSize, size = stickSize
     //   WholeBlock      → offset = 0, size = physBlock[p]
-    auto extractOpSlice = [&](const OperandPlan &plan, int planOwner,
-                               ArrayRef<int64_t> physBlock,
+    auto extractOpSlice = [&](const OperandPlan &plan,
                                RankedTensorType resultTy) -> Value {
+      ArrayRef<int64_t> physBlock = plan.coords.physBlock;
       int rank = (int)physBlock.size();
       SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
       for (int p = 0; p < rank; ++p) {
@@ -977,21 +1013,24 @@ struct RewriteDescriptorLayoutPass
     Value result = emitStickLoop(b, loc, stickFactor, cVal,
         [&](OpBuilder &bb, Value s, Value acc) {
       stickIV = s;
-      // Temporarily redirect b so extractOpSlice / emitTranspose2D use bb.
       OpBuilder saved = b;
       b = bb;
-      Value aSlicePhys = extractOpSlice(aPlan, 0, aPhysShape, sliceAPhysTy);
-      Value bSlicePhys = extractOpSlice(bPlan, 1, bPhysShape, sliceBPhysTy);
-      Value aSlice = transposeA ? emitTranspose2D(aSlicePhys, aElemTy) : aSlicePhys;
-      Value bSlice = transposeB ? emitTranspose2D(bSlicePhys, bElemTy) : bSlicePhys;
-      Value r = linalg::MatmulOp::create(b, loc, accTy2D,
-          ValueRange{aSlice, bSlice}, ValueRange{acc}).getResult(0);
+      SmallVector<Value> slices;
+      for (unsigned i = 0; i < plans.size(); ++i) {
+        auto elemTy =
+            cast<RankedTensorType>(plans[i].value.getType()).getElementType();
+        Value slicePhys = extractOpSlice(plans[i], sliceTys[i]);
+        slices.push_back(transposeFlags[i]
+                             ? emitTranspose2D(slicePhys, elemTy)
+                             : slicePhys);
+      }
+      Value r = spec.emitOp(b, loc, slices, acc, accTy);
       b = saved;
       return r;
     });
 
-    mm.getResult(0).replaceAllUsesWith(result);
-    mm.erase();
+    op.getResult(0).replaceAllUsesWith(result);
+    op.erase();
     return success();
   }
 
@@ -1034,65 +1073,52 @@ struct RewriteDescriptorLayoutPass
   // OpBuilder(st) which positions before the store.
   LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
                                const OperandPlan &dPlan) {
-    Value inputTile = st.getDataTile(); // the LOGICAL input (rank-2)
+    Value inputTile = st.getDataTile(); // logical input (rank-2)
     OpBuilder b(st);
     Location loc = st.getLoc();
 
-    auto logTy = cast<RankedTensorType>(inputTile.getType());
-    Type elemTy = logTy.getElementType();
-    ArrayRef<int64_t> logShape = logTy.getShape(); // [BLOCK_M, BLOCK_N] — per-block tile
+    Type elemTy = cast<RankedTensorType>(inputTile.getType()).getElementType();
 
-    ArrayRef<int64_t> physBlock = dPlan.coords.physBlock; // [Nstick, M, lane]
+    // All physical accounting comes from the plan — no logShape lookups.
+    ArrayRef<int64_t> physBlock = dPlan.coords.physBlock; // e.g. [Nstick, M, lane]
     int physRank = (int)physBlock.size();
+    int64_t stickSize = physBlock[dPlan.lane]; // lane = innermost phys dim
 
-    // Verify assumptions: exactly one floor dim, rest are opSlice.
-    // The lane dim (innermost) and any identity parallel dims are opTileDims.
     if (dPlan.floorDims.empty())
       return st.emitError(
           "spyre_tensor_layout: store sink stage requires at least one "
           "parallel floor dim in the output layout");
-    // loopDims must be empty for a store.
     if (!dPlan.loopDims.empty())
       return st.emitError(
           "spyre_tensor_layout: store sink stage: unexpected reduction dim");
 
-    // The logical C slice is extracted in logical-dim order and inserted into
-    // D's opSlice dims directly (no transpose). This is only correct when D's
-    // opSlice dims are already in ascending logical-dim order. Guard against
-    // layouts that would need a transpose (the source stage handles that case
-    // via transposeA/transposeB; the sink stage does not yet).
+    // Guard: opTile dims must appear in ascending logical-dim order so that
+    // the logical extract below matches physical insertion without a transpose.
     {
       int64_t prevLogDim = -1;
       for (int p : dPlan.opTileDims) {
         int64_t logDim = dPlan.dimRoles[p];
         if (logDim < prevLogDim)
           return st.emitError(
-              "spyre_tensor_layout: store sink stage: output opSlice dims are "
+              "spyre_tensor_layout: store sink stage: output opTile dims are "
               "not in ascending logical-dim order (transpose not yet supported)");
         prevLogDim = logDim;
       }
     }
 
-    // stickSize = lane extent (e.g. 64). factor = how many D sticks the logical
-    // C tile spans on the floor dim = logShape[logDim] / stickSize.
-    int laneDim = dPlan.lane; // innermost phys dim of D (= physRank-1)
-    int64_t stickSize = physBlock[laneDim]; // e.g. 64
-
-    // helpers
     auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
 
-    // Build the initial physical D accumulator (tensor.empty over physBlock).
-    SmallVector<int64_t> sinkPhysShape(physBlock.begin(), physBlock.end());
-    Value physicalSink = tensor::EmptyOp::create(b, loc, sinkPhysShape, elemTy);
+    // Build the initial physical sink accumulator (tensor.empty over physBlock).
+    SmallVector<int64_t> sinkShape(physBlock.begin(), physBlock.end());
+    Value physicalSink = tensor::EmptyOp::create(b, loc, sinkShape, elemTy);
 
     // Collect IVs from existing enclosing loops (wired by Phase 1).
-    // For floor dims with physBlock[p]==1 the IV is always 0 (trip-1, no loop).
     SmallVector<Loop> loops;
     auto storeTile = dyn_cast_or_null<mlir::ktdp::ConstructAccessTilesOp>(
         st.getAccessTile().getDefiningOp());
     collectLoopIVsForTile(st, storeTile, 0, /*loopDims=*/{}, loops);
 
-    // Build floorIVs[physDim] → IV or c0 for trip-1 dims.
+    // Build floorIVs[physDim] → IV or c0 for trip-1 floor dims.
     Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
     SmallVector<Value> floorIVs(physRank, c0);
     for (auto &l : loops) {
@@ -1105,70 +1131,75 @@ struct RewriteDescriptorLayoutPass
       }
     }
 
-    // Base C-extract parameters (offset 0, full size on every dim).
-    int logRank = (int)logShape.size();
-    SmallVector<OpFoldResult> cOffsetsBase(logRank), cSizesBase(logRank),
-        cStrides(logRank, idx(1));
-    for (int d = 0; d < logRank; ++d) {
-      cOffsetsBase[d] = idx(0);
-      cSizesBase[d]   = idx(logShape[d]);
+    // Build extract/insert parameter base arrays from the physical plan.
+    //
+    // inputTile is logical (rank = dPlan.coords.logicalRank). For each logical
+    // dim d, the base offset is 0 and the base size is:
+    //   - stickSize            if d is the logical src of a floor dim (will be
+    //                          overridden per-iteration inside the stick loop)
+    //   - physBlock[p]         for opTile dims (taken whole)
+    // We derive sizes by scanning dimRoles rather than reading logShape.
+    unsigned logRank = dPlan.coords.logicalRank;
+    SmallVector<OpFoldResult> inputOffsetsBase(logRank, idx(0));
+    SmallVector<OpFoldResult> inputSizesBase(logRank);
+    SmallVector<OpFoldResult> inputStrides(logRank, idx(1));
+    // Default: fill from opTileDims (physBlock[p] for each logical src).
+    for (int p : dPlan.opTileDims) {
+      int64_t logDim = dPlan.dimRoles[p];
+      if (logDim >= 0 && (unsigned)logDim < logRank)
+        inputSizesBase[logDim] = idx(physBlock[p]);
+    }
+    // Floor dims: size = stickSize on that logical dim (overridden in loop body).
+    for (int p : dPlan.floorDims) {
+      int64_t logDim = dPlan.dimRoles[p];
+      if (logDim >= 0 && (unsigned)logDim < logRank)
+        inputSizesBase[logDim] = idx(stickSize);
     }
 
-    // Base D-insert parameters (offset 0 / full size for non-floor dims).
-    SmallVector<OpFoldResult> dOffsetsBase(physRank), dSizes(physRank),
-        dStrides(physRank, idx(1));
-    for (int p = 0; p < physRank; ++p) {
-      bool isFloor = llvm::is_contained(dPlan.floorDims, p);
-      dOffsetsBase[p] = idx(0);
-      dSizes[p] = isFloor ? idx(1) : idx(physBlock[p]);
-    }
+    // Sink insert: offset 0 / full physBlock size for non-floor dims.
+    SmallVector<OpFoldResult> sinkOffsetsBase(physRank, idx(0));
+    SmallVector<OpFoldResult> sinkSizes(physRank);
+    SmallVector<OpFoldResult> sinkStrides(physRank, idx(1));
+    for (int p = 0; p < physRank; ++p)
+      sinkSizes[p] = llvm::is_contained(dPlan.floorDims, p)
+                         ? idx(1) : idx(physBlock[p]);
 
-    // For each floor dim, lift logical C into the physical D shape.
-    //   factor  = logShape[logDim] / stickSize   (BLOCK_N / 64)
-    //
-    // factor==1 (BLOCK_N == stickSize): inputTile is exactly one stick wide.
-    //   Use tensor.expand_shape to insert the size-1 floor dim — no copy,
-    //   no loop. Reassociation: split logDim into [floorDim, logDim] in phys.
-    //
-    // factor>1 (BLOCK_N > stickSize): inputTile spans multiple sticks.
-    //   Loop s=0..factor-1: extract the s-th stickSize slice of C on logDim,
-    //   insert into position s of physicalSink on the floor dim.
-    // `n` (enclosing N-block IV) is NOT used here — the access tile already
-    // encodes the global N position. We only fill the local physicalSink buffer.
+    // For each floor dim p: scatter inputTile's sticks into physicalSink.
+    // tripCount = physBlock[p] (number of sticks along this dim — computed
+    // from the coord map during Phase 1, no logShape division needed).
     Value acc = physicalSink;
     for (int p : dPlan.floorDims) {
       int64_t logDim = dPlan.dimRoles[p];
-      if (logDim < 0 || logDim >= logRank) continue;
+      if (logDim < 0 || (unsigned)logDim >= logRank) continue;
 
-      int64_t factor = logShape[logDim] / stickSize;
+      int64_t tripCount = physBlock[p]; // sticks per tile along dim p
+      Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
 
-      {
-        Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
-
-        // Slice shape: stickSize on logDim, full extent elsewhere.
-        SmallVector<int64_t> slShape(logShape.begin(), logShape.end());
-        slShape[logDim] = stickSize;
-        auto slTy = RankedTensorType::get(slShape, elemTy);
-
-        acc = emitStickLoop(b, loc, factor, acc,
-            [&](OpBuilder &bb, Value s, Value sinkAccumulator) -> Value {
-              // C-extract: s-th stick-slice of the tile on logDim.
-              SmallVector<OpFoldResult> cOff = cOffsetsBase;
-              SmallVector<OpFoldResult> cSz  = cSizesBase;
-              cOff[logDim] =
-                  arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
-              cSz[logDim] = idx(stickSize);
-              Value inputSlice = tensor::ExtractSliceOp::create(
-                  bb, loc, slTy, inputTile, cOff, cSz, cStrides);
-
-              // D-insert: position s within the local physicalSink buffer.
-              SmallVector<OpFoldResult> dOff = dOffsetsBase;
-              Value dStick = s; // within-block index (0..factor-1)
-              dOff[p] = dStick;
-              return tensor::InsertSliceOp::create(
-                  bb, loc, inputSlice, sinkAccumulator, dOff, dSizes, dStrides);
-            });
+      // Extract-result type: stickSize on the floor's logical dim, physBlock
+      // for every opTile logical dim.
+      SmallVector<int64_t> slShape(logRank);
+      for (int p2 : dPlan.opTileDims) {
+        int64_t ld = dPlan.dimRoles[p2];
+        if (ld >= 0 && (unsigned)ld < logRank) slShape[ld] = physBlock[p2];
       }
+      slShape[logDim] = stickSize;
+      auto slTy = RankedTensorType::get(slShape, elemTy);
+
+      acc = emitStickLoop(b, loc, tripCount, acc,
+          [&](OpBuilder &bb, Value s, Value sinkAccumulator) -> Value {
+            // Input-extract: s-th stick-slice of inputTile on the floor's logDim.
+            SmallVector<OpFoldResult> inOff = inputOffsetsBase;
+            inOff[logDim] =
+                arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
+            Value inputSlice = tensor::ExtractSliceOp::create(
+                bb, loc, slTy, inputTile, inOff, inputSizesBase, inputStrides);
+
+            // Sink-insert: position s along floor dim p.
+            SmallVector<OpFoldResult> sinkOff = sinkOffsetsBase;
+            sinkOff[p] = s;
+            return tensor::InsertSliceOp::create(
+                bb, loc, inputSlice, sinkAccumulator, sinkOff, sinkSizes, sinkStrides);
+          });
     }
     Value result = acc;
 
