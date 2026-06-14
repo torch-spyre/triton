@@ -34,12 +34,13 @@
 //       rewriteOnePhysicalize(marker)
 //         isLoweredDescriptor / getDescriptorMemView
 //         buildPhysicalMemoryView   -> physical ConstructMemoryViewOp
-//           applyStatic             derive physical static extents
-//         rewriteAccessTile(tile)   -> physical ConstructAccessTilesOp
-//           mapIndices / applyIndex
+//           applyStatic / applyCoordMap  derive physical static extents
+//         rewriteAccessTile(tile, coords) -> physical ConstructAccessTilesOp
+//           applyIndex              SSA index mapping per coord-op
+//           rescaleEnclosingLoop    rescale enclosing scf.for to stick granularity
 //         retypeLoad                -> physical ktdp.load + retypeChain
-//           retypeChain             propagate type (stops at multi-tensor ops)
-//         retypeStore               redirect access tile operand (output stays
+//           retypeChain             propagate type (stops at isContractionOp)
+//         redirectStoreAccessTile   redirect access tile operand (output stays
 //                                   logical-typed; sink stage fixes it in Phase 2)
 //         (marker kept alive for Phase 2)
 //     Phase 2 — synthesizeContractions (loop-until-stable):
@@ -56,8 +57,9 @@
 //     Phase 3 — eraseMarker (marker + dead bridge cast)
 //
 //   Coord helpers (free functions):
-//     applyStatic  : compile-time extent (shape / block_shape)
-//     applyIndex   : SSA load/store offset (identity | divsi | remsi)
+//     applyStatic     : compile-time extent for one dim
+//     applyCoordMap   : compile-time extents for all physical dims
+//     applyIndex      : SSA load/store offset (identity | divsi | remsi)
 //
 //===----------------------------------------------------------------------===//
 
@@ -123,6 +125,25 @@ static std::optional<int64_t> applyStatic(int64_t logical, CoordOp op,
     return arg;
   }
   return std::nullopt;
+}
+
+// Compute physical static extents from logical static extents via a coord map.
+// Returns false if any physical dim is dynamic; caller handles the dynamic path.
+static bool applyCoordMap(ArrayRef<int64_t> logSizes,
+                          ArrayRef<int64_t> physSrc,
+                          ArrayRef<int64_t> physOp,
+                          ArrayRef<int64_t> physArg,
+                          SmallVectorImpl<int64_t> &out) {
+  unsigned physRank = physSrc.size();
+  out.resize(physRank);
+  for (unsigned k = 0; k < physRank; ++k) {
+    auto sz = applyStatic(logSizes[physSrc[k]],
+                          static_cast<CoordOp>(physOp[k]), physArg[k]);
+    if (!sz)
+      return false;
+    out[k] = *sz;
+  }
+  return true;
 }
 
 /// Walk a def-chain of index arithmetic back to the single BlockArgument it
@@ -1164,7 +1185,7 @@ struct RewriteDescriptorLayoutPass
   //   3. ktdp.load result tensor     : retyped to physical rank
   //   4. ktdp.store src tensor       : access tile redirected to physical tile
   //   5. elementwise ops downstream  : result tensors retyped (retypeChain)
-  //      (stops at multi-tensor ops like linalg.matmul)
+  //      (stops at contraction ops; see isContractionOp)
   LogicalResult rewriteOnePhysicalize(triton::SpyreTensorLayoutOp marker) {
     Value desc = marker.getDesc();
 
@@ -1182,12 +1203,25 @@ struct RewriteDescriptorLayoutPass
       return marker.emitError(
           "spyre_tensor_layout: cannot locate construct_memory_view behind cast");
 
-    ArrayRef<int64_t> physSrc = marker.getPhysSrc();
-    ArrayRef<int64_t> physOp  = marker.getPhysOp();
-    ArrayRef<int64_t> physArg = marker.getPhysArg();
+    // Build OperandCoords from the marker's coord map. physBlock is
+    // tile-specific and filled inside rewriteAccessTile from logBlock.
+    OperandCoords coords;
+    coords.src        = marker.getPhysSrc();
+    coords.op         = marker.getPhysOp();
+    coords.arg        = marker.getPhysArg();
+    coords.logicalRank = cast<MemRefType>(memView.getType()).getRank();
+    // physBlock is tile-specific; rewriteAccessTile computes it from logBlock.
+
+    // Convenience aliases so the code below is unchanged.
+    ArrayRef<int64_t> physSrc = coords.src;
+    ArrayRef<int64_t> physOp  = coords.op;
+    ArrayRef<int64_t> physArg = coords.arg;
     unsigned physRank = physSrc.size();
 
     // --- 1. Build physical construct_memory_view ---
+    // The "coord map" (physSrc/physOp/physArg) defines the logical→physical
+    // transformation per physical dim; see OperandPlan::coords for the same
+    // triplet consumed by Phase 2.
     // Derive the coord map using the static sizes on the existing logical view.
     // Dynamic logical dims produce dynamic physical dims (floordiv) or are
     // resolved to the constant modulus (mod).
@@ -1358,8 +1392,7 @@ struct RewriteDescriptorLayoutPass
         tiles.push_back(tile);
 
     for (auto tileOp : tiles) {
-      if (failed(rewriteAccessTile(tileOp, newMemView,
-                                   physSrc, physOp, physArg)))
+      if (failed(rewriteAccessTile(tileOp, newMemView, coords)))
         return failure();
     }
 
@@ -1385,13 +1418,37 @@ struct RewriteDescriptorLayoutPass
     return physIdx;
   }
 
+  // Rescale an scf.for loop to stick granularity.
+  // Sets ub = old_ub * factor and step = factor (or step = 1 when factor == 1).
+  // IV values become 0, factor, 2*factor, ... — tile-granular stick indices.
+  // Phase 2 emits an inner loop over sticks within each tile.
+  void rescaleEnclosingLoop(scf::ForOp forOp, int64_t factor) {
+    Type ivTy = forOp.getInductionVar().getType();
+    OpBuilder b(forOp);
+    Location loc = forOp.getLoc();
+    if (factor > 1) {
+      Value factorV = arith::ConstantOp::create(b, loc,
+                          b.getIntegerAttr(ivTy, factor));
+      Value newUb = arith::MulIOp::create(b, loc,
+                        forOp.getUpperBound(), factorV).getResult();
+      forOp.setUpperBound(newUb);
+      forOp.setStep(factorV);
+    } else {
+      Value c1v = arith::ConstantOp::create(b, loc,
+                      b.getIntegerAttr(ivTy, 1));
+      forOp.setStep(c1v);
+    }
+  }
+
   // Rebuild ConstructAccessTilesOp with the physical memView + block shape.
   // Erases the old tile; users (ktdp.load/store) are retargeted to the new tile.
   LogicalResult rewriteAccessTile(mlir::ktdp::ConstructAccessTilesOp tileOp,
                                   Value newMemView,
-                                  ArrayRef<int64_t> physSrc,
-                                  ArrayRef<int64_t> physOp,
-                                  ArrayRef<int64_t> physArg) {
+                                  const OperandCoords &coords) {
+    ArrayRef<int64_t> physSrc = coords.src;
+    ArrayRef<int64_t> physOp  = coords.op;
+    ArrayRef<int64_t> physArg = coords.arg;
+
     OpBuilder b(tileOp);
     Location loc = tileOp.getLoc();
     MLIRContext *ctx = b.getContext();
@@ -1403,20 +1460,15 @@ struct RewriteDescriptorLayoutPass
     unsigned physRank = physSrc.size();
     (void)logRank; // physRank may differ (stick dim expands 2->3)
 
-    // Compute physical block shape.
-    SmallVector<int64_t> physBlock(physRank);
-    for (unsigned k = 0; k < physRank; ++k) {
-      int64_t src = physSrc[k];
-      auto op = static_cast<CoordOp>(physOp[k]);
-      int64_t arg = physArg[k];
-      if (src < 0 || src >= (int64_t)logRank)
+    // Compute physical block shape via applyCoordMap.
+    SmallVector<int64_t> physBlock;
+    if (!applyCoordMap(logBlock, physSrc, physOp, physArg, physBlock))
+      return tileOp.emitError(
+          "spyre_tensor_layout: cannot derive static block_shape");
+    // Validate phys_src bounds.
+    for (unsigned k = 0; k < physRank; ++k)
+      if (physSrc[k] < 0 || physSrc[k] >= (int64_t)logRank)
         return tileOp.emitError("spyre_tensor_layout: phys_src out of range");
-      auto pb = applyStatic(logBlock[src], op, arg);
-      if (!pb)
-        return tileOp.emitError(
-            "spyre_tensor_layout: cannot derive static block_shape");
-      physBlock[k] = *pb;
-    }
 
     // Map the logical index operands to physical index operands.
     // The existing tile's index operands are already index-typed (cast from i32
@@ -1425,19 +1477,10 @@ struct RewriteDescriptorLayoutPass
                                tileOp.getIndices().end());
     // For FloorDiv (stick-index) dims: trace the logical index back to its
     // enclosing scf.for IV. If found, rescale the loop's trip by
-    // factor = BLOCK_d // stickSize (= arg for FloorDiv / arg for the Mod lane
-    // dim sharing the same logical src) and wire the IV directly. This discards
-    // the muli(%iv, BLOCK_d) + divsi chain that Phase 1 previously emitted.
+    // factor = physBlock[k] (sticks per tile along this dim) and wire the IV
+    // directly. This discards the muli(%iv, BLOCK_d) + divsi chain.
     // For Mod (lane) dims: always emit remsi (lane is never iterated).
     // For Identity: pass through.
-    //
-    // stickSize for each logical src dim = physArg[lane_k] where lane_k is the
-    // Mod dim sharing that src. We collect it per logical src below.
-    SmallVector<int64_t> stickSizeForLogSrc(logBlock.size(), 0);
-    for (unsigned k = 0; k < physRank; ++k)
-      if (static_cast<CoordOp>(physOp[k]) == CoordOp::Mod)
-        stickSizeForLogSrc[physSrc[k]] = physArg[k];
-
     SmallVector<Value> physIdx;
     for (unsigned k = 0; k < physRank; ++k) {
       int64_t src = physSrc[k];
@@ -1449,49 +1492,17 @@ struct RewriteDescriptorLayoutPass
         physIdx.push_back(logI);
         break;
       case CoordOp::FloorDiv: {
-        // S6 Phase 1: attempt to trace logI back to an enclosing scf.for IV
-        // and rescale that loop to stick granularity.
-        auto [iv, logStride] = traceToMLIRBlockArgWithStride(logI);
+        // Attempt to trace logI back to an enclosing scf.for IV and rescale
+        // that loop to stick granularity.
+        BlockArgument iv = traceToMLIRBlockArg(logI);
         scf::ForOp forOp = iv ? dyn_cast_or_null<scf::ForOp>(
                                     iv.getOwner()->getParentOp())
                               : nullptr;
         if (forOp && forOp.getInductionVar() == iv) {
-          // Rescale: new_trip = old_trip * factor, step = 1.
-          // factor = logStride / stickSize: how many sticks the loop IV advances
-          // per iteration.
-          int64_t stickSize = stickSizeForLogSrc[src];
-          if (stickSize > 0 && logStride < stickSize)
-            return tileOp.emitError(
-                "spyre_tensor_layout: block size (")
-                << logStride << ") is smaller than stick size (" << stickSize
-                << ") on logical dim " << src
-                << " — BLOCK must be >= stickSize for stickified dims";
-          int64_t factor    = (stickSize > 0) ? (logStride / stickSize) : 1;
-          Type ivTy = iv.getType();
-          // Rescale: ub *= factor, step = factor. IV values are 0, factor,
-          // 2*factor, ... — tile-granular, valid as access-tile coordinates.
-          // Phase 2 emits an inner loop 0..factor to iterate sticks within
-          // each tile (StickifiedBlock on B's K-flat, StickIndex on A).
-          if (factor > 1) {
-            OpBuilder bBefore(forOp);
-            Location forLoc = forOp.getLoc();
-            Value oldUb = forOp.getUpperBound();
-            Value factorV = arith::ConstantOp::create(
-                bBefore, forLoc, bBefore.getIntegerAttr(ivTy, factor));
-            Value newUb = arith::MulIOp::create(bBefore, forLoc, oldUb, factorV)
-                              .getResult();
-            forOp.setUpperBound(newUb);
-            forOp.setStep(factorV);
-          } else {
-            // factor == 1: ensure step is 1.
-            OpBuilder bBefore(forOp);
-            Value c1v = arith::ConstantOp::create(
-                bBefore, forOp.getLoc(), bBefore.getIntegerAttr(ivTy, 1));
-            forOp.setStep(c1v);
-          }
+          rescaleEnclosingLoop(forOp, physBlock[k]);
           // Wire the IV directly as the stick-index coord (tile-granular).
           // construct_access_tiles requires index-typed operands; cast if needed.
-          Value ivIdx = ivTy.isIndex()
+          Value ivIdx = iv.getType().isIndex()
                             ? iv
                             : arith::IndexCastOp::create(b, loc,
                                   b.getIndexType(), iv).getResult();
@@ -1528,7 +1539,7 @@ struct RewriteDescriptorLayoutPass
       if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
         retypeLoad(ld, newTile.getResult(), physBlock);
       } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
-        retypeStore(st, newTile.getResult());
+        redirectStoreAccessTile(st, newTile.getResult());
       } else {
         return user->emitError(
             "spyre_tensor_layout: unexpected user of access tile");
@@ -1553,17 +1564,29 @@ struct RewriteDescriptorLayoutPass
   }
 
   // Redirect ktdp.store's access tile operand to the new physical tile.
-  // The src tensor is already physical-typed via retypeChain from retypeLoad.
-  void retypeStore(mlir::ktdp::StoreOp st, Value newTile) {
+  // Does NOT retype the store's data tensor — that is Phase 2's job (store sink
+  // stage). The src tensor remains logical-rank until synthesizeContractions runs.
+  void redirectStoreAccessTile(mlir::ktdp::StoreOp st, Value newTile) {
     st.getAccessTileMutable().set(newTile);
+  }
+
+  // True if the op is a contraction (matmul, reduce, etc.) whose result shape
+  // is determined by its own semantics rather than being inherited from a single
+  // physical input. retypeChain stops here and does not propagate through.
+  // NOTE: uses a tensor-operand-count heuristic (>1 tensor operand). This
+  // misclassifies elementwise ops with two tensor inputs (e.g. add) as
+  // contractions; replacing with an explicit op-type check is tracked as P1-2.
+  static bool isContractionOp(Operation *op) {
+    int tensorOperandCount = 0;
+    for (auto operand : op->getOperands())
+      if (isa<RankedTensorType>(operand.getType()))
+        ++tensorOperandCount;
+    return tensorOperandCount > 1;
   }
 
   // Forward-retype the elementwise op chain: replace oldVal with newVal
   // everywhere and update result types of single-result ops that still carry
-  // the old (logical-rank) type.
-  // Stops at multi-tensor-operand ops (contractions: linalg.matmul, reduce,
-  // etc.) whose result shape is determined by their own semantics, not by the
-  // physical shape of one input.
+  // the old (logical-rank) type. Stops at contraction ops.
   void retypeChain(Value oldVal, Value newVal) {
     oldVal.replaceAllUsesWith(newVal);
     SmallVector<Operation *> worklist(newVal.getUsers().begin(),
@@ -1572,13 +1595,7 @@ struct RewriteDescriptorLayoutPass
       Operation *op = worklist.pop_back_val();
       if (op->getNumResults() != 1)
         continue;
-      // Stop at contraction ops: more than one tensor-typed operand means the
-      // result shape is not simply inherited from one input.
-      int tensorOperandCount = 0;
-      for (auto operand : op->getOperands())
-        if (isa<RankedTensorType>(operand.getType()))
-          ++tensorOperandCount;
-      if (tensorOperandCount > 1)
+      if (isContractionOp(op))
         continue;
       auto resTy  = dyn_cast<RankedTensorType>(op->getResult(0).getType());
       auto opndTy = op->getNumOperands() > 0
