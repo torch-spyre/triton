@@ -444,6 +444,13 @@ struct RewriteDescriptorLayoutPass
     unsigned logicalRank;
     // Physical shape of the load result tensor.
     ArrayRef<int64_t> physBlock;
+
+    static OperandCoords fromMarker(triton::SpyreTensorLayoutOp marker,
+                                    unsigned logRank,
+                                    ArrayRef<int64_t> physBlock) {
+      return {marker.getPhysSrc(), marker.getPhysOp(), marker.getPhysArg(),
+              logRank, physBlock};
+    }
   };
 
   // Assign a role to each physical dim of an operand:
@@ -817,8 +824,8 @@ struct RewriteDescriptorLayoutPass
             "spyre_tensor_layout: cannot find layout marker for source op operand");
       auto physShape =
           cast<RankedTensorType>(op.getInputs()[i].getType()).getShape();
-      OperandCoords coords{marker.getPhysSrc(), marker.getPhysOp(),
-                           marker.getPhysArg(), spec.logicalRank, physShape};
+      OperandCoords coords = OperandCoords::fromMarker(marker, spec.logicalRank,
+                                                       physShape);
       SmallVector<int64_t> dimRoles;
       buildDimRoles(coords, spec.operands[i].consumedLogicalDims,
                     spec.operands[i].parallelRole, dimRoles);
@@ -1043,8 +1050,7 @@ struct RewriteDescriptorLayoutPass
     auto tileTy = cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
     ArrayRef<int64_t> physBlock = tileTy.getShape();
 
-    OperandCoords dC{marker.getPhysSrc(), marker.getPhysOp(),
-                     marker.getPhysArg(), 2, physBlock};
+    OperandCoords dC = OperandCoords::fromMarker(marker, 2, physBlock);
 
     // D has no reduction dim: every physical dim's logical src is a parallel dim.
     // Roles[p] = phys_src[p] — the logical dim index it derives from.
