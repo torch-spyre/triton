@@ -146,6 +146,59 @@ def gather_kernel(
 
 
 @triton.jit
+def gather_kernel_spyre(
+    in_ptr,
+    out_ptr,
+    idx_ptr,
+    y_offset,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K_INDICES: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    IN_LAYOUT: tl.constexpr,
+    OUT_LAYOUT: tl.constexpr,
+):
+    """Spyre physical-layout variant of gather_kernel.
+
+    Identical to gather_kernel except that in_desc and out_desc are
+    annotated with Spyre stick-tiling layouts via tl.spyre_tensor_layout.
+    idx_desc is not annotated (index arrays have no stick layout).
+
+    IN_LAYOUT  — stick-tiling for in_ptr's full [M, N] extent.
+    OUT_LAYOUT — stick-tiling for out_ptr's full [K_INDICES, BLOCK_COLS] extent.
+    """
+    idx_desc = tl.make_tensor_descriptor(
+        idx_ptr,
+        shape=[K_INDICES],
+        strides=[1],
+        block_shape=[K_INDICES],
+    )
+    idx = idx_desc.load([0])
+
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[1, BLOCK_COLS],
+    )
+    if IN_LAYOUT is not None and IN_LAYOUT != 0:
+        tl.spyre_tensor_layout(in_desc, IN_LAYOUT)
+
+    result = in_desc.gather(idx, y_offset)
+
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[K_INDICES, BLOCK_COLS],
+        strides=[BLOCK_COLS, 1],
+        block_shape=[K_INDICES, BLOCK_COLS],
+    )
+    if OUT_LAYOUT is not None and OUT_LAYOUT != 0:
+        tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
+
+    out_desc.store([0, 0], result)
+
+
+@triton.jit
 def gather_2d_kernel(
     in_ptr,
     out_ptr,
