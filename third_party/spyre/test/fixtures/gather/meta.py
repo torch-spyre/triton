@@ -622,10 +622,16 @@ VARIANTS = {
                        "IN_LAYOUT", "OUT_LAYOUT"],
         "params": {
             "M":          [256],
-            "N":          [64],
+            # N spans multiple source N-sticks (256/64 = 4) so the physical
+            # in_desc first dim is > 1 and the gather's floordiv/mod actually
+            # selects a source stick rather than collapsing to stick 0.
+            "N":          [256],
             "K_INDICES":  [32],
             "BLOCK_COLS": [64],
-            "y_offset":   [0],
+            # y_offset=96 starts mid-stick (stick 1, lane 32); the 64-wide read
+            # window 96..159 straddles source sticks 1 and 2, exercising the
+            # cross-stick carry in the reconstructed (y_offset + col) index.
+            "y_offset":   [96],
             # in_ptr [M, N]: stick-on-N → [N//_S, M, N%_S]
             "IN_LAYOUT":  [[(1, "floordiv", _SS("in_ptr")), 0, (1, "mod", _SS("in_ptr"))]],
             # out_ptr [K_INDICES, BLOCK_COLS]: stick-on-N → [BLOCK_COLS//_S, K_INDICES, BLOCK_COLS%_S]
@@ -639,7 +645,17 @@ VARIANTS = {
         "output_key": "out_ptr",
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("ktdp.construct_indirect_access_tile"),
+            # in_desc is physicalized stick-on-N → rank-3 [N//stick, M, stick]
+            # view = [4, 256, 64] (4 source N-sticks).
+            t.assert_result_type(
+                "ktdp.construct_memory_view", "4x256x64xf16"),
+            # The gather reads one output stick (BLOCK_COLS=64) for K_INDICES=32
+            # rows, so the indirect access tile is rank-3 [1, 32, 64].
+            t.assert_result(
+                "ktdp.construct_indirect_access_tile", shape=[1, 32, 64]),
+            # The rank-3 load result flows straight into the rank-3 store sink,
+            # so no insert_slice is synthesized (ranks already match).
+            t.assert_absent("tensor.insert_slice"),
         ),
     },
 }
