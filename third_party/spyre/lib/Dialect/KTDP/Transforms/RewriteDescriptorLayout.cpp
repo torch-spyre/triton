@@ -217,6 +217,13 @@ struct RewriteDescriptorLayoutPass
   // Populated during Phase 1; read during Phase 2 (markers still live).
   DenseMap<Value, triton::SpyreTensorLayoutOp> physMemViewToMarker;
 
+  // Loops already rescaled to stick granularity. Pass-level (not per-descriptor)
+  // because multiple descriptors can share the same loop IV — the first
+  // descriptor that physicalizes a FloorDiv dim rescales the loop and fixes the
+  // muli multipliers; subsequent descriptors on the same loop must skip.
+  DenseSet<scf::ForOp> rescaledLoops;
+
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
@@ -1303,10 +1310,22 @@ struct RewriteDescriptorLayoutPass
         indirectTiles.push_back(tile);
     }
 
+    // Direct tiles only own the loop rescaling:
+    //   - FloorDiv dim: traces index → scf.for IV; rescales loop to stick
+    //     granularity + divides muli(iv, C) constants by the same factor.
+    //     e.g. `for i in range(2)` + `offset = i*128` →
+    //          `for i in range(0,4,2)` + `offset = i*64`
+    //   - rescaledLoops guards against double-rescaling if multiple direct
+    //     tiles in the same descriptor share the loop.
+    //   - if the trace fails (trip-1 / non-loop index): falls back to divsi.
     for (auto tileOp : tiles) {
       if (failed(rewriteAccessTile(tileOp, newMemView, coords)))
         return failure();
     }
+    // Indirect tiles (gather) rewrite only the affine subscript maps; the
+    // stick math is baked into the map expressions. Loop rescaling is left to
+    // the direct tiles above — the gather loop must also drive at least one
+    // direct tile (e.g. the output store) so the loop is already rescaled here.
     for (auto tileOp : indirectTiles) {
       if (failed(rewriteIndirectAccessTile(tileOp, newMemView, coords)))
         return failure();
@@ -1320,6 +1339,30 @@ struct RewriteDescriptorLayoutPass
     // Marker and bridge cast are NOT erased here — Phase 2 (synthesizeContractions)
     // still needs to read the marker's coord map. Phase 3 calls eraseMarker.
     return success();
+  }
+
+  // After rescaleEnclosingLoop(iv, factor), the IV runs in stick-index space
+  // (0, factor, 2*factor, ...). Any muli(iv, C) in the loop body that computes
+  // a byte/element offset was written assuming the IV was a block index, so C
+  // must be divided by factor to remain correct. This helper finds all direct
+  // muli(iv, C) uses of iv where C is a constant multiple of factor and rewrites
+  // the constant in place.
+  void scaleDownIVMuls(BlockArgument iv, int64_t factor) {
+    if (factor <= 1)
+      return;
+    for (Operation *user : llvm::make_early_inc_range(iv.getUsers())) {
+      auto muli = dyn_cast<arith::MulIOp>(user);
+      if (!muli || muli.getLhs() != iv)
+        continue;
+      auto cst = getConstantInt(muli.getRhs());
+      if (!cst || (*cst % factor) != 0)
+        continue;
+      OpBuilder b(muli);
+      Value newCst = arith::ConstantOp::create(
+          b, muli.getLoc(),
+          b.getIntegerAttr(muli.getRhs().getType(), *cst / factor));
+      muli.getRhs().replaceAllUsesWith(newCst);
+    }
   }
 
   // Rescale an scf.for loop to stick granularity.
@@ -1419,7 +1462,10 @@ struct RewriteDescriptorLayoutPass
                                     iv.getOwner()->getParentOp())
                               : nullptr;
         if (forOp && forOp.getInductionVar() == iv) {
-          rescaleEnclosingLoop(forOp, physBlock[k]);
+          if (rescaledLoops.insert(forOp).second) {
+            rescaleEnclosingLoop(forOp, physBlock[k]);
+            scaleDownIVMuls(iv, physBlock[k]);
+          }
           // Wire the IV directly as the stick-index coord (tile-granular).
           // construct_access_tiles requires index-typed operands; cast if needed.
           Value ivIdx = iv.getType().isIndex()
