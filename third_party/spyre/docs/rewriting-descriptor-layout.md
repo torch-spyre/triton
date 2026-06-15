@@ -199,18 +199,19 @@ values that came from (or go to) an annotated descriptor.
 ## Example 3: tl.gather
 
 `gather_kernel_spyre` from `test/fixtures/gather/kernel.py` (`spyre_stick`
-variant). The kernel gathers `K_INDICES=32` rows from a `[M=256, N=256]`
-source matrix into a `[K_INDICES, BLOCK_COLS] = [32, 64]` output tile, reading
-columns `y_offset .. y_offset+BLOCK_COLS` of each gathered row with
-`y_offset=96`. Both `in_desc` and `out_desc` are annotated stick-on-N
-(`STICK_SIZE=64`, fp16); `idx_desc` is not annotated.
+variant). The kernel gathers `K_INDICES=32` full rows from a `[M=256, N=256]`
+source matrix into a `[K_INDICES, N] = [32, 256]` output, tiling the column dim
+into `N // BLOCK_COLS = 2` chunks of `BLOCK_COLS=128`. Both `in_desc` and
+`out_desc` are annotated stick-on-N (`STICK_SIZE=64`, fp16); `idx_desc` is not
+annotated.
 
-> `phys in  = [N//64, M, 64] = [4, 256, 64]` (four N-sticks of width 64)
-> `phys out = [BLOCK_COLS//64, K_INDICES, 64] = [1, 32, 64]` (one N-stick)
+> `phys in  = [N//64, M, 64] = [4, 256, 64]` (four source N-sticks of width 64)
+> `phys out = [N//64, K_INDICES, 64] = [4, 32, 64]` (four output N-sticks)
 
-The read window `96 .. 159` straddles source N-sticks 1 and 2, so the
-`floordiv`/`mod` reconstruction below selects a non-trivial source stick and
-carries across the stick boundary — `y_offset` is not stick-aligned.
+Because `BLOCK_COLS=128` is **two sticks** wide, each gather/store touches two
+sticks at once, and the `col_stick` loop is rescaled from `range(0, 2)` over
+128-wide blocks to `range(0, 4, 2)` over 64-wide sticks (see *Loop rescaling*
+under Phase 1).
 
 ### Triton
 
@@ -218,31 +219,38 @@ carries across the stick boundary — `y_offset` is not stick-aligned.
 @triton.jit
 def gather_kernel_spyre(
     in_ptr, out_ptr, idx_ptr, y_offset,
-    M: tl.constexpr, N: tl.constexpr,
-    K_INDICES: tl.constexpr, BLOCK_COLS: tl.constexpr,
+    M: tl.constexpr, N: tl.constexpr, K_INDICES: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr,
     IN_LAYOUT: tl.constexpr, OUT_LAYOUT: tl.constexpr,
 ):
-    idx_desc = tl.make_tensor_descriptor(
-        idx_ptr, shape=[K_INDICES], strides=[1], block_shape=[K_INDICES],
-    )
-    idx = idx_desc.load([0])
+    pid_m = tl.program_id(0)
+    n_blocks = N // BLOCK_COLS
+    rows_per_core = tl.cdiv(tl.cdiv(K_INDICES, BLOCK_ROWS), tl.num_programs(0))
 
+    idx_desc = tl.make_tensor_descriptor(
+        idx_ptr, shape=[K_INDICES], strides=[1], block_shape=[BLOCK_ROWS],
+    )
     in_desc = tl.make_tensor_descriptor(
         in_ptr, shape=[M, N], strides=[N, 1], block_shape=[1, BLOCK_COLS],
     )
     if IN_LAYOUT is not None and IN_LAYOUT != 0:
         tl.spyre_tensor_layout(in_desc, IN_LAYOUT)   # stick-on-N annotation
 
-    result = in_desc.gather(idx, y_offset)
-
     out_desc = tl.make_tensor_descriptor(
-        out_ptr, shape=[K_INDICES, BLOCK_COLS], strides=[BLOCK_COLS, 1],
-        block_shape=[K_INDICES, BLOCK_COLS],
+        out_ptr, shape=[K_INDICES, N], strides=[N, 1],
+        block_shape=[BLOCK_ROWS, BLOCK_COLS],
     )
     if OUT_LAYOUT is not None and OUT_LAYOUT != 0:
         tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)  # stick-on-N annotation
 
-    out_desc.store([0, 0], result)
+    m_start = pid_m * rows_per_core
+    for m_sub in range(0, rows_per_core):
+        for col_stick in range(n_blocks):       # this loop is rescaled below
+            offset_m = (m_start + m_sub) * BLOCK_ROWS
+            col_offset = col_stick * BLOCK_COLS
+            idx = idx_desc.load([offset_m])
+            result = in_desc.gather(idx, col_offset)
+            out_desc.store([offset_m, col_offset], result)
 ```
 
 ### KTIR (after full lowering)
@@ -250,48 +258,56 @@ def gather_kernel_spyre(
 ```mlir
 func.func @gather_kernel_spyre(%arg0: index, %arg1: index, %arg2: index, %arg3: i32)
     attributes {grid = [1]} {
-  %c0 = arith.constant 0 : index
+  %pid_m = ktdp.get_compute_tile_id : index
+  %pid_m_0 = arith.index_cast %pid_m : index to i32
 
   // idx_desc: no annotation → rank-1, logical.
   %idx_desc = ktdp.construct_memory_view %arg2, sizes: [32], strides: [1] {...}
                 : memref<32xsi32>
-
-  // in_desc: IN_LAYOUT → rank-3 physical [N//64, 256, 64] = [4, 256, 64]
-  //          = [stick, row, lane] (four source N-sticks).
+  // in_desc:  IN_LAYOUT  → rank-3 physical [N//64, M, 64] = [4, 256, 64].
   %in_desc = ktdp.construct_memory_view %arg0, sizes: [4, 256, 64], strides: [64, 256, 1] {...}
                : memref<4x256x64xf16>
+  // out_desc: OUT_LAYOUT → rank-3 physical [N//64, K_INDICES, 64] = [4, 32, 64].
+  %out_desc = ktdp.construct_memory_view %arg1, sizes: [4, 32, 64], strides: [64, 256, 1] {...}
+                : memref<4x32x64xf16>
 
-  %y_offset = arith.index_cast %arg3 : i32 to index   // = 96
+  // col_stick loop, RESCALED to stick granularity: range(0,2) over 128-wide
+  // blocks became range(0,4,2) over 64-wide sticks. col_offset's multiplier
+  // dropped from BLOCK_COLS=128 to STICK_SIZE=64 in lockstep (see below).
+  scf.for %arg4 = %c0_i32 to %c4_i32 step %c2_i32 : i32 {
+    %offset_m  = arith.muli %pid_m_0, %c32_i32 : i32
+    %col_offset = arith.muli %arg4, %c64_i32 : i32     // arg4 * 64, not * 128
+    %idx    = arith.index_cast %offset_m  : i32 to index
+    %result = arith.index_cast %col_offset : i32 to index
 
-  // Physicalized gather. The output column j is reconstructed from the stick
-  // and lane iteration variables (j = d_stick*64 + d_lane), the source column
-  // is y_offset + j, and that is split into the source stick/lane via
-  // floordiv/mod. With y_offset=96 the window 96..159 spans source sticks 1-2,
-  // so floordiv yields 1 or 2 (not collapsing to 0). Intermediate variables
-  // (d_stick, d_row, d_lane).
-  //   dim 0 (stick): direct, (y_offset + d_stick*64 + d_lane) floordiv 64
-  //   dim 1 (row):   indirect, idx[d_row]
-  //   dim 2 (lane):  direct, (y_offset + d_stick*64 + d_lane) mod 64
-  %gather_tile = ktdp.construct_indirect_access_tile
-                   intermediate_variables(%d_stick, %d_row, %d_lane)
-                   %in_desc[
-                     ((%y_offset + %d_stick * 64 + %d_lane) floordiv 64),
-                     ind(%idx_desc[%c0 + %d_row]),
-                     ((%y_offset + %d_stick * 64 + %d_lane) mod 64)
-                   ] {...}
-                   : memref<4x256x64xf16>, memref<32xsi32> -> !ktdp.access_tile<1x32x64xindex>
-  %result = ktdp.load %gather_tile : <1x32x64xindex> -> tensor<1x32x64xf16>
+    // Physicalized gather. The output column j within a tile is reconstructed
+    // from the stick + lane iteration variables (j = d_stick*64 + d_lane); the
+    // source column is col_offset + j, split into the source stick/lane via
+    // floordiv/mod. The tile is 2 sticks wide → access_tile<2x32x64>.
+    //   dim 0 (stick): direct,   (col_offset + d_stick*64 + d_lane) floordiv 64
+    //   dim 1 (row):   indirect, idx[d_row]
+    //   dim 2 (lane):  direct,   (col_offset + d_stick*64 + d_lane) mod 64
+    %gather_tile = ktdp.construct_indirect_access_tile
+                     intermediate_variables(%d_stick, %d_row, %d_lane)
+                     %in_desc[
+                       ((%result + %d_stick * 64 + %d_lane) floordiv 64),
+                       ind(%idx_desc[%idx + %d_row]),
+                       ((%result + %d_stick * 64 + %d_lane) mod 64)
+                     ] {...}
+                     : memref<4x256x64xf16>, memref<32xsi32> -> !ktdp.access_tile<2x32x64xindex>
+    %loaded = ktdp.load %gather_tile : <2x32x64xindex> -> tensor<2x32x64xf16>
 
-  // out_desc: OUT_LAYOUT → rank-3 physical [1, 32, 64] (one N-stick).
-  %out_desc = ktdp.construct_memory_view %arg1,
-                sizes: [1, 32, 64], strides: [64, 64, 1] {...}
-                : memref<1x32x64xf16>
-  %out_tile = ktdp.construct_access_tile %out_desc[%c0, %c0, %c0] {...}
-                : memref<1x32x64xf16> -> !ktdp.access_tile<1x32x64xindex>
+    // out_desc store tile: the stick coord is the (rescaled) IV directly; the
+    // lane coord is col_offset mod 64 (= 0, sticks are 64-aligned here).
+    %stick = arith.index_cast %arg4 : i32 to index
+    %lane  = arith.remsi %result, %c64 : index
+    %out_tile = ktdp.construct_access_tile %out_desc[%stick, %idx, %lane] {...}
+                  : memref<4x32x64xf16> -> !ktdp.access_tile<2x32x64xindex>
 
-  // Both the gather result and the output tile are rank-3 → store directly,
-  // no insert_slice needed.
-  ktdp.store %result, %out_tile : tensor<1x32x64xf16>, <1x32x64xindex>
+    // Both load result and output tile are rank-3 → store directly, no insert_slice.
+    ktdp.store %loaded, %out_tile : tensor<2x32x64xf16>, <2x32x64xindex>
+  }
+  return
 }
 ```
 
@@ -301,19 +317,24 @@ func.func @gather_kernel_spyre(%arg0: index, %arg1: index, %arg2: index, %arg3: 
 stick-on-N view `memref<4x256x64xf16>`, and the
 `ktdp.construct_indirect_access_tile` is rewritten to address it. Because a
 stick-tiled column dim splits into two physical dims (stick + lane), the
-indirect tile gains a third intermediate variable: the logical output column
-`j = d_stick*64 + d_lane` is recombined, the source column `y_offset + j` is
-formed, and that single expression is split back into the source's stick and
-lane coordinates with `floordiv`/`mod`. This carries correctly across the
-source stick boundary, so **`y_offset` need not be stick-aligned**. The
-indirect (row) subscript — `idx[d_row]` — is unaffected; only the direct
-column dim is stick-split.
+indirect tile gains a third intermediate variable: the logical column within a
+tile `j = d_stick*64 + d_lane` is recombined, the source column `col_offset + j`
+is formed, and that single expression is split back into the source's stick and
+lane coordinates with `floordiv`/`mod`. This carries correctly across a source
+stick boundary, so a non-stick-aligned `col_offset` would still be correct. The
+indirect (row) subscript — `idx[d_row]` — is unaffected; only the direct column
+dim is stick-split.
 
 `OUT_LAYOUT` physicalizes the gather **output**: `out_desc` is the rank-3
-`memref<1x32x64xf16>`. Because the gather tile is now also rank-3, its load
+`memref<4x32x64xf16>`. Because the gather tile is now also rank-3, its load
 result matches the output tile rank directly — the store sink needs **no**
-`tensor.insert_slice` (contrast the matmul case in Example 1, where the
-logical rank-2 result must be scattered into the rank-3 stick container).
+`tensor.insert_slice` (contrast the matmul case in Example 1, where the logical
+rank-2 result must be scattered into the rank-3 stick container).
+
+The `col_stick` loop comes out **rescaled** to stick granularity
+(`range(0,2,1)` → `range(0,4,2)`, `col_offset = iv*128` → `iv*64`) — a Phase 1
+mechanism shared by both descriptors over that loop. See *Loop rescaling* under
+Phase 1 below.
 
 
 ## Pass Design
@@ -340,6 +361,22 @@ For every `tt.spyre_tensor_layout` marker the pass:
 
 Phase 1 is the only phase a purely pointwise kernel exercises. The
 `tt.spyre_tensor_layout` marker is kept alive for Phase 2.
+
+#### Loop rescaling
+
+A loop written over logical blocks (`for i in range(n_blocks)`,
+`offset = i*BLOCK`) addresses memory in stick units once physicalized. When a
+`FloorDiv` (stick-index) tile coordinate traces back to an enclosing `scf.for`
+IV, `rewriteAccessTile` rescales that loop by `factor = physBlock` (sticks per
+tile): `ub *= factor`, `step = factor`, and every `muli(iv, C)` in the body has
+`C` divided by `factor` (so `offset = i*BLOCK` → `i*STICK`). The IV is then wired
+directly as the stick coordinate. With `physBlock=1` (single-stick tile) this is
+a no-op.
+
+Only the direct-tile path rescales: `rewriteIndirectAccessTile` (gather)
+reconstructs its coordinates inside the affine map and leaves the loop alone.
+Multiple descriptors can share one loop, so a pass-level `rescaledLoops` set
+ensures only the first to physicalize a `FloorDiv` dim rescales it; the rest skip.
 
 ### Phase 2 — synthesize loop nests (fixpoint loop)
 

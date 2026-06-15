@@ -154,26 +154,39 @@ def gather_kernel_spyre(
     M: tl.constexpr,
     N: tl.constexpr,
     K_INDICES: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
     IN_LAYOUT: tl.constexpr,
     OUT_LAYOUT: tl.constexpr,
 ):
     """Spyre physical-layout variant of gather_kernel.
 
-    Identical to gather_kernel except that in_desc and out_desc are
-    annotated with Spyre stick-tiling layouts via tl.spyre_tensor_layout.
-    idx_desc is not annotated (index arrays have no stick layout).
+    Gathers K_INDICES full rows of the [M, N] source into a [K_INDICES, N]
+    output, tiling the column dim into N // BLOCK_COLS chunks. in_desc and
+    out_desc are annotated with Spyre stick-tiling layouts via
+    tl.spyre_tensor_layout; idx_desc is not (index arrays have no stick layout).
+
+    The inner col_stick loop is what exercises the multi-stick rewrite when
+    BLOCK_COLS spans more than one stick: RewriteDescriptorLayout rescales the
+    loop to stick granularity and the out_desc / in_desc tiles share that loop.
 
     IN_LAYOUT  — stick-tiling for in_ptr's full [M, N] extent.
-    OUT_LAYOUT — stick-tiling for out_ptr's full [K_INDICES, BLOCK_COLS] extent.
+    OUT_LAYOUT — stick-tiling for out_ptr's full [K_INDICES, N] extent.
     """
+
+    pid_m = tl.program_id(0)
+    grid_m = tl.num_programs(0)
+
+    m_blocks = tl.cdiv(K_INDICES, BLOCK_ROWS)
+    n_blocks = tl.cdiv(N, BLOCK_COLS)
+    rows_per_core = tl.cdiv(m_blocks, grid_m)
+
     idx_desc = tl.make_tensor_descriptor(
         idx_ptr,
         shape=[K_INDICES],
         strides=[1],
-        block_shape=[K_INDICES],
+        block_shape=[BLOCK_ROWS],
     )
-    idx = idx_desc.load([0])
 
     in_desc = tl.make_tensor_descriptor(
         in_ptr,
@@ -184,19 +197,26 @@ def gather_kernel_spyre(
     if IN_LAYOUT is not None and IN_LAYOUT != 0:
         tl.spyre_tensor_layout(in_desc, IN_LAYOUT)
 
-    result = in_desc.gather(idx, y_offset)
-
     out_desc = tl.make_tensor_descriptor(
         out_ptr,
-        shape=[K_INDICES, BLOCK_COLS],
-        strides=[BLOCK_COLS, 1],
-        block_shape=[K_INDICES, BLOCK_COLS],
+        shape=[K_INDICES, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_ROWS, BLOCK_COLS],
     )
     if OUT_LAYOUT is not None and OUT_LAYOUT != 0:
         tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
 
-    out_desc.store([0, 0], result)
+    m_start = pid_m * rows_per_core
 
+    for m_sub in range(0, rows_per_core):
+      for col_stick in range(n_blocks):
+          m_block = m_start + m_sub
+          offset_m = m_block * BLOCK_ROWS
+          col_offset = col_stick * BLOCK_COLS
+
+          idx = idx_desc.load([offset_m])
+          result = in_desc.gather(idx, col_offset)
+          out_desc.store([offset_m, col_offset], result)
 
 @triton.jit
 def gather_2d_kernel(
