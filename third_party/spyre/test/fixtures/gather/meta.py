@@ -36,6 +36,8 @@ Two kernel families share this fixture:
                               unchanged.
 """
 
+import functools
+
 import numpy as np
 
 from . import kernel
@@ -131,6 +133,30 @@ def make_inputs_large_k(M, N, K_INDICES, BLOCK_COLS, y_offset,
                         seed=1006, allow_duplicates=True)
 
 
+def make_inputs_spyre(M, N, K_INDICES, BLOCK_COLS, y_offset,
+                      **_unused) -> dict:
+    """fp16 inputs for the Spyre physical-layout variant."""
+    rng = np.random.default_rng(seed=42)
+    in_data = rng.standard_normal((M, N)).astype(np.float16)
+    idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
+    out_data = np.zeros((K_INDICES, BLOCK_COLS), dtype=np.float16)
+    return {
+        "in_ptr":   in_data,
+        "out_ptr":  out_data,
+        "idx_ptr":  idx_data,
+        "y_offset": y_offset,
+    }
+
+
+def run_spyre(inputs: dict) -> np.ndarray:
+    """NumPy oracle for the Spyre variant (same semantics as run, fp16)."""
+    in_data = inputs["in_ptr"]
+    idx = inputs["idx_ptr"]
+    y_offset = inputs["y_offset"]
+    block_cols = inputs["out_ptr"].shape[1]
+    return in_data[idx, y_offset:y_offset + block_cols]
+
+
 def run(inputs: dict) -> np.ndarray:
     """NumPy oracle: gather rows from ``in_ptr`` at ``idx_ptr`` positions.
 
@@ -214,6 +240,28 @@ SIGNATURE = {
     "K_INDICES":  "i32",
     "BLOCK_COLS": "i32",
 }
+
+_DTYPE_MAP = {"fp32": np.float32, "fp16": np.float16}
+
+def _np_dtype(sig, key):
+    return _DTYPE_MAP[sig[key].lstrip("*")]
+
+def _sticksize(sig, key):
+    return 128 // np.dtype(_np_dtype(sig, key)).itemsize
+
+_SIG_SPYRE = {
+    "in_ptr":      "*fp16",
+    "out_ptr":     "*fp16",
+    "idx_ptr":     "*i32",
+    "y_offset":    "i32",
+    "M":           "i32",
+    "N":           "i32",
+    "K_INDICES":   "i32",
+    "BLOCK_COLS":  "i32",
+    "IN_LAYOUT":   "constexpr",
+    "OUT_LAYOUT":  "constexpr",
+}
+_SS = functools.partial(_sticksize, _SIG_SPYRE)
 
 # 2D kernel has no ``y_offset`` argument and adds ``BLOCK_ROWS``.
 _SIG_2D = {
@@ -561,5 +609,37 @@ VARIANTS = {
         "inputs":       make_inputs_2d_large_table,
         "output_key":   "out_ptr",
         "extra_checks": _EXTRA_CHECKS,
+    },
+    # ------------------------------------------------------------------
+    # Spyre physical-layout variant.
+    # in_desc [M, N] annotated stick-on-N; out_desc [K_INDICES, BLOCK_COLS]
+    # annotated stick-on-N. idx_desc is not annotated.
+    # ------------------------------------------------------------------
+    "spyre_stick": {
+        "kernel_fn":  kernel.gather_kernel_spyre,
+        "SIGNATURE":  _SIG_SPYRE,
+        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS",
+                       "IN_LAYOUT", "OUT_LAYOUT"],
+        "params": {
+            "M":          [256],
+            "N":          [64],
+            "K_INDICES":  [32],
+            "BLOCK_COLS": [64],
+            "y_offset":   [0],
+            # in_ptr [M, N]: stick-on-N → [N//_S, M, N%_S]
+            "IN_LAYOUT":  [[(1, "floordiv", _SS("in_ptr")), 0, (1, "mod", _SS("in_ptr"))]],
+            # out_ptr [K_INDICES, BLOCK_COLS]: stick-on-N → [BLOCK_COLS//_S, K_INDICES, BLOCK_COLS%_S]
+            "OUT_LAYOUT": [[(1, "floordiv", _SS("out_ptr")), 0, (1, "mod", _SS("out_ptr"))]],
+        },
+        "tags":       ["descriptor-gather", "spyre-tensor-layout"],
+        "grid":       [1],
+        "parallel":   False,
+        "reference":  run_spyre,
+        "inputs":     make_inputs_spyre,
+        "output_key": "out_ptr",
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("ktdp.construct_indirect_access_tile"),
+        ),
     },
 }
