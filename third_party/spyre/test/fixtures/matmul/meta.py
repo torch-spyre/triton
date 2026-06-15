@@ -85,6 +85,23 @@ _SIG_BMM = {
     "BLOCK_N": "i32",
 }
 
+# Spyre physical-layout variants: same arg list as matmul_kernel plus the
+# three optional layout constexprs (A/B/C_LAYOUT) carrying the stick-tiling.
+_SIG_SPYRE = {
+    "a_ptr":    "*fp32",
+    "b_ptr":    "*fp32",
+    "c_ptr":    "*fp32",
+    "M":        "i32",
+    "K":        "i32",
+    "N":        "i32",
+    "BLOCK_M":  "i32",
+    "BLOCK_K":  "i32",
+    "BLOCK_N":  "i32",
+    "A_LAYOUT": "constexpr",
+    "B_LAYOUT": "constexpr",
+    "C_LAYOUT": "constexpr",
+}
+
 _SIG_2D_GRID = {
     "a_ptr":   "*fp32",
     "b_ptr":   "*fp32",
@@ -154,10 +171,12 @@ VARIANTS = {
             "lowers to `linalg.matmul`."
         ),
         "kernel_fn":    kernel.matmul_kernel,
-        "constexpr":    ["M", "K", "N", "BLOCK_M", "BLOCK_K", "BLOCK_N"],
+        "constexpr":    ["M", "K", "N", "BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
         "params":       {
             "M": [512], "K": [64], "N": [256],
             "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+            "A_LAYOUT": [0], "B_LAYOUT": [0], "C_LAYOUT": [0],
         },
         "grid":         [32],
         "reference":    run,
@@ -187,7 +206,13 @@ VARIANTS = {
             "`memref<?x?xf32>`, so the compiled kernel runs unchanged "
             "for any `(M, K, N)` that fits the scratchpad tile budget."
         ),
-        "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N"],
+        "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            "M": [512], "K": [64], "N": [256],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+            "A_LAYOUT": [0], "B_LAYOUT": [0], "C_LAYOUT": [0],
+        },
         "extra_checks": lambda t: (
             t.assert_present("linalg.matmul"),
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
@@ -289,6 +314,164 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_present("linalg.matmul"),
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
+        ),
+    },
+    # --- Spyre physical-layout variants ---
+    # Both annotate A, B, C with a stick-tiling layout so the kernel lowers
+    # through RewriteDescriptorLayout's loop synthesis (source matmul stage +
+    # store sink stage) instead of staying logical. Single N-stick / M-stick /
+    # K-stick (M=K=N=64, BLOCK=64, stick=64), grid [1].
+    #   stick-on-X layout: phys [X//64, other, X%64]
+    #     = [(X_logical, "floordiv", 64), other_logical, (X_logical, "mod", 64)]
+    "spyre_stick_parallel": {
+        # Case 1: parallel sticks. A stick-on-M, B & C stick-on-N. No K
+        # reduction loop — one inner linalg.matmul per output stick.
+        "tags": ["descriptor-load-static", "descriptor-store-static", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "Matmul with Spyre stick-tiling annotations: A stick-on-M, "
+            "B/C stick-on-N. Exercises the source matmul stage (no reduction "
+            "loop, single output stick) and the store sink stage."
+        ),
+        "kernel_fn":    kernel.matmul_kernel,
+        "SIGNATURE":    _SIG_SPYRE,
+        "constexpr":    ["M", "K", "N", "BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            # M=N=64 with stick size 64 → single output stick per dim.
+            # Multi-output-stick scatter is not yet implemented.
+            "M": [64], "K": [64], "N": [64],
+            "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
+            # A[M,K] stick-on-M: [M//64, K, M%64]
+            "A_LAYOUT": [[(0, "floordiv", 64), 1, (0, "mod", 64)]],
+            # B[K,N] stick-on-N: [N//64, K, N%64]
+            "B_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            # C[M,N] stick-on-N: [N//64, M, N%64]
+            "C_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+        },
+        "grid":         [1],
+        "reference":    run,
+        "inputs":       make_inputs,
+        "output_key":   "c_ptr",
+        "rtol":         1e-2,
+        "atol":         1e-3,
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.matmul"),
+            t.assert_present("tensor.insert_slice"),  # store sink stage
+        ),
+    },
+    "spyre_stick_parallel_dynamic": {
+        # Dynamic-shape variant of spyre_stick_parallel: A stick-on-M, B/C
+        # stick-on-N, but M/K/N are runtime i32. The physical descriptors lower
+        # to memref<?x?x64xf32> with runtime strides; the source + sink loop
+        # nests use runtime ceildiv trip counts (exercises the Loop.trip
+        # dynamic-SSA branch on the no-reduction path).
+        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "Dynamic-shape variant of spyre_stick_parallel: M/K/N runtime, so "
+            "the source + sink loop nests use runtime trip counts."
+        ),
+        "kernel_fn":    kernel.matmul_kernel,
+        "SIGNATURE":    _SIG_SPYRE,
+        "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            "M": [64], "K": [64], "N": [64],
+            "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
+            "A_LAYOUT": [[(0, "floordiv", 64), 1, (0, "mod", 64)]],
+            "B_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            "C_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+        },
+        "grid":         [1],
+        "reference":    run,
+        "inputs":       make_inputs,
+        "output_key":   "c_ptr",
+        "rtol":         1e-2,
+        "atol":         1e-3,
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.matmul"),
+            t.assert_present("tensor.insert_slice"),
+        ),
+    },
+    "spyre_stick_k": {
+        # Case 2: A stick-on-K (split-K). A's K dim drives a reduction loop;
+        # B's K-flat dim is offset per K-stick. B & C stick-on-N.
+        "tags": ["descriptor-load-static", "descriptor-store-static", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "Matmul with A stick-on-K (split-K): the K-stick dim drives a "
+            "reduction loop, B's K-flat dim is offset per stick. B/C "
+            "stick-on-N. Exercises the K-stick reduction path + store sink."
+        ),
+        "kernel_fn":    kernel.matmul_kernel,
+        "SIGNATURE":    _SIG_SPYRE,
+        "constexpr":    ["M", "K", "N", "BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            # K=128 with stick size 64 → 2 K-sticks, so the reduction loop has
+            # trip count 2 and the synthesized slice offsets are non-zero.
+            "M": [64], "K": [128], "N": [64],
+            "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
+            # A[M,K] stick-on-K: [K//64, M, K%64]
+            "A_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            # B[K,N] stick-on-N: [N//64, K, N%64]
+            "B_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            # C[M,N] stick-on-N: [N//64, M, N%64]
+            "C_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+        },
+        "grid":         [1],
+        "reference":    run,
+        "inputs":       make_inputs,
+        "output_key":   "c_ptr",
+        "rtol":         1e-2,
+        "atol":         1e-3,
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.matmul"),
+            t.assert_present("scf.for"),               # K-stick reduction loop
+            t.assert_present("tensor.insert_slice"),   # store sink stage
+        ),
+    },
+    "spyre_stick_k_dynamic": {
+        # Dynamic-shape variant of spyre_stick_k: A stick-on-K with BLOCK_K=128
+        # and stick size 64, so A's K-stick dim spans 2 sticks and
+        # RewriteDescriptorLayout emits a 2-iteration K-stick reduction loop.
+        # B's K-flat dim (extent 128 > stickSize 64) is therefore SlicedStick:
+        # advanced one 64-wide stick per reduction iteration at offset k*64.
+        # The B slice offset is a runtime SSA value, exercising the dynamic-
+        # offset path in tensor.extract_slice.
+        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "Dynamic-shape variant of spyre_stick_k: BLOCK_K=128 with stick "
+            "size 64 forces a 2-iteration K-stick reduction loop whose trip "
+            "count is a runtime ceildiv value (exercises Loop.trip dynamic path)."
+        ),
+        "kernel_fn":    kernel.matmul_kernel,
+        "SIGNATURE":    _SIG_SPYRE,
+        "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            "M": [64], "K": [128], "N": [64],
+            "BLOCK_M": [64], "BLOCK_K": [128], "BLOCK_N": [64],
+            "A_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            "B_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            "C_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+        },
+        "grid":         [1],
+        "reference":    run,
+        "inputs":       make_inputs,
+        "output_key":   "c_ptr",
+        "rtol":         1e-2,
+        "atol":         1e-3,
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.matmul"),
+            t.assert_present("scf.for"),
+            t.assert_present("tensor.insert_slice"),
         ),
     },
     # --- BMM 3D grid variants ---

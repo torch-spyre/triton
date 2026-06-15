@@ -363,10 +363,14 @@ class TestMatmulKSplit(RewriteLayoutTester):
     _KERNEL = """
         module {{
           tt.func @mm(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f16>,
-                      %m: i32, %k: i32, %n: i32) {{
+                      %m: i32, %n: i32) {{
             %M = arith.constant 256 : i32
             %K = arith.constant 128 : i32
             %N = arith.constant 256 : i32
+            %num_k = arith.constant 2 : i32
+            %c0 = arith.constant 0 : i32
+            %c1 = arith.constant 1 : i32
+            %c64 = arith.constant 64 : i32
             %sK = arith.constant 128 : i64
             %sN = arith.constant 256 : i64
             %sM = arith.constant 256 : i64
@@ -379,14 +383,19 @@ class TestMatmulKSplit(RewriteLayoutTester):
                 : <f16>, <64x64xf16>
             tt.spyre_tensor_layout %adesc {a_layout} : <64x64xf16>
             tt.spyre_tensor_layout %bdesc {b_layout} : <64x64xf16>
-            %at = tt.descriptor_load %adesc[%m, %k]
-                : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
-            %bt = tt.descriptor_load %bdesc[%k, %n]
-                : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
-            %acc = arith.constant dense<0.0> : tensor<64x64xf32>
-            %d = tt.dot %at, %bt, %acc
-                : tensor<64x64xf16> * tensor<64x64xf16> -> tensor<64x64xf32>
-            %dh = arith.truncf %d : tensor<64x64xf32> to tensor<64x64xf16>
+            %acc_init = arith.constant dense<0.0> : tensor<64x64xf32>
+            %result = scf.for %k = %c0 to %num_k step %c1
+                iter_args(%acc = %acc_init) -> (tensor<64x64xf32>) : i32 {{
+              %k64 = arith.muli %k, %c64 : i32
+              %at = tt.descriptor_load %adesc[%m, %k64]
+                  : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
+              %bt = tt.descriptor_load %bdesc[%k64, %n]
+                  : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
+              %d = tt.dot %at, %bt, %acc
+                  : tensor<64x64xf16> * tensor<64x64xf16> -> tensor<64x64xf32>
+              scf.yield %d : tensor<64x64xf32>
+            }}
+            %dh = arith.truncf %result : tensor<64x64xf32> to tensor<64x64xf16>
             tt.descriptor_store %cdesc[%m, %n], %dh
                 : !tt.tensordesc<64x64xf16>, tensor<64x64xf16>
             tt.return
