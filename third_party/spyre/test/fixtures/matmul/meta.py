@@ -18,6 +18,8 @@ Multi-axis grid variants (one tile per core):
 See ``fixtures/README.md`` for the field reference and discovery rules.
 """
 
+import functools
+
 import numpy as np
 
 from . import kernel
@@ -27,26 +29,44 @@ from . import kernel
 # Reference (NumPy oracle) + input makers
 # ---------------------------------------------------------------------------
 
-def make_inputs(M: int, K: int, N: int, **_unused) -> dict:
+# - Move this when more fixtures use spyre layout annotations
+_DTYPE_MAP = {
+    "fp32": np.float32,
+    "fp16": np.float16,
+}
+
+# - Move this when more fixtures use spyre layout annotations
+def _np_dtype(signature, key):
+    """Map a SIGNATURE pointer type like ``'*fp16'`` to a NumPy dtype."""
+    triton_type = signature[key].lstrip("*")
+    return _DTYPE_MAP[triton_type]
+
+def _sticksize(signature, key):
+    """Spyre stick size = 128 bytes / element-size (derived from dtype)."""
+    return 128 // np.dtype(_np_dtype(signature, key)).itemsize
+
+def make_inputs(M: int, K: int, N: int, *, dtype=np.float32, **_unused) -> dict:
     """Build ``[M,K]``, ``[K,N]``, ``[M,N]`` buffers for matmul_kernel."""
     rng = np.random.default_rng(seed=0)
-    a = rng.standard_normal((M, K)).astype(np.float32)
-    b = rng.standard_normal((K, N)).astype(np.float32)
-    c = np.zeros((M, N), dtype=np.float32)
+    a = rng.standard_normal((M, K)).astype(dtype)
+    b = rng.standard_normal((K, N)).astype(dtype)
+    c = np.zeros((M, N), dtype=dtype)
     return {"a_ptr": a, "b_ptr": b, "c_ptr": c}
 
+# aliases
+_make_inputs_fp16 = functools.partial(make_inputs, dtype=np.float16)
 
 def run(inputs: dict) -> np.ndarray:
     """NumPy oracle: standard 2D matmul."""
     return inputs["a_ptr"] @ inputs["b_ptr"]
 
 
-def make_inputs_bmm(B: int, M: int, K: int, N: int, **_unused) -> dict:
+def make_inputs_bmm(B: int, M: int, K: int, N: int, *, dtype=np.float32, **_unused) -> dict:
     """Build ``[B,M,K]``, ``[B,K,N]``, ``[B,M,N]`` buffers for bmm_matmul_kernel."""
     rng = np.random.default_rng(seed=0)
-    a = rng.standard_normal((B, M, K)).astype(np.float32)
-    b = rng.standard_normal((B, K, N)).astype(np.float32)
-    c = np.zeros((B, M, N), dtype=np.float32)
+    a = rng.standard_normal((B, M, K)).astype(dtype)
+    b = rng.standard_normal((B, K, N)).astype(dtype)
+    c = np.zeros((B, M, N), dtype=dtype)
     return {"a_ptr": a, "b_ptr": b, "c_ptr": c}
 
 
@@ -88,9 +108,9 @@ _SIG_BMM = {
 # Spyre physical-layout variants: same arg list as matmul_kernel plus the
 # three optional layout constexprs (A/B/C_LAYOUT) carrying the stick-tiling.
 _SIG_SPYRE = {
-    "a_ptr":    "*fp32",
-    "b_ptr":    "*fp32",
-    "c_ptr":    "*fp32",
+    "a_ptr":    "*fp16",
+    "b_ptr":    "*fp16",
+    "c_ptr":    "*fp16",
     "M":        "i32",
     "K":        "i32",
     "N":        "i32",
@@ -101,6 +121,7 @@ _SIG_SPYRE = {
     "B_LAYOUT": "constexpr",
     "C_LAYOUT": "constexpr",
 }
+_SS = functools.partial(_sticksize, _SIG_SPYRE)
 
 _SIG_2D_GRID = {
     "a_ptr":   "*fp32",
@@ -317,12 +338,12 @@ VARIANTS = {
         ),
     },
     # --- Spyre physical-layout variants ---
-    # Both annotate A, B, C with a stick-tiling layout so the kernel lowers
+    # All annotate A, B, C with a stick-tiling layout so the kernel lowers
     # through RewriteDescriptorLayout's loop synthesis (source matmul stage +
-    # store sink stage) instead of staying logical. Single N-stick / M-stick /
-    # K-stick (M=K=N=64, BLOCK=64, stick=64), grid [1].
-    #   stick-on-X layout: phys [X//64, other, X%64]
-    #     = [(X_logical, "floordiv", 64), other_logical, (X_logical, "mod", 64)]
+    # store sink stage) instead of staying logical. Stick size is derived from
+    # the element dtype via _sticksize (fp16 → 64 = 128 bytes / 2).
+    #   stick-on-X layout: phys [X//stick, other, X%stick]
+    #     = [(X_logical, "floordiv", stick), other_logical, (X_logical, "mod", stick)]
     "spyre_stick_parallel": {
         # Case 1: parallel sticks. A stick-on-M, B & C stick-on-N. No K
         # reduction loop — one inner linalg.matmul per output stick.
@@ -342,19 +363,19 @@ VARIANTS = {
             # Multi-output-stick scatter is not yet implemented.
             "M": [64], "K": [64], "N": [64],
             "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
-            # A[M,K] stick-on-M: [M//64, K, M%64]
-            "A_LAYOUT": [[(0, "floordiv", 64), 1, (0, "mod", 64)]],
-            # B[K,N] stick-on-N: [N//64, K, N%64]
-            "B_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
-            # C[M,N] stick-on-N: [N//64, M, N%64]
-            "C_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            # A[M,K] stick-on-M: [M//_S, K, M%_S]
+            "A_LAYOUT": [[(0, "floordiv", _SS("a_ptr")), 1, (0, "mod", _SS("a_ptr"))]],
+            # B[K,N] stick-on-N: [N//_S, K, N%_S]
+            "B_LAYOUT": [[(1, "floordiv", _SS("b_ptr")), 0, (1, "mod", _SS("b_ptr"))]],
+            # C[M,N] stick-on-N: [N//_S, M, N%_S]
+            "C_LAYOUT": [[(1, "floordiv", _SS("c_ptr")), 0, (1, "mod", _SS("c_ptr"))]],
         },
         "grid":         [1],
         "reference":    run,
-        "inputs":       make_inputs,
+        "inputs":       _make_inputs_fp16,
         "output_key":   "c_ptr",
         "rtol":         1e-2,
-        "atol":         1e-3,
+        "atol":         5e-2,  # fp16 ULP noise
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.matmul"),
@@ -364,7 +385,7 @@ VARIANTS = {
     "spyre_stick_parallel_dynamic": {
         # Dynamic-shape variant of spyre_stick_parallel: A stick-on-M, B/C
         # stick-on-N, but M/K/N are runtime i32. The physical descriptors lower
-        # to memref<?x?x64xf32> with runtime strides; the source + sink loop
+        # to memref<?x?x64xf16> with runtime strides; the source + sink loop
         # nests use runtime ceildiv trip counts (exercises the Loop.trip
         # dynamic-SSA branch on the no-reduction path).
         "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot",
@@ -380,16 +401,16 @@ VARIANTS = {
         "params":       {
             "M": [64], "K": [64], "N": [64],
             "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
-            "A_LAYOUT": [[(0, "floordiv", 64), 1, (0, "mod", 64)]],
-            "B_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
-            "C_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            "A_LAYOUT": [[(0, "floordiv", _SS("a_ptr")), 1, (0, "mod", _SS("a_ptr"))]],
+            "B_LAYOUT": [[(1, "floordiv", _SS("b_ptr")), 0, (1, "mod", _SS("b_ptr"))]],
+            "C_LAYOUT": [[(1, "floordiv", _SS("c_ptr")), 0, (1, "mod", _SS("c_ptr"))]],
         },
         "grid":         [1],
         "reference":    run,
-        "inputs":       make_inputs,
+        "inputs":       _make_inputs_fp16,
         "output_key":   "c_ptr",
         "rtol":         1e-2,
-        "atol":         1e-3,
+        "atol":         5e-2,  # fp16 ULP noise
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.matmul"),
@@ -415,19 +436,16 @@ VARIANTS = {
             # trip count 2 and the synthesized slice offsets are non-zero.
             "M": [64], "K": [128], "N": [64],
             "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
-            # A[M,K] stick-on-K: [K//64, M, K%64]
-            "A_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
-            # B[K,N] stick-on-N: [N//64, K, N%64]
-            "B_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
-            # C[M,N] stick-on-N: [N//64, M, N%64]
-            "C_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            "A_LAYOUT": [[(0, "floordiv", _SS("a_ptr")), 1, (0, "mod", _SS("a_ptr"))]],
+            "B_LAYOUT": [[(1, "floordiv", _SS("b_ptr")), 0, (1, "mod", _SS("b_ptr"))]],
+            "C_LAYOUT": [[(1, "floordiv", _SS("c_ptr")), 0, (1, "mod", _SS("c_ptr"))]],
         },
         "grid":         [1],
         "reference":    run,
-        "inputs":       make_inputs,
+        "inputs":       _make_inputs_fp16,
         "output_key":   "c_ptr",
         "rtol":         1e-2,
-        "atol":         1e-3,
+        "atol":         5e-2,  # fp16 ULP noise
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.matmul"),
@@ -457,16 +475,16 @@ VARIANTS = {
         "params":       {
             "M": [64], "K": [128], "N": [64],
             "BLOCK_M": [64], "BLOCK_K": [128], "BLOCK_N": [64],
-            "A_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
-            "B_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
-            "C_LAYOUT": [[(1, "floordiv", 64), 0, (1, "mod", 64)]],
+            "A_LAYOUT": [[(0, "floordiv", _SS("a_ptr")), 1, (0, "mod", _SS("a_ptr"))]],
+            "B_LAYOUT": [[(1, "floordiv", _SS("b_ptr")), 0, (1, "mod", _SS("b_ptr"))]],
+            "C_LAYOUT": [[(1, "floordiv", _SS("c_ptr")), 0, (1, "mod", _SS("c_ptr"))]],
         },
         "grid":         [1],
         "reference":    run,
-        "inputs":       make_inputs,
+        "inputs":       _make_inputs_fp16,
         "output_key":   "c_ptr",
         "rtol":         1e-2,
-        "atol":         1e-3,
+        "atol":         5e-2,  # fp16 ULP noise
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.matmul"),

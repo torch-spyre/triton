@@ -34,30 +34,33 @@
 //       rewriteOnePhysicalize(marker)
 //         isLoweredDescriptor / getDescriptorMemView
 //         buildPhysicalMemoryView   -> physical ConstructMemoryViewOp
-//           applyStatic             derive physical static extents
-//         rewriteAccessTile(tile)   -> physical ConstructAccessTilesOp
-//           mapIndices / applyIndex
+//           applyStatic / applyCoordMap  derive physical static extents
+//         rewriteAccessTile(tile, coords) -> physical ConstructAccessTilesOp
+//           applyIndex              SSA index mapping per coord-op
+//           rescaleEnclosingLoop    rescale enclosing scf.for to stick granularity
 //         retypeLoad                -> physical ktdp.load + retypeChain
-//           retypeChain             propagate type (stops at multi-tensor ops)
-//         retypeStore               redirect access tile operand (output stays
+//           retypeChain             propagate type (stops at isContractionOp)
+//         redirectStoreAccessTile   redirect access tile operand (output stays
 //                                   logical-typed; sink stage fixes it in Phase 2)
 //         (marker kept alive for Phase 2)
 //     Phase 2 — synthesizeContractions (loop-until-stable):
-//       source: dispatchMatmul(mm)
-//         findMarkerForOperand      trace load -> access tile -> memView -> marker
-//         classify                  build OperandPlan (dimRoles, floorDims, reduceLoop…)
-//         emitMatmulStage           walk existing loops (collectExistingLoopIVs),
+//       source: dispatchMatmul(mm) → dispatchSource<MatmulOp>(mm, K-wiring)
+//         findMarkerForOperand / walkToLoad  trace load chain -> marker
+//         isSingleTensorElementwiseOp        shared predicate for all walks
+//         classify                  build OperandPlan (dimRoles, floorDims, loopDims…)
+//         emitSourceStage           walk existing loops (collectExistingLoopIVs),
 //                                   extract slices + linalg.matmul; inner stick
 //                                   loop (emitStickLoop) for StickifiedBlock
-//       sink:   dispatchStore(st)   (only when output descriptor is annotated)
-//         findMarkerForStore        trace store -> access tile -> memView -> marker
-//         classify / emitStoreStage walk existing loops, scatter logical C into
-//                                   physical D via tensor.insert_slice
+//       sink:   dispatchSink(st)   (only when output descriptor is annotated)
+//         findMarkerForStore        forward worklist walk -> marker
+//         classify / emitSinkStage  walk existing loops, scatter inputTile into
+//                                   physicalSink via tensor.insert_slice
 //     Phase 3 — eraseMarker (marker + dead bridge cast)
 //
 //   Coord helpers (free functions):
-//     applyStatic  : compile-time extent (shape / block_shape)
-//     applyIndex   : SSA load/store offset (identity | divsi | remsi)
+//     applyStatic     : compile-time extent for one dim
+//     applyCoordMap   : compile-time extents for all physical dims
+//     applyIndex      : SSA load/store offset (identity | divsi | remsi)
 //
 //===----------------------------------------------------------------------===//
 
@@ -123,6 +126,25 @@ static std::optional<int64_t> applyStatic(int64_t logical, CoordOp op,
     return arg;
   }
   return std::nullopt;
+}
+
+// Compute physical static extents from logical static extents via a coord map.
+// Returns false if any physical dim is dynamic; caller handles the dynamic path.
+static bool applyCoordMap(ArrayRef<int64_t> logSizes,
+                          ArrayRef<int64_t> physSrc,
+                          ArrayRef<int64_t> physOp,
+                          ArrayRef<int64_t> physArg,
+                          SmallVectorImpl<int64_t> &out) {
+  unsigned physRank = physSrc.size();
+  out.resize(physRank);
+  for (unsigned k = 0; k < physRank; ++k) {
+    auto sz = applyStatic(logSizes[physSrc[k]],
+                          static_cast<CoordOp>(physOp[k]), physArg[k]);
+    if (!sz)
+      return false;
+    out[k] = *sz;
+  }
+  return true;
 }
 
 /// Walk a def-chain of index arithmetic back to the single BlockArgument it
@@ -284,19 +306,20 @@ struct RewriteDescriptorLayoutPass
       eraseMarker(marker);
   }
 
-  // Generic stick-loop helper: emits scf.for s=0..factor iter_args(acc) and
-  // calls body(builder, stickIV, acc). For factor<=1, calls body with the
-  // outer builder and a constant-0 IV (no loop emitted). Used by both the
-  // matmul source stage and the store sink scatter.
-  Value emitStickLoop(OpBuilder &b, Location loc, int64_t factor, Value acc,
+  // Generic stick-loop helper: emits scf.for s=0..tripCount iter_args(acc) and
+  // calls body(builder, stickIV, acc). tripCount is the total number of stick
+  // iterations at this nesting level. For tripCount<=1, calls body with the
+  // outer builder and a constant-0 IV (no loop emitted — 0 or 1 trip inlines).
+  // Used by both the matmul source stage and the store sink scatter.
+  Value emitStickLoop(OpBuilder &b, Location loc, int64_t tripCount, Value acc,
                       function_ref<Value(OpBuilder &, Value, Value)> body) {
-    if (factor <= 1) {
+    if (tripCount <= 1) {
       Value s0 = arith::ConstantIndexOp::create(b, loc, 0);
       return body(b, s0, acc);
     }
     Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
     Value c1 = arith::ConstantIndexOp::create(b, loc, 1);
-    Value ub = arith::ConstantIndexOp::create(b, loc, factor);
+    Value ub = arith::ConstantIndexOp::create(b, loc, tripCount);
     auto forOp = scf::ForOp::create(b, loc, c0, ub, c1, ValueRange{acc});
     OpBuilder ib = OpBuilder::atBlockBegin(forOp.getBody());
     Value stepped =
@@ -311,10 +334,15 @@ struct RewriteDescriptorLayoutPass
   // to rank > 2 and synthesize the scf.for loop nest that produces a 2D result.
   // Also walks ktdp.store ops whose output descriptor is annotated (data_tile
   // is logical but access_tile is already physical from Phase 1) and calls
-  // dispatchStore to synthesize the scatter nest. Repeats until stable.
+  // dispatchSink to synthesize the scatter nest. Repeats until stable.
   // Currently handles linalg.matmul + ktdp.store; extend by adding a dispatch
   // branch for other contraction / sink ops as needed.
   LogicalResult synthesizeContractions(ModuleOp module) {
+    // Onion-peeling: each iteration physicalizes one layer of the def chain.
+    // Terminates because each iteration strictly reduces the number of
+    // rank-mismatched ops (Phase 1 already handles single-tensor chains;
+    // Phase 2 handles multi-tensor ops whose inputs were retyped by Phase 1
+    // or by a prior Phase 2 iteration). The IR is finite so the loop converges.
     bool changed = true;
     while (changed) {
       changed = false;
@@ -354,7 +382,7 @@ struct RewriteDescriptorLayoutPass
         auto marker = findMarkerForStore(st.getDataTile());
         if (!marker)
           continue;
-        if (failed(dispatchStore(st, marker)))
+        if (failed(dispatchSink(st, marker)))
           return failure();
         changed = true;
       }
@@ -362,36 +390,49 @@ struct RewriteDescriptorLayoutPass
     return success();
   }
 
-  // Walk back from a matmul operand through the elementwise chain to the
-  // ktdp.load, then look up the physical memView -> marker map populated
-  // during Phase 1.
-  triton::SpyreTensorLayoutOp findMarkerForOperand(Value operand) {
-    Value v = operand;
+  // True iff op is a single-result elementwise op with exactly one
+  // RankedTensor operand. Used by all three chain-walk helpers.
+  static bool isSingleTensorElementwiseOp(Operation *op) {
+    if (op->getNumResults() != 1 || op->getNumOperands() == 0)
+      return false;
+    int tensorOps = 0;
+    for (auto operand : op->getOperands())
+      if (isa<RankedTensorType>(operand.getType()))
+        ++tensorOps;
+    return tensorOps == 1;
+  }
+
+  // Walk backward from `val` through single-tensor elementwise ops to the
+  // ktdp.load that produced it. Returns the load, or null if not found.
+  static mlir::ktdp::LoadOp walkToLoad(Value val) {
+    Value v = val;
     while (true) {
       auto *defOp = v.getDefiningOp();
       if (!defOp)
         return {};
-      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(defOp)) {
-        auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
-            ld.getAccessTile().getDefiningOp());
-        if (!tile)
-          return {};
-        auto it = physMemViewToMarker.find(tile.getBase());
-        return it != physMemViewToMarker.end() ? it->second
-                                               : triton::SpyreTensorLayoutOp{};
-      }
-      // Step back through single-tensor-operand elementwise ops.
-      if (defOp->getNumResults() != 1 || defOp->getNumOperands() == 0)
+      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(defOp))
+        return ld;
+      if (!isSingleTensorElementwiseOp(defOp))
         return {};
-      int tensorOps = 0;
-      for (auto op : defOp->getOperands())
-        if (isa<RankedTensorType>(op.getType()))
-          ++tensorOps;
-      if (tensorOps != 1)
-        return {};
-      for (auto op : defOp->getOperands())
-        if (isa<RankedTensorType>(op.getType())) { v = op; break; }
+      for (auto operand : defOp->getOperands())
+        if (isa<RankedTensorType>(operand.getType())) { v = operand; break; }
     }
+  }
+
+  // Walk back from a matmul operand through the elementwise chain to the
+  // ktdp.load, then look up the physical memView -> marker map populated
+  // during Phase 1.
+  triton::SpyreTensorLayoutOp findMarkerForOperand(Value operand) {
+    auto ld = walkToLoad(operand);
+    if (!ld)
+      return {};
+    auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
+        ld.getAccessTile().getDefiningOp());
+    if (!tile)
+      return {};
+    auto it = physMemViewToMarker.find(tile.getBase());
+    return it != physMemViewToMarker.end() ? it->second
+                                           : triton::SpyreTensorLayoutOp{};
   }
 
   // Per-operand coord-map info read from a still-live marker.
@@ -403,26 +444,38 @@ struct RewriteDescriptorLayoutPass
     unsigned logicalRank;
     // Physical shape of the load result tensor.
     ArrayRef<int64_t> physBlock;
+
+    static OperandCoords fromMarker(triton::SpyreTensorLayoutOp marker,
+                                    unsigned logRank,
+                                    ArrayRef<int64_t> physBlock) {
+      return {marker.getPhysSrc(), marker.getPhysOp(), marker.getPhysArg(),
+              logRank, physBlock};
+    }
   };
 
   // Assign a role to each physical dim of an operand:
   //   >= 0  : parallel dim, maps to C dim [value]
-  //   -1    : reduction dim — K-stick (loop), K-flat, or K-lane (inner dot)
+  //   -1    : reduction dim — consumed by Op (inner) or looped (outer)
   //
-  // All dims whose logical source is the K dimension get role -1 regardless of
-  // whether they are FloorDiv (K-stick) or not. classify() then splits them
-  // right-to-left: the rightmost -1 dim is reduceInner (consumed by the Op);
-  // the rest are reduceLoop (each becomes an scf.for reduction loop).
-  static void buildDimRoles(const OperandCoords &coords, int64_t kLogicalSrc,
+  // All physical dims whose logical source is in `consumedLogicalDims` get
+  // role -1. classify() then splits them right-to-left: the rightmost is
+  // opInnerDim (consumed by Op); the rest are loopDims (scf.for reduction loops).
+  //
+  // `parallelRole` is the role assigned to non-consumed dims — typically the
+  // logical C dim index they contribute to (0=M, 1=N, etc.).
+  // Build per-physical-dim roles from a per-logical-dim reduction predicate.
+  // reductionMask[logDim] = true → any physical dim whose src is that logical dim
+  // gets role -1 (reduction); others get `parallelRole`.
+  static void buildDimRoles(const OperandCoords &coords,
+                             ArrayRef<bool> reductionMask,
                              int64_t parallelRole,
                              SmallVectorImpl<int64_t> &roles) {
     int n = (int)coords.src.size();
     roles.resize(n);
     for (int p = 0; p < n; ++p) {
-      if (coords.src[p] != kLogicalSrc)
-        roles[p] = parallelRole;
-      else
-        roles[p] = -1; // all K dims: reduction (inner or loop, split by classify)
+      int64_t logDim = coords.src[p];
+      bool isReduction = logDim < (int64_t)reductionMask.size() && reductionMask[logDim];
+      roles[p] = isReduction ? -1 : parallelRole;
     }
   }
 
@@ -433,24 +486,25 @@ struct RewriteDescriptorLayoutPass
   // (and the slice-type computation) as a pure lookup — no loop-set inspection
   // or cross-operand reasoning at slice time.
   enum class SliceKind {
-    StickIndex,       // floor/reduceLoop dim: offset = this operand's own loop IV,
+    StickIndex,       // floor/loopDims dim: offset = this operand's own loop IV,
                       // size = 1 (selects one stick along a stick-index dim).
-    StickifiedBlock,  // reduceInner spanning >1 stick (B's K-flat): offset =
+    StickifiedBlock,  // opInnerDim spanning >1 stick (B's K-flat): offset =
                       // reduction IV * stickSize, size = stickSize (one stick, R-b).
-    WholeBlock,       // lane / opSlice / single-stick reduceInner: offset = 0,
+    WholeBlock,       // lane / opSlice / single-stick opInnerDim: offset = 0,
                       // size = physBlock[p] (taken whole as part of the 2D tile).
   };
 
   // One operand classified by its Map(Op, X) roles and physical layout.
   // `classify` fills all derived fields from `coords` + `dimRoles`.
+  // `resolveAndReconcile` fills the resolved fields after classify().
   //
   // Field semantics (right-to-left traversal of the physical dims, R-c):
   //   lane        = innermost phys dim (rank-1); always the stick lane — full slice
   //   floorDims   = parallel dims that are FloorDiv (stick-index dims) → loops
   //   reduceDims  = all -1 dims, right-to-left order
-  //   reduceInner = rightmost reduceDim → consumed by Op (inner dot)
-  //   reduceLoop  = remaining reduceDims (all but rightmost) → reduction loops
-  //   opSliceDims = residual >= 0 dims that are not floorDims (fed to Op as-is)
+  //   opInnerDim = rightmost reduceDim → consumed by Op (inner dot)
+  //   loopDims  = remaining reduceDims (all but rightmost) → reduction loops
+  //   opTileDims = residual >= 0 dims that are not floorDims (fed to Op as-is)
   struct OperandPlan {
     Value               value;      // SSA tensor (physical on memory side)
     OperandCoords       coords;     // coord map + shape (kept for op/arg lookups)
@@ -459,185 +513,103 @@ struct RewriteDescriptorLayoutPass
     int                lane;        // innermost phys dim = rank-1
     int64_t            stickSize;   // stick/lane width = physBlock[lane] (e.g. 64).
                                     // The slice extent for any stick-width dim
-                                    // (the lane, and a sliced reduceInner). Distinct
+                                    // (the lane, and a sliced opInnerDim). Distinct
                                     // from physBlock[dim], which is the full dim
                                     // extent (= n_sticks * stickSize when BLOCK > stick).
     SmallVector<int>   floorDims;   // parallel stick-index dims → loops (role>=0, FloorDiv)
     SmallVector<int>   reduceDims;  // all -1 dims in right-to-left order
-    int                reduceInner; // rightmost reduceDim → consumed by Op; -1 if none
-    SmallVector<int>   reduceLoop;  // reduceDims minus reduceInner → reduction loops
-    SmallVector<int>   opSliceDims; // residual >= 0 non-floor dims (the 2D slice for matmul)
+    int                opInnerDim;  // rightmost reduceDim → consumed by Op; -1 if none
+    SmallVector<int>   loopDims;    // reduceDims minus opInnerDim → reduction loops
+    SmallVector<int>   opTileDims;  // residual >= 0 non-floor dims (the 2D slice for matmul)
     SmallVector<SliceKind> sliceKind; // per-phys-dim slice behavior (see SliceKind)
 
-    // Threaded from the physical construct_memory_view (R-a). Populated by
-    // dispatchMatmul / dispatchStore after classify(); consumed by S5.
-    SmallVector<OpFoldResult> strides; // physical stride per dim (attr=static, Value=dynamic)
-    SmallVector<OpFoldResult> sizes;   // physical extent per dim (attr=static, Value=dynamic)
+    // Resolved fields — filled by resolveAndReconcile() after classify().
+    // emitSourceStage reads these only; it does not re-derive from spec/dimRoles.
+    bool     needsTranspose;    // true iff the op-tile must be transposed before the op
+    int64_t  opExtentLo;        // extent of opTileDims[0] after slicing (pre-transpose)
+    int64_t  opExtentHi;        // extent of opTileDims[1] after slicing (pre-transpose)
+    int64_t  parallelOutputAxis; // output axis this operand contributes to (its parallelRole)
+    int64_t  parallelExtent;     // post-transpose extent along that output axis
+
   };
-
-  // Same walk as findMarkerForOperand, but returns the physical
-  // ConstructMemoryViewOp rather than the marker. Used by dispatchMatmul to
-  // thread strides/sizes into the OperandPlan (S4).
-  mlir::ktdp::ConstructMemoryViewOp getMemViewForOperand(Value operand) {
-    Value v = operand;
-    while (true) {
-      auto *defOp = v.getDefiningOp();
-      if (!defOp)
-        return {};
-      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(defOp)) {
-        auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
-            ld.getAccessTile().getDefiningOp());
-        if (!tile)
-          return {};
-        return tile.getBase().getDefiningOp<mlir::ktdp::ConstructMemoryViewOp>();
-      }
-      if (defOp->getNumResults() != 1 || defOp->getNumOperands() == 0)
-        return {};
-      int tensorOps = 0;
-      for (auto op : defOp->getOperands())
-        if (isa<RankedTensorType>(op.getType()))
-          ++tensorOps;
-      if (tensorOps != 1)
-        return {};
-      for (auto op : defOp->getOperands())
-        if (isa<RankedTensorType>(op.getType())) { v = op; break; }
-    }
-  }
-
-  // Populate plan.strides and plan.sizes from the physical ConstructMemoryViewOp
-  // that backs the operand's load. Static dims become IndexAttr; dynamic dims
-  // become the SSA Value from the memViewOp's dynamic operand lists.
-  // Also asserts static consistency: sizes[p] == coords.physBlock[p] for every
-  // statically-known dim (catches mismatches between the tensor type and the
-  // memView before S5 flips consumers to the threaded values).
-  static LogicalResult threadStridesAndSizes(
-      OperandPlan &plan, mlir::ktdp::ConstructMemoryViewOp memViewOp,
-      MLIRContext *ctx) {
-    ArrayRef<int64_t> staticSizes   = memViewOp.getStaticSizes();
-    ArrayRef<int64_t> staticStrides = memViewOp.getStaticStrides();
-    auto dynSizes   = memViewOp.getSizes();
-    auto dynStrides = memViewOp.getStrides();
-
-    int physRank = (int)staticSizes.size();
-    plan.sizes.resize(physRank);
-    plan.strides.resize(physRank);
-
-    // TODO(S5): Revisit whether a consistency check between plan.sizes and
-    // coords.physBlock is appropriate here. They serve different purposes:
-    // - plan.sizes[p] (from memViewOp) = full descriptor extent = trip count
-    //   for floor dims, or full physical extent for opSlice/lane dims.
-    // - coords.physBlock[p] (from the load result tensor type) = block extent
-    //   = 1 for floor dims (one stick per block), physBlock[p] for opSlice.
-    // They are NOT equal in general (e.g. floor dim: 1 vs N_sticks; M-row dim:
-    // BM vs M_total). A check needs to verify each dim category independently.
-    int dynSzPos = 0, dynStPos = 0;
-    for (int p = 0; p < physRank; ++p) {
-      if (staticSizes[p] != ShapedType::kDynamic) {
-        plan.sizes[p] = IntegerAttr::get(IndexType::get(ctx), staticSizes[p]);
-      } else {
-        plan.sizes[p] = dynSizes[dynSzPos++];
-      }
-      if (staticStrides[p] != ShapedType::kDynamic) {
-        plan.strides[p] = IntegerAttr::get(IndexType::get(ctx), staticStrides[p]);
-      } else {
-        plan.strides[p] = dynStrides[dynStPos++];
-      }
-    }
-    return success();
-  }
 
   // One loop dim whose IV is needed by extractOpSlice / the store insert.
   // Collected from the existing scf.for nest by collectExistingLoopIVs.
   struct Loop {
     enum Kind { Parallel, Reduction } kind;
-    int   owner;    // which operand: 0=A, 1=B
+    int   owner;    // which operand (index into plans vector)
     int   physDim;  // phys dim the IV indexes
     Value iv;       // induction variable
   };
 
   // Walk enclosing scf.for ops of `op` and populate `loops` with one entry per
-  // floor/reduceLoop dim in aPlan/bPlan whose IV was wired by Phase 1.
+  // floor/loopDims dim in aPlan/bPlan whose IV was wired by Phase 1.
   // Phase 1 stored the (index-cast) loop IV directly as the coord operand of
   // the construct_access_tile for each FloorDiv dim; we recover it by tracing
   // each coord operand back through index_cast to its BlockArgument.
-  static void collectExistingLoopIVs(Operation *op,
-                                     const OperandPlan &aPlan,
-                                     const OperandPlan &bPlan,
-                                     SmallVectorImpl<Loop> &loops) {
-    // Helper: get the construct_access_tile backing a plan's load chain.
-    auto getTile = [](const OperandPlan &plan)
-        -> mlir::ktdp::ConstructAccessTilesOp {
-      Value v = plan.value;
-      if (!v) return {};
-      while (true) {
-        auto *defOp = v.getDefiningOp();
-        if (!defOp) return {};
-        if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(defOp))
-          return dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
-              ld.getAccessTile().getDefiningOp());
-        if (defOp->getNumResults() != 1 || defOp->getNumOperands() == 0)
-          return {};
-        int cnt = 0;
-        for (auto o : defOp->getOperands())
-          if (isa<RankedTensorType>(o.getType())) ++cnt;
-        if (cnt != 1) return {};
-        for (auto o : defOp->getOperands())
-          if (isa<RankedTensorType>(o.getType())) { v = o; break; }
-      }
-    };
+  // Trace an index Value through index_cast to a BlockArgument that is the
+  // induction variable (arg #0) of an enclosing scf.for.
+  static Value traceToForIV(Value v) {
+    while (true) {
+      if (auto ba = dyn_cast<BlockArgument>(v))
+        return (isa<scf::ForOp>(ba.getOwner()->getParentOp()) &&
+                ba.getArgNumber() == 0)
+                   ? ba
+                   : Value{};
+      auto *op = v.getDefiningOp();
+      if (!op) return {};
+      if (isa<arith::IndexCastOp, arith::IndexCastUIOp>(op))
+        { v = op->getOperand(0); continue; }
+      return {};
+    }
+  }
 
-    // Helper: trace an index Value through index_cast to a BlockArgument; check
-    // it is the induction var of an enclosing scf.for (arg #0 of body block).
-    auto traceToForIV = [](Value v) -> Value {
-      while (true) {
-        if (auto ba = dyn_cast<BlockArgument>(v))
-          return (isa<scf::ForOp>(ba.getOwner()->getParentOp()) &&
-                  ba.getArgNumber() == 0)
-                     ? ba
-                     : Value{};
-        auto *op = v.getDefiningOp();
-        if (!op) return {};
-        if (isa<arith::IndexCastOp, arith::IndexCastUIOp>(op))
-          { v = op->getOperand(0); continue; }
-        return {};
-      }
-    };
+  // Trace a plan's tensor value back through single-tensor ops to the
+  // ktdp.load that produced it, then return the ConstructAccessTilesOp
+  // feeding that load.
+  static mlir::ktdp::ConstructAccessTilesOp
+  tileForPlan(const OperandPlan &plan) {
+    if (!plan.value) return {};
+    auto ld = walkToLoad(plan.value);
+    if (!ld) return {};
+    return dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
+        ld.getAccessTile().getDefiningOp());
+  }
 
-    auto aTile = getTile(aPlan);
-    auto bTile = getTile(bPlan);
+  // Scan one access tile's coord operands and record which enclosing scf.for
+  // IVs drive each physical dim. Populates ivToPhysDim for use by
+  // collectLoopIVsForTile.
+  static void scanTileIVs(
+      mlir::ktdp::ConstructAccessTilesOp tile,
+      DenseMap<Value, int /*physDim*/> &ivToPhysDim) {
+    if (!tile) return;
+    auto indices = tile.getIndices();
+    for (unsigned k = 0; k < indices.size(); ++k) {
+      Value forIV = traceToForIV(indices[k]);
+      if (forIV && !ivToPhysDim.count(forIV))
+        ivToPhysDim[forIV] = (int)k;
+    }
+  }
 
-    // For the store stage, also scan the store's own access tile if present.
-    mlir::ktdp::ConstructAccessTilesOp storeTile;
-    if (auto st = dyn_cast<mlir::ktdp::StoreOp>(op))
-      storeTile = dyn_cast_or_null<mlir::ktdp::ConstructAccessTilesOp>(
-          st.getAccessTile().getDefiningOp());
+  // Walk the enclosing scf.for nest of `op` and collect Loop entries for
+  // every IV that drives a physical dim of `tile`. `owner` is stored on
+  // each Loop for the caller's use. `loopDims` dims (if any) are marked
+  // Loop::Reduction; all others are Loop::Parallel.
+  static void collectLoopIVsForTile(
+      Operation *op, mlir::ktdp::ConstructAccessTilesOp tile, int owner,
+      ArrayRef<int> loopDims, SmallVectorImpl<Loop> &loops) {
+    DenseMap<Value, int> ivToPhysDim;
+    scanTileIVs(tile, ivToPhysDim);
 
-    // For each tile, build a map physDim -> forIV from its coord operands.
-    DenseMap<Value, std::pair<int /*owner*/, int /*physDim*/>> ivToOwnerDim;
-    auto scanTile = [&](mlir::ktdp::ConstructAccessTilesOp tile, int owner) {
-      if (!tile) return;
-      auto indices = tile.getIndices();
-      for (unsigned k = 0; k < indices.size(); ++k) {
-        Value forIV = traceToForIV(indices[k]);
-        if (forIV && !ivToOwnerDim.count(forIV))
-          ivToOwnerDim[forIV] = {owner, (int)k};
-      }
-    };
-    scanTile(aTile, 0);
-    scanTile(bTile, 1);
-    scanTile(storeTile, 0); // store: owner=0, physDim=coord index
-
-    // Walk enclosing scf.for ops and emit Loop entries for matched IVs.
     Operation *cur = op->getParentOp();
     while (cur) {
       if (auto forOp = dyn_cast<scf::ForOp>(cur)) {
         Value iv = forOp.getInductionVar();
-        auto it = ivToOwnerDim.find(iv);
-        if (it != ivToOwnerDim.end()) {
-          auto [owner, physDim] = it->second;
-          // Determine kind: reduction if physDim is in aPlan.reduceLoop.
+        auto it = ivToPhysDim.find(iv);
+        if (it != ivToPhysDim.end()) {
+          int physDim = it->second;
           Loop::Kind kind = Loop::Parallel;
-          for (int p : aPlan.reduceLoop)
+          for (int p : loopDims)
             if (p == physDim) { kind = Loop::Reduction; break; }
           loops.push_back({kind, owner, physDim, iv});
         }
@@ -653,10 +625,10 @@ struct RewriteDescriptorLayoutPass
   //
   // Right-to-left pass:
   //   - innermost dim (rank-1) → lane (always full inner slice)
-  //   - -1 dims → reduceDims (right-to-left); rightmost is reduceInner
-  //     (consumed by Op), the rest are reduceLoop (become scf.for loops)
+  //   - -1 dims → reduceDims (right-to-left); rightmost is opInnerDim
+  //     (consumed by Op), the rest are loopDims (become scf.for loops)
   //   - >= 0 FloorDiv dims → floorDims (parallel stick-index loops)
-  //   - residual >= 0 dims → opSliceDims (fed to Op as-is)
+  //   - residual >= 0 dims → opTileDims (fed to Op as-is)
   static OperandPlan classify(Value val, const OperandCoords &coords,
                                ArrayRef<int64_t> dimRoles) {
     int rank = (int)dimRoles.size();
@@ -666,44 +638,44 @@ struct RewriteDescriptorLayoutPass
     plan.dimRoles  = SmallVector<int64_t>(dimRoles.begin(), dimRoles.end());
     plan.lane      = rank - 1;
     plan.stickSize = coords.physBlock[rank - 1]; // lane extent = stick width
-    plan.reduceInner = -1;
+    plan.opInnerDim = -1;
 
     // Walk right-to-left (innermost first) per R-c.
-    // -1 dims: track reduceDims and split into reduceInner (rightmost, consumed
-    // by Op) and reduceLoop (outer, each becomes an scf.for reduction loop).
-    // reduceInner is also added to opSliceDims during the walk so the existing
-    // extraction machinery (which builds the 2D Op tile from opSliceDims) keeps
-    // working unchanged. S3-S5 will switch extraction to use reduceInner directly.
+    // -1 dims: track reduceDims and split into opInnerDim (rightmost, consumed
+    // by Op) and loopDims (outer, each becomes an scf.for reduction loop).
+    // opInnerDim is also added to opTileDims during the walk so the existing
+    // extraction machinery (which builds the 2D Op tile from opTileDims) keeps
+    // working unchanged. S3-S5 will switch extraction to use opInnerDim directly.
     for (int p = rank - 1; p >= 0; --p) {
       int64_t role = dimRoles[p];
       bool isFloor = (role >= 0 &&
                       static_cast<CoordOp>(coords.op[p]) == CoordOp::FloorDiv);
       if (role == -1) {
         plan.reduceDims.push_back(p);
-        if (plan.reduceInner == -1) {
-          plan.reduceInner = p; // first -1 seen right-to-left = rightmost
-          plan.opSliceDims.push_back(p); // consumed by Op — part of the 2D tile
+        if (plan.opInnerDim == -1) {
+          plan.opInnerDim = p; // first -1 seen right-to-left = rightmost
+          plan.opTileDims.push_back(p); // consumed by Op — part of the 2D tile
         } else {
-          plan.reduceLoop.push_back(p); // outer -1 dims → loops
+          plan.loopDims.push_back(p); // outer -1 dims → loops
         }
       } else if (isFloor) {
         plan.floorDims.push_back(p);
       } else {
         // role >= 0, non-floor (identity parallel or lane)
-        plan.opSliceDims.push_back(p);
+        plan.opTileDims.push_back(p);
       }
     }
     // Reverse so dims appear in ascending physical order (left-to-right),
     // matching the expectations of buildExtract and collectLoops callers.
     std::reverse(plan.floorDims.begin(), plan.floorDims.end());
-    std::reverse(plan.reduceLoop.begin(), plan.reduceLoop.end());
-    std::reverse(plan.opSliceDims.begin(), plan.opSliceDims.end());
+    std::reverse(plan.loopDims.begin(), plan.loopDims.end());
+    std::reverse(plan.opTileDims.begin(), plan.opTileDims.end());
 
     // Assign the per-dim slice behavior from local geometry (R-c + R-b):
-    //   floor / reduceLoop dim       → StickIndex (one stick by its own IV)
-    //   reduceInner spanning >1 stick → StickifiedBlock (B's K-flat; one stick per
+    //   floor / loopDims dim       → StickIndex (one stick by its own IV)
+    //   opInnerDim spanning >1 stick → StickifiedBlock (B's K-flat; one stick per
     //     reduction iter). Detected purely by extent > stickSize, so a single-
-    //     stick reduceInner (incl. the case where reduceInner IS the lane) is WholeBlock.
+    //     stick opInnerDim (incl. the case where opInnerDim IS the lane) is WholeBlock.
     //   everything else (lane, opSlice) → WholeBlock (taken whole in the 2D tile)
     plan.sliceKind.assign(rank, SliceKind::WholeBlock);
     auto markList = [&](ArrayRef<int> dims) {
@@ -711,10 +683,10 @@ struct RewriteDescriptorLayoutPass
         plan.sliceKind[p] = SliceKind::StickIndex;
     };
     markList(plan.floorDims);
-    markList(plan.reduceLoop);
-    if (plan.reduceInner != -1 &&
-        coords.physBlock[plan.reduceInner] > plan.stickSize)
-      plan.sliceKind[plan.reduceInner] = SliceKind::StickifiedBlock;
+    markList(plan.loopDims);
+    if (plan.opInnerDim != -1 &&
+        coords.physBlock[plan.opInnerDim] > plan.stickSize)
+      plan.sliceKind[plan.opInnerDim] = SliceKind::StickifiedBlock;
     return plan;
   }
 
@@ -745,13 +717,7 @@ struct RewriteDescriptorLayoutPass
             return it->second;
         }
         // Continue through single-tensor-result elementwise ops (e.g. truncf).
-        if (user->getNumResults() != 1)
-          continue;
-        int tensorOps = 0;
-        for (auto op : user->getOperands())
-          if (isa<RankedTensorType>(op.getType()))
-            ++tensorOps;
-        if (tensorOps != 1)
+        if (!isSingleTensorElementwiseOp(user))
           continue;
         worklist.push_back(user->getResult(0));
       }
@@ -759,112 +725,246 @@ struct RewriteDescriptorLayoutPass
     return {};
   }
 
-  // Cross-operand SliceKind fix-up: StickifiedBlock is only valid when a
-  // reduction loop exists (aPlan.reduceLoop non-empty). When neither operand
-  // has a reduceLoop, K is contracted whole in one tile — demote any
-  // StickifiedBlock to WholeBlock so extractOpSlice never calls getReduceIV()
-  // on a null IV.
-  static void reconcilePlans(OperandPlan &aPlan, OperandPlan &bPlan) {
-    if (!aPlan.reduceLoop.empty() || !bPlan.reduceLoop.empty())
-      return;
-    for (auto *plan : {&aPlan, &bPlan})
-      for (auto &sk : plan->sliceKind)
-        if (sk == SliceKind::StickifiedBlock)
-          sk = SliceKind::WholeBlock;
+  // Per-operand descriptor for a source contraction op.
+  // canonicalAxes[i] = output-axis index for logical dim i, or -1 for reduction.
+  // e.g. matmul A=(m,k): {0,-1};  B=(k,n): {-1,1}.
+  struct SourceOperandSpec {
+    SmallVector<int64_t> canonicalAxes; // one entry per logical dim of this operand
+  };
+
+  // Per-logical-dim reduction predicate: isReduction[i] = true iff dim i is reduction.
+  static SmallVector<bool> isReduction(const SourceOperandSpec &spec) {
+    SmallVector<bool> result;
+    for (int64_t ax : spec.canonicalAxes)
+      result.push_back(ax == -1);
+    return result;
   }
 
-  // Per-matmul entry point for Phase 2: trace operands to markers, build
-  // OperandPlans, and call emitMatmulStage.
-  LogicalResult dispatchMatmul(linalg::MatmulOp mm) {
-    auto aMarker = findMarkerForOperand(mm.getInputs()[0]);
-    auto bMarker = findMarkerForOperand(mm.getInputs()[1]);
-    if (!aMarker || !bMarker)
-      return mm.emitError(
-          "spyre_tensor_layout: cannot find layout markers for matmul operands");
-
-    auto aPhysShape = cast<RankedTensorType>(mm.getInputs()[0].getType()).getShape();
-    auto bPhysShape = cast<RankedTensorType>(mm.getInputs()[1].getType()).getShape();
-
-    OperandCoords aC{aMarker.getPhysSrc(), aMarker.getPhysOp(),
-                     aMarker.getPhysArg(), 2, aPhysShape};
-    OperandCoords bC{bMarker.getPhysSrc(), bMarker.getPhysOp(),
-                     bMarker.getPhysArg(), 2, bPhysShape};
-
-    // A logical: dim0=M (src 0 → parallel), dim1=K (src 1 → reduction).
-    // B logical: dim0=K (src 0 → reduction), dim1=N (src 1 → parallel).
-    SmallVector<int64_t> dimRoleA, dimRoleB;
-    buildDimRoles(aC, /*kLogicalSrc=*/1, /*parallelRole=*/0, dimRoleA);
-    buildDimRoles(bC, /*kLogicalSrc=*/0, /*parallelRole=*/1, dimRoleB);
-
-    OperandPlan aPlan = classify(mm.getInputs()[0], aC, dimRoleA);
-    OperandPlan bPlan = classify(mm.getInputs()[1], bC, dimRoleB);
-
-    reconcilePlans(aPlan, bPlan);
-
-    // S4: thread physical strides/sizes from the construct_memory_view into
-    // the plans. Not yet consumed by emitMatmulStage (S5 flips the switch).
-    auto aMemView = getMemViewForOperand(mm.getInputs()[0]);
-    auto bMemView = getMemViewForOperand(mm.getInputs()[1]);
-    if (!aMemView || !bMemView)
-      return mm.emitError(
-          "spyre_tensor_layout: cannot locate physical memory view for matmul operands");
-    MLIRContext *ctx = mm.getContext();
-    if (failed(threadStridesAndSizes(aPlan, aMemView, ctx)))
-      return failure();
-    if (failed(threadStridesAndSizes(bPlan, bMemView, ctx)))
-      return failure();
-
-    return emitMatmulStage(mm, aPlan, bPlan);
+  // The unique parallel output-axis carried by this operand.
+  static int64_t parallelRole(const SourceOperandSpec &spec) {
+    for (int64_t v : spec.canonicalAxes)
+      if (v != -1) return v;
+    llvm_unreachable("SourceOperandSpec: no parallel axis");
   }
 
-  // Source stage: extract 2D A/B slices from the already-physicalized loads,
-  // emit linalg.matmul(outs=cVal) at mm's position, RAUW mm's result, erase mm.
-  // Phase 1 already rescaled and wired the enclosing scf.for loops; Phase 2
-  // reads their IVs via collectExistingLoopIVs and emits only the slices +
-  // matmul — no new loops.
-  LogicalResult emitMatmulStage(linalg::MatmulOp mm,
-                                const OperandPlan &aPlan,
-                                const OperandPlan &bPlan) {
-    OpBuilder b(mm);
-    Location loc = mm.getLoc();
+  // Transpose needed iff canonical low dim is reduction XOR physical low dim is.
+  static bool needsTranspose(const SourceOperandSpec &spec, int64_t dimLoRole) {
+    bool canonicalLowIsReduction = isReduction(spec)[0];
+    bool physicalLowIsReduction  = (dimLoRole == -1);
+    return canonicalLowIsReduction != physicalLowIsReduction;
+  }
 
-    Value cVal = mm.getOutputs()[0];
+  // Descriptor for one source contraction op (e.g. linalg.matmul).
+  // `emitOp` receives all (possibly transposed) input slices + accumulator
+  // and returns the updated accumulator. Acc shape is derived from each
+  // operand's resolved opExtentLo/Hi + needsTranspose fields by emitSourceStage.
+  struct SourceOpSpec {
+    SmallVector<SourceOperandSpec> operands;  // one per input
+    unsigned logicalRank;
+    function_ref<Value(OpBuilder &, Location, ArrayRef<Value> /*slices*/,
+                       Value /*acc*/, RankedTensorType /*accTy*/)>
+        emitOp;
+  };
 
-    auto aElemTy = cast<RankedTensorType>(aPlan.value.getType()).getElementType();
-    auto bElemTy = cast<RankedTensorType>(bPlan.value.getType()).getElementType();
-    auto accTy   = cast<RankedTensorType>(cVal.getType()).getElementType();
+  // Generic source-stage entry point for N-input contraction ops. Iterates
+  // spec.operands to trace each input to its marker, build OperandPlans, and
+  // call emitSourceStage. Op-specific wiring comes from the spec; add a new
+  // dispatchXxx (batch_matmul, conv) by building a different SourceOpSpec.
+  template <typename OpT>
+  LogicalResult dispatchSource(OpT op, const SourceOpSpec &spec) {
+    unsigned nOps = spec.operands.size();
+    SmallVector<OperandPlan, 2> plans(nOps);
 
-    ArrayRef<int64_t> aPhysShape = aPlan.coords.physBlock;
-    ArrayRef<int64_t> bPhysShape = bPlan.coords.physBlock;
+    for (unsigned i = 0; i < nOps; ++i) {
+      auto marker = findMarkerForOperand(op.getInputs()[i]);
+      if (!marker)
+        return op.emitError(
+            "spyre_tensor_layout: cannot find layout marker for source op operand");
+      auto physShape =
+          cast<RankedTensorType>(op.getInputs()[i].getType()).getShape();
+      OperandCoords coords = OperandCoords::fromMarker(marker, spec.logicalRank,
+                                                       physShape);
+      SmallVector<int64_t> dimRoles;
+      buildDimRoles(coords, isReduction(spec.operands[i]),
+                    parallelRole(spec.operands[i]), dimRoles);
+      plans[i] = classify(op.getInputs()[i], coords, dimRoles);
+    }
 
-    // Each operand must have exactly 2 opSlice dims (the 2D matmul tile).
-    if (aPlan.opSliceDims.size() != 2 || bPlan.opSliceDims.size() != 2)
-      return mm.emitError(
-          "spyre_tensor_layout: expected exactly 2 opSlice dims per operand");
+    resolveAndReconcile(plans, spec);
 
-    int aDimLo = aPlan.opSliceDims[0], aDimHi = aPlan.opSliceDims[1];
-    int bDimLo = bPlan.opSliceDims[0], bDimHi = bPlan.opSliceDims[1];
+    return emitSourceStage(op, spec.emitOp, plans);
+  }
 
-    // 2D slice result types (physical order).
-    auto opSliceExtent = [](const OperandPlan &plan, int p) -> int64_t {
-      return plan.sliceKind[p] == SliceKind::StickifiedBlock
-                 ? plan.stickSize
-                 : plan.coords.physBlock[p];
-    };
-    auto sliceAPhysTy = RankedTensorType::get(
-        {opSliceExtent(aPlan, aDimLo), opSliceExtent(aPlan, aDimHi)}, aElemTy);
-    auto sliceBPhysTy = RankedTensorType::get(
-        {opSliceExtent(bPlan, bDimLo), opSliceExtent(bPlan, bDimHi)}, bElemTy);
+  // Per-dim op-tile slice extent: stickSize for StickifiedBlock, full physBlock
+  // otherwise. This is the extent of the op-tile dim before any transpose.
+  static int64_t opSliceExtent(const OperandPlan &plan, int p) {
+    return plan.sliceKind[p] == SliceKind::StickifiedBlock
+               ? plan.stickSize
+               : plan.coords.physBlock[p];
+  }
 
-    bool transposeA = (aPlan.dimRoles[aDimLo] == -1);
-    bool transposeB = (bPlan.dimRoles[bDimLo] != -1);
-
-    int64_t M  = transposeA ? aPhysShape[aDimHi] : aPhysShape[aDimLo];
-    int64_t KA = transposeA ? aPhysShape[aDimLo] : aPhysShape[aDimHi];
-    int64_t N  = transposeB ? bPhysShape[bDimLo] : bPhysShape[bDimHi];
-    auto accTy2D = RankedTensorType::get({M, N}, accTy);
-
+  // Extract an op-tile stick slice from `plan`. Offsets/sizes follow sliceKind:
+  //   StickIndex      → offset = stickIV (within-tile), size = 1
+  //                     (only when physBlock[p] > 1; else offset = 0)
+  //   StickifiedBlock → offset = stickIV * stickSize, size = stickSize
+  //   WholeBlock      → offset = 0, size = physBlock[p]
+  // `stickIV` is the current stick iteration variable (may be nullptr for
+  // the trivial stickFactor=1 case where emitStickLoop passes a const-0).
+  static Value extractOpSlice(OpBuilder &b, Location loc,
+                               const OperandPlan &plan,
+                               RankedTensorType resultTy, Value stickIV) {
     auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
+    ArrayRef<int64_t> physBlock = plan.coords.physBlock;
+    int rank = (int)physBlock.size();
+    SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
+    for (int p = 0; p < rank; ++p) {
+      switch (plan.sliceKind[p]) {
+      case SliceKind::StickIndex: {
+        Value iv = (physBlock[p] > 1) ? stickIV : Value{};
+        if (!iv) {
+          offsets[p] = idx(0);
+        } else if (iv.getType().isIndex()) {
+          offsets[p] = iv;
+        } else {
+          offsets[p] = arith::IndexCastOp::create(b, loc,
+                           b.getIndexType(), iv).getResult();
+        }
+        sizes[p] = idx(1);
+        break;
+      }
+      case SliceKind::StickifiedBlock: {
+        Value sIdx = stickIV.getType().isIndex()
+                         ? stickIV
+                         : arith::IndexCastOp::create(b, loc,
+                               b.getIndexType(), stickIV).getResult();
+        Value stickSz = arith::ConstantIndexOp::create(b, loc, plan.stickSize);
+        offsets[p] = arith::MulIOp::create(b, loc, sIdx, stickSz).getResult();
+        sizes[p]   = idx(plan.stickSize);
+        break;
+      }
+      case SliceKind::WholeBlock:
+        offsets[p] = idx(0);
+        sizes[p]   = idx(physBlock[p]);
+        break;
+      }
+    }
+    return tensor::ExtractSliceOp::create(
+        b, loc, resultTy, plan.value, offsets, sizes, strides);
+  }
+
+  // Resolution + cross-operand fix-up for N operand plans.
+  //
+  // 1. Resolve per-operand transpose + op-tile extents from the classified plan
+  //    and the einsum spec, storing results into the plan's resolved fields so
+  //    emitSourceStage reads them without re-consulting the spec or dimRoles.
+  //
+  // 2. StickifiedBlock demotion: StickifiedBlock is only valid when some plan
+  //    has loopDims. When none do, demote all StickifiedBlock to WholeBlock so
+  //    extractOpSlice never uses a null IV. (Must run after resolution because
+  //    opExtentLo/Hi must reflect the demoted kind.)
+  // Resolve per-operand transpose, extents, and output-axis contribution. All
+  // einsum knowledge (canonicalAxes) is consumed here; emitSourceStage works
+  // from resolved fields only and never touches the spec again.
+  static void resolveAndReconcile(SmallVectorImpl<OperandPlan> &plans,
+                                   const SourceOpSpec &spec) {
+    // Step 1 — resolve per-operand fields.
+    for (unsigned i = 0; i < plans.size(); ++i) {
+      OperandPlan &plan = plans[i];
+      const SourceOperandSpec &opSpec = spec.operands[i];
+      int dimLo = plan.opTileDims[0], dimHi = plan.opTileDims[1];
+      plan.needsTranspose = needsTranspose(opSpec, plan.dimRoles[dimLo]);
+      plan.opExtentLo = opSliceExtent(plan, dimLo);
+      plan.opExtentHi = opSliceExtent(plan, dimHi);
+      plan.parallelOutputAxis = parallelRole(opSpec);
+      SmallVector<bool> redMask = isReduction(opSpec);
+      plan.parallelExtent = !redMask[0]
+                                ? (plan.needsTranspose ? plan.opExtentHi : plan.opExtentLo)
+                                : (plan.needsTranspose ? plan.opExtentLo : plan.opExtentHi);
+    }
+
+    // Step 2 — StickifiedBlock demotion.
+    bool anyLoop = false;
+    for (auto &p : plans)
+      if (!p.loopDims.empty()) { anyLoop = true; break; }
+    if (!anyLoop) {
+      for (auto &plan : plans)
+        for (auto &sk : plan.sliceKind)
+          if (sk == SliceKind::StickifiedBlock)
+            sk = SliceKind::WholeBlock;
+      // Re-derive extents and parallelExtent now that sliceKind has changed.
+      for (unsigned i = 0; i < plans.size(); ++i) {
+        OperandPlan &plan = plans[i];
+        const SourceOperandSpec &opSpec = spec.operands[i];
+        int dimLo = plan.opTileDims[0], dimHi = plan.opTileDims[1];
+        plan.opExtentLo = opSliceExtent(plan, dimLo);
+        plan.opExtentHi = opSliceExtent(plan, dimHi);
+        SmallVector<bool> redMask = isReduction(opSpec);
+        plan.parallelExtent = !redMask[0]
+                                  ? (plan.needsTranspose ? plan.opExtentHi : plan.opExtentLo)
+                                  : (plan.needsTranspose ? plan.opExtentLo : plan.opExtentHi);
+      }
+    }
+  }
+
+  // linalg.matmul instantiation:
+  //   A=(m,k): dim0=M (output 0), dim1=K (reduction).
+  //   B=(k,n): dim0=K (reduction), dim1=N (output 1).
+  LogicalResult dispatchMatmul(linalg::MatmulOp mm) {
+    SourceOpSpec spec;
+    spec.operands = {SourceOperandSpec{{0, -1}},   // A=(m,k)
+                     SourceOperandSpec{{-1, 1}}};  // B=(k,n)
+    spec.logicalRank = 2;
+    spec.emitOp = [](OpBuilder &b, Location loc,
+                     ArrayRef<Value> slices, Value acc,
+                     RankedTensorType accTy) -> Value {
+      return linalg::MatmulOp::create(b, loc, accTy,
+          ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
+    };
+    return dispatchSource(mm, spec);
+  }
+
+  // Source stage: for each operand in `plans`, extract its op slice from the
+  // already-physicalized load, emit the contraction op (via spec.emitOp) at
+  // op's position, RAUW the result, erase op. Phase 1 already rescaled and
+  // wired the enclosing scf.for loops; Phase 2 reads their IVs via
+  // collectExistingLoopIVs and emits only the slices + op — no new loops.
+  template <typename OpT>
+  LogicalResult emitSourceStage(
+      OpT op,
+      function_ref<Value(OpBuilder &, Location, ArrayRef<Value>, Value,
+                         RankedTensorType)>
+          emitOp,
+      ArrayRef<OperandPlan> plans) {
+    OpBuilder b(op);
+    Location loc = op.getLoc();
+
+    Value cVal = op.getOutputs()[0];
+    auto accElemTy = cast<RankedTensorType>(cVal.getType()).getElementType();
+
+    // Each operand must have exactly 2 opSlice dims (the op tile).
+    for (unsigned i = 0; i < plans.size(); ++i)
+      if (plans[i].opTileDims.size() != 2)
+        return op.emitError(
+            "spyre_tensor_layout: expected exactly 2 opSlice dims per operand");
+
+    // Per-operand op-tile slice types — derived from resolved extents.
+    SmallVector<RankedTensorType> sliceTys;
+    for (unsigned i = 0; i < plans.size(); ++i) {
+      const OperandPlan &plan = plans[i];
+      auto elemTy = cast<RankedTensorType>(plan.value.getType()).getElementType();
+      sliceTys.push_back(RankedTensorType::get(
+          {plan.opExtentLo, plan.opExtentHi}, elemTy));
+    }
+
+    // Acc shape from resolved per-plan fields: each input plan contributes its
+    // parallelExtent to its parallelOutputAxis.
+    int64_t maxAxis = -1;
+    for (auto &plan : plans)
+      if (plan.parallelOutputAxis > maxAxis) maxAxis = plan.parallelOutputAxis;
+    SmallVector<int64_t> accDims(maxAxis + 1, 0);
+    for (auto &plan : plans)
+      accDims[plan.parallelOutputAxis] = plan.parallelExtent;
+    auto accTy = RankedTensorType::get(accDims, accElemTy);
 
     auto emitTranspose2D = [&](Value src, Type elemT) -> Value {
       auto srcTy = cast<RankedTensorType>(src.getType());
@@ -875,105 +975,52 @@ struct RewriteDescriptorLayoutPass
           b.getDenseI64ArrayAttr({1, 0})).getResult()[0];
     };
 
-    // Collect IVs from the existing enclosing scf.for loops (wired by Phase 1).
-    SmallVector<Loop> loops;
-    collectExistingLoopIVs(mm, aPlan, bPlan, loops);
-
     // Determine if a StickifiedBlock dim exists and what factor it has.
-    // factor > 1 means each loaded tile spans factor sticks; Phase 2 emits
-    // an inner stick loop 0..factor to iterate within the tile.
     int64_t stickFactor = 1;
-    for (auto *plan : {&aPlan, &bPlan}) {
-      for (int p = 0; p < (int)plan->sliceKind.size(); ++p) {
-        if (plan->sliceKind[p] == SliceKind::StickifiedBlock) {
-          int64_t f = plan->coords.physBlock[p] / plan->stickSize;
+    for (auto &plan : plans)
+      for (int p = 0; p < (int)plan.sliceKind.size(); ++p)
+        if (plan.sliceKind[p] == SliceKind::StickifiedBlock) {
+          int64_t f = plan.coords.physBlock[p] / plan.stickSize;
           if (f > stickFactor) stickFactor = f;
         }
-      }
-    }
 
-    // stickIV: the within-tile stick index used by StickIndex (when
-    // physBlock[p] > 1) and StickifiedBlock. For factor==1 it stays null
-    // (set below before extractOpSlice is called).
+    // stickIV: within-tile stick index used by StickIndex / StickifiedBlock.
     Value stickIV;
-
-    // Extract a 2D stick slice from `plan`. Offsets/sizes follow sliceKind:
-    //   StickIndex      → offset = stickIV (within-tile), size = 1
-    //                     (only when physBlock[p] > 1; else offset = 0)
-    //   StickifiedBlock → offset = stickIV * stickSize, size = stickSize
-    //   WholeBlock      → offset = 0, size = physBlock[p]
-    auto extractOpSlice = [&](const OperandPlan &plan, int planOwner,
-                               ArrayRef<int64_t> physBlock,
-                               RankedTensorType resultTy) -> Value {
-      int rank = (int)physBlock.size();
-      SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
-      for (int p = 0; p < rank; ++p) {
-        switch (plan.sliceKind[p]) {
-        case SliceKind::StickIndex: {
-          Value iv = (physBlock[p] > 1) ? stickIV : Value{};
-          if (!iv) {
-            offsets[p] = idx(0);
-          } else if (iv.getType().isIndex()) {
-            offsets[p] = iv;
-          } else {
-            offsets[p] = arith::IndexCastOp::create(b, loc,
-                             b.getIndexType(), iv).getResult();
-          }
-          sizes[p] = idx(1);
-          break;
-        }
-        case SliceKind::StickifiedBlock: {
-          Value sIdx = stickIV.getType().isIndex()
-                           ? stickIV
-                           : arith::IndexCastOp::create(b, loc,
-                                 b.getIndexType(), stickIV).getResult();
-          Value stickSz = arith::ConstantIndexOp::create(b, loc, plan.stickSize);
-          offsets[p] = arith::MulIOp::create(b, loc, sIdx, stickSz).getResult();
-          sizes[p]   = idx(plan.stickSize);
-          break;
-        }
-        case SliceKind::WholeBlock:
-          offsets[p] = idx(0);
-          sizes[p]   = idx(physBlock[p]);
-          break;
-        }
-      }
-      return tensor::ExtractSliceOp::create(
-          b, loc, resultTy, plan.value, offsets, sizes, strides);
-    };
 
     Value result = emitStickLoop(b, loc, stickFactor, cVal,
         [&](OpBuilder &bb, Value s, Value acc) {
       stickIV = s;
-      // Temporarily redirect b so extractOpSlice / emitTranspose2D use bb.
       OpBuilder saved = b;
       b = bb;
-      Value aSlicePhys = extractOpSlice(aPlan, 0, aPhysShape, sliceAPhysTy);
-      Value bSlicePhys = extractOpSlice(bPlan, 1, bPhysShape, sliceBPhysTy);
-      Value aSlice = transposeA ? emitTranspose2D(aSlicePhys, aElemTy) : aSlicePhys;
-      Value bSlice = transposeB ? emitTranspose2D(bSlicePhys, bElemTy) : bSlicePhys;
-      Value r = linalg::MatmulOp::create(b, loc, accTy2D,
-          ValueRange{aSlice, bSlice}, ValueRange{acc}).getResult(0);
+      SmallVector<Value> slices;
+      for (unsigned i = 0; i < plans.size(); ++i) {
+        auto elemTy =
+            cast<RankedTensorType>(plans[i].value.getType()).getElementType();
+        Value slicePhys = extractOpSlice(b, loc, plans[i], sliceTys[i], stickIV);
+        slices.push_back(plans[i].needsTranspose
+                             ? emitTranspose2D(slicePhys, elemTy)
+                             : slicePhys);
+      }
+      Value r = emitOp(b, loc, slices, acc, accTy);
       b = saved;
       return r;
     });
 
-    mm.getResult(0).replaceAllUsesWith(result);
-    mm.erase();
+    op.getResult(0).replaceAllUsesWith(result);
+    op.erase();
     return success();
   }
 
   // Per-store entry point for the sink stage: read the D coord map from the
   // marker, build the OperandPlan for D (all dims parallel), and call
-  // emitStoreStage.
-  LogicalResult dispatchStore(mlir::ktdp::StoreOp st,
+  // emitSinkStage.
+  LogicalResult dispatchSink(mlir::ktdp::StoreOp st,
                               triton::SpyreTensorLayoutOp marker) {
     // The access tile shape IS the physical block shape of D.
     auto tileTy = cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
     ArrayRef<int64_t> physBlock = tileTy.getShape();
 
-    OperandCoords dC{marker.getPhysSrc(), marker.getPhysOp(),
-                     marker.getPhysArg(), 2, physBlock};
+    OperandCoords dC = OperandCoords::fromMarker(marker, 2, physBlock);
 
     // D has no reduction dim: every physical dim's logical src is a parallel dim.
     // Roles[p] = phys_src[p] — the logical dim index it derives from.
@@ -983,7 +1030,7 @@ struct RewriteDescriptorLayoutPass
       dimRoleD[p] = marker.getPhysSrc()[p]; // logical dim index; all parallel
 
     OperandPlan dPlan = classify(st.getDataTile(), dC, dimRoleD);
-    return emitStoreStage(st, dPlan);
+    return emitSinkStage(st, dPlan);
   }
 
   // Sink stage: consume the LOGICAL data_tile from the store, synthesize a
@@ -997,69 +1044,57 @@ struct RewriteDescriptorLayoutPass
   //   2. Insert it into the physical D accumulator via tensor.insert_slice.
   //
   // Placement (R-e): emitted at the block of the logical data_tile, after its
-  // last use. Since logicalC lives at the function body level (produced by the
+  // last use. Since inputTile lives at the function body level (produced by the
   // matmul stage or by retypeChain from a load), the builder is set there by
   // OpBuilder(st) which positions before the store.
-  LogicalResult emitStoreStage(mlir::ktdp::StoreOp st,
+  LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
                                const OperandPlan &dPlan) {
-    Value logicalC = st.getDataTile(); // the LOGICAL input (rank-2)
+    Value inputTile = st.getDataTile(); // logical input (rank-2)
     OpBuilder b(st);
     Location loc = st.getLoc();
 
-    auto logTy = cast<RankedTensorType>(logicalC.getType());
-    Type elemTy = logTy.getElementType();
-    ArrayRef<int64_t> logShape = logTy.getShape(); // [BLOCK_M, BLOCK_N] — per-block tile
+    Type elemTy = cast<RankedTensorType>(inputTile.getType()).getElementType();
 
-    ArrayRef<int64_t> physBlock = dPlan.coords.physBlock; // [Nstick, M, lane]
+    // All physical accounting comes from the plan — no logShape lookups.
+    ArrayRef<int64_t> physBlock = dPlan.coords.physBlock; // e.g. [Nstick, M, lane]
     int physRank = (int)physBlock.size();
+    int64_t stickSize = physBlock[dPlan.lane]; // lane = innermost phys dim
 
-    // Verify assumptions: exactly one floor dim, rest are opSlice.
-    // The lane dim (innermost) and any identity parallel dims are opSliceDims.
     if (dPlan.floorDims.empty())
       return st.emitError(
           "spyre_tensor_layout: store sink stage requires at least one "
           "parallel floor dim in the output layout");
-    // reduceLoop must be empty for a store.
-    if (!dPlan.reduceLoop.empty())
+    if (!dPlan.loopDims.empty())
       return st.emitError(
           "spyre_tensor_layout: store sink stage: unexpected reduction dim");
 
-    // The logical C slice is extracted in logical-dim order and inserted into
-    // D's opSlice dims directly (no transpose). This is only correct when D's
-    // opSlice dims are already in ascending logical-dim order. Guard against
-    // layouts that would need a transpose (the source stage handles that case
-    // via transposeA/transposeB; the sink stage does not yet).
+    // Guard: opTile dims must appear in ascending logical-dim order so that
+    // the logical extract below matches physical insertion without a transpose.
     {
       int64_t prevLogDim = -1;
-      for (int p : dPlan.opSliceDims) {
+      for (int p : dPlan.opTileDims) {
         int64_t logDim = dPlan.dimRoles[p];
         if (logDim < prevLogDim)
           return st.emitError(
-              "spyre_tensor_layout: store sink stage: output opSlice dims are "
+              "spyre_tensor_layout: store sink stage: output opTile dims are "
               "not in ascending logical-dim order (transpose not yet supported)");
         prevLogDim = logDim;
       }
     }
 
-    // stickSize = lane extent (e.g. 64). factor = how many D sticks the logical
-    // C tile spans on the floor dim = logShape[logDim] / stickSize.
-    int laneDim = dPlan.lane; // innermost phys dim of D (= physRank-1)
-    int64_t stickSize = physBlock[laneDim]; // e.g. 64
-
-    // helpers
     auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
 
-    // Build the initial physical D accumulator (tensor.empty over physBlock).
-    SmallVector<int64_t> dPhysShape(physBlock.begin(), physBlock.end());
-    Value dEmpty = tensor::EmptyOp::create(b, loc, dPhysShape, elemTy);
+    // Build the initial physical sink accumulator (tensor.empty over physBlock).
+    SmallVector<int64_t> sinkShape(physBlock.begin(), physBlock.end());
+    Value physicalSink = tensor::EmptyOp::create(b, loc, sinkShape, elemTy);
 
     // Collect IVs from existing enclosing loops (wired by Phase 1).
-    // For floor dims with physBlock[p]==1 the IV is always 0 (trip-1, no loop).
-    OperandPlan dummy; // bPlan unused for store; pass dummy
     SmallVector<Loop> loops;
-    collectExistingLoopIVs(st, dPlan, dummy, loops);
+    auto storeTile = dyn_cast_or_null<mlir::ktdp::ConstructAccessTilesOp>(
+        st.getAccessTile().getDefiningOp());
+    collectLoopIVsForTile(st, storeTile, 0, /*loopDims=*/{}, loops);
 
-    // Build floorIVs[physDim] → IV or c0 for trip-1 dims.
+    // Build floorIVs[physDim] → IV or c0 for trip-1 floor dims.
     Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
     SmallVector<Value> floorIVs(physRank, c0);
     for (auto &l : loops) {
@@ -1072,64 +1107,74 @@ struct RewriteDescriptorLayoutPass
       }
     }
 
-    // Base C-extract parameters (offset 0, full size on every dim).
-    int logRank = (int)logShape.size();
-    SmallVector<OpFoldResult> cOffsetsBase(logRank), cSizesBase(logRank),
-        cStrides(logRank, idx(1));
-    for (int d = 0; d < logRank; ++d) {
-      cOffsetsBase[d] = idx(0);
-      cSizesBase[d]   = idx(logShape[d]);
+    // Build extract/insert parameter base arrays from the physical plan.
+    //
+    // inputTile is logical (rank = dPlan.coords.logicalRank). For each logical
+    // dim d, the base offset is 0 and the base size is:
+    //   - stickSize            if d is the logical src of a floor dim (will be
+    //                          overridden per-iteration inside the stick loop)
+    //   - physBlock[p]         for opTile dims (taken whole)
+    // We derive sizes by scanning dimRoles rather than reading logShape.
+    unsigned logRank = dPlan.coords.logicalRank;
+    SmallVector<OpFoldResult> inputOffsetsBase(logRank, idx(0));
+    SmallVector<OpFoldResult> inputSizesBase(logRank);
+    SmallVector<OpFoldResult> inputStrides(logRank, idx(1));
+    // Default: fill from opTileDims (physBlock[p] for each logical src).
+    for (int p : dPlan.opTileDims) {
+      int64_t logDim = dPlan.dimRoles[p];
+      if (logDim >= 0 && (unsigned)logDim < logRank)
+        inputSizesBase[logDim] = idx(physBlock[p]);
     }
-
-    // Base D-insert parameters (offset 0 / full size for non-floor dims).
-    SmallVector<OpFoldResult> dOffsetsBase(physRank), dSizes(physRank),
-        dStrides(physRank, idx(1));
-    for (int p = 0; p < physRank; ++p) {
-      bool isFloor = llvm::is_contained(dPlan.floorDims, p);
-      dOffsetsBase[p] = idx(0);
-      dSizes[p] = isFloor ? idx(1) : idx(physBlock[p]);
-    }
-
-    // For each floor dim, scatter `factor` stick-slices of logical C into the
-    // physical D accumulator.
-    //   factor  = logShape[logDim] / stickSize   (BLOCK_N / 64)
-    //   C-extract offset on logDim = s * stickSize
-    //   D-insert offset on physDim = s   (within-block index; dEmpty is always
-    //                                      physBlock-sized, floor dim = factor)
-    // `n` (enclosing N-block IV) is NOT used here — the access tile already
-    // encodes the global N position. We only fill the local dEmpty buffer.
-    // For factor==1 (BLOCK_N == stickSize), emitStickLoop elides the loop
-    // (s=0), giving: cOffset=0 (whole tile), dOffset=0 — copy the whole tile.
-    Value acc = dEmpty;
+    // Floor dims: size = stickSize on that logical dim (overridden in loop body).
     for (int p : dPlan.floorDims) {
       int64_t logDim = dPlan.dimRoles[p];
-      if (logDim < 0 || logDim >= logRank) continue;
+      if (logDim >= 0 && (unsigned)logDim < logRank)
+        inputSizesBase[logDim] = idx(stickSize);
+    }
 
-      int64_t factor = logShape[logDim] / stickSize;
+    // Sink insert: offset 0 / full physBlock size for non-floor dims.
+    SmallVector<OpFoldResult> sinkOffsetsBase(physRank, idx(0));
+    SmallVector<OpFoldResult> sinkSizes(physRank);
+    SmallVector<OpFoldResult> sinkStrides(physRank, idx(1));
+    for (int p = 0; p < physRank; ++p)
+      sinkSizes[p] = llvm::is_contained(dPlan.floorDims, p)
+                         ? idx(1) : idx(physBlock[p]);
+
+    // For each floor dim p: scatter inputTile's sticks into physicalSink.
+    // tripCount = physBlock[p] (number of sticks along this dim — computed
+    // from the coord map during Phase 1, no logShape division needed).
+    Value acc = physicalSink;
+    for (int p : dPlan.floorDims) {
+      int64_t logDim = dPlan.dimRoles[p];
+      if (logDim < 0 || (unsigned)logDim >= logRank) continue;
+
+      int64_t tripCount = physBlock[p]; // sticks per tile along dim p
       Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
 
-      // Slice shape: stickSize on logDim, full extent elsewhere.
-      SmallVector<int64_t> slShape(logShape.begin(), logShape.end());
+      // Extract-result type: stickSize on the floor's logical dim, physBlock
+      // for every opTile logical dim.
+      SmallVector<int64_t> slShape(logRank);
+      for (int p2 : dPlan.opTileDims) {
+        int64_t ld = dPlan.dimRoles[p2];
+        if (ld >= 0 && (unsigned)ld < logRank) slShape[ld] = physBlock[p2];
+      }
       slShape[logDim] = stickSize;
       auto slTy = RankedTensorType::get(slShape, elemTy);
 
-      acc = emitStickLoop(b, loc, factor, acc,
-          [&](OpBuilder &bb, Value s, Value dAcc) -> Value {
-            // C-extract: s-th stick-slice of the tile on logDim.
-            SmallVector<OpFoldResult> cOff = cOffsetsBase;
-            SmallVector<OpFoldResult> cSz  = cSizesBase;
-            cOff[logDim] =
+      acc = emitStickLoop(b, loc, tripCount, acc,
+          [&](OpBuilder &bb, Value s, Value sinkAccumulator) -> Value {
+            // Input-extract: s-th stick-slice of inputTile on the floor's logDim.
+            SmallVector<OpFoldResult> inOff = inputOffsetsBase;
+            inOff[logDim] =
                 arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
-            cSz[logDim] = idx(stickSize);
-            Value cSlice = tensor::ExtractSliceOp::create(
-                bb, loc, slTy, logicalC, cOff, cSz, cStrides);
+            Value inputSlice = tensor::ExtractSliceOp::create(
+                bb, loc, slTy, inputTile, inOff, inputSizesBase, inputStrides);
 
-            // D-insert: position s within the local dEmpty buffer.
-            SmallVector<OpFoldResult> dOff = dOffsetsBase;
-            Value dStick = s; // within-block index (0..factor-1)
-            dOff[p] = dStick;
+            // Sink-insert: position s along floor dim p.
+            SmallVector<OpFoldResult> sinkOff = sinkOffsetsBase;
+            sinkOff[p] = s;
             return tensor::InsertSliceOp::create(
-                bb, loc, cSlice, dAcc, dOff, dSizes, dStrides);
+                bb, loc, inputSlice, sinkAccumulator, sinkOff, sinkSizes, sinkStrides);
           });
     }
     Value result = acc;
@@ -1160,7 +1205,7 @@ struct RewriteDescriptorLayoutPass
   //   3. ktdp.load result tensor     : retyped to physical rank
   //   4. ktdp.store src tensor       : access tile redirected to physical tile
   //   5. elementwise ops downstream  : result tensors retyped (retypeChain)
-  //      (stops at multi-tensor ops like linalg.matmul)
+  //      (stops at contraction ops; see isContractionOp)
   LogicalResult rewriteOnePhysicalize(triton::SpyreTensorLayoutOp marker) {
     Value desc = marker.getDesc();
 
@@ -1178,12 +1223,25 @@ struct RewriteDescriptorLayoutPass
       return marker.emitError(
           "spyre_tensor_layout: cannot locate construct_memory_view behind cast");
 
-    ArrayRef<int64_t> physSrc = marker.getPhysSrc();
-    ArrayRef<int64_t> physOp  = marker.getPhysOp();
-    ArrayRef<int64_t> physArg = marker.getPhysArg();
+    // Build OperandCoords from the marker's coord map. physBlock is
+    // tile-specific and filled inside rewriteAccessTile from logBlock.
+    OperandCoords coords;
+    coords.src        = marker.getPhysSrc();
+    coords.op         = marker.getPhysOp();
+    coords.arg        = marker.getPhysArg();
+    coords.logicalRank = cast<MemRefType>(memView.getType()).getRank();
+    // physBlock is tile-specific; rewriteAccessTile computes it from logBlock.
+
+    // Convenience aliases so the code below is unchanged.
+    ArrayRef<int64_t> physSrc = coords.src;
+    ArrayRef<int64_t> physOp  = coords.op;
+    ArrayRef<int64_t> physArg = coords.arg;
     unsigned physRank = physSrc.size();
 
     // --- 1. Build physical construct_memory_view ---
+    // The "coord map" (physSrc/physOp/physArg) defines the logical→physical
+    // transformation per physical dim; see OperandPlan::coords for the same
+    // triplet consumed by Phase 2.
     // Derive the coord map using the static sizes on the existing logical view.
     // Dynamic logical dims produce dynamic physical dims (floordiv) or are
     // resolved to the constant modulus (mod).
@@ -1354,8 +1412,7 @@ struct RewriteDescriptorLayoutPass
         tiles.push_back(tile);
 
     for (auto tileOp : tiles) {
-      if (failed(rewriteAccessTile(tileOp, newMemView,
-                                   physSrc, physOp, physArg)))
+      if (failed(rewriteAccessTile(tileOp, newMemView, coords)))
         return failure();
     }
 
@@ -1381,13 +1438,37 @@ struct RewriteDescriptorLayoutPass
     return physIdx;
   }
 
+  // Rescale an scf.for loop to stick granularity.
+  // Sets ub = old_ub * factor and step = factor (or step = 1 when factor == 1).
+  // IV values become 0, factor, 2*factor, ... — tile-granular stick indices.
+  // Phase 2 emits an inner loop over sticks within each tile.
+  void rescaleEnclosingLoop(scf::ForOp forOp, int64_t factor) {
+    Type ivTy = forOp.getInductionVar().getType();
+    OpBuilder b(forOp);
+    Location loc = forOp.getLoc();
+    if (factor > 1) {
+      Value factorV = arith::ConstantOp::create(b, loc,
+                          b.getIntegerAttr(ivTy, factor));
+      Value newUb = arith::MulIOp::create(b, loc,
+                        forOp.getUpperBound(), factorV).getResult();
+      forOp.setUpperBound(newUb);
+      forOp.setStep(factorV);
+    } else {
+      Value c1v = arith::ConstantOp::create(b, loc,
+                      b.getIntegerAttr(ivTy, 1));
+      forOp.setStep(c1v);
+    }
+  }
+
   // Rebuild ConstructAccessTilesOp with the physical memView + block shape.
   // Erases the old tile; users (ktdp.load/store) are retargeted to the new tile.
   LogicalResult rewriteAccessTile(mlir::ktdp::ConstructAccessTilesOp tileOp,
                                   Value newMemView,
-                                  ArrayRef<int64_t> physSrc,
-                                  ArrayRef<int64_t> physOp,
-                                  ArrayRef<int64_t> physArg) {
+                                  const OperandCoords &coords) {
+    ArrayRef<int64_t> physSrc = coords.src;
+    ArrayRef<int64_t> physOp  = coords.op;
+    ArrayRef<int64_t> physArg = coords.arg;
+
     OpBuilder b(tileOp);
     Location loc = tileOp.getLoc();
     MLIRContext *ctx = b.getContext();
@@ -1399,20 +1480,15 @@ struct RewriteDescriptorLayoutPass
     unsigned physRank = physSrc.size();
     (void)logRank; // physRank may differ (stick dim expands 2->3)
 
-    // Compute physical block shape.
-    SmallVector<int64_t> physBlock(physRank);
-    for (unsigned k = 0; k < physRank; ++k) {
-      int64_t src = physSrc[k];
-      auto op = static_cast<CoordOp>(physOp[k]);
-      int64_t arg = physArg[k];
-      if (src < 0 || src >= (int64_t)logRank)
+    // Compute physical block shape via applyCoordMap.
+    SmallVector<int64_t> physBlock;
+    if (!applyCoordMap(logBlock, physSrc, physOp, physArg, physBlock))
+      return tileOp.emitError(
+          "spyre_tensor_layout: cannot derive static block_shape");
+    // Validate phys_src bounds.
+    for (unsigned k = 0; k < physRank; ++k)
+      if (physSrc[k] < 0 || physSrc[k] >= (int64_t)logRank)
         return tileOp.emitError("spyre_tensor_layout: phys_src out of range");
-      auto pb = applyStatic(logBlock[src], op, arg);
-      if (!pb)
-        return tileOp.emitError(
-            "spyre_tensor_layout: cannot derive static block_shape");
-      physBlock[k] = *pb;
-    }
 
     // Map the logical index operands to physical index operands.
     // The existing tile's index operands are already index-typed (cast from i32
@@ -1421,19 +1497,10 @@ struct RewriteDescriptorLayoutPass
                                tileOp.getIndices().end());
     // For FloorDiv (stick-index) dims: trace the logical index back to its
     // enclosing scf.for IV. If found, rescale the loop's trip by
-    // factor = BLOCK_d // stickSize (= arg for FloorDiv / arg for the Mod lane
-    // dim sharing the same logical src) and wire the IV directly. This discards
-    // the muli(%iv, BLOCK_d) + divsi chain that Phase 1 previously emitted.
+    // factor = physBlock[k] (sticks per tile along this dim) and wire the IV
+    // directly. This discards the muli(%iv, BLOCK_d) + divsi chain.
     // For Mod (lane) dims: always emit remsi (lane is never iterated).
     // For Identity: pass through.
-    //
-    // stickSize for each logical src dim = physArg[lane_k] where lane_k is the
-    // Mod dim sharing that src. We collect it per logical src below.
-    SmallVector<int64_t> stickSizeForLogSrc(logBlock.size(), 0);
-    for (unsigned k = 0; k < physRank; ++k)
-      if (static_cast<CoordOp>(physOp[k]) == CoordOp::Mod)
-        stickSizeForLogSrc[physSrc[k]] = physArg[k];
-
     SmallVector<Value> physIdx;
     for (unsigned k = 0; k < physRank; ++k) {
       int64_t src = physSrc[k];
@@ -1445,49 +1512,17 @@ struct RewriteDescriptorLayoutPass
         physIdx.push_back(logI);
         break;
       case CoordOp::FloorDiv: {
-        // S6 Phase 1: attempt to trace logI back to an enclosing scf.for IV
-        // and rescale that loop to stick granularity.
-        auto [iv, logStride] = traceToMLIRBlockArgWithStride(logI);
+        // Attempt to trace logI back to an enclosing scf.for IV and rescale
+        // that loop to stick granularity.
+        BlockArgument iv = traceToMLIRBlockArg(logI);
         scf::ForOp forOp = iv ? dyn_cast_or_null<scf::ForOp>(
                                     iv.getOwner()->getParentOp())
                               : nullptr;
         if (forOp && forOp.getInductionVar() == iv) {
-          // Rescale: new_trip = old_trip * factor, step = 1.
-          // factor = logStride / stickSize: how many sticks the loop IV advances
-          // per iteration.
-          int64_t stickSize = stickSizeForLogSrc[src];
-          if (stickSize > 0 && logStride < stickSize)
-            return tileOp.emitError(
-                "spyre_tensor_layout: block size (")
-                << logStride << ") is smaller than stick size (" << stickSize
-                << ") on logical dim " << src
-                << " — BLOCK must be >= stickSize for stickified dims";
-          int64_t factor    = (stickSize > 0) ? (logStride / stickSize) : 1;
-          Type ivTy = iv.getType();
-          // Rescale: ub *= factor, step = factor. IV values are 0, factor,
-          // 2*factor, ... — tile-granular, valid as access-tile coordinates.
-          // Phase 2 emits an inner loop 0..factor to iterate sticks within
-          // each tile (StickifiedBlock on B's K-flat, StickIndex on A).
-          if (factor > 1) {
-            OpBuilder bBefore(forOp);
-            Location forLoc = forOp.getLoc();
-            Value oldUb = forOp.getUpperBound();
-            Value factorV = arith::ConstantOp::create(
-                bBefore, forLoc, bBefore.getIntegerAttr(ivTy, factor));
-            Value newUb = arith::MulIOp::create(bBefore, forLoc, oldUb, factorV)
-                              .getResult();
-            forOp.setUpperBound(newUb);
-            forOp.setStep(factorV);
-          } else {
-            // factor == 1: ensure step is 1.
-            OpBuilder bBefore(forOp);
-            Value c1v = arith::ConstantOp::create(
-                bBefore, forOp.getLoc(), bBefore.getIntegerAttr(ivTy, 1));
-            forOp.setStep(c1v);
-          }
+          rescaleEnclosingLoop(forOp, physBlock[k]);
           // Wire the IV directly as the stick-index coord (tile-granular).
           // construct_access_tiles requires index-typed operands; cast if needed.
-          Value ivIdx = ivTy.isIndex()
+          Value ivIdx = iv.getType().isIndex()
                             ? iv
                             : arith::IndexCastOp::create(b, loc,
                                   b.getIndexType(), iv).getResult();
@@ -1524,7 +1559,7 @@ struct RewriteDescriptorLayoutPass
       if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
         retypeLoad(ld, newTile.getResult(), physBlock);
       } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
-        retypeStore(st, newTile.getResult());
+        redirectStoreAccessTile(st, newTile.getResult());
       } else {
         return user->emitError(
             "spyre_tensor_layout: unexpected user of access tile");
@@ -1549,17 +1584,29 @@ struct RewriteDescriptorLayoutPass
   }
 
   // Redirect ktdp.store's access tile operand to the new physical tile.
-  // The src tensor is already physical-typed via retypeChain from retypeLoad.
-  void retypeStore(mlir::ktdp::StoreOp st, Value newTile) {
+  // Does NOT retype the store's data tensor — that is Phase 2's job (store sink
+  // stage). The src tensor remains logical-rank until synthesizeContractions runs.
+  void redirectStoreAccessTile(mlir::ktdp::StoreOp st, Value newTile) {
     st.getAccessTileMutable().set(newTile);
+  }
+
+  // True if the op is a contraction (matmul, reduce, etc.) whose result shape
+  // is determined by its own semantics rather than being inherited from a single
+  // physical input. retypeChain stops here and does not propagate through.
+  // NOTE: uses a tensor-operand-count heuristic (>1 tensor operand). This
+  // misclassifies elementwise ops with two tensor inputs (e.g. add) as
+  // contractions; replacing with an explicit op-type check is tracked as P1-2.
+  static bool isContractionOp(Operation *op) {
+    int tensorOperandCount = 0;
+    for (auto operand : op->getOperands())
+      if (isa<RankedTensorType>(operand.getType()))
+        ++tensorOperandCount;
+    return tensorOperandCount > 1;
   }
 
   // Forward-retype the elementwise op chain: replace oldVal with newVal
   // everywhere and update result types of single-result ops that still carry
-  // the old (logical-rank) type.
-  // Stops at multi-tensor-operand ops (contractions: linalg.matmul, reduce,
-  // etc.) whose result shape is determined by their own semantics, not by the
-  // physical shape of one input.
+  // the old (logical-rank) type. Stops at contraction ops.
   void retypeChain(Value oldVal, Value newVal) {
     oldVal.replaceAllUsesWith(newVal);
     SmallVector<Operation *> worklist(newVal.getUsers().begin(),
@@ -1568,13 +1615,7 @@ struct RewriteDescriptorLayoutPass
       Operation *op = worklist.pop_back_val();
       if (op->getNumResults() != 1)
         continue;
-      // Stop at contraction ops: more than one tensor-typed operand means the
-      // result shape is not simply inherited from one input.
-      int tensorOperandCount = 0;
-      for (auto operand : op->getOperands())
-        if (isa<RankedTensorType>(operand.getType()))
-          ++tensorOperandCount;
-      if (tensorOperandCount > 1)
+      if (isContractionOp(op))
         continue;
       auto resTy  = dyn_cast<RankedTensorType>(op->getResult(0).getType());
       auto opndTy = op->getNumOperands() > 0
