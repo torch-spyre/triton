@@ -36,6 +36,7 @@ _SINGLE_PASS_TEST_FILES = (
     _TEST_DIR / "test_lower_compute_ops.py",
     _TEST_DIR / "test_distribute_work.py",
     _TEST_DIR / "test_lower_desc_memory.py",
+    _TEST_DIR / "test_rewrite_descriptor_layout.py",
 )
 
 _DEFAULT_DEST = _SPYRE_ROOT / "docs" / "patterns"
