@@ -524,13 +524,13 @@ tile = tl.descriptor_load(desc, [pid_m * BLOCK_M, pid_k * BLOCK_K])
 
 **Round-trip evidence**
 
-- `matmul::dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-2d, num-programs-fold)
+- `matmul::dynamic` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-store-dynamic, dot, program-id-2d, num-programs-fold)
 - `matmul::bmm_dynamic` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid_dynamic` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, dot, program-id-2d)
-- `matmul::bmm_3d_grid_dynamic` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, dot, program-id-3d)
-- `vector_add::dynamic` (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
+- `matmul::spyre_stick_parallel_dynamic` — M=64, K=64, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-store-dynamic, dot, program-id-1d, spyre-tensor-layout)
+- `matmul::spyre_stick_k_dynamic` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-store-dynamic, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 4 more variants_
+_+ 6 more variants_
 
 ## descriptor-load-dynamic-from-scalar-load
 
@@ -581,13 +581,13 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>
 
 **Round-trip evidence**
 
-- `matmul::default` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-2d, num-programs-fold)
+- `matmul::default` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-store-static, dot, program-id-2d, num-programs-fold)
 - `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-2d)
-- `matmul::bmm_3d_grid` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-3d)
-- `softmax::default` — M=1024, N=1024, BLOCK_SIZE=1024 (also demonstrates: descriptor-store-static, reduce, broadcast, program-id-1d, num-programs-fold)
+- `matmul::spyre_stick_parallel` — M=64, K=64, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-store-static, dot, program-id-1d, spyre-tensor-layout)
+- `matmul::spyre_stick_k` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-store-static, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 7 more variants_
+_+ 11 more variants_
 
 ## descriptor-offset-base
 
@@ -802,13 +802,13 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])
 
 **Round-trip evidence**
 
-- `matmul::dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-2d, num-programs-fold)
+- `matmul::dynamic` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-load-dynamic, dot, program-id-2d, num-programs-fold)
 - `matmul::bmm_dynamic` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-dynamic, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid_dynamic` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-dynamic, dot, program-id-2d)
-- `matmul::bmm_3d_grid_dynamic` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-dynamic, dot, program-id-3d)
-- `vector_add::dynamic` (also demonstrates: descriptor-load-dynamic, program-id-1d, num-programs-fold)
+- `matmul::spyre_stick_parallel_dynamic` — M=64, K=64, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-dynamic, dot, program-id-1d, spyre-tensor-layout)
+- `matmul::spyre_stick_k_dynamic` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-dynamic, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 4 more variants_
+_+ 6 more variants_
 
 ## descriptor-store-static
 
@@ -825,15 +825,114 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
 
 **Round-trip evidence**
 
-- `matmul::default` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-2d, num-programs-fold)
+- `matmul::default` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-load-static, dot, program-id-2d, num-programs-fold)
 - `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-2d)
-- `matmul::bmm_3d_grid` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-3d)
-- `softmax::default` — M=1024, N=1024, BLOCK_SIZE=1024 (also demonstrates: descriptor-load-static, reduce, broadcast, program-id-1d, num-programs-fold)
+- `matmul::spyre_stick_parallel` — M=64, K=64, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, dot, program-id-1d, spyre-tensor-layout)
+- `matmul::spyre_stick_k` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 7 more variants_
+_+ 11 more variants_
+
+## physical-layout-gather
+
+### Supported
+
+#### ✅ `test_gather_marker_erased`
+
+```python
+# Annotated gather: the memory view is physicalized; the indirect
+# access tile is not re-anchored (its result was dropped by DCE).
+desc = tl.make_tensor_descriptor(ptr, shape=[M, K], strides=[K, 1],
+                                 block_shape=[1, 64])
+tl.spyre_tensor_layout(desc, [(1, 'floordiv', 64), 0, (1, 'mod', 64)])
+tile = tl.descriptor_gather(desc, x_offsets, y)   # memory view physicalized
+```
+
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:221` (`TestGather.test_gather_marker_erased`)</sup>
+
+## physical-layout-matmul-k-split
+
+### Supported
+
+#### ✅ `test_matmul_k_split_lowers`
+
+```python
+# A stick-on-K: scf.for over K-sticks, accumulating [M,N] result.
+a_desc = tl.make_tensor_descriptor(a_ptr, shape=[M,K], strides=[K,1],
+                                   block_shape=[M, 64])
+tl.spyre_tensor_layout(a_desc, [(1,'floordiv',64), 0, (1,'mod',64)])
+acc = tl.dot(a_tile, b_tile, acc)   # K-stick loop synthesized by pass
+```
+
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:406` (`TestMatmulKSplit.test_matmul_k_split_lowers`)</sup>
+
+## physical-layout-matmul-single-stick
+
+### Supported
+
+#### ✅ `test_matmul_single_stick_lowers`
+
+```python
+# Both operands have a singleton leading stick dim [1,m,k] x [1,k,n].
+# The pass collapses to [m,k] x [k,n], runs linalg.matmul, result is 2-D.
+a_desc = tl.make_tensor_descriptor(a_ptr, shape=[M,K], strides=[K,1],
+                                   block_shape=[64, K])
+tl.spyre_tensor_layout(a_desc, [(0,'floordiv',64), 1, (0,'mod',64)])
+```
+
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:322` (`TestMatmulSingleStick.test_matmul_single_stick_lowers`)</sup>
+
+## physical-layout-rewrite
+
+### Supported
+
+#### ✅ `test_memory_view_is_physical_rank3`
+
+```python
+desc = tl.make_tensor_descriptor(ptr, shape=[M, N], strides=[N, 1],
+                                 block_shape=[BLOCK_M, BLOCK_N])
+# annotate the physical (stick-tiled) device layout; the pass rewrites
+# the lowered KTDP memory view + access tile to the physical layout.
+tl.spyre_tensor_layout(desc, [(1, 'floordiv', 64),  # N // 64 (stick index)
+                              0,                     # M       (identity)
+                              (1, 'mod', 64)])       # N % 64  (stick lane)
+```
+
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:92` (`TestStaticLayout.test_memory_view_is_physical_rank3`)</sup>
+
+### Rejected
+
+#### ❌ `test_layout_via_local_fails`
+
+```python
+# NOT supported: binding the layout list to a local first.
+# The keyword strings get tensor-converted by the jit code generator.
+lay = [(1, 'floordiv', 64), 0, (1, 'mod', 64)]
+tl.spyre_tensor_layout(desc, lay)        # ❌ raises CompilationError
+# Pass it inline instead:
+tl.spyre_tensor_layout(desc, [(1, 'floordiv', 64), 0, (1, 'mod', 64)])  # ✅
+```
+
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:671` (`TestInlineOnly.test_layout_via_local_fails`)</sup>
+
+## physical-layout-store-annotated-output
+
+### Supported
+
+#### ✅ `test_annotated_output_lowers`
+
+```python
+# Annotated C/output: the sink stage scatters logical C into a
+# physical [N//64, M, lane] buffer via tensor.insert_slice.
+c_desc = tl.make_tensor_descriptor(c_ptr, shape=[M,N], strides=[N,1],
+                                   block_shape=[BLOCK_M, BLOCK_N])
+tl.spyre_tensor_layout(c_desc, [(1,'floordiv',64), 0, (1,'mod',64)])
+# The store data_tile is replaced by a physical [N//64,M,64] tensor.
+```
+
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:490` (`TestMatmulAnnotatedOutput.test_annotated_output_lowers`)</sup>
 
 
 ---
 
-_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-load-dynamic-from-scalar-load`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-load-dynamic-from-scalar-load`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`, `physical-layout-gather`, `physical-layout-matmul-k-split`, `physical-layout-matmul-single-stick`, `physical-layout-rewrite`, `physical-layout-store-annotated-output`. Add a tagged fixture variant to verify end-to-end._
