@@ -678,8 +678,8 @@ VARIANTS = {
                          "BLOCK_M", "BLOCK_K1", "BLOCK_K2", "BLOCK_N",
                          "A_LAYOUT", "B_LAYOUT", "C_LAYOUT", "D_LAYOUT"],
         "params":       {
-            "M":  [64], "K1": [64], "K2": [64], "N": [64],
-            "BLOCK_M": [64], "BLOCK_K1": [64], "BLOCK_K2": [64], "BLOCK_N": [64],
+            "M":  [64], "K1": [128], "K2": [128], "N": [256],
+            "BLOCK_M": [64], "BLOCK_K1": [128], "BLOCK_K2": [128], "BLOCK_N": [64],
             # A[M,K1] stick-on-M:  [M//S, K1, M%S]
             "A_LAYOUT": [[(0, "floordiv", _SC("a_ptr")), 1, (0, "mod", _SC("a_ptr"))]],
             # B[K1,K2] stick-on-K2 (N-dim of B): [K2//S, K1, K2%S]
@@ -693,8 +693,13 @@ VARIANTS = {
         "reference":    run_chained,
         "inputs":       make_inputs_chained,
         "output_key":   "d_ptr",
-        "rtol":         1e-2,
-        "atol":         5e-2,  # fp16 ULP noise
+        # Two-stage fp16 accumulation: bc = B@C (fp16, over K2=128) then D = A@bc
+        # (fp16, over K1=128). The NumPy oracle accumulates each @ in fp32, so the
+        # staged fp16 reductions drift ~0.3 abs on large elements; near-zero
+        # elements pick up larger relative error. Looser than the single-matmul
+        # variants accordingly.
+        "rtol":         5e-2,
+        "atol":         5e-1,
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.matmul"),

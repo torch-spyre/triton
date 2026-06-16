@@ -45,8 +45,11 @@
 //     Phase 2 — synthesizeContractions (loop-until-stable):
 //       single walk → dispatchOne per op type:
 //         linalg.MatmulOp → dispatchMatmul → dispatchSource (classify, emitSourceStage)
+//         linalg.ReduceOp → dispatchReduce → dispatchSource (classify, emitSourceStage)
 //         ktdp.StoreOp    → dispatchSink   (classify, emitSinkStage)
 //       add new contraction/sink types to dispatchOne + a dispatchXxx helper
+//       emitSourceStage uses getDpsInits()[0] (linalg DPS interface) so it
+//       works generically for MatmulOp, ReduceOp, and future source ops
 //     Phase 3 — eraseMarker (marker + dead bridge cast)
 //
 //   Coord helpers (free functions):
@@ -290,6 +293,9 @@ struct RewriteDescriptorLayoutPass
     if (auto mm = dyn_cast<linalg::MatmulOp>(op))
       return sourceNeedsDispatch(mm, 2) ? (changed = true, dispatchMatmul(mm)) : success();
 
+    if (auto rd = dyn_cast<linalg::ReduceOp>(op))
+      return sourceNeedsDispatch(rd, 2) ? (changed = true, dispatchReduce(rd)) : success();
+
     if (auto st = dyn_cast<mlir::ktdp::StoreOp>(op)) {
       auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
       auto tileTy = dyn_cast<mlir::ktdp::AccessTileType>(
@@ -316,7 +322,7 @@ struct RewriteDescriptorLayoutPass
       changed = false;
       SmallVector<Operation *> candidates;
       module.walk([&](Operation *op) {
-        if (isa<linalg::MatmulOp, mlir::ktdp::StoreOp>(op))
+        if (isa<linalg::MatmulOp, linalg::ReduceOp, mlir::ktdp::StoreOp>(op))
           candidates.push_back(op);
       });
       for (auto *op : candidates)
@@ -694,12 +700,21 @@ struct RewriteDescriptorLayoutPass
                       parallelRole(spec.operands[i]), dimRoles);
         plans[i] = classify(operand, coords, dimRoles);
       } else {
-        // No load found. Scratchpad if produced by a contraction, error otherwise.
-        auto *defOp = operand.getDefiningOp();
-        if (!defOp || !isContractionOp(defOp))
+        // No load found → scratchpad: a logical value flowing in from elsewhere
+        // (a contraction result, or one carried out of an scf.for via iter_args,
+        // etc.) that we consume whole. The real invariant is not "produced by a
+        // contraction" but "already logical": a ranked tensor whose rank matches
+        // this operand's logical rank (== canonicalAxes size). We process ops
+        // inside-out, so whatever produced this operand has already been lowered
+        // to its logical shape — exactly what this op expects. classifyScratchpad
+        // indexes canonicalAxes per dim, so a rank mismatch would be UB — guard
+        // it here with a clean error instead.
+        auto tensorTy = dyn_cast<RankedTensorType>(operand.getType());
+        if (!tensorTy ||
+            tensorTy.getRank() != (int64_t)spec.operands[i].canonicalAxes.size())
           return op.emitError(
               "spyre_tensor_layout: source op operand is neither a physical "
-              "load nor a scratchpad contraction result");
+              "load nor a logical (scratchpad) tensor of the expected rank");
         plans[i] = classifyScratchpad(operand, spec.operands[i]);
       }
     }
@@ -843,6 +858,28 @@ struct RewriteDescriptorLayoutPass
     return dispatchSource(mm, spec);
   }
 
+  // linalg.reduce instantiation:
+  //   input=(m,n): dim0=M (parallel, output axis 0), dim1=N (reduction).
+  //   Reduction axis = 1 in the logical 2D input tile.
+  LogicalResult dispatchReduce(linalg::ReduceOp rd) {
+    SourceOpSpec spec;
+    spec.operands = {SourceOperandSpec{{0, -1}}};  // input=(m,n): M parallel, N reduction
+    spec.logicalRank = 2;
+    spec.emitOp = [](OpBuilder &b, Location loc,
+                     ArrayRef<Value> slices, Value acc,
+                     RankedTensorType accTy) -> Value {
+      // slices[0] is a 2D [M, stickSize] tile; reduce over dim 1 → [M].
+      SmallVector<int64_t> dims = {1};
+      return linalg::ReduceOp::create(
+          b, loc, ValueRange{slices[0]}, ValueRange{acc}, dims,
+          [&](OpBuilder &inner, Location iloc, ValueRange args) {
+            Value sum = arith::AddFOp::create(inner, iloc, args[0], args[1]);
+            linalg::YieldOp::create(inner, iloc, sum);
+          }).getResult(0);
+    };
+    return dispatchSource(rd, spec);
+  }
+
   // Source stage: for each operand in `plans`, extract its op slice from the
   // already-physicalized load, emit the contraction op (via spec.emitOp) at
   // op's position, RAUW the result, erase op. Phase 1 already rescaled and
@@ -858,7 +895,10 @@ struct RewriteDescriptorLayoutPass
     OpBuilder b(op);
     Location loc = op.getLoc();
 
-    Value cVal = op.getOutputs()[0];
+    // getDpsInits() is the linalg DPS interface shared by all source ops
+    // (MatmulOp, ReduceOp, …). It supersedes the op-specific getOutputs() /
+    // getInits() accessors so emitSourceStage stays generic across op types.
+    Value cVal = op.getDpsInits()[0];
     auto accElemTy = cast<RankedTensorType>(cVal.getType()).getElementType();
 
     // Per-operand op-tile slice types — derived from resolved extents.
@@ -891,14 +931,45 @@ struct RewriteDescriptorLayoutPass
           b.getDenseI64ArrayAttr({1, 0})).getResult()[0];
     };
 
-    // Determine if a StickifiedBlock dim exists and what factor it has.
+    // Determine the stick loop trip count (stickFactor).
+    //
+    // All operands of one op share the same logical reduction axis. A physical
+    // dim p is the stickified floor of that axis iff:
+    //   (a) dimRoles[p] == some logical reduction dim (canonicalAxes[logDim]==-1)
+    //   (b) coords.op[p] == CoordOp::FloorDiv  (floor half of the stick pair)
+    //   (c) physBlock[p] > 1                   (actually spans multiple sticks)
+    //
+    // For each plan, scan loopDims for such a dim and compute its trip count.
+    // All plans that have a stickified floor dim must agree on the same factor
+    // (they partition the same logical reduction axis). Assert at most one
+    // stickified logical reduction axis today; to support multiple, emit one
+    // nested stick loop per axis and move this derivation to resolveAndReconcile.
+    //
+    // NOTE: if stickFactor derivation is needed in more than one place, move it
+    // into resolveAndReconcile and store it as a resolved field on SourceOpSpec.
     int64_t stickFactor = 1;
-    for (auto &plan : plans)
-      for (int p = 0; p < (int)plan.sliceKind.size(); ++p)
-        if (plan.sliceKind[p] == SliceKind::StickifiedBlock) {
-          int64_t f = plan.coords.physBlock[p] / plan.stickSize;
-          if (f > stickFactor) stickFactor = f;
-        }
+    for (auto &plan : plans) {
+      for (int p : plan.loopDims) {
+        // Only floor dims (FloorDiv) of the stick pair drive the loop.
+        if (static_cast<CoordOp>(plan.coords.op[p]) != CoordOp::FloorDiv)
+          continue;
+        // dimRoles[p] is the logical dim index; must be a reduction dim.
+        int64_t logDim = plan.dimRoles[p];
+        if (logDim >= 0) // parallel dim in loopDims — shouldn't happen, skip
+          continue;
+        int64_t f;
+        if (plan.sliceKind[p] == SliceKind::StickifiedBlock)
+          f = plan.coords.physBlock[p] / plan.stickSize;
+        else
+          f = plan.coords.physBlock[p]; // StickIndex: physBlock = n_sticks
+        if (f <= 1)
+          continue; // single-stick, no loop needed
+        if (stickFactor != 1 && stickFactor != f)
+          llvm_unreachable("emitSourceStage: plans disagree on stickFactor — "
+                           "mixed reduction stick counts not yet supported");
+        stickFactor = f;
+      }
+    }
 
     // stickIV: within-tile stick index used by StickIndex / StickifiedBlock.
     Value stickIV;
@@ -929,14 +1000,18 @@ struct RewriteDescriptorLayoutPass
 
   // Per-store entry point for the sink stage: read the D coord map from the
   // marker, build the OperandPlan for D (all dims parallel), and call
-  // emitSinkStage.
+  // emitSinkStage. logRank is derived from the data tile's actual rank so
+  // this handles both 2D outputs (matmul) and 1D outputs (reduce).
   LogicalResult dispatchSink(mlir::ktdp::StoreOp st,
                               triton::SpyreTensorLayoutOp marker) {
     // The access tile shape IS the physical block shape of D.
     auto tileTy = cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
     ArrayRef<int64_t> physBlock = tileTy.getShape();
 
-    OperandCoords dC = OperandCoords::fromMarker(marker, 2, physBlock);
+    // Derive logical rank from the data tile (the value being stored).
+    unsigned logRank =
+        cast<RankedTensorType>(st.getDataTile().getType()).getRank();
+    OperandCoords dC = OperandCoords::fromMarker(marker, logRank, physBlock);
 
     // D has no reduction dim: every physical dim's logical src is a parallel dim.
     // Roles[p] = phys_src[p] — the logical dim index it derives from.
