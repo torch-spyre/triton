@@ -195,6 +195,14 @@ The takeaway: a descriptor-less intermediate is left in its logical form and
 fed directly to the consuming op — the physical-layout rewrite only touches
 values that came from (or go to) an annotated descriptor.
 
+**Scratchpad recognition is by type, not by producer.** A non-physical operand
+is a scratchpad iff it is already logical — a ranked tensor of the operand's
+logical rank — regardless of what op produced it. `bc` is not always a direct
+`linalg.matmul`: when an enclosing loop survives (`n_blocks > 1`) the inner
+`B @ C` stays wrapped in its `scf.for`, so `bc` is the loop result. The pass
+processes ops inside-out, so whatever produced `bc` has already been lowered to
+its logical shape — which is exactly the shape the outer matmul expects.
+
 
 ## Example 3: tl.gather
 
@@ -337,6 +345,139 @@ mechanism shared by both descriptors over that loop. See *Loop rescaling* under
 Phase 1 below.
 
 
+## Example 4: Row-sum reduce
+
+`reduce_spyre` from `test/fixtures/reduce/kernel.py` (`spyre_stick` variant).
+The kernel computes `out[m] = sum(in[m, :])` over a `[M=64, N=256]` input,
+distributing `M`-blocks across the grid. `in_desc` is annotated stick-on-N
+(`STICK_SIZE=64`, fp16); `out_desc` is annotated with a 1D stick layout
+(`STICK_SIZE=64`).
+
+> `phys in  = [N//64, M, 64] = [4, 64, 64]` (four N-sticks)
+> `phys out = [M//64, 64]    = [1, 64]`      (one output M-stick)
+
+### Triton
+
+```python
+@triton.jit
+def reduce_spyre(
+    in_ptr, out_ptr,
+    M: tl.constexpr, N: tl.constexpr, BLOCK_M: tl.constexpr,
+    IN_LAYOUT: tl.constexpr, OUT_LAYOUT: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    grid_m = tl.num_programs(0)
+    m_blocks = tl.cdiv(M, BLOCK_M)
+    rows_per_core = tl.cdiv(m_blocks, grid_m)
+
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, N],
+    )
+    tl.spyre_tensor_layout(in_desc, IN_LAYOUT)   # stick-on-N annotation
+
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[M], strides=[1], block_shape=[BLOCK_M],
+    )
+    tl.spyre_tensor_layout(out_desc, OUT_LAYOUT) # 1D stick annotation
+
+    m_start = pid_m * rows_per_core
+    m_end   = tl.minimum(m_start + rows_per_core, m_blocks)
+    for m_sub in range(m_start, m_end):
+        a_tile = in_desc.load([m_sub * BLOCK_M, 0])
+        out_desc.store([m_sub * BLOCK_M], a_tile.sum(1))
+```
+
+### KTIR (after full lowering)
+
+```mlir
+func.func @reduce_spyre(%arg0: index, %arg1: index) attributes {grid = [1]} {
+  %pid_m = ktdp.get_compute_tile_id : index
+
+  // in_desc: IN_LAYOUT → rank-3 physical [N//64, M, 64] = [4, 64, 64]
+  %in_desc = ktdp.construct_memory_view %arg0, sizes: [4, 64, 64], strides: [64, 256, 1] {...}
+               : memref<4x64x64xf16>
+  // out_desc: OUT_LAYOUT → rank-2 physical [M//64, 64] = [1, 64]
+  %out_desc = ktdp.construct_memory_view %arg1, sizes: [1, 64], strides: [64, 1] {...}
+                : memref<1x64xf16>
+
+  scf.for %m_sub = %pid_m to ... {
+    %m_off = arith.muli %m_sub, %c64 : index
+
+    // Physicalized load: four N-sticks → tensor<4x64x64xf16>
+    %A_tile = ktdp.construct_access_tile %in_desc[%c0, %m_off, %c0] {...}
+                : memref<4x64x64xf16> -> !ktdp.access_tile<4x64x64xindex>
+    %A = ktdp.load %A_tile : <4x64x64xindex> -> tensor<4x64x64xf16>
+
+    // Source stage (dispatchReduce): scf.for over 4 N-sticks, accumulate into [64].
+    // The stick count (4) comes from the N-stick FLOOR dim; the lane (dim 2) is
+    // the opInnerDim the reduce consumes.
+    %init = linalg.fill ins(%cst : f16) outs(%empty : tensor<64xf16>) -> tensor<64xf16>
+    %acc = scf.for %k = %c0 to %c4 step %c1 iter_args(%acc_in = %init)
+               -> tensor<64xf16> {
+      // extract one N-stick slice: tensor<4x64x64xf16> → tensor<64x64xf16>
+      %slice = tensor.extract_slice %A[%k, 0, 0] [1, 64, 64] [1, 1, 1]
+                 : tensor<4x64x64xf16> to tensor<64x64xf16>
+      // reduce over dim=1 (the lane). outs(%acc_in) carries the running sum:
+      // linalg.reduce combines each row's sum into the accumulator init.
+      %partial = linalg.reduce ins(%slice : tensor<64x64xf16>)
+                               outs(%acc_in : tensor<64xf16>) dimensions = [1]
+        (%in: f16, %out: f16) {
+          %s = arith.addf %in, %out : f16
+          linalg.yield %s : f16
+        }
+      scf.yield %partial : tensor<64xf16>
+    }
+
+    // Sink stage (dispatchSink): scatter [64] into physical [1, 64] container
+    %stick_idx = arith.index_cast %m_sub : ...
+    %lane      = arith.remsi %m_off, %c64 : index
+    %out_tile  = ktdp.construct_access_tile %out_desc[%stick_idx, %lane] {...}
+                   : memref<1x64xf16> -> !ktdp.access_tile<1x64xindex>
+    %container = tensor.empty() : tensor<1x64xf16>
+    %out_phys  = tensor.insert_slice %acc into %container[0, 0] [1, 64] [1, 1]
+                   : tensor<64xf16> into tensor<1x64xf16>
+    ktdp.store %out_phys, %out_tile : tensor<1x64xf16>, <1x64xindex>
+  }
+}
+```
+
+### What happened
+
+**Source stage (`dispatchReduce`)**: the physical load produces
+`tensor<4x64x64xf16>` (4 N-sticks × M-rows × lane). The reduction axis N is
+stickified, so it splits into two physical dims: the N-stick **floor** dim
+(`physBlock[0]=4`, a `loopDim`) and the **lane** (`physBlock[2]=64`, the
+`opInnerDim` consumed directly by the reduce). `dispatchSource` reads the
+loop trip count from the floor `loopDim` (`stickFactor=4`) and emits one
+`scf.for` over the 4 N-sticks: each iteration calls `extractOpSlice` to peel
+one `tensor<64x64xf16>` slice (M-rows × lane), then `linalg.reduce` reduces
+over `dim=1` (the lane) and accumulates into the running `tensor<64xf16>`
+row-sum via the loop's `iter_args`. The accumulator init comes from
+`op.getDpsInits()[0]` — the linalg DPS interface shared by all source ops
+(matmul, reduce, …). Compare the K-stick loop in Example 1: the machinery
+is identical; only the emitted inner op differs.
+
+**Sink stage (`dispatchSink`)**: the output descriptor is 1D `[M]` with a
+2-element physical layout `[M//64, 64]` — rank 2, one floor dim and one lane.
+`dispatchSink` derives `logRank` from the data tile type (rank 1) rather than
+hardcoding 2, so the scatter loop correctly indexes the logical `[64]`
+result by its single dimension. The `tensor.insert_slice` scatters the
+`tensor<64xf16>` result into a `tensor<1x64xf16>` container before the store.
+
+The reduce case exercises three generalizations over the matmul path:
+1. **`dispatchReduce`** — a new source handler that builds a single-input
+   `SourceOpSpec` with `canonicalAxes = {0, -1}` (M parallel, N reduction)
+   and emits `linalg.reduce` instead of `linalg.matmul`. The stick loop from
+   `dispatchSource` is reused unchanged; only the `emitOp` lambda differs.
+2. **Stick loop from a floor `loopDim`** — for matmul's stick-on-K the
+   reduction `opInnerDim` spans multiple sticks (`StickifiedBlock`); for
+   reduce the lane is a single stick and the *floor* dim carries the stick
+   count. `stickFactor` is derived from whichever floor dim of the shared
+   logical reduction axis spans `>1` stick, covering both shapes.
+3. **Rank-1 sink** — `dispatchSink` now derives logical rank from the
+   data tile, enabling 1D output layouts (the 2-element `[M//S, S]` form).
+
+
 ## Pass Design
 
 `RewriteDescriptorLayout` runs in three phases.
@@ -383,13 +524,18 @@ ensures only the first to physicalize a `FloorDiv` dim rescales it; the rest ski
 Phase 2 is the only op-aware part. `synthesizeContractions` walks all
 contraction and store ops in a `while (changed)` loop:
 
-- **source (e.g. `linalg.matmul`)**: when any input is rank-3 (physical),
-  `dispatchMatmul` slices operands into canonical 2D orientation and emits
-  an `scf.for` loop for any reduction (K-stick) dim; the result is always
-  rank-2 / logical.
+- **source (e.g. `linalg.matmul`, `linalg.reduce`)**: when any input is
+  rank-3 (physical), the dispatch method (`dispatchMatmul` or `dispatchReduce`)
+  slices operands into canonical 2D orientation and emits an `scf.for` loop
+  for any reduction (K-stick / N-stick) dim; the result is always rank-≤2 /
+  logical. Both handlers share `dispatchSource` / `emitSourceStage`; they
+  differ only in the `SourceOpSpec` (operand axes) and the `emitOp` lambda
+  (which op to build). `emitSourceStage` retrieves the accumulator init via
+  `getDpsInits()[0]` — the linalg DPS interface common to all source ops.
 - **sink (`ktdp.store`)**: when `data_tile` rank ≠ `access_tile` rank, the
   sink stage emits `tensor.insert_slice` to scatter the logical value into a
-  physical stick container.
+  physical stick container. `logRank` is derived from the data tile type, so
+  1D outputs (e.g. the reduce `[M]` case) work alongside the 2D matmul case.
 
 To add a new contraction type: add a dispatch method and hook it to
 `dispatchOne`. The method's responsibility is to construct a
@@ -404,9 +550,12 @@ Phase 1's elementwise retyping deliberately stops at the first contraction.
 Every contraction Phase 2 resolves uniformly:
 
 - **consumes** each operand normalized to canonical 2D orientation: a
-  physical operand is sliced + transposed (`classify`); a logical
-  intermediate (scratchpad) is already canonical and passed through whole
-  (`classifyScratchpad`).
+  physical operand (traced to an annotated load by `walkToLoad`) is sliced +
+  transposed (`classify`); any other operand is a logical intermediate
+  (scratchpad), already canonical and passed through whole
+  (`classifyScratchpad`). The scratchpad test is purely the operand's *type*
+  (a ranked tensor of the expected logical rank), so it covers a direct
+  contraction result and one carried out of an `scf.for` alike (see Example 2).
 - **emits** its result as a rank-2 *canonical* tensor — logical, carrying no
   stick dim and no physical layout.
 
