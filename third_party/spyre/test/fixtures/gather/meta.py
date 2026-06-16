@@ -203,6 +203,36 @@ def run_2d(inputs: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# 1D-source gather — input maker + oracle
+#
+# The 1D kernel takes a 1D source vector and produces a 1D output. The
+# rank-2 ``[K, 1]`` shape used internally by the kernel descriptor is
+# an implementation detail to satisfy the gather verifier; the user-facing
+# buffers are 1D.
+# ---------------------------------------------------------------------------
+
+def make_inputs_1d(K: int, K_INDICES: int, BLOCK_ROWS: int) -> dict:
+    """Inputs for the ``1d`` variant. Source and output are 1D ``[K]``
+    and ``[K_INDICES]`` respectively. Distinct seed (2001) so this
+    variant doesn't share random data with any other gather variant."""
+    del BLOCK_ROWS
+    rng = np.random.default_rng(2001)
+    in_data = rng.standard_normal((K,)).astype(np.float32)
+    idx_data = rng.integers(0, K, size=(K_INDICES,)).astype(np.int32)
+    out_data = np.zeros((K_INDICES,), dtype=np.float32)
+    return {
+        "in_ptr":  in_data,
+        "out_ptr": out_data,
+        "idx_ptr": idx_data,
+    }
+
+
+def run_1d(inputs: dict) -> np.ndarray:
+    """NumPy oracle for the 1D-source kernel: ``out[i] = in[idx[i]]``."""
+    return inputs["in_ptr"][inputs["idx_ptr"]]
+
+
+# ---------------------------------------------------------------------------
 # Rank-N (N ≥ 3) input makers and oracles
 # ---------------------------------------------------------------------------
 
@@ -600,6 +630,35 @@ def run_2d_index_3d_block(inputs: dict, *, BLOCK_B: int, BLOCK_L: int, BLOCK_H: 
     return out
 
 
+# 1D-source gather — input maker + oracle
+#
+# The 1D kernel takes a 1D source vector and produces a 1D output. The
+# rank-2 ``[K, 1]`` shape used internally by the kernel descriptor is
+# an implementation detail to satisfy the gather verifier; the user-facing
+# buffers are 1D.
+# ---------------------------------------------------------------------------
+
+def make_inputs_1d(K: int, K_INDICES: int, BLOCK_ROWS: int) -> dict:
+    """Inputs for the ``1d`` variant. Source and output are 1D ``[K]``
+    and ``[K_INDICES]`` respectively. Distinct seed (2001) so this
+    variant doesn't share random data with any other gather variant."""
+    del BLOCK_ROWS
+    rng = np.random.default_rng(2001)
+    in_data = rng.standard_normal((K,)).astype(np.float32)
+    idx_data = rng.integers(0, K, size=(K_INDICES,)).astype(np.int32)
+    out_data = np.zeros((K_INDICES,), dtype=np.float32)
+    return {
+        "in_ptr":  in_data,
+        "out_ptr": out_data,
+        "idx_ptr": idx_data,
+    }
+
+
+def run_1d(inputs: dict) -> np.ndarray:
+    """NumPy oracle for the 1D-source kernel: ``out[i] = in[idx[i]]``."""
+    return inputs["in_ptr"][inputs["idx_ptr"]]
+
+
 # ---------------------------------------------------------------------------
 # SIGNATURE
 # ---------------------------------------------------------------------------
@@ -724,6 +783,18 @@ _SIG_2D_INDEX_4D = {
     "BLOCK_B":  "i32",
     "BLOCK_L":  "i32",
     "BLOCK_H":  "i32",
+}
+
+# 1D kernel: 1D source ``in[K]`` and 1D output ``out[K_INDICES]``.
+# No ``y_offset`` (width-1 rows leave nothing to slice), no ``M``/``N``/
+# ``BLOCK_COLS``. ``K`` is the source length.
+_SIG_1D = {
+    "in_ptr":     "*fp32",
+    "out_ptr":    "*fp32",
+    "idx_ptr":    "*i32",
+    "K":          "i32",
+    "K_INDICES":  "i32",
+    "BLOCK_ROWS": "i32",
 }
 
 
@@ -1058,6 +1129,34 @@ VARIANTS = {
         "parallel":     True,
         "reference":    run_2d,
         "inputs":       make_inputs_2d_large_table,
+        "output_key":   "out_ptr",
+        "extra_checks": _EXTRA_CHECKS,
+    },
+    "1d": {
+        # 1D-source gather distributed across grid=[32].
+        # K_INDICES=256, BLOCK_ROWS=8 → m_blocks = 256/8 = 32, so each
+        # of the 32 cores owns exactly one gather call (blocks_per_core
+        # = cdiv(32, 32) = 1). BLOCK_ROWS=8 is the frontend gather
+        # verifier minimum (semantic.py: x_offsets.shape[0] >= 8).
+        #
+        # Internally the kernel describes the 1D source as [K, 1] with
+        # block_shape=[1, 1] — see gather_1d_kernel docstring and the
+        # paired test_lower_desc_memory.py negative+positive pair
+        # (test_gather_rank1_block_rejected /
+        #  test_gather_1d_source_via_rank2_reshape_lowers).
+        "kernel_fn":    kernel.gather_1d_kernel,
+        "SIGNATURE":    _SIG_1D,
+        "constexpr":    ["K", "K_INDICES", "BLOCK_ROWS"],
+        "params": {
+            "K":          [1024],
+            "K_INDICES":  [256],
+            "BLOCK_ROWS": [8],
+        },
+        "tags":         ["descriptor-gather", "1d-source"],
+        "grid":         [32],
+        "parallel":     True,
+        "reference":    run_1d,
+        "inputs":       make_inputs_1d,
         "output_key":   "out_ptr",
         "extra_checks": _EXTRA_CHECKS,
     },
