@@ -1860,10 +1860,20 @@ class TritonSemantic(Generic[TensorTy]):
         assert isinstance(base.dtype, tl.pointer_type)
         elem_size = base.dtype.element_ty.primitive_bitwidth // 8
         contig_dim_size = tl._unwrap_if_constexpr(block_shape[-1])
-        if contig_dim_size * elem_size < 16:
+        # --- START --- changed for spyre
+        # The 16-byte minimum on the contiguous block dimension is an
+        # NVIDIA TMA hardware alignment requirement. Spyre has no such
+        # constraint — its lowering descends to ktdp ops whose access
+        # tiles are described element-wise. Skipping this check on Spyre
+        # lets a 1D-source gather be expressed as a [K, 1]-shaped
+        # descriptor with block_shape=[1, 1], which the gather op
+        # verifier accepts (see test_lower_desc_memory.py
+        # ::test_gather_1d_source_via_rank2_reshape_lowers).
+        if not target_info.is_spyre() and contig_dim_size * elem_size < 16:
             raise ValueError(
                 f"Descriptor block shape must have at least 16 bytes in the last dimension, but got {contig_dim_size} * {elem_size} = {contig_dim_size * elem_size} bytes"
             )
+        # --- END --- changed for spyre
 
         last_stride = tl._unwrap_if_constexpr(strides[-1])
         if last_stride != 1:

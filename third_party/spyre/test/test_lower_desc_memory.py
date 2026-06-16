@@ -937,6 +937,131 @@ class TestDescriptorGather(LowerDescMemoryTester):
             """)
         self.assert_stderr(capfd, "cannot lower descriptor op")
 
+    # ----------------------------------------------------------------
+    # Rank-1 source rejection + reshape-to-rank-2 workaround.
+    #
+    # ``tt.descriptor_gather`` indexes the descriptor's outermost
+    # dimension. The verifier (``verifyGatherScatterOp`` in
+    # ``Ops.cpp``) requires the block to be at least rank-2 even on
+    # Spyre — the leading dim is the indirect axis (must be size 1
+    # in the block), and at least one trailing direct dim must
+    # exist. A truly rank-1 descriptor block has no separate indirect
+    # axis to pin to size 1, so the op is structurally undefined.
+    #
+    # User-facing consequence: a 1D source vector ``in[K]`` whose
+    # elements are gathered as scalars (``out[i] = in[idx[i]]``)
+    # cannot be expressed by passing a rank-1 descriptor. The
+    # workaround is to model the same K elements as a ``[K, 1]``
+    # column matrix with ``block_shape=[1, 1]``; the gather then
+    # indexes dim 0 (size K) and produces a ``[K_INDICES, 1]``
+    # result, which the kernel can collapse back to 1D if needed.
+    # ----------------------------------------------------------------
+
+    @pattern("descriptor-gather", category="memory", negative=True, example=[
+        "# NOT supported: rank-1 descriptor block for 1D-source gather.",
+        "# The frontend rejects this with 'descriptor must be at least 2D';",
+        "# at the IR level the op verifier emits the same diagnostic.",
+        "in_desc = tl.make_tensor_descriptor(in_ptr,",
+        "                                    shape=[K], strides=[1],",
+        "                                    block_shape=[BLOCK_COLS])  # rank-1 — REJECTED",
+        "out = tl.descriptor_gather(in_desc, idx, 0)",
+    ])
+    def test_gather_rank1_block_rejected(self, capfd):
+        """Rank-1 descriptor block is rejected by the gather verifier.
+
+        ``<32xf16>`` is a rank-1 block — there is no leading
+        indirect dim to fan ``x_offsets`` over, so the verifier
+        in ``Ops.cpp::verifyGatherScatterOp`` rejects it at parse
+        time with "descriptor block must be at least 2D" (Spyre
+        relaxed the upstream "must be 2D exactly" check to "rank
+        >= 2", but rank-1 is still illegal).
+
+        Hence the exception message is "Parse MLIR file failed",
+        not "PassManager::run failed" — the verifier fires before
+        the pass manager runs. The companion positive test
+        :meth:`test_gather_1d_source_via_rank2_reshape_lowers`
+        shows the working idiom: model the 1D source as a
+        ``[K, 1]`` column matrix with ``block_shape=[1, 1]``.
+        """
+        with pytest.raises(RuntimeError, match="Parse MLIR file failed"):
+            self.run("""
+            module {
+              tt.func @k(%ptr: !tt.ptr<f16>,
+                         %x_offsets: tensor<32xi32>, %y_offset: i32) {
+                %K = arith.constant 1024 : i32
+                %stride = arith.constant 1 : i64
+                %desc = tt.make_tensor_descriptor %ptr, [%K], [%stride]
+                    : <f16>, <32xf16>
+                %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                    : (!tt.tensordesc<32xf16>, tensor<32xi32>, i32) -> tensor<32xf16>
+                tt.return
+              }
+            }
+            """)
+        self.assert_stderr(capfd, "descriptor block must be at least 2D")
+
+    @pattern("descriptor-gather", category="memory", example=[
+        "# Workaround for rank-1 source: model the 1D vector as a [K, 1]",
+        "# column matrix and gather with a [1, 1] block. The gather still",
+        "# produces a rank-2 result tensor<K_INDICES x 1 x f16>; collapse",
+        "# it to 1D in the kernel if needed.",
+        "in_desc = tl.make_tensor_descriptor(in_ptr,",
+        "                                    shape=[K, 1], strides=[1, 1],",
+        "                                    block_shape=[1, 1])",
+        "out = tl.descriptor_gather(in_desc, idx, 0)  # tensor<K_INDICES x 1 x f16>",
+    ])
+    def test_gather_1d_source_via_rank2_reshape_lowers(self):
+        """A 1D source vector gathered as a rank-2 ``[K, 1]`` matrix lowers.
+
+        Source described as ``[1024, 1]`` with block ``<1x1xf16>`` —
+        the leading 1 in the block satisfies the "block dim 0 == 1"
+        gather constraint, and the trailing dim of size 1 is the
+        per-row payload (one scalar per gathered row). The result
+        is rank-2 ``tensor<32x1xf16>``.
+
+        This is the Spyre-supported way to express ``out[i] =
+        in_1d[idx[i]]`` on a 1D source: there is no rank-1 gather
+        op in the dialect, so the kernel must treat the vector as
+        a column matrix. Pinned alongside
+        :meth:`test_gather_rank1_block_rejected` so that if the
+        verifier is ever relaxed to accept rank-1 blocks, both the
+        rejection and the workaround status of this idiom show up
+        as XPASS together.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {
+            %K = arith.constant 1024 : i32
+            %one = arith.constant 1 : i32
+            %stride_row = arith.constant 1 : i64
+            %stride_col = arith.constant 1 : i64
+            %idx_count = arith.constant 32 : i32
+            %idx_stride = arith.constant 1 : i64
+            %c0_i32 = arith.constant 0 : i32
+
+            // Index buffer staged via descriptor_load — same idiom as
+            // the rank-2 gather test above. The gather pattern's
+            // index-trace requires this provenance.
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_count], [%idx_stride]
+                : <i32>, <32xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32]
+                : !tt.tensordesc<32xi32> -> tensor<32xi32>
+
+            // 1D source modelled as [K, 1]; block <1x1xf16> picks one
+            // scalar per gathered index. Result is rank-2 [32, 1].
+            %desc = tt.make_tensor_descriptor %ptr, [%K, %one], [%stride_row, %stride_col]
+                : <f16>, <1x1xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x1xf16>, tensor<32xi32>, i32) -> tensor<32x1xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_indirect_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_gather")
+
 
 # =========================================================================
 # tt.descriptor_gather — N-D block (Spyre extension)
