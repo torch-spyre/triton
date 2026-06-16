@@ -2611,6 +2611,56 @@ def make_tensor_descriptor(
     return _semantic.make_tensor_descriptor(base, shape, strides, block_shape, padding_option)
 
 
+# --- START --- added for spyre
+@builtin
+def spyre_tensor_layout(desc, layout, _semantic=None):
+    """(Spyre only) Annotate a tensor descriptor with its physical device layout.
+
+    ``layout`` is a list of per-physical-dim coordinate entries giving the
+    OpSpec ``device_coordinates`` map. Each entry describes how to compute a
+    **physical index** from the logical access indices:
+
+    - ``src`` (a bare int) — identity: ``phys_idx = logical_idx[src]``.
+    - ``(src, "floordiv", div)`` — ``phys_idx = logical_idx[src] // div``.
+    - ``(src, "mod", mod)`` — ``phys_idx = logical_idx[src] % mod``.
+
+    (``(src, "identity")`` is also accepted as the explicit form of a bare int.)
+
+    The physical **extent** of each dim follows from the coordinate op:
+    identity and mod dims have a fixed extent (the logical extent or the
+    modulus); floordiv dims have extent ``ceil(logical_extent[src] / div)``
+    so that partial tiles at the boundary are covered.
+
+    e.g. an ``[M, N]`` tensor stick-tiled on ``N`` — physical layout
+    ``[ceil(N/64), M, 64]``, indices ``[N//64, M, N%64]``::
+
+        tl.spyre_tensor_layout(desc, [
+            (1, "floordiv", 64),   # phys dim 0: stick index = N // 64
+            0,                     # phys dim 1: row index   = M  (identity on logical dim 0)
+            (1, "mod", 64),        # phys dim 2: lane index  = N % 64
+        ])
+
+    The N dim appears twice — ``floordiv`` gives the stick index, ``mod`` gives
+    the lane offset within the stick — matching OpSpec ``[floor(c/64), …, c%64]``.
+
+    Carried as *attributes* (not SSA values) so the layout survives constant
+    folding — a static ``[N//64, M, N%64]`` written as live values would fold to
+    ``[4,512,0]`` and lose the stick identity. The Spyre KTDP lowering reads the
+    coordinate map with the descriptor's logical shape operands to build the
+    physical memory view; the descriptor's ``shape``/``strides``/``block_shape``
+    stay logical.
+
+    Note: pass ``layout`` inline at the call site — binding it to a local first
+    makes the ``@triton.jit`` code generator try to tensor-convert the keyword
+    strings.
+
+    Emits a ``tt.spyre_tensor_layout`` marker op. Only valid on the ``spyre``
+    target — raises on any other backend.
+    """
+    return _semantic.spyre_tensor_layout(desc, layout)
+# --- END --- added for spyre
+
+
 # -----------------------
 # Atomic Memory Operations
 # -----------------------

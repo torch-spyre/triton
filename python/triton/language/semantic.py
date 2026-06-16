@@ -1889,3 +1889,52 @@ class TritonSemantic(Generic[TensorTy]):
                                                             [s.handle for s in strides], block_shape, is_signed_int,
                                                             padding)
         return tl.tensor_descriptor(handle, shape, strides, type)
+
+    # --- START --- added for spyre
+    # Coordinate-op keywords -> the i64 codes stored on the op.
+    _SPYRE_COORD_OPS = {"identity": 0, "floordiv": 1, "mod": 2}
+
+    def spyre_tensor_layout(self, desc, layout) -> tl.tensor:
+        target = driver.active.get_current_target()
+        if target.backend != "spyre":
+            raise ValueError(
+                "tl.spyre_tensor_layout is only supported on the 'spyre' "
+                f"backend, not '{target.backend}'")
+        # `layout` is a list of per-physical-dim coordinate entries (the OpSpec
+        # device_coordinates form):
+        #   src                          -> bare int: identity on logical dim src
+        #   (src, "identity")            -> logical dim src, unchanged
+        #   (src, "floordiv"|"mod", arg) -> logical dim src // arg  /  % arg
+        # Split into three i64 arrays the builder stamps as fold-proof attributes.
+        src, op, arg = [], [], []
+        for i, entry in enumerate(layout):
+            # A tuple entry is a tl.tuple (note: NOT a Python tuple); a bare int
+            # is a constexpr scalar -> identity coordinate on that logical dim.
+            if not isinstance(entry, (tl.tuple, tuple, list)):
+                src.append(int(tl._unwrap_if_constexpr(entry)))
+                op.append(self._SPYRE_COORD_OPS["identity"])
+                arg.append(0)
+                continue
+            entry = [tl._unwrap_if_constexpr(e) for e in entry]
+            if len(entry) not in (2, 3):
+                raise ValueError(
+                    f"spyre_tensor_layout: layout entry {i} must be a bare int "
+                    f"(identity) or (src, op[, arg]), got {tuple(entry)}")
+            o = entry[1]
+            if isinstance(o, str):
+                if o not in self._SPYRE_COORD_OPS:
+                    raise ValueError(
+                        f"spyre_tensor_layout: op keyword must be one of "
+                        f"{sorted(self._SPYRE_COORD_OPS)}, got {o!r}")
+                o = self._SPYRE_COORD_OPS[o]
+            o = int(o)
+            if o not in (0, 1, 2):
+                raise ValueError(
+                    f"spyre_tensor_layout: op must be a keyword "
+                    f"{sorted(self._SPYRE_COORD_OPS)} or 0/1/2, got {entry[1]!r}")
+            src.append(int(entry[0]))
+            op.append(o)
+            arg.append(int(entry[2]) if len(entry) == 3 else 0)
+        self.builder.create_spyre_tensor_layout(desc.handle, src, op, arg)
+        return tl.tensor(None, tl.void)
+    # --- END --- added for spyre
