@@ -208,6 +208,7 @@ result = tl.descriptor_gather(src_desc, indices, 0)
 
 - `gather::3d` — M=256, BLOCK_SIZE=16, HEAD_DIM=64, K_INDICES=32
 - `gather::3d_group` — M=256, NUM_GROUPS=8, HEAD_DIM=64, K_INDICES=32, group_idx=3
+- `gather::3d_partial` — M=256, NUM_TOKENS=64, TOKEN_BLOCK=16, HEAD_DIM=64, K_INDICES=32
 
 ## descriptor-gather-nd-block-dim0
 
@@ -624,6 +625,7 @@ tl.descriptor_scatter(dst_desc, indices, y_offset, value)
 **Round-trip evidence**
 
 - `gather::scatter_3d` — M=256, BLOCK_SIZE=16, HEAD_DIM=64, K_INDICES=32
+- `gather::scatter_3d_partial` — M=256, NUM_TOKENS=64, TOKEN_BLOCK=16, HEAD_DIM=64, K_INDICES=32
 
 ## descriptor-store-dynamic
 

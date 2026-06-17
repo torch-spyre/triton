@@ -15,7 +15,7 @@ functions sharing one source file:
   `out[i, j] = in[idx[i], j]`.
 
 Both back the same downstream pattern: **embedding lookups** and
-**paged KV-cache attention**.
+**indirect row-gather access into a 2D source**.
 
 ### Pythonic semantics
 

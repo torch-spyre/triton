@@ -53,8 +53,8 @@ def _make_inputs(
 
     Generates a random source matrix and a K_INDICES-element row-index
     array.  ``allow_duplicates`` controls whether the same row may appear
-    twice (the realistic case for batched embedding lookup / paged KV;
-    the unique-index case stresses the indirect-load mechanic without
+    twice (the realistic case for batched embedding lookup; the
+    unique-index case stresses the indirect-load mechanic without
     aliasing).
 
     ``y_offset`` does not influence input *generation* but is stashed
@@ -226,12 +226,20 @@ def _check_rank_n_preconditions(
       flows straight through to ``tt.descriptor_gather``'s ``y_offset``
       capture, with no verifier or lowering-pass bounds check. A violating
       value silently reads out of bounds in the source tensor.
+
+    A partial caller — passing ``group_idx`` without ``NUM_GROUPS`` or vice
+    versa — would silently skip the bounds check, so we reject that shape
+    explicitly rather than letting it pass.
     """
     assert K_INDICES <= M, (
         f"K_INDICES ({K_INDICES}) must be <= M ({M}) for unique-index "
         f"sampling without replacement"
     )
-    if group_idx is not None and NUM_GROUPS is not None:
+    assert (group_idx is None) == (NUM_GROUPS is None), (
+        f"group_idx and NUM_GROUPS must be passed together or both omitted; "
+        f"got group_idx={group_idx}, NUM_GROUPS={NUM_GROUPS}"
+    )
+    if group_idx is not None:
         assert 0 <= group_idx < NUM_GROUPS, (
             f"group_idx must satisfy 0 <= group_idx < NUM_GROUPS; "
             f"got group_idx={group_idx}, NUM_GROUPS={NUM_GROUPS}"
@@ -332,14 +340,98 @@ def make_inputs_scatter_3d(
     """
     _check_rank_n_preconditions(K_INDICES, M=M)
     rng = np.random.default_rng(2004)
-    dst_data = np.zeros((M, BLOCK_SIZE, HEAD_DIM), dtype=np.float32)
-    data_data = rng.standard_normal((K_INDICES, BLOCK_SIZE, HEAD_DIM)).astype(np.float32)
+    dst = np.zeros((M, BLOCK_SIZE, HEAD_DIM), dtype=np.float32)
+    src = rng.standard_normal((K_INDICES, BLOCK_SIZE, HEAD_DIM)).astype(np.float32)
     idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
-    return {"dst_ptr": dst_data, "data_ptr": data_data, "idx_ptr": idx_data}
+    return {"dst_ptr": dst, "data_ptr": src, "idx_ptr": idx_data}
 
 
 def run_scatter_3d(inputs: dict) -> np.ndarray:
     """NumPy oracle for the 3D scatter kernel: dst[idx[i], :, :] = data[i, :, :] for each i."""
+    dst = inputs["dst_ptr"].copy()
+    dst[inputs["idx_ptr"]] = inputs["data_ptr"]
+    return dst
+
+
+def _check_partial_preconditions(
+    K_INDICES: int, M: int, NUM_TOKENS: int, TOKEN_BLOCK: int,
+) -> None:
+    """Guard ``3d_partial`` / ``scatter_3d_partial`` preconditions.
+
+    Augments :func:`_check_rank_n_preconditions` with the divisibility
+    invariant the partial-extent fixtures rely on: ``TOKEN_BLOCK`` must
+    divide ``NUM_TOKENS`` so the ``scf.for`` sweep over
+    ``NUM_BLOCKS = NUM_TOKENS // TOKEN_BLOCK`` windows covers every dim-1
+    element exactly once. NUM_TOKENS divisibility has no upstream
+    verifier — a violating variant would either skip elements at the tail
+    (oracle mismatch) or read out of bounds.
+    """
+    _check_rank_n_preconditions(K_INDICES, M=M)
+    assert NUM_TOKENS % TOKEN_BLOCK == 0, (
+        f"TOKEN_BLOCK ({TOKEN_BLOCK}) must divide NUM_TOKENS ({NUM_TOKENS}) "
+        f"for exact tiling along dim 1"
+    )
+
+
+def make_inputs_3d_partial(
+    M: int, NUM_TOKENS: int, TOKEN_BLOCK: int, HEAD_DIM: int,
+    K_INDICES: int,
+    **_unused,
+) -> dict:
+    """Inputs for ``gather_3d_partial_kernel``.
+
+    Output buffer is ``[K_INDICES, NUM_TOKENS, HEAD_DIM]`` — the kernel's
+    ``scf.for`` sweep covers every window along dim 1 in order, so the
+    full output reconstructs ``in[idx, :, :]``.
+    """
+    _check_partial_preconditions(K_INDICES, M, NUM_TOKENS, TOKEN_BLOCK)
+    rng = np.random.default_rng(2005)
+    in_data = rng.standard_normal((M, NUM_TOKENS, HEAD_DIM)).astype(np.float32)
+    idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
+    out_data = np.zeros((K_INDICES, NUM_TOKENS, HEAD_DIM), dtype=np.float32)
+    return {"in_ptr": in_data, "out_ptr": out_data, "idx_ptr": idx_data}
+
+
+def run_3d_partial(inputs: dict) -> np.ndarray:
+    """Oracle for ``gather_3d_partial_kernel``: full-sweep reconstruction.
+
+    Each loop iteration writes one ``[K_INDICES, TOKEN_BLOCK, HEAD_DIM]``
+    window of ``in[idx, b*G:(b+1)*G, :]``; concatenating all windows
+    yields ``in[idx, :, :]``. Numerical equality with this oracle proves
+    every iteration's ``y_offset`` capture landed at the correct dim-1
+    window — a regression that pinned ``y_offset`` to a single iteration's
+    value would scramble the output.
+    """
+    return inputs["in_ptr"][inputs["idx_ptr"]]
+
+
+def make_inputs_scatter_3d_partial(
+    M: int, NUM_TOKENS: int, TOKEN_BLOCK: int, HEAD_DIM: int,
+    K_INDICES: int,
+    **_unused,
+) -> dict:
+    """Inputs for ``scatter_3d_partial_kernel``.
+
+    ``data_ptr`` is the full ``[K_INDICES, NUM_TOKENS, HEAD_DIM]`` source;
+    the kernel sweeps every ``TOKEN_BLOCK``-wide window along dim 1 and
+    scatters it into ``dst[M, NUM_TOKENS, HEAD_DIM]`` at the rows named by
+    ``idx_ptr``. Unique indices keep the oracle deterministic.
+    """
+    _check_partial_preconditions(K_INDICES, M, NUM_TOKENS, TOKEN_BLOCK)
+    rng = np.random.default_rng(2006)
+    dst = np.zeros((M, NUM_TOKENS, HEAD_DIM), dtype=np.float32)
+    src = rng.standard_normal((K_INDICES, NUM_TOKENS, HEAD_DIM)).astype(np.float32)
+    idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
+    return {"dst_ptr": dst, "data_ptr": src, "idx_ptr": idx_data}
+
+
+def run_scatter_3d_partial(inputs: dict) -> np.ndarray:
+    """Oracle for ``scatter_3d_partial_kernel``: ``dst[idx, :, :] = data``.
+
+    The full-sweep loop writes every dim-1 window in order, so the final
+    ``dst`` equals the source ``data`` indexed back into the destination
+    rows.
+    """
     dst = inputs["dst_ptr"].copy()
     dst[inputs["idx_ptr"]] = inputs["data_ptr"]
     return dst
@@ -416,6 +508,30 @@ _SIG_SCATTER_3D = {
     "K_INDICES":  "i32",
 }
 
+# Partial-extent variants: dim 1 is read/written at TOKEN_BLOCK < NUM_TOKENS,
+# in an scf.for sweep with y_offset = b * TOKEN_BLOCK computed inside the loop.
+_SIG_3D_PARTIAL = {
+    "in_ptr":      "*fp32",
+    "out_ptr":     "*fp32",
+    "idx_ptr":     "*i32",
+    "M":           "i32",
+    "NUM_TOKENS":  "i32",
+    "TOKEN_BLOCK": "i32",
+    "HEAD_DIM":    "i32",
+    "K_INDICES":   "i32",
+}
+
+_SIG_SCATTER_3D_PARTIAL = {
+    "dst_ptr":     "*fp32",
+    "data_ptr":    "*fp32",
+    "idx_ptr":     "*i32",
+    "M":           "i32",
+    "NUM_TOKENS":  "i32",
+    "TOKEN_BLOCK": "i32",
+    "HEAD_DIM":    "i32",
+    "K_INDICES":   "i32",
+}
+
 
 # ---------------------------------------------------------------------------
 # VARIANTS
@@ -430,6 +546,27 @@ _SIG_SCATTER_3D = {
 _EXTRA_CHECKS = lambda t: (
     t.assert_absent("unrealized_conversion_cast"),
     t.assert_present("ktdp.construct_indirect_access_tile"),
+)
+
+
+# Partial-extent variants: layered on top of _EXTRA_CHECKS to pin the in-loop
+# y_offset capture. The kernel computes ``y_offset = b * TOKEN_BLOCK`` inside
+# an ``scf.for``, so the lowered ``ktdp.construct_indirect_access_tile``
+# (whose ``c_y`` operand SSA-depends on the loop-variant ``arith.muli``) must
+# land inside the loop body. The descriptor itself is built outside the loop,
+# so its ``ktdp.construct_memory_view`` should stay at function top — same
+# hoisting rule as ``descriptor-placement-top-level``, but for the gather/
+# scatter path.
+#
+# A regression that hoisted the access tile out of the loop would either
+# constant-fold y_offset to a single window (numerical mismatch) or fail
+# to build at all.
+_PARTIAL_EXTRA_CHECKS = lambda t: (
+    t.assert_absent("unrealized_conversion_cast"),
+    t.assert_present("ktdp.construct_indirect_access_tile", parent="scf.for"),
+    t.assert_present("ktdp.construct_memory_view", parent="func.func"),
+    t.assert_count("ktdp.construct_indirect_access_tile", 0, cmp="eq",
+                   parent="func.func"),
 )
 
 
@@ -791,7 +928,13 @@ VARIANTS = {
         #
         # group_idx=3 (non-zero) makes the c_y capture load-bearing — a bug
         # that dropped c_y from the subscript would pass group_idx=0 but
-        # fail here.  Pins the descriptor-gather-nd-subscripts pattern.
+        # fail here.
+        #
+        # Note: this variant does NOT pin the descriptor-gather-nd-subscripts
+        # pattern (partial extent on dim 1 vs. full extent on dim ≥ 2). Block
+        # dim 1 is 1, so the role contrast is invisible — see
+        # ``gather_3d_group_kernel`` docstring. The ``3d_partial`` /
+        # ``scatter_3d_partial`` variants below cover that pattern.
         "kernel_fn":    kernel.gather_3d_group_kernel,
         "SIGNATURE":    _SIG_3D_GROUP,
         "constexpr":    ["M", "NUM_GROUPS", "HEAD_DIM", "K_INDICES"],
@@ -854,5 +997,66 @@ VARIANTS = {
         "inputs":       make_inputs_scatter_3d,
         "output_key":   "dst_ptr",
         "extra_checks": _EXTRA_CHECKS,
+    },
+    # ------------------------------------------------------------------
+    # Partial-extent rank-3 variants: block dim 1 is a strict divisor of
+    # source dim 1 (``TOKEN_BLOCK | NUM_TOKENS``, ``TOKEN_BLOCK < NUM_TOKENS``);
+    # an ``scf.for`` sweeps the windows along dim 1 with
+    # ``y_offset = b * TOKEN_BLOCK`` computed inside the loop body. Each
+    # iteration performs a windowed gather/scatter along dim 1:
+    #
+    #     dst[idx[i], b*G:(b+1)*G, :] = data[i, b*G:(b+1)*G, :]   # G | shape[1]
+    #
+    # The full sweep reconstructs ``in[idx, :, :]`` numerically, so the
+    # oracle is the same as the ``3d`` variant. The partial-extent + in-
+    # loop y_offset capture properties live in IR — pinned by
+    # ``_PARTIAL_EXTRA_CHECKS`` (access tile inside ``scf.for``, view at
+    # function top).
+    #
+    # Sizes: NUM_TOKENS=64, TOKEN_BLOCK=16 → 4 windows. K_INDICES=32 keeps
+    # the per-iteration gather identical in shape to the ``3d`` variant
+    # (``[32, 16, 64]``) for easy cross-reference.
+    # ------------------------------------------------------------------
+    "3d_partial": {
+        "kernel_fn":    kernel.gather_3d_partial_kernel,
+        "SIGNATURE":    _SIG_3D_PARTIAL,
+        "constexpr":    ["M", "NUM_TOKENS", "TOKEN_BLOCK", "HEAD_DIM", "K_INDICES"],
+        "params": {
+            "M":           [256],
+            "NUM_TOKENS":  [64],
+            "TOKEN_BLOCK": [16],
+            "HEAD_DIM":    [64],
+            "K_INDICES":   [32],
+        },
+        "tags":         ["descriptor-gather-nd"],
+        "grid":         [32],
+        "parallel":     False,
+        "reference":    run_3d_partial,
+        "inputs":       make_inputs_3d_partial,
+        "output_key":   "out_ptr",
+        "extra_checks": _PARTIAL_EXTRA_CHECKS,
+    },
+    "scatter_3d_partial": {
+        # Write-back mirror of "3d_partial": same shape and sweep
+        # structure, so gather/scatter exercise symmetric partial-extent
+        # windowed access. Mirror's _PARTIAL_EXTRA_CHECKS pins that the
+        # scatter's indirect access tile also lands inside the scf.for.
+        "kernel_fn":    kernel.scatter_3d_partial_kernel,
+        "SIGNATURE":    _SIG_SCATTER_3D_PARTIAL,
+        "constexpr":    ["M", "NUM_TOKENS", "TOKEN_BLOCK", "HEAD_DIM", "K_INDICES"],
+        "params": {
+            "M":           [256],
+            "NUM_TOKENS":  [64],
+            "TOKEN_BLOCK": [16],
+            "HEAD_DIM":    [64],
+            "K_INDICES":   [32],
+        },
+        "tags":         ["descriptor-scatter-nd"],
+        "grid":         [32],
+        "parallel":     False,
+        "reference":    run_scatter_3d_partial,
+        "inputs":       make_inputs_scatter_3d_partial,
+        "output_key":   "dst_ptr",
+        "extra_checks": _PARTIAL_EXTRA_CHECKS,
     },
 }
