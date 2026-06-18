@@ -1506,45 +1506,33 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
 # tt.descriptor_gather / scatter — 2-D (rank-N) x_offsets
 # =========================================================================
 #
-# STATUS: partially implemented — verifier accepts rank-K x_offsets (Step 1 of
-# docs/impl-strategy-2d-x-offsets.md); frontend + Spyre lowering still pending.
+# STATUS: implemented (Steps 1–4 of docs/impl-strategy-2d-x-offsets.md).
 #
 # The N-D relaxation (#8) widened the *descriptor block* and *result* to
-# rank ≥ 2 but kept ``x_offsets`` strictly 1-D.  Step 1 relaxed the verifier so
-# ``x_offsets`` may itself be rank ≥ 2, letting a kernel gather/scatter a
+# rank ≥ 2 but kept ``x_offsets`` strictly 1-D.  The rank-K relaxation lets
+# ``x_offsets`` itself be rank ≥ 1, so a kernel can gather/scatter a
 # multi-dimensional *grid* of pages (e.g. one page per (sequence, head) pair)
 # without flattening by hand.  (The old ``test_gather_2d_indices_rejected``,
 # which pinned the verifier rejection, was removed with that change.)
 #
-# Intended semantics (mirrors the rank-N lowering, but with K indirect axes
-# instead of one, where K = rank(x_offsets)):
+# Semantics (K = rank(x_offsets), R = block rank, result rank = K + R - 1):
 #
-#   x_offsets : tensor<N x M x i32>          (rank-2 index grid)
+#   x_offsets : tensor<N x M x i32>          (rank-2 index grid, K=2)
 #   desc block: <1 x C x dtype>              (leading 1 still required)
 #   result    : tensor<N x M x C x dtype>    (index grid dims, then block[1:])
 #
-#   result[d_0, d_1, d_2] = base[ x_offsets[c_x + d_0, d_1],   // 2 indirect axes
-#                                 y_offset + d_2 ]              // direct + y_offset
+#   result[d_0, d_1, d_2] = base[ x_offsets[c_x0 + d_0, c_x1 + d_1],  // ONE
+#                                 y_offset + d_2 ]                     // base dim 0
 #
-# This maps directly onto ``ktdp.construct_indirect_access_tile``, whose own
-# op documentation already shows a multi-index form ``Y[m,k] = X[IDX[m,k], ...]``
-# (KtdpOps.td) — so the *target* dialect supports it.  The remaining work is the
-# frontend (``semantic.py`` ``assert len(x_offsets.shape) == 1``) and the Spyre
-# lowering helpers (``buildGatherSubscriptMaps`` / ``resolveIndexView`` hard-code
-# a single indirect axis on dim 0).  See ``docs/impl-strategy-2d-x-offsets.md``.
-#
-# Until the lowering lands, every test here still FAILs (the frontend/lowering
-# do not yet build the K-D indirect read), so the whole class stays strict-xfail
-# — consistent with the repo convention of pinning known gaps without reddening
-# the suite.  When the feature is implemented, drop the ``pytestmark`` and the
-# tests become live regression coverage.
+# Crucially this is **one** indirect base dim (the page/row axis) whose
+# subscript map produces K results — the K-D address into the index view —
+# NOT K separate indirect base dims.  That is exactly the form
+# ``ktdp.construct_indirect_access_tile`` expects: the KTDP verifier requires
+# an indirect subscript map's result count to equal the index memref rank
+# (KtdpOps.cpp).  So the printed access tile has R subscripts (one per base
+# dim), of which the first is ``ind(idx[c_x0 + d_0, ..., c_x{K-1} + d_{K-1}])``.
+# See ``docs/impl-strategy-2d-x-offsets.md``.
 
-@pytest.mark.xfail(
-    reason="2-D x_offsets not yet fully supported; verifier accepts rank-K "
-    "indices (Step 1) but the frontend/lowering still assume a single indirect "
-    "axis. See docs/impl-strategy-2d-x-offsets.md.",
-    strict=True,
-)
 class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
     """Lowering of ``tt.descriptor_gather`` / ``tt.descriptor_scatter`` with a
     rank-2 ``x_offsets`` index grid.
@@ -1631,22 +1619,28 @@ class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
         self.assert_result("ktdp.load", shape=[8, 4, 64], elem_type="f16")
 
     @pattern("descriptor-gather-2d-indices-subscripts", category="memory", example=[
-        "# 2-D x_offsets → dims 0 AND 1 are both indirect (index-grid axes):",
+        "# 2-D x_offsets → ONE indirect base dim with a 2-D index address:",
         "x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>",
         "data = tl.descriptor_gather(desc, x_offsets, y_offset)",
-        "# lowers to: ind(idx[c_x + d0, d1]), ind(idx[... d1]), (c_y + d2)",
-        "# Contrast rank-1 x_offsets, where only dim 0 is indirect.",
+        "# lowers to: ind(idx[c_x0 + d0, c_x1 + d1]), (c_y + d2)",
+        "# Contrast rank-1 x_offsets, where the index address is 1-D.",
     ])
     def test_gather_2d_indices_two_indirect_axes(self):
-        """Pin that BOTH leading dims are indirect for a rank-2 ``x_offsets``.
+        """Pin that the indirect base dim carries a 2-D index address for a
+        rank-2 ``x_offsets``.
 
         This is the load-bearing difference from the rank-1 N-D gather, where
-        dim 0 is the *only* indirect axis (see
-        ``test_gather_3d_subscript_kinds_pin_offset_axis``).  With a 2-D index
-        grid, dims 0 and 1 both read from the index view; the ``y_offset``
-        direct axis moves to dim 2.  A regression that kept a single indirect
-        axis would still produce a rank-3 tile (passing the structural counts
-        above) but with the wrong subscript kinds, so inspect them textually.
+        the indirect address is 1-D (see
+        ``test_gather_3d_subscript_kinds_pin_offset_axis``).  ``x_offsets`` adds
+        index-grid axes to the *address* of a single indirect base dim — NOT
+        extra indirect base dims: the KTDP op encodes the K-D index lookup as
+        one ``ind(...)`` subscript whose inner ``[...]`` lists K coordinates
+        (the verifier requires the indirect map's result count to equal the
+        index-view rank).  So a rank-2 ``x_offsets`` over a ``<1x64>`` block
+        prints **two** subscripts — ``ind(idx[c_x0 + d0, c_x1 + d1])`` then the
+        direct ``(c_y + d2)`` — with both index-grid coordinates inside the
+        first.  A regression that dropped an index axis would shrink the inner
+        address, so inspect it textually.
         """
         self.run("""
         module {
@@ -1679,25 +1673,36 @@ class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
         """)
         self.assert_present("ktdp.construct_indirect_access_tile")
         subscripts = _parse_indirect_subscripts(str(self.mod))
-        assert len(subscripts) == 3, (
-            f"2-D-index gather must have 3 subscripts; got {len(subscripts)}: "
-            f"{subscripts}"
+        # base = source matrix memref<1024x128> → rank 2 → 2 base-dim subscripts
+        # (one per base dim). The K=2 index grid lives in the *address* of the
+        # single indirect base dim, not as extra base dims.
+        assert len(subscripts) == 2, (
+            f"2-D-index gather over a <1x64> block must have 2 subscripts (one "
+            f"per base dim); got {len(subscripts)}: {subscripts}"
         )
-        # Dims 0 and 1 are BOTH indirect (the two index-grid axes).
+        # Base dim 0: the single indirect axis, carrying a 2-D index address.
         assert subscripts[0].startswith("ind("), (
-            f"dim 0 must be indirect (index-grid axis); got `{subscripts[0]}`"
+            f"base dim 0 must be indirect (the page axis); got `{subscripts[0]}`"
         )
-        assert subscripts[1].startswith("ind("), (
-            "dim 1 must ALSO be indirect for a rank-2 x_offsets — this is the "
-            f"distinction from rank-1 gather; got `{subscripts[1]}`"
+        # The inner `idx[...]` address must list BOTH index-grid coordinates:
+        # a top-level comma inside the indirect subscript's `[...]`. This is the
+        # K=2 distinction from rank-1 gather (whose inner address is 1-D).
+        inner = subscripts[0][subscripts[0].find("[") + 1:subscripts[0].rfind("]")]
+        assert inner.count(",") == 1, (
+            "rank-2 x_offsets: the indirect address must carry 2 coordinates "
+            f"(`ind(idx[c_x0 + d0, c_x1 + d1])`); got inner `{inner}`"
         )
-        # Dim 2 is the direct y_offset column axis.
-        assert not subscripts[2].startswith("ind("), (
-            f"dim 2 (block columns) must be direct; got `{subscripts[2]}`"
+        assert " + " in inner, (
+            "the indirect address must capture the x_offset anchors "
+            f"(`c_x{{j}} + d_j`); got inner `{inner}`"
         )
-        assert " + " in subscripts[2], (
-            "dim 2 direct subscript must capture y_offset "
-            f"(form `(<y_offset> + <iv>)`); got `{subscripts[2]}`"
+        # Base dim 1: the direct y_offset column axis (moved past the K=2 grid).
+        assert not subscripts[1].startswith("ind("), (
+            f"base dim 1 (block columns) must be direct; got `{subscripts[1]}`"
+        )
+        assert " + " in subscripts[1], (
+            "base dim 1 direct subscript must capture y_offset "
+            f"(form `(<y_offset> + <iv>)`); got `{subscripts[1]}`"
         )
 
     @pytest.mark.parametrize("R,C,COLS", [(8, 4, 64), (16, 2, 32), (4, 8, 128)])

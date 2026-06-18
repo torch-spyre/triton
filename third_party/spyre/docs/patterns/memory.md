@@ -93,7 +93,7 @@ data = tl.descriptor_gather(desc, x_offsets, y_offset)
 # → tensor<8 x 4 x BLOCK_COLS x f16>  (two indirect axes, then block cols)
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1568` (`TestDescriptorGatherScatter2DIndices.test_gather_2d_indices_lowered`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1556` (`TestDescriptorGatherScatter2DIndices.test_gather_2d_indices_lowered`)</sup>
 
 ## descriptor-gather-2d-indices-3d-block
 
@@ -116,7 +116,7 @@ data = tl.descriptor_gather(desc, x_offsets, y_offset)
 # → tensor<8 x 4 x B x D x f16>  (2 indirect axes + block[1:] = 2 trailing)
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1797` (`TestDescriptorGatherScatter2DIndices.test_gather_2d_indices_3d_block`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1802` (`TestDescriptorGatherScatter2DIndices.test_gather_2d_indices_3d_block`)</sup>
 
 ## descriptor-gather-2d-indices-subscripts
 
@@ -124,25 +124,30 @@ data = tl.descriptor_gather(desc, x_offsets, y_offset)
 
 #### ✅ `test_gather_2d_indices_two_indirect_axes`
 
-_Pin that BOTH leading dims are indirect for a rank-2 ``x_offsets``_
+_Pin that the indirect base dim carries a 2-D index address for a rank-2 ``x_offsets``_
 
 This is the load-bearing difference from the rank-1 N-D gather, where
-dim 0 is the *only* indirect axis (see
-``test_gather_3d_subscript_kinds_pin_offset_axis``).  With a 2-D index
-grid, dims 0 and 1 both read from the index view; the ``y_offset``
-direct axis moves to dim 2.  A regression that kept a single indirect
-axis would still produce a rank-3 tile (passing the structural counts
-above) but with the wrong subscript kinds, so inspect them textually.
+the indirect address is 1-D (see
+``test_gather_3d_subscript_kinds_pin_offset_axis``).  ``x_offsets`` adds
+index-grid axes to the *address* of a single indirect base dim — NOT
+extra indirect base dims: the KTDP op encodes the K-D index lookup as
+one ``ind(...)`` subscript whose inner ``[...]`` lists K coordinates
+(the verifier requires the indirect map's result count to equal the
+index-view rank).  So a rank-2 ``x_offsets`` over a ``<1x64>`` block
+prints **two** subscripts — ``ind(idx[c_x0 + d0, c_x1 + d1])`` then the
+direct ``(c_y + d2)`` — with both index-grid coordinates inside the
+first.  A regression that dropped an index axis would shrink the inner
+address, so inspect it textually.
 
 ```python
-# 2-D x_offsets → dims 0 AND 1 are both indirect (index-grid axes):
+# 2-D x_offsets → ONE indirect base dim with a 2-D index address:
 x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>
 data = tl.descriptor_gather(desc, x_offsets, y_offset)
-# lowers to: ind(idx[c_x + d0, d1]), ind(idx[... d1]), (c_y + d2)
-# Contrast rank-1 x_offsets, where only dim 0 is indirect.
+# lowers to: ind(idx[c_x0 + d0, c_x1 + d1]), (c_y + d2)
+# Contrast rank-1 x_offsets, where the index address is 1-D.
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1633` (`TestDescriptorGatherScatter2DIndices.test_gather_2d_indices_two_indirect_axes`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1621` (`TestDescriptorGatherScatter2DIndices.test_gather_2d_indices_two_indirect_axes`)</sup>
 
 ## descriptor-gather-4d
 
@@ -272,7 +277,7 @@ Expected diagnostics:
 
 - `descriptor block must have exactly 1 row`
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1882` (`TestDescriptorGatherNDLimits.test_gather_3d_block_dim0_not_one_fails`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1887` (`TestDescriptorGatherNDLimits.test_gather_3d_block_dim0_not_one_fails`)</sup>
 
 ## descriptor-gather-nd-permuted-strides
 
@@ -512,7 +517,7 @@ Expected diagnostics:
 - `must be ptr`
 - `got 'index'`
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2316` (`TestAddptrIntoDescriptor.test_addptr_into_descriptor_fails`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2321` (`TestAddptrIntoDescriptor.test_addptr_into_descriptor_fails`)</sup>
 
 ## descriptor-placement-conditional
 
@@ -548,7 +553,7 @@ if cond:
     tile = tl.descriptor_load(desc, [off])
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2222` (`TestDescriptorPlacement.test_descriptor_inside_scf_if_view_inside_branch`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2227` (`TestDescriptorPlacement.test_descriptor_inside_scf_if_view_inside_branch`)</sup>
 
 ## descriptor-placement-nested
 
@@ -577,7 +582,7 @@ for i in range(0, N, BLOCK):
     tile = tl.descriptor_load(desc, [i])
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2171` (`TestDescriptorPlacement.test_nested_descriptor_view_inside_loop`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2176` (`TestDescriptorPlacement.test_nested_descriptor_view_inside_loop`)</sup>
 
 ## descriptor-placement-top-level
 
@@ -607,7 +612,7 @@ for off in range(0, N, BLOCK):
     tile = tl.descriptor_load(desc, [off])  # inside the loop
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2116` (`TestDescriptorPlacement.test_top_level_descriptor_view_outside_loop`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2121` (`TestDescriptorPlacement.test_top_level_descriptor_view_outside_loop`)</sup>
 
 ## descriptor-rank-reduce
 
@@ -651,7 +656,7 @@ x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>
 tl.descriptor_scatter(desc, x_offsets, y_offset, value)  # value: <8x4x64xf16>
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1744` (`TestDescriptorGatherScatter2DIndices.test_scatter_2d_indices_lowered`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1749` (`TestDescriptorGatherScatter2DIndices.test_scatter_2d_indices_lowered`)</sup>
 
 ## descriptor-scatter-nd
 
