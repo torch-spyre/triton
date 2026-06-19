@@ -69,7 +69,7 @@ Expected diagnostics:
 - `gather::min_block_cols` — M=64, N=64, K_INDICES=8, BLOCK_COLS=8, y_offset=32
 - `gather::slice_at_end` — M=256, N=64, K_INDICES=16, BLOCK_COLS=16, y_offset=48
 
-_+ 8 more variants_
+_+ 10 more variants_
 
 ## descriptor-gather-2d-indices
 
@@ -121,6 +121,11 @@ data = tl.descriptor_gather(desc, x_offsets, y_offset)
 ```
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1802` (`TestDescriptorGatherScatter2DIndices.test_gather_2d_indices_3d_block`)</sup>
+
+**Round-trip evidence**
+
+- `gather::2d_index_3d_block` — M=16, D1=6, D2=8, IS0=4, IS1=8, S0=2, S1=4, C1=2, y_offset=2 (also demonstrates: descriptor-gather)
+- `gather::2d_index_3d_block_large` — M=32768, D1=32, D2=128, IS0=12, IS1=256, S0=2, S1=64, C1=4, y_offset=8 (also demonstrates: descriptor-gather)
 
 ## descriptor-gather-2d-indices-subscripts
 
@@ -739,4 +744,4 @@ _+ 7 more variants_
 
 ---
 
-_Patterns without round-trip evidence: `descriptor-gather-2d-indices-3d-block`, `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-4d`, `descriptor-gather-5d`, `descriptor-gather-nd`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`, `descriptor-scatter-nd`. Add a tagged fixture variant to verify end-to-end._

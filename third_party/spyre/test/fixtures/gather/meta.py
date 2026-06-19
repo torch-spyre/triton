@@ -36,6 +36,8 @@ Two kernel families share this fixture:
                               unchanged.
 """
 
+import functools
+
 import numpy as np
 
 from . import kernel
@@ -521,6 +523,84 @@ def run_2d_index_roundtrip(inputs: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# rank-2 index grid x rank-3 source block -> rank-4 output (f16).
+#
+# Drives ``gather_2d_index_3d_block_kernel``: a 2-D (S0 x S1) index grid
+# gathers from a rank-3 source [M, D1, D2] with block [1, C1, D2] (leading 1 =
+# the fanned-out page), producing a rank-4 [S0, S1, C1, D2] result stored into
+# the [0,0,0,0] corner of a [IS0, IS1, D1, D2] output table. ``y_offset`` is
+# non-zero, exercising the direct subscript on the inner (D1) axis. f16 source
+# (a pure indexed copy, so the oracle compares bit-exactly).
+# See docs/impl-strategy-2d-x-offsets.md.
+# ---------------------------------------------------------------------------
+
+def _make_inputs_2d_index_4d_out(
+    M, D1, D2, IS0, IS1, S0, S1, C1, h_offset, *, seed,
+) -> dict:
+    """Rank-3 f16 source + a full [IS0, IS1] index buffer of page indices.
+
+    The index buffer matches the *descriptor* full shape [IS0, IS1]; the
+    kernel loads only the [0:S0, 0:S1] block from it (so the buffer must
+    be the full extent — a block-sized buffer would put the strided reads
+    of later index rows past its end). Indices are sampled in ``[0, M)``
+    (duplicates allowed — gather has no aliasing concern). ``y_offset`` is
+    stashed for the oracle; ``y_offset + C1 <= D1`` must hold (the variant
+    params ensure it). The output buffer is the full [IS0, IS1, D1, D2]
+    table; the kernel writes only the [S0, S1, C1, D2] corner.
+    """
+    rng = np.random.default_rng(seed)
+    in_data = rng.standard_normal((M, D1, D2)).astype(np.float16)
+    idx_data = rng.integers(0, M, size=(IS0, IS1)).astype(np.int32)
+    out_data = np.zeros((IS0, IS1, D1, D2), dtype=np.float16)
+    return {
+        "in_ptr":   in_data,
+        "out_ptr":  out_data,
+        "idx_ptr":  idx_data,
+        "h_offset": h_offset,
+    }
+
+
+def make_inputs_2d_index_3d_block(
+    CACHE_SZ, HEAD, D, B, L, BLOCK_B, BLOCK_L, BLOCK_H, h_offset, **_unused,
+) -> dict:
+    return _make_inputs_2d_index_4d_out(
+        CACHE_SZ, HEAD, D, B, L, BLOCK_B, BLOCK_L, BLOCK_H, h_offset, seed=4001,
+    )
+
+
+def make_inputs_2d_index_3d_block_large(
+    CACHE_SZ, HEAD, D, B, L, BLOCK_B, BLOCK_L, BLOCK_H, h_offset, **_unused,
+) -> dict:
+    return _make_inputs_2d_index_4d_out(
+        CACHE_SZ, HEAD, D, B, L, BLOCK_B, BLOCK_L, BLOCK_H, h_offset, seed=4002,
+    )
+
+
+def run_2d_index_3d_block(inputs: dict, *, BLOCK_B: int, BLOCK_L: int, BLOCK_H: int) -> np.ndarray:
+    """Oracle:
+        result[i, j, c, d] = in[idx[i, j], h_offset + c, d]
+    written into the [0:BLOCK_B, 0:BLOCK_L, 0:BLOCK_H, 0:D] corner of a zeroed
+    [B, L, HEAD, D] table.
+
+    The kernel loads only the [0:BLOCK_B, 0:BLOCK_L] block of the full [B, L]
+    index buffer, so the oracle slices the same corner. ``BLOCK_B``/``BLOCK_L``/``BLOCK_H``
+    are block (compile-time) sizes baked per-variant via
+    ``functools.partial`` — not recoverable from the runtime ``inputs``
+    buffers (the index buffer is the full [B, L], the output the full
+    [BLOCK_B, BLOCK_L, HEAD, D]).
+    """
+    in_data = inputs["in_ptr"]               # [CACHE_SZ, HEAD, D]
+    idx = inputs["idx_ptr"][:BLOCK_B, :BLOCK_L]         # [BLOCK_B, BLOCK_L] block of the full grid
+    h = inputs["h_offset"]
+    out = np.zeros_like(inputs["out_ptr"])    # [B, L, BLOCK_B, BLOCK_L]
+    D = in_data.shape[2]
+    # Advanced index dim 0 by the 2-D grid, slice the inner D1 axis,
+    # full D -> tile shape [BLOCK_B, BLOCK_L, BLOCK_H, D].
+    out[:BLOCK_B, :BLOCK_L, :BLOCK_H, :D] = in_data[idx, h:h + BLOCK_H, :]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # SIGNATURE
 # ---------------------------------------------------------------------------
 
@@ -627,6 +707,23 @@ _SIG_2D_INDEX = {
     "S0":         "i32",
     "S1":         "i32",
     "BLOCK_COLS": "i32",
+}
+
+# rank-2 index grid x rank-3 source block -> rank-4 output (f16 source).
+# Runtime args (in/out/idx pointers + h_offset) first; the rest are constexpr.
+_SIG_2D_INDEX_4D = {
+    "in_ptr":   "*fp16",
+    "out_ptr":  "*fp16",
+    "idx_ptr":  "*i32",
+    "h_offset": "i32",
+    "CACHE_SZ": "i32",
+    "HEAD":     "i32",
+    "D":        "i32",
+    "B":        "i32",
+    "L":        "i32",
+    "BLOCK_B":  "i32",
+    "BLOCK_L":  "i32",
+    "BLOCK_H":  "i32",
 }
 
 
@@ -1214,6 +1311,66 @@ VARIANTS = {
         "direct_access_tile": False,
         "reference":    run_2d_index_roundtrip,
         "inputs":       make_inputs_2d_index_roundtrip,
+        "output_key":   "out_ptr",
+        "extra_checks": _EXTRA_CHECKS,
+    },
+    # ------------------------------------------------------------------
+    # rank-2 index grid x rank-3 source block -> rank-4 output.  Both
+    # generalisations at once (2-D x_offsets AND a rank-3 block), with a
+    # non-zero h_offset on the inner axis.  f16 source; the gather is a
+    # pure indexed copy so the oracle compares bit-exactly.
+    # ------------------------------------------------------------------
+    "2d_index_3d_block": {
+        # 2x4 index grid into a [16, 6, 8] source, block [1, 2, 8]:
+        # reads in[idx[i,j], 2:4, :] -> [2, 4, 2, 8] tile, stored into the
+        # corner of a [4, 8, 6, 8] output. h_offset=2 (non-zero) exercises
+        # the direct subscript on the inner D1=6 axis.
+        "kernel_fn":    kernel.gather_2d_index_3d_block_kernel,
+        "SIGNATURE":    _SIG_2D_INDEX_4D,
+        "constexpr":    ["CACHE_SZ", "HEAD", "D", "B", "L", "BLOCK_B", "BLOCK_L", "BLOCK_H"],
+        "params": {
+            "CACHE_SZ": [16],
+            "HEAD":     [6],
+            "D":        [8],
+            "B":        [4],
+            "L":        [8],
+            "BLOCK_B":  [2],
+            "BLOCK_L":  [4],
+            "BLOCK_H":  [2],
+            "h_offset": [2],
+        },
+        "tags":         ["descriptor-gather", "descriptor-gather-2d-indices-3d-block"],
+        "grid":         [32],
+        "parallel":     False,
+        "reference":    functools.partial(run_2d_index_3d_block, BLOCK_B=2, BLOCK_L=4, BLOCK_H=2),
+        "inputs":       make_inputs_2d_index_3d_block,
+        "output_key":   "out_ptr",
+        "extra_checks": _EXTRA_CHECKS,
+    },
+    "2d_index_3d_block_large": {
+        # Paged-KV scale: 2x64 index grid into a [32768, 32, 128] page pool,
+        # block [1, 4, 128]: reads in[idx[i,j], 8:12, :] -> [2, 64, 4, 128]
+        # tile, stored into the corner of a [12, 256, 32, 128] output.
+        # h_offset=8 (non-zero) on the inner D1=32 axis.
+        "kernel_fn":    kernel.gather_2d_index_3d_block_kernel,
+        "SIGNATURE":    _SIG_2D_INDEX_4D,
+        "constexpr":    ["CACHE_SZ", "HEAD", "D", "B", "L", "BLOCK_B", "BLOCK_L", "BLOCK_H"],
+        "params": {
+            "CACHE_SZ": [32768],
+            "HEAD":     [32],
+            "D":        [128],
+            "B":        [12],
+            "L":        [256],
+            "BLOCK_B":  [2],
+            "BLOCK_L":  [64],
+            "BLOCK_H":  [4],
+            "h_offset": [8],
+        },
+        "tags":         ["descriptor-gather", "descriptor-gather-2d-indices-3d-block"],
+        "grid":         [32],
+        "parallel":     False,
+        "reference":    functools.partial(run_2d_index_3d_block, BLOCK_B=2, BLOCK_L=64, BLOCK_H=4),
+        "inputs":       make_inputs_2d_index_3d_block_large,
         "output_key":   "out_ptr",
         "extra_checks": _EXTRA_CHECKS,
     },
