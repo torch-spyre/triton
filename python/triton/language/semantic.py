@@ -1158,10 +1158,8 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Validate minimum block size.
         # --- START --- changed for spyre
-        # The >= 8 rows minimum is an NVIDIA TMA swizzle constraint, not a Spyre
-        # one. For a rank-K (K > 1) index grid there is no single "rows"
-        # dimension, so the check is skipped under Spyre; for K == 1 it is kept
-        # on dim 0 for parity. Mirrors the verifier decision (Ops.cpp).
+        # The >= 8 rows minimum (and the min-cols check below) is an NVIDIA TMA
+        # swizzle constraint, not a Spyre one.
         if not target_info.is_spyre():
             assert x_offsets.shape[0] >= 8, f"descriptor gather must have at least 8 rows, but got {x_offsets.shape}"
             # TMA (NVIDIA) requires block_shape[1] >= 32/bitwidth * 8 columns.
@@ -1205,10 +1203,8 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Validate minimum block size.
         # --- START --- changed for spyre
-        # The >= 8 rows minimum is an NVIDIA TMA swizzle constraint, not a Spyre
-        # one. For a rank-K (K > 1) index grid there is no single "rows"
-        # dimension, so the check is skipped under Spyre; for K == 1 it is kept
-        # on dim 0 for parity. Mirrors the verifier decision (Ops.cpp).
+        # The >= 8 rows minimum (and the min-cols check below) is an NVIDIA TMA
+        # swizzle constraint, not a Spyre one.
         if not target_info.is_spyre():
             assert x_offsets.shape[0] >= 8, f"descriptor scatter must have at least 8 rows, but got {x_offsets.shape}"
             # Mirror of the gather TMA min-cols check; see descriptor_gather above.
