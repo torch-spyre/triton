@@ -1485,9 +1485,17 @@ LogicalResult GatherOp::inferReturnTypes(
 static LogicalResult verifyGatherScatterResultType(Operation *op,
                                                    ShapedType resultType,
                                                    ShapedType indicesType) {
+#ifdef TRITON_BUILD_TTIR_ONLY // --- added for spyre
+  // Spyre: x_offsets may be a rank-K index grid (K >= 1); rank-1 is the K=1
+  // case. The result's leading K dims mirror the index grid (checked below).
+  if (indicesType.getRank() < 1)
+    return op->emitOpError("x offsets must be at least 1D, but got ")
+           << indicesType;
+#else
   if (indicesType.getRank() != 1)
     return op->emitOpError("x offsets must be a 1D tensor, but got ")
            << indicesType;
+#endif
 #ifdef TRITON_BUILD_TTIR_ONLY // --- added for spyre
   // rank-2-exact check relaxed to rank >= 2 for Spyre
   if (resultType.getRank() < 2)
@@ -1503,9 +1511,12 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
   // layouts. However, these have minimum size requirements.
   // TODO: We can support smaller gather sizes by padding the `local_alloc` this
   // lowers to to the nearest minimum tile size.
+#ifndef TRITON_BUILD_TTIR_ONLY
+  // The >= 8 rows minimum is an NVIDIA TMA swizzle constraint, not a Spyre one.
   if (unsigned rows = resultType.getShape()[0]; rows < 8) {
     return op->emitOpError("must have at least 8 rows, but got ") << rows;
   }
+#endif
 
   Type dtype = resultType.getElementType();
   if (dtype.getIntOrFloatBitWidth() > 32)
@@ -1523,10 +1534,28 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
 #endif
   // --- END --- added for spyre
 
+#ifdef TRITON_BUILD_TTIR_ONLY // --- added for spyre
+  // Spyre: the leading K result dims mirror the full x_offsets index grid.
+  // Guard the rank first so the per-dim loop below cannot index out of bounds
+  // on malformed IR (the full rank == K + R - 1 coupling is checked by the
+  // caller once block rank is known).
+  if (resultType.getRank() < indicesType.getRank())
+    return op->emitOpError("result rank (")
+           << resultType.getRank() << ") must be at least x_offsets rank ("
+           << indicesType.getRank() << "), but got " << resultType;
+  for (int i = 0; i < indicesType.getRank(); ++i) {
+    if (resultType.getShape()[i] != indicesType.getShape()[i]) {
+      return op->emitOpError("result dim ")
+             << i << " must match x_offsets (" << indicesType.getShape()[i]
+             << "), but got " << resultType;
+    }
+  }
+#else
   if (resultType.getShape()[0] != indicesType.getShape()[0]) {
     return op->emitOpError("result tensor must have as many rows as indices (")
            << indicesType.getShape()[0] << "), but got " << resultType;
   }
+#endif
 
   return success();
 }
@@ -1557,16 +1586,20 @@ LogicalResult verifyGatherScatterOp(Operation *op, ShapedType blockType,
     return failure();
 
 #ifdef TRITON_BUILD_TTIR_ONLY // --- added for spyre
-  // cols-match generalised to a per-dim loop for rank-N under Spyre
-  if (blockType.getRank() != resultType.getRank()) {
-    return op->emitOpError("result tensor rank must match block rank (")
-           << blockType.getRank() << "), but got " << resultType;
+  // Spyre: result rank = K + (R - 1), where K = x_offsets rank, R = block rank.
+  // The leading K result dims are the index grid (checked against x_offsets in
+  // verifyGatherScatterResultType); the trailing R-1 dims mirror block[1:].
+  int K = indicesType.getRank();
+  if (resultType.getRank() != K + blockType.getRank() - 1) {
+    return op->emitOpError(
+               "result rank must be x_offsets rank + block rank - 1 (")
+           << K + blockType.getRank() - 1 << "), but got " << resultType;
   }
   for (int i = 1; i < blockType.getRank(); ++i) {
-    if (resultType.getShape()[i] != blockType.getShape()[i]) {
-      return op->emitOpError("result tensor dim ")
-             << i << " must match block (" << blockType.getShape()[i]
-             << "), but got " << resultType;
+    if (resultType.getShape()[K + i - 1] != blockType.getShape()[i]) {
+      return op->emitOpError("result trailing dim ")
+             << (K + i - 1) << " must match block dim " << i << " ("
+             << blockType.getShape()[i] << "), but got " << resultType;
     }
   }
 #else

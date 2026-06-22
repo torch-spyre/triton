@@ -226,19 +226,22 @@ static Value buildDirectAccessTile(OpBuilder &builder, Location loc,
 // Indirect access tile helpers (gather/scatter)
 //===----------------------------------------------------------------------===//
 
-/// Resolved index view + descriptor_load anchor offset for a
+/// Resolved index view + descriptor_load anchor offsets for a
 /// gather/scatter `x_offsets` tensor.  `view` is the memref the indirect
-/// access tile reads from (e.g. `memref<N_ELEMENTS x si32>`); `offset`
-/// is the descriptor_load anchor offset — i.e. the `[offset]` argument
-/// to `idx_desc.load([offset])`.  Carrying `offset` out of the trace
-/// lets the gather lowering consume `view[offset + d0]` instead of the
-/// offset-less `view[d0]`, which would otherwise silently drop the
+/// access tile reads from (e.g. `memref<N_ELEMENTS x si32>` at rank 1, or
+/// `memref<S0 x S1 x si32>` for a rank-2 index grid); `offsets` are the
+/// descriptor_load anchor offsets — i.e. the `[offset...]` arguments to
+/// `idx_desc.load([offset...])`, one per dim of the index buffer.
+/// Carrying the offsets out of the trace lets the gather lowering consume
+/// `view[offset_0 + d_0, ..., offset_{K-1} + d_{K-1}]` instead of the
+/// offset-less `view[d_0, ...]`, which would otherwise silently drop the
 /// descriptor_load offset and always read the buffer's prefix (the bug
-/// fixed by this trace path).  Both fields are non-null on the success
-/// path.
+/// fixed by this trace path).  `view` is non-null and `offsets` carries one
+/// entry per index-buffer dim (K entries for a rank-K index grid) on the
+/// success path.
 struct ResolvedIndexView {
   Value view;
-  Value offset;
+  SmallVector<Value> offsets; // one anchor per index-buffer dim
 };
 
 /// Try to resolve a tensor that was loaded via
@@ -258,11 +261,11 @@ struct ResolvedIndexView {
 /// `applyPartialConversion` surfaces "failed to legalize" against the
 /// unconverted gather/scatter op.
 ///
-/// Asserts (invariants from `ConvertDescriptorLoad`): when the chain
-/// matches, the access tile carries exactly one base index, since the
-/// only ops in this pipeline that emit `construct_access_tile` for an
-/// index buffer come from rank-1 descriptor_loads.  An assert failure
-/// here is a compiler bug, not bad user input.
+/// When the chain matches, the access tile carries one base index per dim
+/// of the index buffer (one for a rank-1 buffer, K for a rank-K index
+/// grid), since `ConvertDescriptorLoad` emits `construct_access_tile` with
+/// one `index`-typed offset operand per view dim.  All of them are carried
+/// out so the gather/scatter lowering can apply the full K-D anchor.
 static std::optional<ResolvedIndexView>
 traceToSourceMemoryView(Value tensor) {
   auto loadOp = tensor.getDefiningOp<mlir::ktdp::LoadOp>();
@@ -276,11 +279,10 @@ traceToSourceMemoryView(Value tensor) {
 
   // `indices` are the `index`-typed offset operands the descriptor_load
   // lowering passed to construct_access_tile (one per dim of the view).
+  // Carry the full list: K entries for a rank-K index grid.
   auto indices = tileOp.getIndices();
-  assert(indices.size() == 1 &&
-         "traced rank-1 index buffer must carry exactly one base index — "
-         "ConvertDescriptorLoad invariant violated");
-  return ResolvedIndexView{tileOp.getBase(), indices.front()};
+  return ResolvedIndexView{tileOp.getBase(),
+                           SmallVector<Value>(indices.begin(), indices.end())};
 }
 
 /// Resolve an `x_offsets` tensor to a `ResolvedIndexView` for use by
@@ -297,9 +299,9 @@ traceToSourceMemoryView(Value tensor) {
 ///         x_offsets = idx_desc.load([m])      # shape: <32xi32>
 ///         tile      = desc.gather(x_offsets, y_off)
 ///
-///   - resolved->view   : memref<1024xi32>     (full index buffer)
-///   - xOffsets type    : tensor<32xi32>       (one tile)
-///   - resolved->offset : %m                   (loop iv, in [0, 1024))
+///   - resolved->view    : memref<1024xi32>    (full index buffer)
+///   - xOffsets type     : tensor<32xi32>      (one tile)
+///   - resolved->offsets : [%m]                (loop iv, in [0, 1024))
 ///
 /// The descriptor's full size (1024) may exceed the tile size (32);
 /// the indirect map then reads
@@ -307,7 +309,8 @@ traceToSourceMemoryView(Value tensor) {
 /// which traverses indices [%m, %m+32) of the full buffer — exactly
 /// the tile the descriptor_load would have materialised.  Without
 /// capturing `%m`, the map would degenerate to `x_offsets[d0]` and
-/// every iteration would re-read the buffer's first 32 entries.
+/// every iteration would re-read the buffer's first 32 entries.  For a
+/// rank-K index grid `offsets` carries one anchor per grid dim.
 static FailureOr<ResolvedIndexView>
 resolveIndexView(Value xOffsets) {
   auto resolved = traceToSourceMemoryView(xOffsets);
@@ -340,34 +343,40 @@ resolveIndexView(Value xOffsets) {
 }
 
 /// Build the subscript kinds, subscript maps, variable space set, and
-/// variable space order for an N-D gather pattern:
-///   result[d_0, d_1, d_2, ..., d_{rank-1}]
-///       = base[ x_offsets[x_offset + d_0],
-///               y_offset + d_1,
-///               d_2,
-///               ...,
-///               d_{rank-1} ]
+/// variable space order for a rank-`K` `x_offsets` × rank-`R` block gather:
+///   result[d_0, ..., d_{K-1},  d_K, d_{K+1}, ..., d_{K+R-2}]
+///       = base[ x_offsets[c_x0 + d_0, ..., c_x{K-1} + d_{K-1}],  // base dim 0
+///               y_offset + d_K,                                  // base dim 1
+///               d_{K+1}, ..., d_{K+R-2} ]                        // base dims >=2
 ///
-/// `x_offset` is the descriptor_load offset into the index buffer
-/// (the `[offset]` argument to `idx_desc.load([offset])`); it is
-/// always captured because the only legal `x_offsets` provenance is a
+/// `K = indexRank` is the rank of the `x_offsets` index grid; `R = blockRank`
+/// is the descriptor block rank, recovered as `R = resultRank - K + 1`.  The
+/// result tile is rank `K + R - 1`: `K` index-grid dims followed by the `R-1`
+/// trailing block dims.  There is exactly **one** indirect base dim (dim 0,
+/// the page/row axis); its subscript map produces `K` results — the K-D
+/// address into the index view — matching the KTDP verifier requirement
+/// `map.getNumResults() == indirect_memref_rank` (KtdpOps.cpp).
+///
+/// `c_x0..c_x{K-1}` are the descriptor_load anchor offsets into the index
+/// buffer (the `[offset...]` arguments to `idx_desc.load([offset...])`); they
+/// are always captured because the only legal `x_offsets` provenance is a
 /// descriptor_load (see resolveIndexView).
 ///
 /// Captured variable layout in the affine domain (left to right):
-///   c_x = x_offset, c_y = y_offset, then d_0 .. d_{rank-1}.
+///   c_x0 .. c_x{K-1} (index anchors), c_y (y_offset), then d_0 .. d_{rank-1}.
 ///
-/// Affine maps:
-///   dim 0  (indirect):     (c_x, c_y, d_0, ...) -> c_x + d_0
-///   dim 1  (direct, y_off): (c_x, c_y, d_0, ...) -> c_y + d_1
-///   dim i  (direct, plain, for i in [2, rank)):
-///                          (c_x, c_y, d_0, ...) -> d_i
+/// Affine maps (rank = result rank = K + R - 1):
+///   base dim 0 (indirect):     (c_x.., c_y, d_..) -> (c_x0+d_0, .., c_x{K-1}+d_{K-1})
+///   base dim 1 (direct, y_off): (c_x.., c_y, d_..) -> c_y + d_K
+///   base dim i (direct, plain, for i in [2, R)):
+///                              (c_x.., c_y, d_..) -> d_{K + i - 1}
 ///
 /// `variables_space_set` constrains each d_i to [0, resultShape[i]);
 /// `variables_space_order` is the identity over (d_0, ..., d_{rank-1}).
 ///
-/// `numCaptured` is fixed at 2 regardless of rank: tt.descriptor_gather
-/// carries one descriptor, one 1-D index tensor, and one scalar y_offset
-/// at every rank, so the captured-variable list never grows.
+/// `numCaptured = K + 1`: one anchor per index-grid dim plus the scalar
+/// y_offset.  When `K = 1` every formula collapses to the rank-1 gather
+/// (single indirect anchor `c_x0`, `numCaptured = 2`) exactly.
 struct GatherSubscriptInfo {
   ArrayAttr subscriptKinds;
   ArrayAttr subscriptMaps;
@@ -376,53 +385,64 @@ struct GatherSubscriptInfo {
 };
 
 static GatherSubscriptInfo
-buildGatherSubscriptMaps(MLIRContext *ctx, ArrayRef<int64_t> resultShape) {
-  assert(resultShape.size() >= 2 &&
-         "gather subscript maps require rank >= 2");
+buildGatherSubscriptMaps(MLIRContext *ctx, unsigned indexRank,
+                         ArrayRef<int64_t> resultShape) {
+  unsigned resultRank = resultShape.size();
+  assert(resultRank >= 2 && "gather subscript maps require result rank >= 2");
+  assert(indexRank >= 1 && indexRank < resultRank &&
+         "index rank K must be in [1, resultRank): K=resultRank-R+1 with R>=2");
+  unsigned K = indexRank;
+  unsigned blockRank = resultRank - K + 1; // R
 
   auto kindTrue = BoolAttr::get(ctx, true);
   auto kindFalse = BoolAttr::get(ctx, false);
 
-  // Two captured scalars (c_x, c_y) followed by `rank` iteration
-  // variables (d_0 .. d_{rank-1}).
-  constexpr unsigned numCaptured = 2u;
-  unsigned rank = resultShape.size();
-  unsigned dimCount = numCaptured + rank;
-  constexpr unsigned cxSlot = 0u;          // captured x_offset
-  constexpr unsigned cySlot = 1u;          // captured y_offset
-  unsigned d0Slot = numCaptured;           // first iteration variable
+  // Captured scalars c_x0..c_x{K-1} (index anchors), then c_y, followed by
+  // `resultRank` iteration variables (d_0 .. d_{resultRank-1}).
+  unsigned numCaptured = K + 1u;
+  unsigned cySlot = K;             // c_y, after the K index anchors
+  unsigned d0Slot = numCaptured;   // first iteration variable
+  unsigned dimCount = numCaptured + resultRank;
 
   SmallVector<Attribute> kinds;
   SmallVector<Attribute> maps;
-  kinds.reserve(rank);
-  maps.reserve(rank);
+  kinds.reserve(blockRank);
+  maps.reserve(blockRank);
 
-  // dim 0: indirect, c_x + d_0
-  kinds.push_back(kindTrue);
-  maps.push_back(AffineMapAttr::get(AffineMap::get(
-      dimCount, /*symbolCount=*/0,
-      getAffineDimExpr(cxSlot, ctx) + getAffineDimExpr(d0Slot, ctx), ctx)));
+  // base dim 0: indirect. K-result address into the K-D index view:
+  //   result_dim j = c_x{j} + d_j   for j in [0, K)
+  {
+    SmallVector<AffineExpr> addr;
+    addr.reserve(K);
+    for (unsigned j = 0; j < K; ++j)
+      addr.push_back(getAffineDimExpr(/*c_x j*/ j, ctx) +
+                     getAffineDimExpr(d0Slot + j, ctx));
+    kinds.push_back(kindTrue);
+    maps.push_back(AffineMapAttr::get(
+        AffineMap::get(dimCount, /*symbolCount=*/0, addr, ctx)));
+  }
 
-  // dim 1: direct with y_offset, c_y + d_1
+  // base dim 1: direct with y_offset, c_y + d_K
+  // (block rank R >= 2 is enforced by the verifier, so this dim always exists.)
   kinds.push_back(kindFalse);
   maps.push_back(AffineMapAttr::get(AffineMap::get(
       dimCount, /*symbolCount=*/0,
-      getAffineDimExpr(cySlot, ctx) + getAffineDimExpr(d0Slot + 1, ctx), ctx)));
+      getAffineDimExpr(cySlot, ctx) + getAffineDimExpr(d0Slot + K, ctx), ctx)));
 
-  // dims [2, rank): direct, no offset, d_i
-  for (unsigned i = 2; i < rank; ++i) {
+  // base dims [2, R): direct, no offset, d_{K + i - 1}
+  for (unsigned i = 2; i < blockRank; ++i) {
     kinds.push_back(kindFalse);
     maps.push_back(AffineMapAttr::get(AffineMap::get(
         dimCount, /*symbolCount=*/0,
-        getAffineDimExpr(d0Slot + i, ctx), ctx)));
+        getAffineDimExpr(d0Slot + K + i - 1, ctx), ctx)));
   }
 
-  // Intermediate-variable space: 0 <= d_i < resultShape[i] for each i.
+  // Intermediate-variable space: 0 <= d_i < resultShape[i] for each result dim.
   SmallVector<AffineExpr> constraints;
   SmallVector<bool> eqFlags;
-  constraints.reserve(2 * rank);
-  eqFlags.reserve(2 * rank);
-  for (unsigned i = 0; i < rank; ++i) {
+  constraints.reserve(2 * resultRank);
+  eqFlags.reserve(2 * resultRank);
+  for (unsigned i = 0; i < resultRank; ++i) {
     // d_i >= 0
     constraints.push_back(getAffineDimExpr(i, ctx));
     eqFlags.push_back(false);
@@ -432,13 +452,13 @@ buildGatherSubscriptMaps(MLIRContext *ctx, ArrayRef<int64_t> resultShape) {
     eqFlags.push_back(false);
   }
   auto spaceSet = IntegerSet::get(
-      /*dimCount=*/rank, /*symbolCount=*/0, constraints, eqFlags);
+      /*dimCount=*/resultRank, /*symbolCount=*/0, constraints, eqFlags);
 
   return {
       ArrayAttr::get(ctx, kinds),
       ArrayAttr::get(ctx, maps),
       spaceSet,
-      AffineMap::getMultiDimIdentityMap(rank, ctx),
+      AffineMap::getMultiDimIdentityMap(resultRank, ctx),
   };
 }
 
@@ -448,28 +468,32 @@ buildGatherSubscriptMaps(MLIRContext *ctx, ArrayRef<int64_t> resultShape) {
 /// helper constructs the access tile and returns it.  Indirect-only
 /// deviations:
 ///   - Takes a separately resolved `indexView` and its descriptor_load
-///     anchor `xOffsetIndex` for the indirect dimension, plus a
-///     `yOffset` for the direct dimension.  Both `indexView` and
-///     `xOffsetIndex` are produced by :func:`resolveIndexView` and are
-///     non-null on the success path; this helper asserts that contract.
+///     anchor offsets `xOffsetIndices` (one per index-grid dim, K total)
+///     for the single indirect dimension, plus a `yOffset` for the direct
+///     dimension.  `indexView` and `xOffsetIndices` are produced by
+///     :func:`resolveIndexView` and are non-null / non-empty on the success
+///     path; this helper asserts that contract.
 ///
-/// `resultShape` is the shape of the gather/scatter result tile (which
-/// for gather is also the access-tile shape: dim 0 is fanned out to
-/// the index count, and trailing dims mirror `block_shape[1:]` of the
-/// source descriptor). The helper supports any rank >= 2.
+/// `resultShape` is the shape of the gather/scatter result tile (which for
+/// gather is also the access-tile shape: the leading `K` dims are fanned out
+/// to the index grid, and the trailing dims mirror `block_shape[1:]` of the
+/// source descriptor).  `K = xOffsetIndices.size()` is the index rank; the
+/// helper supports any result rank >= 2 with `K` in `[1, resultRank)`.
 static Value
 buildIndirectAccessTile(OpBuilder &builder, Location loc, Value memView,
-                        Value indexView, Value xOffsetIndex,
+                        Value indexView, ValueRange xOffsetIndices,
                         ArrayRef<int64_t> resultShape, Value yOffset) {
-  assert(xOffsetIndex && "x_offset must be present (resolveIndexView "
-                         "returns failure() on trace miss)");
+  assert(!xOffsetIndices.empty() &&
+         "x_offset anchors must be present (resolveIndexView returns "
+         "failure() on trace miss)");
   assert(resultShape.size() >= 2 &&
          "indirect access tile requires rank >= 2");
   MLIRContext *ctx = builder.getContext();
   auto indexType = builder.getIndexType();
 
   auto accessTileType = mlir::ktdp::AccessTileType::get(resultShape, indexType);
-  auto sub = buildGatherSubscriptMaps(ctx, resultShape);
+  auto sub = buildGatherSubscriptMaps(ctx, /*indexRank=*/xOffsetIndices.size(),
+                                      resultShape);
 
   // Cast yOffset (i32 from Triton) to index, mirroring how direct casts
   // its `indices` operands.
@@ -477,8 +501,11 @@ buildIndirectAccessTile(OpBuilder &builder, Location loc, Value memView,
       arith::IndexCastOp::create(builder, loc, indexType, yOffset);
 
   // Captured-variable order must match the dim ordering used by
-  // buildGatherSubscriptMaps: x_offset first (c_x), then y_offset (c_y).
-  SmallVector<Value> capturedVars{xOffsetIndex, yOffsetIndex};
+  // buildGatherSubscriptMaps: the K index anchors (c_x0..c_x{K-1}) first,
+  // then y_offset (c_y).
+  SmallVector<Value> capturedVars(xOffsetIndices.begin(),
+                                  xOffsetIndices.end());
+  capturedVars.push_back(yOffsetIndex);
 
   auto indirectTile = mlir::ktdp::ConstructIndirectAccessTilesOp::create(
       builder, loc, accessTileType,
@@ -565,8 +592,11 @@ struct ConvertDescriptorGather
       return failure();
 
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    // Pass the full K-D anchor list; buildIndirectAccessTile builds a single
+    // indirect base dim whose address spans the K index-grid axes. For rank-1
+    // x_offsets this is the single anchor of the original 1-D gather.
     Value accessTile = buildIndirectAccessTile(
-        rewriter, loc, memView, indexRes->view, indexRes->offset,
+        rewriter, loc, memView, indexRes->view, indexRes->offsets,
         resultType.getShape(), op.getYOffset());
 
     auto loadResult = mlir::ktdp::LoadOp::create(
@@ -593,8 +623,10 @@ struct ConvertDescriptorScatter
       return failure();
 
     auto srcType = cast<RankedTensorType>(op.getSrc().getType());
+    // See ConvertDescriptorGather: pass the full K-D anchor list so the
+    // indirect base dim addresses the whole index grid.
     Value accessTile = buildIndirectAccessTile(
-        rewriter, loc, memView, indexRes->view, indexRes->offset,
+        rewriter, loc, memView, indexRes->view, indexRes->offsets,
         srcType.getShape(), op.getYOffset());
 
     mlir::ktdp::StoreOp::create(rewriter, loc, op.getSrc(), accessTile);
