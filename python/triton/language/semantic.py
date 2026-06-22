@@ -1162,9 +1162,8 @@ class TritonSemantic(Generic[TensorTy]):
         # one. For a rank-K (K > 1) index grid there is no single "rows"
         # dimension, so the check is skipped under Spyre; for K == 1 it is kept
         # on dim 0 for parity. Mirrors the verifier decision (Ops.cpp).
-        if not target_info.is_spyre() or len(x_offsets.shape) == 1:
-            assert x_offsets.shape[0] >= 8, f"descriptor gather must have at least 8 rows, but got {x_offsets.shape}"
         if not target_info.is_spyre():
+            assert x_offsets.shape[0] >= 8, f"descriptor gather must have at least 8 rows, but got {x_offsets.shape}"
             # TMA (NVIDIA) requires block_shape[1] >= 32/bitwidth * 8 columns.
             # Spyre omits this: for rank-N gather, dim 1 can legitimately be 1.
             dtype = desc.dtype
@@ -1210,9 +1209,8 @@ class TritonSemantic(Generic[TensorTy]):
         # one. For a rank-K (K > 1) index grid there is no single "rows"
         # dimension, so the check is skipped under Spyre; for K == 1 it is kept
         # on dim 0 for parity. Mirrors the verifier decision (Ops.cpp).
-        if not target_info.is_spyre() or len(x_offsets.shape) == 1:
-            assert x_offsets.shape[0] >= 8, f"descriptor scatter must have at least 8 rows, but got {x_offsets.shape}"
         if not target_info.is_spyre():
+            assert x_offsets.shape[0] >= 8, f"descriptor scatter must have at least 8 rows, but got {x_offsets.shape}"
             # Mirror of the gather TMA min-cols check; see descriptor_gather above.
             dtype = desc.dtype
             min_cols = 32 // dtype.primitive_bitwidth * 8

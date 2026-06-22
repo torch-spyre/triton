@@ -1511,15 +1511,8 @@ static LogicalResult verifyGatherScatterResultType(Operation *op,
   // layouts. However, these have minimum size requirements.
   // TODO: We can support smaller gather sizes by padding the `local_alloc` this
   // lowers to to the nearest minimum tile size.
-#ifdef TRITON_BUILD_TTIR_ONLY // --- added for spyre
+#ifndef TRITON_BUILD_TTIR_ONLY
   // The >= 8 rows minimum is an NVIDIA TMA swizzle constraint, not a Spyre one.
-  // For a rank-K (K > 1) index grid there is no single "rows" dimension, so the
-  // check is skipped; for K == 1 it is retained on result dim 0 for parity.
-  if (indicesType.getRank() == 1) {
-    if (unsigned rows = resultType.getShape()[0]; rows < 8)
-      return op->emitOpError("must have at least 8 rows, but got ") << rows;
-  }
-#else
   if (unsigned rows = resultType.getShape()[0]; rows < 8) {
     return op->emitOpError("must have at least 8 rows, but got ") << rows;
   }
