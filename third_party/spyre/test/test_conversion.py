@@ -17,21 +17,16 @@ from pathlib import Path
 import pytest
 
 from utils import make_ktir_mod
+from scripts._patterns import clean_ir
 
 
 CONVERSION_DIR = Path(__file__).parent / "Conversion"
 CONVERSIONS = sorted(CONVERSION_DIR.glob("*.mlir"))
 
 
-def strip_locs(s: str) -> str:
-    s = re.sub(r"\s*loc\(#loc\d*\)", "", s)
-    s = re.sub(r"^#loc\d*\s*=.*\n?", "", s, flags=re.M)
-    return s
-
-
 def run_passes(path: Path) -> str:
     module = make_ktir_mod(path, grid=(32,))
-    return strip_locs(module.str())
+    return clean_ir(module.str())
 
 
 @pytest.mark.parametrize("conversion", CONVERSIONS, ids=lambda p: p.name)
