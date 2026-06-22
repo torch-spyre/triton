@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 from pathlib import Path
 import pytest
 
@@ -29,7 +28,8 @@ def run_passes(path: Path) -> str:
     return clean_ir(module.str())
 
 
-@pytest.mark.parametrize("conversion", CONVERSIONS, ids=lambda p: p.name)
-def test_conversion(conversion, check_ir):
-    produced = run_passes(conversion)
-    check_ir(produced, conversion)
+class TestConversion:
+    @pytest.mark.parametrize("conversion", CONVERSIONS, ids=lambda p: p.name)
+    def test_conversion(self, conversion, check_ir):
+        produced = run_passes(conversion)
+        check_ir(produced, conversion)
