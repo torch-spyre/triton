@@ -124,8 +124,8 @@ data = tl.descriptor_gather(desc, x_offsets, y_offset)
 
 **Round-trip evidence**
 
-- `gather::2d_index_3d_block` — M=16, D1=6, D2=8, IS0=4, IS1=8, S0=2, S1=4, C1=2, y_offset=2 (also demonstrates: descriptor-gather)
-- `gather::2d_index_3d_block_large` — M=32768, D1=32, D2=128, IS0=12, IS1=256, S0=2, S1=64, C1=4, y_offset=8 (also demonstrates: descriptor-gather)
+- `gather::2d_index_3d_block` — CACHE_SZ=16, HEAD=6, D=8, B=4, L=8, BLOCK_B=2, BLOCK_L=4, BLOCK_H=2, h_offset=2 (also demonstrates: descriptor-gather)
+- `gather::2d_index_3d_block_large` — CACHE_SZ=32768, HEAD=32, D=128, B=12, L=256, BLOCK_B=2, BLOCK_L=64, BLOCK_H=4, h_offset=8 (also demonstrates: descriptor-gather)
 
 ## descriptor-gather-2d-indices-subscripts
 
@@ -744,4 +744,4 @@ _+ 7 more variants_
 
 ---
 
-_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-4d`, `descriptor-gather-5d`, `descriptor-gather-nd`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`, `descriptor-scatter-nd`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`. Add a tagged fixture variant to verify end-to-end._
