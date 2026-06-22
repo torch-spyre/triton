@@ -436,6 +436,89 @@ def run_scatter_3d_partial(inputs: dict) -> np.ndarray:
     dst[inputs["idx_ptr"]] = inputs["data_ptr"]
     return dst
 
+# ---------------------------------------------------------------------------
+# rank-2 x_offsets (index-grid) variants — input makers + oracles
+#
+# These drive ``gather_2d_index_kernel`` / ``gather_scatter_2d_index_kernel``,
+# which take a 2-D (S0 x S1) index *grid* rather than a 1-D index list. The
+# index buffer is shaped [S0, S1]; the gather result is [S0, S1, BLOCK_COLS].
+# See docs/impl-strategy-2d-x-offsets.md.
+# ---------------------------------------------------------------------------
+
+def _make_inputs_2d_index(
+    M: int, N: int, S0: int, S1: int, BLOCK_COLS: int, y_offset: int,
+    *, seed: int, out_shape,
+) -> dict:
+    """Source matrix + an S0xS1 grid of UNIQUE row indices.
+
+    Unique indices keep the scatter round-trip oracle unambiguous (no
+    two grid cells write the same destination row). ``y_offset`` is
+    stashed for the oracle and threaded to the kernel as a runtime arg,
+    mirroring the 1-D ``_make_inputs``.
+    """
+    rng = np.random.default_rng(seed)
+    in_data = rng.standard_normal((M, N)).astype(np.float32)
+    idx_data = rng.choice(M, size=S0 * S1, replace=False)
+    idx_data = idx_data.reshape(S0, S1).astype(np.int32)
+    out_data = np.zeros(out_shape, dtype=np.float32)
+    return {
+        "in_ptr":   in_data,
+        "out_ptr":  out_data,
+        "idx_ptr":  idx_data,
+        "y_offset": y_offset,
+    }
+
+
+def make_inputs_2d_index_gather(
+    M, N, S0, S1, BLOCK_COLS, y_offset, **_unused,
+) -> dict:
+    """Gather variant: result tile is [S0, S1, BLOCK_COLS]."""
+    return _make_inputs_2d_index(
+        M, N, S0, S1, BLOCK_COLS, y_offset,
+        seed=2025, out_shape=(S0, S1, BLOCK_COLS),
+    )
+
+
+def run_2d_index_gather(inputs: dict) -> np.ndarray:
+    """Oracle for the rank-2-index gather:
+        result[i, j, :] = in[idx[i, j], y_offset : y_offset + BLOCK_COLS]
+
+    ``BLOCK_COLS`` is recovered from the output tile's trailing dim, so
+    no per-variant plumbing is needed (mirrors the 1-D ``run`` oracle).
+    """
+    in_data = inputs["in_ptr"]
+    idx = inputs["idx_ptr"]                 # [S0, S1]
+    y = inputs["y_offset"]
+    bc = inputs["out_ptr"].shape[2]         # [S0, S1, BLOCK_COLS]
+    # Advanced index on axis 0 by the 2-D grid, basic slice on axis 1:
+    # result shape = idx.shape + (bc,) = [S0, S1, bc].
+    return in_data[idx, y:y + bc]
+
+
+def make_inputs_2d_index_roundtrip(
+    M, N, S0, S1, BLOCK_COLS, y_offset, **_unused,
+) -> dict:
+    """Round-trip variant: ``out`` is a zeroed [M, N] table written by the
+    scatter. Uses full-row (``BLOCK_COLS == N``, ``y_offset == 0``) so the
+    oracle needs no BLOCK_COLS plumbing."""
+    return _make_inputs_2d_index(
+        M, N, S0, S1, BLOCK_COLS, y_offset,
+        seed=2026, out_shape=(M, N),
+    )
+
+
+def run_2d_index_roundtrip(inputs: dict) -> np.ndarray:
+    """Oracle for the gather->scatter round-trip (full-row, y_offset=0):
+        out[idx[i, j], :] = in[idx[i, j], :]   for every grid cell,
+        out stays zero on rows no index selects.
+    """
+    in_data = inputs["in_ptr"]
+    idx = inputs["idx_ptr"]
+    out = np.zeros_like(inputs["out_ptr"])  # [M, N]
+    flat = idx.reshape(-1)
+    out[flat, :] = in_data[flat, :]
+    return out
+
 
 # ---------------------------------------------------------------------------
 # SIGNATURE
@@ -530,6 +613,20 @@ _SIG_SCATTER_3D_PARTIAL = {
     "TOKEN_BLOCK": "i32",
     "HEAD_DIM":    "i32",
     "K_INDICES":   "i32",
+}
+
+# rank-2 x_offsets kernels: the index buffer is an S0 x S1 grid (no
+# K_INDICES; adds S0/S1). Both the gather and the round-trip kernel share it.
+_SIG_2D_INDEX = {
+    "in_ptr":     "*fp32",
+    "out_ptr":    "*fp32",
+    "idx_ptr":    "*i32",
+    "y_offset":   "i32",
+    "M":          "i32",
+    "N":          "i32",
+    "S0":         "i32",
+    "S1":         "i32",
+    "BLOCK_COLS": "i32",
 }
 
 
@@ -1058,5 +1155,66 @@ VARIANTS = {
         "inputs":       make_inputs_scatter_3d_partial,
         "output_key":   "dst_ptr",
         "extra_checks": _PARTIAL_EXTRA_CHECKS,
+    },
+    # ------------------------------------------------------------------
+    # rank-2 x_offsets (index-grid) variants.  Use the single-program
+    # ``gather_2d_index_kernel`` / ``gather_scatter_2d_index_kernel`` with
+    # an S0 x S1 index grid (no K_INDICES; adds S0/S1).  These are the
+    # numerical oracles for the rank-K x_offsets relaxation — they confirm
+    # the K-D indirect read (and scatter write) executes with correct
+    # numerics on ktir_cpu.  See docs/impl-strategy-2d-x-offsets.md.
+    # ------------------------------------------------------------------
+    "2d_index_gather": {
+        # 8x4 index grid → gather a [8, 4, 32] tile from a [1024, 64]
+        # source. Non-zero y_offset (16) + BLOCK_COLS=32 < N=64 exercises
+        # the direct y_offset column-slice subscript alongside the two
+        # indirect index-grid axes.
+        "kernel_fn":    kernel.gather_2d_index_kernel,
+        "SIGNATURE":    _SIG_2D_INDEX,
+        "constexpr":    ["M", "N", "S0", "S1", "BLOCK_COLS"],
+        "params": {
+            "M":          [1024],
+            "N":          [64],
+            "S0":         [8],
+            "S1":         [4],
+            "BLOCK_COLS": [32],
+            "y_offset":   [16],
+        },
+        "tags":         ["descriptor-gather", "descriptor-gather-2d-indices"],
+        "grid":         [32],
+        "parallel":     False,
+        "reference":    run_2d_index_gather,
+        "inputs":       make_inputs_2d_index_gather,
+        "output_key":   "out_ptr",
+        "extra_checks": _EXTRA_CHECKS,
+    },
+    "2d_index_roundtrip": {
+        # Gather→scatter round-trip over a shared 8x4 index grid. Full-row
+        # (BLOCK_COLS == N == 64, y_offset == 0) so the scatter writes
+        # whole rows back into a zeroed [1024, 64] table; the oracle then
+        # checks out[idx] == in[idx]. This is the only numerical coverage
+        # of the rank-2 scatter (indirect store) path.
+        "kernel_fn":    kernel.gather_scatter_2d_index_kernel,
+        "SIGNATURE":    _SIG_2D_INDEX,
+        "constexpr":    ["M", "N", "S0", "S1", "BLOCK_COLS"],
+        "params": {
+            "M":          [1024],
+            "N":          [64],
+            "S0":         [8],
+            "S1":         [4],
+            "BLOCK_COLS": [64],
+            "y_offset":   [0],
+        },
+        "tags":         ["descriptor-gather", "descriptor-scatter-2d-indices"],
+        "grid":         [32],
+        "parallel":     False,
+        # All memory ops are indirect (gather load + scatter store); the index
+        # descriptor_load's direct tile is traced away, so no direct
+        # construct_access_tile survives. See test_ktdp_ops_present.
+        "direct_access_tile": False,
+        "reference":    run_2d_index_roundtrip,
+        "inputs":       make_inputs_2d_index_roundtrip,
+        "output_key":   "out_ptr",
+        "extra_checks": _EXTRA_CHECKS,
     },
 }

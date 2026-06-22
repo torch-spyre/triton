@@ -69,7 +69,7 @@ Expected diagnostics:
 - `gather::min_block_cols` — M=64, N=64, K_INDICES=8, BLOCK_COLS=8, y_offset=32
 - `gather::slice_at_end` — M=256, N=64, K_INDICES=16, BLOCK_COLS=16, y_offset=48
 
-_+ 6 more variants_
+_+ 8 more variants_
 
 ## descriptor-gather-2d-indices
 
@@ -94,6 +94,10 @@ data = tl.descriptor_gather(desc, x_offsets, y_offset)
 ```
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1556` (`TestDescriptorGatherScatter2DIndices.test_gather_2d_indices_lowered`)</sup>
+
+**Round-trip evidence**
+
+- `gather::2d_index_gather` — M=1024, N=64, S0=8, S1=4, BLOCK_COLS=32, y_offset=16 (also demonstrates: descriptor-gather)
 
 ## descriptor-gather-2d-indices-3d-block
 
@@ -658,6 +662,10 @@ tl.descriptor_scatter(desc, x_offsets, y_offset, value)  # value: <8x4x64xf16>
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:1749` (`TestDescriptorGatherScatter2DIndices.test_scatter_2d_indices_lowered`)</sup>
 
+**Round-trip evidence**
+
+- `gather::2d_index_roundtrip` — M=1024, N=64, S0=8, S1=4, BLOCK_COLS=64, y_offset=0 (also demonstrates: descriptor-gather)
+
 ## descriptor-scatter-nd
 
 ### Supported
@@ -731,4 +739,4 @@ _+ 7 more variants_
 
 ---
 
-_Patterns without round-trip evidence: `descriptor-gather-2d-indices`, `descriptor-gather-2d-indices-3d-block`, `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-4d`, `descriptor-gather-5d`, `descriptor-gather-nd`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`, `descriptor-scatter-2d-indices`, `descriptor-scatter-nd`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `descriptor-gather-2d-indices-3d-block`, `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`. Add a tagged fixture variant to verify end-to-end._

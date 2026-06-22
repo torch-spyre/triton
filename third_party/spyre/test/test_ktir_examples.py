@@ -265,15 +265,22 @@ class TestExample(KTIRCpuTester, KTIRStructuralTester):
 
         Positive counterpart to ``test_no_tt_ops``: not only must the
         ``tt.*`` ops be gone, but the ``ktdp.*`` replacements must exist.
+
+        Kernels whose every memory op is *indirect* (gather/scatter only,
+        e.g. the rank-2-index round-trip) emit no direct
+        ``ktdp.construct_access_tile`` — the index descriptor_load's tile is
+        traced away by the gather/scatter lowering and DCE'd. Such variants
+        opt out via ``"direct_access_tile": False`` in ``meta.py``; their
+        indirect tiles are pinned by ``extra_checks`` and the single-pass
+        tests in ``test_lower_desc_memory.py``.
         """
+        entry = EXAMPLES[key]
         self.EXAMPLE = key
         self.setup_method()
-        self.assert_present(
-            "ktdp.construct_memory_view",
-            "ktdp.construct_access_tile",
-            "ktdp.load",
-            "ktdp.store",
-        )
+        expected = ["ktdp.construct_memory_view", "ktdp.load", "ktdp.store"]
+        if entry.get("direct_access_tile", True):
+            expected.append("ktdp.construct_access_tile")
+        self.assert_present(*expected)
 
     @pytest.mark.parametrize("key", _keys())
     def test_work_distribution(self, key):
@@ -311,7 +318,14 @@ class TestExample(KTIRCpuTester, KTIRStructuralTester):
         The access-tile shape is indexed into the memory view — a non-
         ``index`` result type indicates the op builder picked the wrong
         element type.
+
+        Skipped for all-indirect kernels (``"direct_access_tile": False``),
+        which emit no direct ``construct_access_tile``; the indirect tile's
+        index typing is covered by ``test_lower_desc_memory.py``.
         """
+        entry = EXAMPLES[key]
+        if not entry.get("direct_access_tile", True):
+            pytest.skip(f"{key}: no direct construct_access_tile (all-indirect kernel)")
         self.EXAMPLE = key
         self.setup_method()
         self.assert_result_type("ktdp.construct_access_tile", "xindex")

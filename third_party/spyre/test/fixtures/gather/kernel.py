@@ -618,3 +618,108 @@ def scatter_3d_partial_kernel(
         y_offset = b * TOKEN_BLOCK
         win = data_desc.load([0, y_offset, 0])
         dst_desc.scatter(win, idx, y_offset)
+
+
+@triton.jit
+def gather_2d_index_kernel(
+    in_ptr,
+    out_ptr,
+    idx_ptr,
+    y_offset,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    """Single-program gather driven by a rank-2 (S0 x S1) index *grid*.
+
+    The rank-K x_offsets relaxation: instead of a 1-D list of row
+    indices, the index buffer is a 2-D grid (e.g. one page per
+    ``(sequence, head)`` pair).  For each grid cell ``(i, j)`` the kernel
+    gathers ``BLOCK_COLS`` columns of source row ``idx[i, j]``:
+
+        result[i, j, :] = in[idx[i, j], y_offset : y_offset + BLOCK_COLS]
+
+    Lowers to a single ``ktdp.construct_indirect_access_tile`` whose
+    indirect base dim carries a 2-D address into the index view (see
+    ``docs/impl-strategy-2d-x-offsets.md``), then a ``ktdp.load`` of the
+    rank-3 ``[S0, S1, BLOCK_COLS]`` result tile.
+    """
+    # 2-D index grid, staged via a rank-2 descriptor_load (the only
+    # provenance the gather lowering traces).
+    idx_desc = tl.make_tensor_descriptor(
+        idx_ptr,
+        shape=[S0, S1],
+        strides=[S1, 1],
+        block_shape=[S0, S1],
+    )
+    idx = idx_desc.load([0, 0])                    # tensor<S0 x S1 x i32>
+
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[1, BLOCK_COLS],
+    )
+    data = in_desc.gather(idx, y_offset)           # tensor<S0 x S1 x BLOCK_COLS>
+
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[S0, S1, BLOCK_COLS],
+        strides=[S1 * BLOCK_COLS, BLOCK_COLS, 1],
+        block_shape=[S0, S1, BLOCK_COLS],
+    )
+    out_desc.store([0, 0, 0], data)
+
+
+@triton.jit
+def gather_scatter_2d_index_kernel(
+    in_ptr,
+    out_ptr,
+    idx_ptr,
+    y_offset,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    """Round-trip: gather a 2-D grid of rows from ``in`` and scatter them
+    back into ``out`` at the *same* 2-D-indexed rows.
+
+    Exercises both the rank-2 ``x_offsets`` gather and scatter lowerings
+    against one shared index grid::
+
+        data[i, j, :]                       = in[idx[i, j], y : y+BLOCK_COLS]
+        out[idx[i, j], y : y+BLOCK_COLS]     = data[i, j, :]
+
+    With ``out`` pre-zeroed and unique indices, after the kernel
+    ``out[idx[i, j], y:y+BLOCK_COLS] == in[idx[i, j], y:y+BLOCK_COLS]`` and
+    every other row of ``out`` stays zero.
+    """
+    idx_desc = tl.make_tensor_descriptor(
+        idx_ptr,
+        shape=[S0, S1],
+        strides=[S1, 1],
+        block_shape=[S0, S1],
+    )
+    idx = idx_desc.load([0, 0])                    # tensor<S0 x S1 x i32>
+
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[1, BLOCK_COLS],
+    )
+    data = in_desc.gather(idx, y_offset)           # tensor<S0 x S1 x BLOCK_COLS>
+
+    # Same single-row template descriptor for the scatter target; the
+    # 2-D index grid fans the payload back out to the addressed rows.
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[1, BLOCK_COLS],
+    )
+    out_desc.scatter(data, idx, y_offset)
