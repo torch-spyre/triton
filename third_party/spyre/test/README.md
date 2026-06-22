@@ -88,3 +88,5 @@ the build tree; if it cannot be found the FileCheck tests skip rather than fail.
 - **Improve the FileCheck tests for `lit`.** Expand the `Conversion/` corpus and
   refine the `CHECK` directives (prefixes, `RUN` lines, per-stage checks) so the
   files are self-contained lit tests.
+- **Use one command or two commands** Run every tests from pytest or from lit test
+  and pytest.
