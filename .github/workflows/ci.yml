@@ -2,6 +2,11 @@ name: Spyre CI
 
 on:
   workflow_dispatch:
+    inputs:
+      ktir_cpu_ref:
+        description: "ktir-cpu git ref to install (commit SHA, branch, or tag). Leave blank to use the pinned ref in setup.py."
+        required: false
+        default: ""
   pull_request:
   push:
     branches: [main]
@@ -53,6 +58,12 @@ jobs:
           GIT_PAT: ${{ secrets.GITHUB_TOKEN }}
         run: |
           uv pip install -v -e ".[spyre-test]"
+
+      - name: Override ktir-cpu ref
+        if: ${{ inputs.ktir_cpu_ref != '' }}
+        run: |
+          uv pip install --no-deps \
+            "ktir-cpu @ git+https://github.com/torch-spyre/ktir-cpu@${{ inputs.ktir_cpu_ref }}"
 
       - name: Install KTDP MLIR bindings
         run: |
