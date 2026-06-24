@@ -22,6 +22,7 @@ concurrency:
 permissions:
   contents: read
   statuses: write
+  checks: write
 
 jobs:
   spyre-tests:
@@ -86,29 +87,41 @@ jobs:
       # set to a known-good SHA/branch, which installs that ref instead (see
       # "Override ktir-cpu ref" step above).
       #
-      # If the tests pass with the override, this step posts a "success" commit
-      # status under the same context name ("Spyre tests") that the PR check
-      # watches, unblocking the merge without changing the pin in setup.py.
+      # If the tests pass with the override, this step finds the failing
+      # "Spyre tests" check run on this commit (posted by the PR-triggered run)
+      # and updates it to success via the Check Runs API, which is what the PR
+      # merge gate actually watches. Commit statuses (the older API) are a
+      # separate system and do not override check runs.
       #
       # The step only runs when `ktir_cpu_ref` is non-empty AND all prior steps
       # succeeded — a failing run never reaches here, so it cannot falsely green
       # a broken commit.
-      - name: Post override status
+      - name: Update failing check run to success
         if: ${{ inputs.ktir_cpu_ref != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # GitHub tokens are scoped to the run that created them — we cannot
+          # PATCH a check run owned by a different run (403). Instead we create
+          # a new check run with the same name "Spyre tests" and conclusion
+          # "success". GitHub uses the most-recent check run per name for the
+          # PR merge gate, so this supersedes the failing PR-triggered run.
           curl -fsSL \
             -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            "https://api.github.com/repos/${{ github.repository }}/check-runs" \
             -d "{
-              \"state\": \"success\",
-              \"target_url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
-              \"description\": \"Passed with ktir-cpu override: ${{ inputs.ktir_cpu_ref }}\",
-              \"context\": \"Spyre tests\"
+              \"name\": \"Spyre tests\",
+              \"head_sha\": \"${{ github.sha }}\",
+              \"status\": \"completed\",
+              \"conclusion\": \"success\",
+              \"details_url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
+              \"output\": {
+                \"title\": \"Passed with ktir-cpu override: ${{ inputs.ktir_cpu_ref }}\",
+                \"summary\": \"Tests passed using ktir-cpu ref '${{ inputs.ktir_cpu_ref }}' instead of the pinned version. See run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+              }
             }"
 
   docs-patterns:
