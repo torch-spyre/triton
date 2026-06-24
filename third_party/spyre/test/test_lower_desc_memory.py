@@ -25,6 +25,63 @@ from conftest import SinglePassTester
 from utils_pattern import pattern
 
 
+def _parse_indirect_subscripts(text: str):
+    """Return the top-level per-dim subscript strings of the first
+    ``ktdp.construct_indirect_access_tile`` op in ``text``.
+
+    The custom printer writes the per-dim subscripts inline rather than as a
+    ``subscript_kinds = [...]`` attribute list, e.g. (single-line, simplified)::
+
+        ktdp.construct_indirect_access_tile
+            intermediate_variables(%d0, %d1, %d2)
+            %view[ind(%idx[%xoff + %d0]), (%yoff + %d1), (%d2)]
+
+    The kind is encoded by the leading token of each subscript:
+      - ``ind(...)`` → indirect (kindTrue)
+      - bare ``(...)`` → direct (kindFalse)
+
+    Returns the list of subscript strings (one per base dimension), split on
+    top-level commas only (the indirect dim's inner ``[...]`` is balanced over).
+    Asserts the op is present and its bracket list is well-formed.
+    """
+    m = re.search(r"ktdp\.construct_indirect_access_tile([\s\S]*?)\{", text)
+    assert m, f"expected a `ktdp.construct_indirect_access_tile` op in:\n{text}"
+    head = m.group(1)
+
+    # Extract the bracketed subscript list: everything between the outermost
+    # `[` and its matching `]`. A simple regex won't do — each subscript may
+    # itself contain `[...]`, so balance brackets manually.
+    lo = head.find("[")
+    assert lo >= 0, f"no `[...]` subscript list found:\n{head}"
+    depth = 0
+    hi = -1
+    for i, ch in enumerate(head[lo:], start=lo):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                hi = i
+                break
+    assert hi > lo, f"unbalanced brackets in subscript list:\n{head}"
+    blob = head[lo + 1:hi]
+
+    # Split on commas NOT inside a nested `[...]` (the indirect dim's inner pair).
+    subscripts = []
+    depth = 0
+    last = 0
+    for i, ch in enumerate(blob):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            subscripts.append(blob[last:i].strip())
+            last = i + 1
+    subscripts.append(blob[last:].strip())
+    return subscripts
+
+
 class LowerDescMemoryTester(SinglePassTester):
     """Shared base for all LowerDescriptorMemory pattern tests."""
     PASS = "add_lower_descriptor_memory"
@@ -1250,71 +1307,19 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
         self.assert_present("ktdp.construct_indirect_access_tile")
 
         # The custom printer for ``construct_indirect_access_tile`` writes
-        # the per-dim subscripts directly inline rather than as a
-        # ``subscript_kinds = [...]`` attribute list.  The printed form
-        # (single-line, simplified):
-        #
-        #   ktdp.construct_indirect_access_tile
-        #       intermediate_variables(%d0, %d1, %d2)
-        #       %view[ind(%idx[%xoff + %d0]), (%yoff + %d1), (%d2)]
-        #
-        # The kind is encoded by the leading token of each subscript:
-        #   - ``ind(...)`` → indirect (kindTrue)
-        #   - bare ``(...)`` → direct (kindFalse)
-        text = str(self.mod)
-        m = re.search(
-            r"ktdp\.construct_indirect_access_tile([\s\S]*?)\{",
-            text,
-        )
-        assert m, (
-            f"expected a `ktdp.construct_indirect_access_tile` op in:\n{text}"
-        )
-        head = m.group(1)
-
-        # Extract the bracketed subscript list: everything between the
-        # outermost `[` and its matching `]`. We can't use a simple regex
-        # because each subscript itself contains `[...]`, so walk the
-        # string and balance brackets manually.
-        lo = head.find("[")
-        assert lo >= 0, f"no `[...]` subscript list found:\n{head}"
-        depth = 0
-        hi = -1
-        for i, ch in enumerate(head[lo:], start=lo):
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    hi = i
-                    break
-        assert hi > lo, f"unbalanced brackets in subscript list:\n{head}"
-        subscripts_blob = head[lo + 1:hi]
-
-        # Split the top-level subscript list on commas that are NOT
-        # inside a nested `[...]` (the inner bracket pair on the
-        # indirect dim).
-        subscripts = []
-        depth = 0
-        last = 0
-        for i, ch in enumerate(subscripts_blob):
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-            elif ch == "," and depth == 0:
-                subscripts.append(subscripts_blob[last:i].strip())
-                last = i + 1
-        subscripts.append(subscripts_blob[last:].strip())
+        # the per-dim subscripts inline; ``_parse_indirect_subscripts`` peels
+        # them apart (see that helper for the printed form / kind encoding).
+        subscripts = _parse_indirect_subscripts(str(self.mod))
 
         assert len(subscripts) == 3, (
             f"rank-3 indirect tile must have 3 subscripts; got {len(subscripts)}: "
-            f"{subscripts}\nin:\n{head}"
+            f"{subscripts}"
         )
 
         # Dim 0: the *only* indirect axis. Must start with `ind(`.
         assert subscripts[0].startswith("ind("), (
             "rank-3: dim 0 must be the indirect axis (`ind(...)`); "
-            f"got `{subscripts[0]}`\nin:\n{head}"
+            f"got `{subscripts[0]}`"
         )
         # And must capture x_offset — the printed form is
         # `ind(<view>[<x_offset> + <iv0>])`, so the inner expression
@@ -1498,6 +1503,360 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
 
 
 # =========================================================================
+# tt.descriptor_gather / scatter — 2-D (rank-N) x_offsets
+# =========================================================================
+#
+# STATUS: implemented (Steps 1–4 of docs/impl-strategy-2d-x-offsets.md).
+#
+# The N-D relaxation (#8) widened the *descriptor block* and *result* to
+# rank ≥ 2 but kept ``x_offsets`` strictly 1-D.  The rank-K relaxation lets
+# ``x_offsets`` itself be rank ≥ 1, so a kernel can gather/scatter a
+# multi-dimensional *grid* of pages (e.g. one page per (sequence, head) pair)
+# without flattening by hand.  (The old ``test_gather_2d_indices_rejected``,
+# which pinned the verifier rejection, was removed with that change.)
+#
+# Semantics (K = rank(x_offsets), R = block rank, result rank = K + R - 1):
+#
+#   x_offsets : tensor<N x M x i32>          (rank-2 index grid, K=2)
+#   desc block: <1 x C x dtype>              (leading 1 still required)
+#   result    : tensor<N x M x C x dtype>    (index grid dims, then block[1:])
+#
+#   result[d_0, d_1, d_2] = base[ x_offsets[c_x0 + d_0, c_x1 + d_1],  // ONE
+#                                 y_offset + d_2 ]                     // base dim 0
+#
+# Crucially this is **one** indirect base dim (the page/row axis) whose
+# subscript map produces K results — the K-D address into the index view —
+# NOT K separate indirect base dims.  That is exactly the form
+# ``ktdp.construct_indirect_access_tile`` expects: the KTDP verifier requires
+# an indirect subscript map's result count to equal the index memref rank
+# (KtdpOps.cpp).  So the printed access tile has R subscripts (one per base
+# dim), of which the first is ``ind(idx[c_x0 + d_0, ..., c_x{K-1} + d_{K-1}])``.
+# See ``docs/impl-strategy-2d-x-offsets.md``.
+
+class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
+    """Lowering of ``tt.descriptor_gather`` / ``tt.descriptor_scatter`` with a
+    rank-2 ``x_offsets`` index grid.
+
+    Each test stages ``x_offsets`` via a 2-D ``tt.descriptor_load`` — the same
+    "index buffer comes from a descriptor_load" provenance the rank-1 tests use
+    (the only provenance the gather pattern accepts post-fallback-removal),
+    just at rank 2.  The descriptor block keeps its leading 1 (the gather
+    contract: dim 0 of the block is fanned out one page at a time); the *two*
+    index-grid dims become the two leading result dims, and the trailing block
+    columns follow.
+
+    Tests:
+      test_gather_2d_indices_lowered          — 2-D grid gather → rank-3 result
+      test_gather_2d_indices_two_indirect_axes — pin dim0/dim1 BOTH indirect
+      test_gather_2d_indices_result_shape     — result = [*idx_grid, block_cols]
+      test_scatter_2d_indices_lowered         — scatter mirror
+      test_gather_2d_indices_3d_block         — 2-D grid × rank-3 block (rank-4 result)
+    """
+
+    @pattern("descriptor-gather-2d-indices", category="memory", example=[
+        "# Gather a 2-D grid of pages — one page per (seq, head) index pair:",
+        "idx_desc = tl.make_tensor_descriptor(idx_ptr, [SEQ, HEADS], [HEADS, 1],",
+        "                                     block_shape=[8, 4])",
+        "x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>",
+        "data = tl.descriptor_gather(desc, x_offsets, y_offset)",
+        "# → tensor<8 x 4 x BLOCK_COLS x f16>  (two indirect axes, then block cols)",
+    ])
+    def test_gather_2d_indices_lowered(self):
+        """A rank-2 ``x_offsets`` (``tensor<8x4xi32>``) gathers an 8×4 grid of
+        rows from a ``<1x64>`` block, producing ``tensor<8x4x64xf16>``.
+
+        Both leading result dims (8, 4) are *indirect* — driven by the index
+        grid — and the trailing 64 is the block-column extent.  Lowers to one
+        ``ktdp.construct_indirect_access_tile`` over the 2-D index view plus a
+        ``ktdp.load`` of the rank-3 result tile.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {
+            %M = arith.constant 1024 : i32        // full tensor rows
+            %K = arith.constant 128 : i32         // full tensor cols
+            %stride_row = arith.constant 128 : i64
+            %stride_col = arith.constant 1 : i64
+            // 2-D index buffer: 8x4 grid of row indices.
+            %idx_rows = arith.constant 8 : i32
+            %idx_cols = arith.constant 4 : i32
+            %idx_srow = arith.constant 4 : i64    // index row stride
+            %idx_scol = arith.constant 1 : i64
+            %c0_i32   = arith.constant 0 : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_rows, %idx_cols],
+                            [%idx_srow, %idx_scol]
+                : <i32>, <8x4xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32, %c0_i32]
+                : !tt.tensordesc<8x4xi32> -> tensor<8x4xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <1x64xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                // result: 8×4 grid of gathered rows × 64 cols
+                : (!tt.tensordesc<1x64xf16>, tensor<8x4xi32>, i32) -> tensor<8x4x64xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_indirect_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_gather")
+        self.assert_absent("unrealized_conversion_cast")
+        self.assert_has_region("ktdp.construct_indirect_access_tile")
+        # Two memory views: the 2-D index grid + the base table.
+        self.assert_count("ktdp.construct_memory_view", 2, cmp="eq")
+        self.assert_result("ktdp.construct_memory_view", shape=[1024, 128],
+                           elem_type="f16")
+        # variables_space_set spans the full rank-3 result:
+        # [0,7]×[0,3]×[0,63] = 3 dims, 6 constraints.
+        self.assert_integer_set("ktdp.construct_indirect_access_tile",
+                                "variables_space_set",
+                                num_dims=3, num_symbols=0, num_constraints=6)
+        # Gather load result = [*index_grid, block_cols] = [8, 4, 64].
+        self.assert_result("ktdp.load", shape=[8, 4, 64], elem_type="f16")
+
+    @pattern("descriptor-gather-2d-indices-subscripts", category="memory", example=[
+        "# 2-D x_offsets → ONE indirect base dim with a 2-D index address:",
+        "x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>",
+        "data = tl.descriptor_gather(desc, x_offsets, y_offset)",
+        "# lowers to: ind(idx[c_x0 + d0, c_x1 + d1]), (c_y + d2)",
+        "# Contrast rank-1 x_offsets, where the index address is 1-D.",
+    ])
+    def test_gather_2d_indices_two_indirect_axes(self):
+        """Pin that the indirect base dim carries a 2-D index address for a
+        rank-2 ``x_offsets``.
+
+        This is the load-bearing difference from the rank-1 N-D gather, where
+        the indirect address is 1-D (see
+        ``test_gather_3d_subscript_kinds_pin_offset_axis``).  ``x_offsets`` adds
+        index-grid axes to the *address* of a single indirect base dim — NOT
+        extra indirect base dims: the KTDP op encodes the K-D index lookup as
+        one ``ind(...)`` subscript whose inner ``[...]`` lists K coordinates
+        (the verifier requires the indirect map's result count to equal the
+        index-view rank).  So a rank-2 ``x_offsets`` over a ``<1x64>`` block
+        prints **two** subscripts — ``ind(idx[c_x0 + d0, c_x1 + d1])`` then the
+        direct ``(c_y + d2)`` — with both index-grid coordinates inside the
+        first.  A regression that dropped an index axis would shrink the inner
+        address, so inspect it textually.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {
+            %M = arith.constant 1024 : i32
+            %K = arith.constant 128 : i32
+            %stride_row = arith.constant 128 : i64
+            %stride_col = arith.constant 1 : i64
+            %idx_rows = arith.constant 8 : i32
+            %idx_cols = arith.constant 4 : i32
+            %idx_srow = arith.constant 4 : i64
+            %idx_scol = arith.constant 1 : i64
+            %c0_i32   = arith.constant 0 : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_rows, %idx_cols],
+                            [%idx_srow, %idx_scol]
+                : <i32>, <8x4xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32, %c0_i32]
+                : !tt.tensordesc<8x4xi32> -> tensor<8x4xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <1x64xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x64xf16>, tensor<8x4xi32>, i32) -> tensor<8x4x64xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_indirect_access_tile")
+        subscripts = _parse_indirect_subscripts(str(self.mod))
+        # base = source matrix memref<1024x128> → rank 2 → 2 base-dim subscripts
+        # (one per base dim). The K=2 index grid lives in the *address* of the
+        # single indirect base dim, not as extra base dims.
+        assert len(subscripts) == 2, (
+            f"2-D-index gather over a <1x64> block must have 2 subscripts (one "
+            f"per base dim); got {len(subscripts)}: {subscripts}"
+        )
+        # Base dim 0: the single indirect axis, carrying a 2-D index address.
+        assert subscripts[0].startswith("ind("), (
+            f"base dim 0 must be indirect (the page axis); got `{subscripts[0]}`"
+        )
+        # The inner `idx[...]` address must list BOTH index-grid coordinates:
+        # a top-level comma inside the indirect subscript's `[...]`. This is the
+        # K=2 distinction from rank-1 gather (whose inner address is 1-D).
+        inner = subscripts[0][subscripts[0].find("[") + 1:subscripts[0].rfind("]")]
+        assert inner.count(",") == 1, (
+            "rank-2 x_offsets: the indirect address must carry 2 coordinates "
+            f"(`ind(idx[c_x0 + d0, c_x1 + d1])`); got inner `{inner}`"
+        )
+        assert " + " in inner, (
+            "the indirect address must capture the x_offset anchors "
+            f"(`c_x{{j}} + d_j`); got inner `{inner}`"
+        )
+        # Base dim 1: the direct y_offset column axis (moved past the K=2 grid).
+        assert not subscripts[1].startswith("ind("), (
+            f"base dim 1 (block columns) must be direct; got `{subscripts[1]}`"
+        )
+        assert " + " in subscripts[1], (
+            "base dim 1 direct subscript must capture y_offset "
+            f"(form `(<y_offset> + <iv>)`); got `{subscripts[1]}`"
+        )
+
+    @pytest.mark.parametrize("R,C,COLS", [(8, 4, 64), (16, 2, 32), (4, 8, 128)])
+    def test_gather_2d_indices_result_shape(self, R, C, COLS):
+        """Result shape is ``[*x_offsets.shape, block_cols]`` for any 2-D grid.
+
+        Parametrised over a few (rows, cols, block_cols) triples to pin that
+        the index grid's *both* dims flow through to the result, in order,
+        ahead of the block columns.
+        """
+        self.run(f"""
+        module {{
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {{
+            %M = arith.constant 4096 : i32
+            %K = arith.constant 256 : i32
+            %stride_row = arith.constant 256 : i64
+            %stride_col = arith.constant 1 : i64
+            %idx_rows = arith.constant {R} : i32
+            %idx_cols = arith.constant {C} : i32
+            %idx_srow = arith.constant {C} : i64
+            %idx_scol = arith.constant 1 : i64
+            %c0_i32   = arith.constant 0 : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_rows, %idx_cols],
+                            [%idx_srow, %idx_scol]
+                : <i32>, <{R}x{C}xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32, %c0_i32]
+                : !tt.tensordesc<{R}x{C}xi32> -> tensor<{R}x{C}xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <1x{COLS}xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x{COLS}xf16>, tensor<{R}x{C}xi32>, i32)
+                  -> tensor<{R}x{C}x{COLS}xf16>
+            tt.return
+          }}
+        }}
+        """)
+        self.assert_absent("tt.descriptor_gather")
+        self.assert_result("ktdp.load", shape=[R, C, COLS], elem_type="f16")
+
+    @pattern("descriptor-scatter-2d-indices", category="memory", example=[
+        "# Scatter a 2-D grid of pages — mirror of the 2-D-index gather:",
+        "x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>",
+        "tl.descriptor_scatter(desc, x_offsets, y_offset, value)  # value: <8x4x64xf16>",
+    ])
+    def test_scatter_2d_indices_lowered(self):
+        """Scatter mirror of ``test_gather_2d_indices_lowered``.
+
+        Same 2-D index grid drives an 8×4 grid of row writes; ``%src`` carries
+        the ``tensor<8x4x64xf16>`` payload.  Lowers via
+        ``ConvertDescriptorScatter`` to ``ktdp.store`` over the same
+        two-indirect-axis access tile.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32,
+                     %src: tensor<8x4x64xf16>) {
+            %M = arith.constant 1024 : i32
+            %K = arith.constant 128 : i32
+            %stride_row = arith.constant 128 : i64
+            %stride_col = arith.constant 1 : i64
+            %idx_rows = arith.constant 8 : i32
+            %idx_cols = arith.constant 4 : i32
+            %idx_srow = arith.constant 4 : i64
+            %idx_scol = arith.constant 1 : i64
+            %c0_i32   = arith.constant 0 : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_rows, %idx_cols],
+                            [%idx_srow, %idx_scol]
+                : <i32>, <8x4xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32, %c0_i32]
+                : !tt.tensordesc<8x4xi32> -> tensor<8x4xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%M, %K], [%stride_row, %stride_col]
+                : <f16>, <1x64xf16>
+            tt.descriptor_scatter %desc[%x_offsets, %y_offset], %src
+                : !tt.tensordesc<1x64xf16>, tensor<8x4xi32>, i32, tensor<8x4x64xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_memory_view",
+                            "ktdp.construct_indirect_access_tile", "ktdp.store")
+        self.assert_absent("tt.descriptor_scatter")
+        self.assert_absent("unrealized_conversion_cast")
+        self.assert_has_region("ktdp.construct_indirect_access_tile")
+        self.assert_count("ktdp.construct_memory_view", 2, cmp="eq")
+        self.assert_integer_set("ktdp.construct_indirect_access_tile",
+                                "variables_space_set",
+                                num_dims=3, num_symbols=0, num_constraints=6)
+
+    @pattern("descriptor-gather-2d-indices-3d-block", category="memory", example=[
+        "# 2-D index grid combined with a rank-3 block (block_shape=[1, B, D]):",
+        "x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>",
+        "data = tl.descriptor_gather(desc, x_offsets, y_offset)",
+        "# → tensor<8 x 4 x B x D x f16>  (2 indirect axes + block[1:] = 2 trailing)",
+    ])
+    def test_gather_2d_indices_3d_block(self):
+        """Rank-2 ``x_offsets`` × rank-3 descriptor block → rank-4 result.
+
+        Combines both relaxations: the 2-D index grid contributes dims 0–1
+        (both indirect), ``y_offset`` lands on dim 2, and the descriptor's
+        trailing inner dim (``block_shape[2]``) is a direct, no-offset dim 3.
+        Pins that the two generalisations compose: K indirect axes (K=2) plus
+        the existing rank-N trailing-dim handling.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>,
+                     %idx_ptr: !tt.ptr<i32>,
+                     %y_offset: i32) {
+            %P = arith.constant 1024 : i32     // NUM_BLOCKS
+            %B = arith.constant 16   : i32     // in-block rows (y_offset axis)
+            %D = arith.constant 128  : i32     // INNER_DIM (trailing, full extent)
+            %s0 = arith.constant 2048 : i64
+            %s1 = arith.constant 128  : i64
+            %s2 = arith.constant 1    : i64
+            %idx_rows = arith.constant 8 : i32
+            %idx_cols = arith.constant 4 : i32
+            %idx_srow = arith.constant 4 : i64
+            %idx_scol = arith.constant 1 : i64
+            %c0_i32   = arith.constant 0 : i32
+
+            %idx_desc = tt.make_tensor_descriptor %idx_ptr, [%idx_rows, %idx_cols],
+                            [%idx_srow, %idx_scol]
+                : <i32>, <8x4xi32>
+            %x_offsets = tt.descriptor_load %idx_desc[%c0_i32, %c0_i32]
+                : !tt.tensordesc<8x4xi32> -> tensor<8x4xi32>
+
+            %desc = tt.make_tensor_descriptor %ptr, [%P, %B, %D], [%s0, %s1, %s2]
+                : <f16>, <1x16x128xf16>
+            %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
+                : (!tt.tensordesc<1x16x128xf16>, tensor<8x4xi32>, i32)
+                  -> tensor<8x4x16x128xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_indirect_access_tile", "ktdp.load")
+        self.assert_absent("tt.descriptor_gather")
+        # Rank-4 result: 2 index-grid dims + 2 block dims.
+        # variables_space_set: 4 dims × 2 = 8 constraints.
+        self.assert_integer_set("ktdp.construct_indirect_access_tile",
+                                "variables_space_set",
+                                num_dims=4, num_symbols=0, num_constraints=8)
+        self.assert_result("ktdp.load", shape=[8, 4, 16, 128], elem_type="f16")
+
+
+# =========================================================================
 # tt.descriptor_gather — N-D limits (kernel-author-facing rejections)
 # =========================================================================
 
@@ -1570,62 +1929,6 @@ class TestDescriptorGatherNDLimits(LowerDescMemoryTester):
             }
             """)
         self.assert_stderr(capfd, "descriptor block must have exactly 1 row")
-
-    @pattern("descriptor-gather-2d-indices", category="memory", negative=True,
-             example=[
-                 "# REJECTED: 2-D index tensor — x_offsets must be rank-1.",
-                 "x_offsets = tl.descriptor_load(idx_desc, [0, 0])  # tensor<8x4xi32> — REJECTED",
-                 "data = tl.descriptor_gather(desc, x_offsets, y_offset)",
-                 "# 'x offsets must be a 1D tensor'",
-                 "# Workaround: flatten before the gather, reshape after if",
-                 "# the 2-D grid structure mattered.",
-                 "x_offsets_1d = tl.reshape(x_offsets, [32])           # rank-1",
-                 "data = tl.descriptor_gather(desc, x_offsets_1d, y_offset)",
-                 "data_2d = tl.reshape(data, [8, 4, BLOCK_COLS])       # recover grid",
-             ])
-    def test_gather_2d_indices_rejected(self, capfd):
-        """2-D index tensor: the index buffer must be 1-D.
-
-        A kernel author who wants to gather a 2-D *grid* of pages
-        (e.g. one page per (sequence, head) pair) cannot pass a 2-D
-        ``x_offsets`` directly.  The verifier in
-        ``verifyGatherScatterResultType`` requires
-        ``indicesType.getRank() == 1``.
-
-        This is *not* a relaxation candidate: the lowering's indirect
-        subscript is ``c_x + d_0`` with a single iteration variable,
-        and ``buildIndirectAccessTile`` builds a single
-        ``construct_memory_view`` over the index tensor.  Allowing
-        rank-2 indices would require either (a) flattening at the
-        verifier — a no-op the kernel author can do themselves and
-        which costs nothing, or (b) carrying a multi-D iteration
-        space through ``buildGatherSubscriptMaps`` — substantially
-        more invasive.
-
-        Pinned at rank-3 (descriptor side) so the failure is
-        unambiguously about the index tensor, not anything trailing.
-        """
-        with pytest.raises(RuntimeError, match="Parse MLIR file failed"):
-            self.run("""
-            module {
-              tt.func @k(%ptr: !tt.ptr<f16>,
-                         %x_offsets: tensor<8x4xi32>,   // 2-D index buffer
-                         %y_offset: i32) {
-                %P = arith.constant 1024 : i32
-                %B = arith.constant 16   : i32
-                %D = arith.constant 128  : i32
-                %s0 = arith.constant 2048 : i64
-                %s1 = arith.constant 128  : i64
-                %s2 = arith.constant 1    : i64
-                %desc = tt.make_tensor_descriptor %ptr, [%P, %B, %D], [%s0, %s1, %s2]
-                    : <f16>, <1x16x128xf16>
-                %data = tt.descriptor_gather %desc[%x_offsets, %y_offset]
-                    : (!tt.tensordesc<1x16x128xf16>, tensor<8x4xi32>, i32) -> tensor<32x16x128xf16>
-                tt.return
-              }
-            }
-            """)
-        self.assert_stderr(capfd, "x offsets must be a 1D tensor")
 
 
 # =========================================================================
