@@ -1,5 +1,7 @@
 # Inter-Tile Reduction and Collectives
 
+Authors: @tnakaike, @fabianlim
+
 **Status:** design note for the `tl` → `tt` → `ktdp` lowering of cross-tile collectives.
 
 When a kernel's iteration space is sliced across tiles (cores), some results must be
@@ -167,10 +169,11 @@ reduced = tl.inter_tile(
     delivery).
 
 What is **not** an argument: the core-ID groups and the core→slice map. The author never writes
-`[[0, 1, 2, 3]]`. The work-slice shape that determines the groups is supplied as a **hint**
-through the existing hint mechanism (the same path that already feeds `numWkSlicesPerDim` /
-`coreIdToWkSlice`; see `work-slicing.md`). The reduction op only references the *name* of the
-axis that hint established.
+`[[0, 1, 2, 3]]`. `axis` names a **grid dimension**, and the name + (optional) core placement come
+from a separate `tl`-level work-slice annotation (`tl.spyre_work_slice`, analogous to
+`tl.spyre_tensor_layout`) — written by the author for hand-written kernels, emitted by Inductor for
+generated ones. §8 specifies how the axis is established; the `tl.inter_tile` call only references
+the *name* it set up.
 
 ### Examples (schematic)
 
@@ -437,7 +440,7 @@ this. There is simply no `tl.inter_tile` call to emit.
 
 ---
 
-## 8. `coreIdToWkSlice` — the connective metadata
+## 8. Establishing the axis — `numWkSlicesPerDim` / `coreIdToWkSlice`
 
 The reduction op names an **axis**, an abstract work-slice dimension. An axis alone does not say
 *which tiles* cooperate. Two pieces of metadata close that gap:
@@ -453,17 +456,52 @@ This is the same role the scheduling-level description played in the older pipel
 map was the single source of truth for which tile owned which slice, and every downstream step read
 it. The reduction construct does not replace that map — it *depends* on it.
 
-**Where it lives at each layer:**
+### 8.1 How the axis is established — one annotation, two providers
 
-- **`tl`** — supplied as a **hint**. The author does not write the core→slice map; they attach a
-  work-slicing hint (the same mechanism that already establishes `numWkSlicesPerDim` /
-  `coreIdToWkSlice`; see `work-slicing.md` §4). The reduction call only references the resulting
-  axis *name*.
-- **`tt`** — carried as **function attributes** (`numWkSlicesPerDim`, `coreIdToWkSlice`) on the
-  enclosing `func.func`. The `LowerInterTile` pass reads them to materialize the producer/consumer
-  tile groups. This is the layer where the abstract axis becomes a concrete tile set.
+`axis` names a **grid dimension**. The grid already declares the work-slice structure: a kernel
+with `grid = [16, 2]` cuts its iteration space 16 ways along dimension 0 and 2 ways along
+dimension 1. So `numWkSlicesPerDim` *is* the grid shape, and `coreIdToWkSlice` **defaults to** the
+natural row-major core→grid-coordinate mapping. The grid alone does not carry two things the
+reduction needs: (a) a *name* for an axis (`"in"`, `"out"`) so `tl.inter_tile(axis=...)` can refer
+to one, and (b) any non-default core placement. Both come from a single `tl`-level **work-slice
+annotation**, directly analogous to `tl.spyre_tensor_layout` (see `rewriting-descriptor-layout.md`):
+the author attaches it, it lowers to a `tt` marker, and the marker becomes the function attributes
+the `LowerInterTile` pass reads.
 
-So the metadata is threaded, not invented: a hint at the Python surface becomes a function
+```python
+# provisional surface — names grid dims so axis="in" resolves; the pin is optional
+tl.spyre_work_slice(axes={0: "out", 1: "in"})
+...
+full = tl.inter_tile(psum, axis="in", combiner=lambda a, b: a + b, mode="all_reduce")
+```
+
+- **slice count** — `numWkSlicesPerDim[name] = grid[that dim]`. Nothing extra to supply.
+- **core map** — `coreIdToWkSlice` is row-major by default; the author overrides it with an explicit
+  **pin** on the annotation only when a cohort must land on particular cores (e.g. adjacent cores so
+  the reduction stays local). Pinning is the exception, not the rule.
+
+**The same annotation serves both providers** — this is the unification behind §6 of
+`fusing-triton-kernels.md`:
+
+- **Hand-written kernel** — the author writes `tl.spyre_work_slice` (and `tl.inter_tile`) directly,
+  exactly as they write `tl.spyre_tensor_layout` today. This is the only extra thing a hand-written
+  cross-tile reduction requires beyond the grid: name the reduction dimension.
+- **Inductor-generated kernel** — Inductor *emits* the same annotation from its `work_division`
+  results (the names `in`/`out`/`mb`/`x` and the core cohorts), just as it emits
+  `tl.spyre_tensor_layout` for layouts. See `work-slicing.md` for how `work_division` computes those
+  names and counts.
+
+So there is one hint surface, not an Inductor-only mechanism the hand-written path lacks.
+
+### 8.2 Where it lives at each layer
+
+- **`tl`** — the `tl.spyre_work_slice` annotation (author-written or Inductor-emitted). The
+  `tl.inter_tile` call only references the *name* it established.
+- **`tt`** — `numWkSlicesPerDim` / `coreIdToWkSlice` **function attributes**, read by `LowerInterTile`
+  to materialize the producer/consumer tile groups. This is where the abstract axis becomes a
+  concrete tile set.
+
+So the metadata is threaded, not invented: an annotation at the Python surface becomes a function
 attribute in TTIR, which the lowering consumes to build the KTIR tile groups.
 
 ---
@@ -487,3 +525,8 @@ attribute in TTIR, which the lowering consumes to build the KTIR tile groups.
    groups (beyond all-reduce / reduce-to-one / reduce-scatter), surfacing the producer/consumer
    split at the frontend (Approach B, §3) becomes more attractive. Until then the fused op is
    simpler and the split stays a lowering-internal concern.
+5. **The work-slice annotation surface (§8.1) is provisional.** The name `tl.spyre_work_slice`, the
+   `axes={dim: name}` form, and the syntax for an optional `coreIdToWkSlice` pin are placeholders.
+   The intent — a `tl`-level annotation analogous to `tl.spyre_tensor_layout`, emitted by Inductor
+   and writable by hand — is firm; the exact spelling needs to be pinned with the descriptor-layout
+   annotation owners so the two surfaces stay consistent.

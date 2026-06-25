@@ -1,6 +1,6 @@
 # Fusing Triton Kernels — Multi-Module KTIR Design
 
-Authors: @tnakaike, @fabianlim 
+Authors: @tnakaike, @fabianlim, @lschu6
 
 > **Status:** standalone design spec. It is about the step *after* per-kernel
 > Triton→KTIR lowering: combining several independently-lowered kernels into KTIR
@@ -125,10 +125,15 @@ set `C == P` producer tile set) and **reduce-to-one** (`|C| == 1`). The verifier
 checks `C ⊆ P` and rejects anything else as `"unsupported"` (not invalid) —
 broadcast, reduce-scatter, gather/scatter are spec'd but not yet implemented.
 
-Because `!ktdp.tile_future` is an SSA value, producer and consumer must live in
-the **same region** — MLIR isolation (`func.func` and `builtin.module` are both
+Because `!ktdp.tile_future` is an SSA value, the `inter_tile_produce` op and its
+matching delivery op (`inter_tile_reduce` / `inter_tile_consume`) must live in the
+**same region** — MLIR isolation (`func.func` and `builtin.module` are both
 `IsolatedFromAbove`) forbids an SSA value from crossing a function or module
-boundary. This single fact is what shapes the whole architecture in §3–§4.
+boundary. Note this is a constraint between the two **inter-tile ops**, *not*
+between the producer and consumer **kernels** of §3–§4: the pair is co-located and
+the future never leaves the function that holds it. What crosses a kernel boundary
+is never the future — it is the LX-resident tensor (§3.3). This single fact is what
+shapes the whole architecture in §3–§4.
 
 **Alternative: `ktdp.construct_distributed_memory_view`.** The `ktdp` dialect
 **[ktir-mlir-frontend]** also has a *view-based* way to express a distributed
@@ -273,12 +278,15 @@ made to, via §5).
 the tensor with the producer's slicing just reads the producer's LX slices. No
 inter-tile op is needed at all; the `store`/`load` pair is simply deleted.
 
-**(b) Cross-core combine — `inter_tile_reduce` at the consumer's start.** When
-the consumer contracts over the dimension the producer sliced, each core holds a
-*partial* result that must be summed across cores. The consumer function **begins
-with** `ktdp.inter_tile_reduce` **[ktir-mlir-frontend]** over the LX partials
-(all-reduce or reduce-to-one, §2.4), then runs its own compute. The reduce is the
-consumer's first op — the function keeps its own body.
+**(b) Cross-core combine — `inter_tile_reduce` after the consumer's local compute.**
+When the consumer contracts over the dimension the producer sliced, the handed-over
+tensor is a *sharded slice*, not a partial — it is read from LX as in (a). The partials
+appear only **after** the consumer runs its own contracting compute: each core computes
+`local_input @ local_weight` over its slice, producing a per-core *partial of the
+output*. `ktdp.inter_tile_reduce` **[ktir-mlir-frontend]** (all-reduce or reduce-to-one,
+§2.4) then sums those output partials across cores. The reduce sits **mid-function,
+right after the local matmul — not at the start — and it reduces the matmul output, not
+the input.**
 
 **FFN worked through** (`down(act(up(x)))`, tensor-parallel):
 
@@ -286,10 +294,24 @@ consumer's first op — the function keeps its own body.
 |---|---|---|---|
 | up | `H = X @ W_up` | `W_up` column-sharded → `H` is `{x: N-split}` | — |
 | act | `A = act(H)` | elementwise, same `{x}` slicing | **(a)** same slicing → reads `H` from LX, no op |
-| down | `Y = A @ W_down` | contracts the sharded dim | **(b)** `down` begins with `inter_tile_reduce` over the per-core partials |
+| down | `Y = A @ W_down` | contracts the sharded dim | **(a)** reads `A` from LX (same `{x}`); the cross-core combine is *internal* to `down` (next row) |
+| down (internal) | `Y_partial = A_local @ W_down_local`, then reduce | each core sums over its slice of the contracted dim | `inter_tile_reduce` over `Y_partial` **after** the local matmul (the §7.2 split-K pattern) |
 
-So up / act / down stay **three separate functions**; only `down` gains a leading
-`inter_tile_reduce`. We do not merge the bodies.
+So up / act / down stay **three separate functions**. The `act → down` hand-off is pure
+elision (case a — `A` stays in LX, addressed by `construct_memory_view`; no inter-tile op,
+no future crosses the boundary). The cross-core combine is entirely **inside `down`**: its
+local matmul's `Y_partial` is wrapped by `inter_tile_produce` and consumed by
+`inter_tile_reduce` in the *same* function, so the `!ktdp.tile_future` never leaves `down`
+(§2.4). We do not merge the bodies, and the reduce is never `down`'s first op.
+
+> **TODO: better example for case (b).** FFN `down` is actually an *intrinsic* split-K
+> reduce (the §7.2 pattern, internal to one function) — the `act → down` round-trip is
+> elided by pure case (a), and the inter-tile reduce is not the round-trip-elision
+> mechanism here. We need an example that genuinely exercises case (b) as a *between-groups*
+> tool: a **producer** group that emits per-core partials to LX, consumed by a **consumer**
+> group (or a dedicated data-movement function) that reduces those LX partials at its start.
+> That is the case where produce+reduce replaces a round-trip, rather than implementing a
+> kernel's own contraction.
 
 At this KTIR layer the producer/consumer express only the **intent** (a combiner
 region); the cross-core reduction *algorithm* (ring topology, in-flight vs
@@ -321,49 +343,56 @@ are applied and is the final gate.
 
 ---
 
-## 6. Do we need a Triton-level inter-tile surface? (issue #20)
+## 6. The Triton-level inter-tile surface (`tl.inter_tile`)
 
-`torch-spyre/triton` **issue #20** proposes a Triton-language surface for
-cross-core reduction: `tl.inter_tile_produce` / `tl.inter_tile_reduce` Python
-builtins → `tt.inter_tile_*` ops → `ktdp.inter_tile_*` **[ktir-mlir-frontend]**.
-The author writes the grouping by hand:
+There is **one** Triton-level surface for cross-tile reduction, and it has **two
+providers**: the fuser synthesizes it for Inductor-lowered kernels, and the author
+writes it directly for hand-written kernels. Both emit the same `tt.inter_tile_*` →
+`ktdp.inter_tile_*` **[ktir-mlir-frontend]** ops, so the rest of this design does not
+care which provider supplied it.
+
+The surface is the **metadata-style** op `tl.inter_tile` designed in `inter-tile.md`:
 
 ```python
-partial = tl.sum(block, axis=0)
-fut = tl.inter_tile_produce(partial, producer_groups=[[0, 1, 2, 3]])
-reduced = tl.inter_tile_reduce(fut, consumer_groups=[[0, 1, 2, 3]],
-                               identity=tl.zeros([64], tl.float16),
-                               combine=lambda l, r: l + r)
-if pid == 0:                       # reduce-to-one; drop the guard for all-reduce
-    OUT_desc.store([0], reduced)
+reduced = tl.inter_tile(x, axis="in", combiner=lambda l, r: l + r, mode="all_reduce")
 ```
 
-**For this design, we do not need it.** Everything the `tl.` builtins ask the
-author to spell out, torch-spyre **already computes**:
+It names a *work-slice axis* (established by a hint, §5) rather than explicit core-ID
+groups, and a `mode` (`all_reduce` / `reduce_to_one` / `reduce_scatter` / `broadcast`)
+rather than a writer guard. This **supersedes** `torch-spyre/triton` **issue #20**'s
+original proposal, where the author hand-wrote the grouping
+(`tl.inter_tile_produce(partial, producer_groups=[[0,1,2,3]])` +
+`tl.inter_tile_reduce(... consumer_groups=..., combine=...)` + an `if pid == 0`
+guard for reduce-to-one). #20's open-ended combiner survives — as the `combiner`
+lambda — but the core-ID groups and the producer/consumer future split do not appear
+at `tl`: groups come from the work-slice metadata, and the `produce` + delivery split
+is a TTIR→KTIR lowering detail (see `inter-tile.md` §6).
 
-| `tl.inter_tile_*` argument (issue #20) | Already in torch-spyre |
+### 6.1 Inductor path — the fuser synthesizes the op
+
+For a kernel that came through torch-spyre Inductor, the author writes **nothing**:
+everything `tl.inter_tile` needs is already computed by the time the fuser runs.
+
+| `tl.inter_tile` input | Already in torch-spyre |
 |---|---|
-| `producer_groups` / `consumer_groups` | the core cohorts in `coreIdToWkSlice` **[torch-spyre]** |
-| `if pid == 0` (reduce-to-one) vs no guard (all-reduce) | implied by whether the consumer needs the result on one core or all |
-| `combine` lambda + `identity` | the op being distributed (the reduction torch-spyre is already lowering) |
+| `axis` (which tiles cooperate) | the core cohorts in `coreIdToWkSlice` + the split factor in `numWkSlicesPerDim` **[torch-spyre]** |
+| `mode` (`reduce_to_one` vs `all_reduce`) | whether the consumer needs the result on one core or all |
+| `combiner` (+ `identity`) | the op being distributed (the reduction Inductor is already lowering) |
 
 So the fuser reads `PerCoreView` / `numWkSlicesPerDim` / `coreIdToWkSlice` and
 **synthesizes** the `ktdp.inter_tile_*` ops itself (§4.2, case b). Re-stating the
-same grouping at the `tl.` level would be redundant for kernels that came through
-Inductor — the intent is *derivable*, not something the author must supply.
+same intent at the `tl` level would be redundant for Inductor kernels — it is
+*derivable*, not something the author must supply.
 
-**The combiner is arbitrary — but it is still captured, in the SDSC JSON.** The
-strongest argument for a `tl.` surface is #20's point that the combiner is
-open-ended: not just `sum`, but argmax, online-softmax-style merges, etc. The
-worry is that an inferred path can only handle a fixed set of named reductions.
-That worry does not apply to the Inductor path, because the combiner there is
-**not free-form text the author wrote** — it is the op Inductor lowered, and
-torch-spyre serializes that op (with its work split) into one **SDSC JSON per
-compute op** **[torch-spyre]**. The reduction the SDSC describes is whatever
-`linalg.reduce` / op chain produced it; an "arbitrary" combiner that came through
-Inductor is therefore already pinned down as a concrete compute description, not
-lost. Concretely, the fuser recovers every `ktdp.inter_tile_reduce` component from
-one SDSC:
+**The combiner is arbitrary — but on this path it is still captured, in the SDSC
+JSON.** #20's strongest point is that the combiner is open-ended: not just `sum`, but
+argmax, online-softmax-style merges, etc. The worry is that a synthesized path can
+only handle a fixed set of named reductions. That worry does not apply to the Inductor
+path, because the combiner there is **not free-form text the author wrote** — it is
+the op Inductor lowered, and torch-spyre serializes that op (with its work split) into
+one **SDSC JSON per compute op** **[torch-spyre]**. An "arbitrary" combiner that came
+through Inductor is therefore already pinned down as a concrete compute description.
+The fuser recovers every `ktdp.inter_tile_reduce` component from one SDSC:
 
 | `ktdp.inter_tile_reduce` needs | SDSC JSON field **[torch-spyre]** |
 |---|---|
@@ -372,31 +401,38 @@ one SDSC:
 | `combine` region | the reduction op's `ComputeNode` `type_` (e.g. `ADD` for matmul psum, `max`/`add` for softmax) in the op's schedule tree |
 | `identity` | that combiner's identity (the `linalg.fill` / accumulator init the op already carries, e.g. `0.0` for sum) |
 
-This is exactly the split-K case (§7.2): the `genericpartialreduction` SDSC for
-the K-combine is an `ADD` over the `in`-axis cohorts — the fuser reads the op and
-the cohorts and emits the matching `inter_tile_reduce`. A softmax distributed over
-its reduction axis is the same shape with a `max` (then `add`) combiner. No author
-lambda; the SDSC already says what to combine and how.
+This is exactly the split-K case (§7.2): the `genericpartialreduction` SDSC for the
+K-combine is an `ADD` over the `in`-axis cohorts — the fuser reads the op and the
+cohorts and synthesizes a `tl.inter_tile(..., axis="in", combiner=add,
+mode="all_reduce")`-equivalent that lowers to the matching `inter_tile_reduce`. A
+softmax distributed over its reduction axis is the same shape with a `max` (then
+`add`) combiner. No author lambda; the SDSC already says what to combine and how.
 
-**Hand-written kernels: combiner design left open.** A standalone Triton kernel
-that did **not** go through torch-spyre Inductor has no `work_division` metadata —
-nobody computed `coreIdToWkSlice` for it, and no SDSC pins down its combiner. There
-the author *is* the only source of both the grouping and the combiner, and a
-genuinely arbitrary combiner (argmax, online-softmax) may be one no Inductor op
-emits, so it cannot be recovered from an SDSC the way the table above describes. **We do
-not commit to a surface for this case here.** Issue #20's `tl.inter_tile_*` builtins (author writes
-the `combine` lambda + `producer_groups`) are one option; an out-of-band annotation
-is another. This mirrors the existing two-path split — the Inductor path derives
-layout/work-division for you (`tl.spyre_tensor_layout` is the analog), the standalone
-path makes the author state it — but the exact combiner-carrying surface for
-hand-written cross-core reductions is **out of scope for this design and left
-open**.
+### 6.2 Hand-written path — the author writes the same op
 
-**Net:** for the fusion scope here (stitching Inductor-lowered kernels), reuse
-`PerCoreView` and the SDSC — the grouping *and* combiner are derivable, so no `tl.`
-surface is needed. Issue #20 is **orthogonal**: it serves hand-written kernels,
-whose combiner design we deliberately leave open. Both converge on the same
-`ktdp.inter_tile_*` ops, so neither blocks the other.
+A standalone Triton kernel that did **not** go through Inductor has no
+`work_division` metadata and no SDSC, so nothing is derivable. The author is the only
+source of the intent — and supplies it through the **same** ops. `mode` and the
+`combiner` lambda go on the `tl.inter_tile` call directly; the genuinely open-ended
+combiners #20 worried about (argmax, online-softmax) are exactly the **region-form
+combiner** the surface supports (`inter-tile.md` §5, §7.4), with an explicit `identity`
+required for the custom case.
+
+The one thing the author must add to make `axis="in"` resolvable is a **work-slice
+annotation** (`tl.spyre_work_slice`, the analog of `tl.spyre_tensor_layout`): it names
+the grid dimensions so the reduction can reference one. The slice counts come from the
+grid shape and `coreIdToWkSlice` defaults to the row-major core→grid map, so naming the
+reduction dimension is usually all that is needed (`inter-tile.md` §8.1). This is the
+**same annotation Inductor emits** on the generated path — not a separate hand-written
+mechanism — so the unification is real: the Inductor path *emits* `tl.spyre_work_slice`
++ synthesizes `tl.inter_tile`; the standalone path has the author *write* both. Same two
+ops, same lowering.
+
+**Net:** one surface (`tl.inter_tile`), two providers. For the fusion scope here
+(stitching Inductor-lowered kernels), the fuser synthesizes it from `PerCoreView` +
+the SDSC, so the author writes nothing. For hand-written kernels the author writes the
+same op. Both converge on the same `ktdp.inter_tile_*` ops via the lowering in
+`inter-tile.md`, so neither path blocks the other.
 
 ---
 
