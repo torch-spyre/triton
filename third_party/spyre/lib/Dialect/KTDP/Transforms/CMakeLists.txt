@@ -2,6 +2,7 @@ add_triton_library(KTDPTransforms
   ConvertFunctions.cpp
   LowerDescriptorMemory.cpp
   LowerComputeOps.cpp
+  RewriteDescriptorLayout.cpp
   DistributeWork.cpp
   Utility.cpp
 

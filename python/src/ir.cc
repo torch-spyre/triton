@@ -1873,7 +1873,22 @@ void init_triton_ir(py::module &&m) {
              return self.create<MakeTensorDescOp>(base, shape, strides,
                                                   tensorShape, isSignedInteger,
                                                   paddingOption);
-           });
+           })
+#ifdef TRITON_BUILD_TTIR_ONLY // --- added for spyre
+      // Spyre-only: emit the tt.spyre_tensor_layout marker op. The physical
+      // layout rides as three i32 array attributes (the OpSpec
+      // device_coordinates form) so it survives constant folding. Guarded out of
+      // GPU builds (the builtin that calls this is also spyre-target-guarded).
+      .def("create_spyre_tensor_layout",
+           [](TritonOpBuilder &self, Value &desc, std::vector<int64_t> &physSrc,
+              std::vector<int64_t> &physOp, std::vector<int64_t> &physArg) -> void {
+             self.create<SpyreTensorLayoutOp>(
+                 desc, self.getBuilder().getDenseI64ArrayAttr(physSrc),
+                 self.getBuilder().getDenseI64ArrayAttr(physOp),
+                 self.getBuilder().getDenseI64ArrayAttr(physArg));
+           })
+#endif // --- added for spyre
+      ;
 
   // Add custom operations.
   for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
