@@ -8,4 +8,5 @@ Patterns are organized by category. Each section lists supported patterns alongs
 
 - [Compute](compute.md)
 - [Distribution](distribution.md)
+- [Inter Tile](inter-tile.md)
 - [Memory](memory.md)
