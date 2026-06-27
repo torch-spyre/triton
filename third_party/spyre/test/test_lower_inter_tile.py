@@ -24,6 +24,7 @@ both the RuntimeError and the MLIR diagnostic on stderr.
 
 import pytest
 from conftest import SinglePassTester
+from utils_pattern import pattern
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +131,11 @@ def _func_attrs(num_slices: dict, core_map: list[dict] | None = None,
 class TestFoldAway(LowerInterTileTester):
     """W[axis] == 1 → partials forwarded directly; no KTDP ops emitted."""
 
+    @pattern("fold-away", category="inter-tile", example=[
+        "# W[axis] == 1: reduction is a no-op, partial forwarded directly",
+        "result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')",
+        "# (axis 'x' has a single slice — no cross-tile communication)",
+    ])
     def test_single_tile_axis(self):
         """Single slice on the reduced axis — op is elided entirely."""
         attrs = _func_attrs({"x": 1})
@@ -179,6 +185,11 @@ class TestFoldAway(LowerInterTileTester):
 class TestGroupSets(LowerInterTileTester):
     """Groups affine sets are emitted and structurally correct."""
 
+    @pattern("group-sets", category="inter-tile", example=[
+        "# Groups affine sets encode which tiles cooperate in a reduction",
+        "result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')",
+        "# producer_tiles_per_group + groups attrs emitted on inter_tile_produce",
+    ])
     def test_groups_present(self):
         """inter_tile_produce carries producer_tiles_per_group + groups."""
         # 4 tiles, all reducing on axis "x" (gsize=4, ngroups=1)
@@ -224,6 +235,10 @@ class TestGroupSets(LowerInterTileTester):
 class TestAllReduce(LowerInterTileTester):
     """all_reduce emits inter_tile_produce + inter_tile_reduce."""
 
+    @pattern("all-reduce", category="inter-tile", example=[
+        "result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')",
+        "# Every tile in the group receives the fully reduced value",
+    ])
     def test_produce_reduce_pair_emitted(self):
         """all_reduce emits produce/reduce pair; tt.inter_tile_reduce is erased."""
         attrs = _func_attrs({"x": 4})
@@ -246,6 +261,10 @@ class TestAllReduce(LowerInterTileTester):
 class TestReduceToOne(LowerInterTileTester):
     """reduce_to_one emits the produce/reduce pair (consumer = pick₀)."""
 
+    @pattern("reduce-to-one", category="inter-tile", example=[
+        "result = tl.inter_tile(partial, axis='x', combiner='add', mode='reduce_to_one')",
+        "# Only the designated tile (pick₀ per group) receives the reduced value",
+    ])
     def test_reduce_to_one_emitted(self):
         attrs = _func_attrs({"x": 4})
         self.run(f"""
@@ -286,6 +305,10 @@ class TestShorthandIdentity(LowerInterTileTester):
         }}
         """)
 
+    @pattern("shorthand-identity", category="inter-tile", example=[
+        "result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')",
+        "# Shorthand 'add' → identity 0.0 filled via linalg.fill + arith.constant",
+    ])
     def test_add_identity(self):
         """add combiner → arith.constant 0.0 via linalg.fill."""
         self._run_shorthand("add")
@@ -314,6 +337,11 @@ class TestShorthandIdentity(LowerInterTileTester):
 class TestResultTypes(LowerInterTileTester):
     """Delivery op result type has rank one less than the partial."""
 
+    @pattern("result-types", category="inter-tile", example=[
+        "partial: tensor<1xNxf32>  # leading unit axis = within-group tile axis",
+        "result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')",
+        "# result: tensor<Nxf32>  — unit axis collapsed, rank decremented by 1",
+    ])
     def test_f32_result_type(self):
         """tensor<1x16xf32> partial → tensor<16xf32> result."""
         attrs = _func_attrs({"x": 2})
@@ -376,6 +404,10 @@ class TestResultTypes(LowerInterTileTester):
 class TestNoOp(LowerInterTileTester):
     """Module with no tt.inter_tile_reduce passes through unchanged."""
 
+    @pattern("no-op", category="inter-tile", example=[
+        "# No tl.inter_tile call — pass does not transform the module",
+        "result = x + y  # plain arithmetic; no inter-tile reduction",
+    ])
     def test_empty_module_unchanged(self):
         self.run("""
         module {
