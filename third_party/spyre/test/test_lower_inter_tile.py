@@ -66,9 +66,12 @@ def _row_major_core_map(num_slices: dict) -> list[dict]:
     return core_map
 
 
-def _func_attrs(num_slices: dict, core_map: list[dict] | None = None,
-                dep: dict | None = None) -> str:
-    """Return the full ``attributes { ... }`` block for a ``tt.func``.
+def _op_attrs(num_slices: dict, core_map: list[dict] | None = None,
+              dep: dict | None = None) -> str:
+    """Return the inline ``{ ... }`` attr-dict for a ``tt.inter_tile_reduce`` op.
+
+    The work-slice metadata is attached directly to the op (not to the enclosing
+    tt.func), so each op carries its own W/C/D.
 
     Args:
         num_slices: axis-name → slice-count, e.g. ``{"x": 2, "y": 4}``.
@@ -85,23 +88,23 @@ def _func_attrs(num_slices: dict, core_map: list[dict] | None = None,
     Examples::
 
         # 2 tiles, single axis "x" — auto row-major:
-        _func_attrs({"x": 2})
+        _op_attrs({"x": 2})
 
         # 4 tiles, "x" outer × "y" inner — auto row-major:
         #   tile 0 → x=0,y=0  tile 1 → x=0,y=1
         #   tile 2 → x=1,y=0  tile 3 → x=1,y=1
-        _func_attrs({"x": 2, "y": 2})
+        _op_attrs({"x": 2, "y": 2})
 
         # Strided layout (T8): "y" outer (s_y=2), "x" inner — auto:
         #   tile 0 → y=0,x=0  tile 1 → y=0,x=1
         #   tile 2 → y=1,x=0  tile 3 → y=1,x=1
-        _func_attrs({"y": 2, "x": 2})
+        _op_attrs({"y": 2, "x": 2})
 
         # Non-standard pin (T5) — explicit core_map:
-        _func_attrs({"x": 2}, core_map=[{"x": 1}, {"x": 0}])
+        _op_attrs({"x": 2}, core_map=[{"x": 1}, {"x": 0}])
 
         # With per-tile dependency:
-        _func_attrs({"x": 2}, dep={"0": [0], "1": [1]})
+        _op_attrs({"x": 2}, dep={"0": [0], "1": [1]})
     """
     if core_map is None:
         core_map = _row_major_core_map(num_slices)
@@ -121,7 +124,7 @@ def _func_attrs(num_slices: dict, core_map: list[dict] | None = None,
             vals = ", ".join(f'{v} : i64' for v in vs)
             items.append(f'"{k}" = [{vals}]')
         base += ', depWkSlices = {' + ", ".join(items) + '}'
-    return "attributes {" + base + "}"
+    return "{" + base + "}"
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +141,15 @@ class TestFoldAway(LowerInterTileTester):
     ])
     def test_single_tile_axis(self):
         """Single slice on the reduced axis — op is elided entirely."""
-        attrs = _func_attrs({"x": 1})
+        attrs = _op_attrs({"x": 1})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x16xf32>) -> tensor<1x16xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<1x16xf32>)
             tt.return %0 : tensor<1x16xf32>
           }}
@@ -157,14 +161,15 @@ class TestFoldAway(LowerInterTileTester):
 
     def test_fold_away_on_non_innermost_axis(self):
         """W[y]==1 triggers fold-away even when other axes have W>1."""
-        attrs = _func_attrs({"x": 4, "y": 1})
+        attrs = _op_attrs({"x": 4, "y": 1})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "y" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<1x8xf32>)
             tt.return %0 : tensor<1x8xf32>
           }}
@@ -193,14 +198,15 @@ class TestGroupSets(LowerInterTileTester):
     def test_groups_present(self):
         """inter_tile_produce carries producer_tiles_per_group + groups."""
         # 4 tiles, all reducing on axis "x" (gsize=4, ngroups=1)
-        attrs = _func_attrs({"x": 4})
+        attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<16xf32>)
             tt.return %0 : tensor<16xf32>
           }}
@@ -211,14 +217,15 @@ class TestGroupSets(LowerInterTileTester):
 
     def test_two_groups(self):
         """2 groups × 2 tiles each: gsize=2, ngroups=2."""
-        attrs = _func_attrs({"x": 2, "y": 2})
+        attrs = _op_attrs({"x": 2, "y": 2})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<8xf32>)
             tt.return %0 : tensor<8xf32>
           }}
@@ -235,14 +242,15 @@ class TestGroupSets(LowerInterTileTester):
           groups = (g) : 2 constraints (g >= 0, g <= ngroups-1)
         Checks C1/Q3: the standard contiguous form used by all current fixtures.
         """
-        attrs = _func_attrs({"x": 4})
+        attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<16xf32>)
             tt.return %0 : tensor<16xf32>
           }}
@@ -263,14 +271,15 @@ class TestGroupSets(LowerInterTileTester):
         groups: 1 dim, 0 symbols, 2 constraints.
         T12 (C7): groups partition producers disjointly.
         """
-        attrs = _func_attrs({"x": 2, "y": 2})
+        attrs = _op_attrs({"x": 2, "y": 2})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<8xf32>)
             tt.return %0 : tensor<8xf32>
           }}
@@ -298,14 +307,15 @@ class TestAllReduce(LowerInterTileTester):
     ])
     def test_produce_reduce_pair_emitted(self):
         """all_reduce emits produce/reduce pair; tt.inter_tile_reduce is erased."""
-        attrs = _func_attrs({"x": 4})
+        attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<16xf32>)
             tt.return %0 : tensor<16xf32>
           }}
@@ -321,14 +331,15 @@ class TestAllReduce(LowerInterTileTester):
         in the group receives the result. Verified by checking both affine sets
         have 1 dim, 1 symbol, 2 constraints (the contiguous group form).
         """
-        attrs = _func_attrs({"x": 2})
+        attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<8xf32>)
             tt.return %0 : tensor<8xf32>
           }}
@@ -339,14 +350,15 @@ class TestAllReduce(LowerInterTileTester):
 
     def test_future_single_use(self):
         """The tile_future produced by inter_tile_produce has exactly one use (C7/Q9)."""
-        attrs = _func_attrs({"x": 2})
+        attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<8xf32>)
             tt.return %0 : tensor<8xf32>
           }}
@@ -365,14 +377,15 @@ class TestReduceToOne(LowerInterTileTester):
         "# Only the designated tile (pick₀ per group) receives the reduced value",
     ])
     def test_reduce_to_one_emitted(self):
-        attrs = _func_attrs({"x": 4})
+        attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "reduce_to_one" combiner = "add"
+                   {attrs}
                    -> (tensor<16xf32>)
             tt.return %0 : tensor<16xf32>
           }}
@@ -390,14 +403,15 @@ class TestShorthandIdentity(LowerInterTileTester):
     """add/max/mul shorthand combiners materialize the correct identity."""
 
     def _run_shorthand(self, combiner: str):
-        attrs = _func_attrs({"x": 2})
+        attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "x" mode = "all_reduce" combiner = "{combiner}"
+                   {attrs}
                    -> (tensor<8xf32>)
             tt.return %0 : tensor<8xf32>
           }}
@@ -447,14 +461,15 @@ class TestResultTypes(LowerInterTileTester):
     ])
     def test_f32_result_type(self):
         """tensor<1x16xf32> partial → tensor<16xf32> result."""
-        attrs = _func_attrs({"x": 2})
+        attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<16xf32>)
             tt.return %0 : tensor<16xf32>
           }}
@@ -464,14 +479,15 @@ class TestResultTypes(LowerInterTileTester):
 
     def test_f16_result_type(self):
         """f16 partial → f16 result (spec P6)."""
-        attrs = _func_attrs({"x": 2})
+        attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x8xf16>) -> tensor<8xf16>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf16>)
                    axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<8xf16>)
             tt.return %0 : tensor<8xf16>
           }}
@@ -481,15 +497,16 @@ class TestResultTypes(LowerInterTileTester):
 
     def test_multi_arity_result_types(self):
         """A=2 partials → A=2 results (multi-arity path, spec P7)."""
-        attrs = _func_attrs({"x": 2})
+        attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
           tt.func @k(%p0: tensor<1x8xf32>, %p1: tensor<1x8xf32>)
               -> (tensor<8xf32>, tensor<8xf32>)
-          {attrs} {{
+          {{
             %0, %1 = tt.inter_tile_reduce
                        partials(%p0 : tensor<1x8xf32>, %p1 : tensor<1x8xf32>)
                        axis = "x" mode = "all_reduce" combiner = "add"
+                       {attrs}
                        -> (tensor<8xf32>, tensor<8xf32>)
             tt.return %0, %1 : tensor<8xf32>, tensor<8xf32>
           }}
@@ -504,14 +521,15 @@ class TestResultTypes(LowerInterTileTester):
         Tests the invariant directly: rank(partial)=2, rank(result)=1.
         For T1: tensor<1x16xf32> → tensor<16xf32>.
         """
-        attrs = _func_attrs({"x": 4})
+        attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
-          {attrs} {{
+          {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
                    -> (tensor<16xf32>)
             tt.return %0 : tensor<16xf32>
           }}
@@ -544,16 +562,14 @@ class TestNoOp(LowerInterTileTester):
         """)
         self.assert_absent("ktdp.inter_tile_produce", "ktdp.inter_tile_reduce")
 
-    def test_func_with_attrs_no_op(self):
-        """Function with work-slice attrs but no inter_tile_reduce → unchanged."""
-        attrs = _func_attrs({"x": 4})
-        self.run(f"""
-        module {{
-          tt.func @k(%a: tensor<16xf32>) -> tensor<16xf32>
-          {attrs} {{
+    def test_func_with_no_op_unchanged(self):
+        """Function with no inter_tile_reduce → unchanged (no op to lower)."""
+        self.run("""
+        module {
+          tt.func @k(%a: tensor<16xf32>) -> tensor<16xf32> {
             tt.return %a : tensor<16xf32>
-          }}
-        }}
+          }
+        }
         """)
         self.assert_absent("ktdp.inter_tile_produce", "ktdp.inter_tile_reduce")
 
@@ -566,15 +582,16 @@ class TestBroadcastDeferred(LowerInterTileTester):
     """broadcast and reduce_scatter are rejected with R8 diagnostic."""
 
     def test_broadcast_rejected(self, capfd):
-        attrs = _func_attrs({"x": 2})
+        attrs = _op_attrs({"x": 2})
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
               tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
-              {attrs} {{
+              {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "broadcast" combiner = ""
+                       {attrs}
                        -> (tensor<8xf32>)
                 tt.return %0 : tensor<8xf32>
               }}
@@ -583,16 +600,17 @@ class TestBroadcastDeferred(LowerInterTileTester):
         self.assert_stderr(capfd, "not yet supported")
 
     def test_reduce_scatter_rejected(self, capfd):
-        attrs = _func_attrs({"x": 2})
+        attrs = _op_attrs({"x": 2})
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
               tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
-              {attrs} {{
+              {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "reduce_scatter" combiner = "add"
                        scatter_dimension = 0
+                       {attrs}
                        -> (tensor<8xf32>)
                 tt.return %0 : tensor<8xf32>
               }}
@@ -609,7 +627,7 @@ class TestValidation(LowerInterTileTester):
     """Inline precondition checks (P3/P4/P5) emit diagnostics and fail."""
 
     def test_missing_work_slice_attrs_rejected(self, capfd):
-        """R2: missing numWkSlicesPerDim → diagnostic."""
+        """R2: op without work-slice attrs → op verifier rejects (requires coreIdToWkSlice)."""
         with pytest.raises(RuntimeError):
             self.run("""
             module {
@@ -622,19 +640,20 @@ class TestValidation(LowerInterTileTester):
               }
             }
             """)
-        self.assert_stderr(capfd, "numWkSlicesPerDim")
+        self.assert_stderr(capfd, "requires attribute")
 
     def test_unknown_axis_rejected(self, capfd):
         """R1: axis not in numWkSlicesPerDim → diagnostic."""
-        attrs = _func_attrs({"y": 2})
+        attrs = _op_attrs({"y": 2})
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
               tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
-              {attrs} {{
+              {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "all_reduce" combiner = "add"
+                       {attrs}
                        -> (tensor<8xf32>)
                 tt.return %0 : tensor<8xf32>
               }}
@@ -644,15 +663,16 @@ class TestValidation(LowerInterTileTester):
 
     def test_unknown_mode_rejected(self, capfd):
         """R5: unknown mode string → diagnostic."""
-        attrs = _func_attrs({"x": 2})
+        attrs = _op_attrs({"x": 2})
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
               tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
-              {attrs} {{
+              {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "bad_mode" combiner = "add"
+                       {attrs}
                        -> (tensor<8xf32>)
                 tt.return %0 : tensor<8xf32>
               }}
@@ -662,15 +682,16 @@ class TestValidation(LowerInterTileTester):
 
     def test_region_combiner_without_identity_rejected(self, capfd):
         """R4: region combiner (combiner="") with no identity operands → diagnostic."""
-        attrs = _func_attrs({"x": 2})
+        attrs = _op_attrs({"x": 2})
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
               tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
-              {attrs} {{
+              {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "all_reduce" combiner = ""
+                       {attrs}
                        -> (tensor<8xf32>)
                 tt.return %0 : tensor<8xf32>
               }}
@@ -680,16 +701,17 @@ class TestValidation(LowerInterTileTester):
 
     def test_scatter_dim_without_reduce_scatter_rejected(self, capfd):
         """R3: scatter_dimension on non-reduce_scatter mode → diagnostic."""
-        attrs = _func_attrs({"x": 2})
+        attrs = _op_attrs({"x": 2})
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
               tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
-              {attrs} {{
+              {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "all_reduce" combiner = "add"
                        scatter_dimension = 0
+                       {attrs}
                        -> (tensor<8xf32>)
                 tt.return %0 : tensor<8xf32>
               }}

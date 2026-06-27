@@ -1052,7 +1052,13 @@ def TT_InterTileReduceOp : TT_Op<"inter_tile_reduce", [
     StrAttr:$axis,
     StrAttr:$mode,
     StrAttr:$combiner,
-    OptionalAttr<I64Attr>:$scatter_dimension
+    OptionalAttr<I64Attr>:$scatter_dimension,
+    // Work-slice op attributes (from tl.inter_tile work_slices/dep_work_slices
+    // constexprs). The frontend derives W from C and stores both on the op so
+    // LowerInterTile can read them without consulting the enclosing tt.func.
+    DictionaryAttr:$numWkSlicesPerDim,        // W: axis → count
+    ArrayAttr:$coreIdToWkSlice,               // C: per-tile {axis → slice-idx}
+    OptionalAttr<DictionaryAttr>:$depWkSlices // D: consumer-local → [prod-local]
   );
   let results = (outs Variadic<AnyTensor>:$results);
   let regions = (region AnyRegion:$combiner_region);

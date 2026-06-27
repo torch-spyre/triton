@@ -79,6 +79,7 @@ from .core import (
     gather,
     histogram,
     inline_asm_elementwise,
+    inter_tile,  # --- added for spyre
     int1,
     int16,
     int32,
@@ -207,6 +208,7 @@ __all__ = [
     "histogram",
     "inline_asm_elementwise",
     "interleave",
+    "inter_tile",  # --- added for spyre
     "int1",
     "int16",
     "int32",
