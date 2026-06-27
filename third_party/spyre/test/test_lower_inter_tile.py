@@ -227,6 +227,63 @@ class TestGroupSets(LowerInterTileTester):
         self.assert_present("ktdp.inter_tile_produce", "ktdp.inter_tile_reduce")
         self.assert_absent("tt.inter_tile_reduce")
 
+    def test_groups_partition(self):
+        """Groups affine sets have the right shape for contiguous coop_α (s_α=1, innermost).
+
+        For gsize=4, ngroups=1:
+          producer_tiles_per_group = (i)[g] : 2 constraints (≥ lower, ≤ upper)
+          groups = (g) : 2 constraints (g >= 0, g <= ngroups-1)
+        Checks C1/Q3: the standard contiguous form used by all current fixtures.
+        """
+        attrs = _func_attrs({"x": 4})
+        self.run(f"""
+        module {{
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          {attrs} {{
+            %0 = tt.inter_tile_reduce
+                   partials(%p : tensor<1x16xf32>)
+                   axis = "x" mode = "all_reduce" combiner = "add"
+                   -> (tensor<16xf32>)
+            tt.return %0 : tensor<16xf32>
+          }}
+        }}
+        """)
+        # producer_tiles_per_group: 1 dim (i), 1 symbol (g), 2 constraints (≥/≤)
+        self.assert_integer_set("ktdp.inter_tile_produce", "producer_tiles_per_group",
+                                num_dims=1, num_symbols=1, num_constraints=2)
+        # groups: 1 dim (g), 0 symbols, 2 constraints (g >= 0, ngroups-1-g >= 0)
+        self.assert_integer_set("ktdp.inter_tile_produce", "groups",
+                                num_dims=1, num_symbols=0, num_constraints=2)
+
+    def test_multi_group_partition(self):
+        """Multi-group case: 2 groups × 2 tiles; verify affine set shapes.
+
+        gsize=2, ngroups=2 (reducing "x", "y" is the orthogonal axis).
+        producer_tiles_per_group: 1 dim, 1 symbol, 2 constraints.
+        groups: 1 dim, 0 symbols, 2 constraints.
+        T12 (C7): groups partition producers disjointly.
+        """
+        attrs = _func_attrs({"x": 2, "y": 2})
+        self.run(f"""
+        module {{
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          {attrs} {{
+            %0 = tt.inter_tile_reduce
+                   partials(%p : tensor<1x8xf32>)
+                   axis = "x" mode = "all_reduce" combiner = "add"
+                   -> (tensor<8xf32>)
+            tt.return %0 : tensor<8xf32>
+          }}
+        }}
+        """)
+        self.assert_integer_set("ktdp.inter_tile_produce", "producer_tiles_per_group",
+                                num_dims=1, num_symbols=1, num_constraints=2)
+        self.assert_integer_set("ktdp.inter_tile_produce", "groups",
+                                num_dims=1, num_symbols=0, num_constraints=2)
+        # The reduce op also carries consumer_tiles_per_group and groups.
+        self.assert_affine_attr("ktdp.inter_tile_reduce", "consumer_tiles_per_group")
+        self.assert_affine_attr("ktdp.inter_tile_reduce", "groups")
+
 
 # ---------------------------------------------------------------------------
 # C2 / Q2 — Delivery selection: all_reduce vs reduce_to_one
@@ -256,6 +313,48 @@ class TestAllReduce(LowerInterTileTester):
         """)
         self.assert_present("ktdp.inter_tile_produce", "ktdp.inter_tile_reduce")
         self.assert_absent("tt.inter_tile_reduce")
+
+    def test_consumer_equals_producer(self):
+        """all_reduce: consumer_tiles_per_group has same affine shape as producer_tiles_per_group (C2/Q2).
+
+        For all_reduce the delivery op's consumer set = producer set — every tile
+        in the group receives the result. Verified by checking both affine sets
+        have 1 dim, 1 symbol, 2 constraints (the contiguous group form).
+        """
+        attrs = _func_attrs({"x": 2})
+        self.run(f"""
+        module {{
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          {attrs} {{
+            %0 = tt.inter_tile_reduce
+                   partials(%p : tensor<1x8xf32>)
+                   axis = "x" mode = "all_reduce" combiner = "add"
+                   -> (tensor<8xf32>)
+            tt.return %0 : tensor<8xf32>
+          }}
+        }}
+        """)
+        self.assert_integer_set("ktdp.inter_tile_reduce", "consumer_tiles_per_group",
+                                num_dims=1, num_symbols=1, num_constraints=2)
+
+    def test_future_single_use(self):
+        """The tile_future produced by inter_tile_produce has exactly one use (C7/Q9)."""
+        attrs = _func_attrs({"x": 2})
+        self.run(f"""
+        module {{
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          {attrs} {{
+            %0 = tt.inter_tile_reduce
+                   partials(%p : tensor<1x8xf32>)
+                   axis = "x" mode = "all_reduce" combiner = "add"
+                   -> (tensor<8xf32>)
+            tt.return %0 : tensor<8xf32>
+          }}
+        }}
+        """)
+        # tile_future result type appears exactly once as an operand (in the reduce op)
+        self.assert_count("ktdp.inter_tile_produce", 1, cmp="eq")
+        self.assert_count("ktdp.inter_tile_reduce", 1, cmp="eq")
 
 
 class TestReduceToOne(LowerInterTileTester):
@@ -310,19 +409,23 @@ class TestShorthandIdentity(LowerInterTileTester):
         "# Shorthand 'add' → identity 0.0 filled via linalg.fill + arith.constant",
     ])
     def test_add_identity(self):
-        """add combiner → arith.constant 0.0 via linalg.fill."""
+        """add combiner → scalar arith.constant fed into linalg.fill (C3/Q4)."""
         self._run_shorthand("add")
         self.assert_present("linalg.fill", "arith.constant")
+        # The fill input is the arith.constant scalar identity value.
+        self.assert_operand("linalg.fill", 0, defined_by="arith.constant")
 
     def test_max_identity(self):
-        """max combiner → arith.constant -inf via linalg.fill."""
+        """max combiner → scalar arith.constant fed into linalg.fill (C3/Q4)."""
         self._run_shorthand("max")
         self.assert_present("linalg.fill", "arith.constant")
+        self.assert_operand("linalg.fill", 0, defined_by="arith.constant")
 
     def test_mul_identity(self):
-        """mul combiner → arith.constant 1.0 via linalg.fill."""
+        """mul combiner → scalar arith.constant fed into linalg.fill (C3/Q4)."""
         self._run_shorthand("mul")
         self.assert_present("linalg.fill", "arith.constant")
+        self.assert_operand("linalg.fill", 0, defined_by="arith.constant")
 
     def test_produce_reduce_regions(self):
         """Producer region contains yield_partial; reducer region contains yield_reduced."""
@@ -393,6 +496,29 @@ class TestResultTypes(LowerInterTileTester):
         }}
         """)
         self.assert_present("ktdp.inter_tile_reduce")
+        self.assert_absent("tt.inter_tile_reduce")
+
+    def test_result_rank_one_less_than_partial(self):
+        """Result rank = partial rank - 1: the unit axis is always collapsed (C4/Q5).
+
+        Tests the invariant directly: rank(partial)=2, rank(result)=1.
+        For T1: tensor<1x16xf32> → tensor<16xf32>.
+        """
+        attrs = _func_attrs({"x": 4})
+        self.run(f"""
+        module {{
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          {attrs} {{
+            %0 = tt.inter_tile_reduce
+                   partials(%p : tensor<1x16xf32>)
+                   axis = "x" mode = "all_reduce" combiner = "add"
+                   -> (tensor<16xf32>)
+            tt.return %0 : tensor<16xf32>
+          }}
+        }}
+        """)
+        # The collapsed result must NOT contain "1x" (the unit axis is gone).
+        self.assert_result_type("ktdp.inter_tile_reduce", "tensor<16xf32>")
         self.assert_absent("tt.inter_tile_reduce")
 
 
