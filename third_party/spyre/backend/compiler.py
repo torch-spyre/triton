@@ -115,14 +115,15 @@ class SpyreBackend(BaseBackend):
     def _make_ktir(self, mod, metadata, options):
         """Lower optimized TTIR to KTIR using C++ MLIR passes.
 
-        Pipeline (add_convert_ttir_to_ktdp expands to steps 1-4):
+        Pipeline (add_convert_ttir_to_ktdp expands to steps 1-5):
         1. LowerDescriptorMemory: tt.descriptor_load/store/gather/scatter -> ktdp.*
         2. LowerScalarLoad: scalar tt.load (+ addptr chain) -> ktdp.* rank-0 read
         3. LowerComputeOps: tt.reduce/broadcast/expand_dims -> linalg/tensor + dead op sweep
-        4. ConvertFunctions: tt.func/return -> func.func/return, !tt.ptr -> index
+        4. LowerInterTile: tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery  # --- added for spyre
+        5. ConvertFunctions: tt.func/return -> func.func/return, !tt.ptr -> index
            (must run last — memory passes consume !tt.ptr args via getBasePtrAsIndex)
-        5. DistributeWork: tt.get_program_id -> ktdp.get_compute_tile_id
-        6. canonicalize + CSE
+        6. DistributeWork: tt.get_program_id -> ktdp.get_compute_tile_id
+        7. canonicalize + CSE
         """
         from triton._C.libtriton import ir, passes, spyre
 

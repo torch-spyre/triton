@@ -1671,5 +1671,170 @@ LogicalResult DescriptorReduceOp::verify() {
                                      getSrc().getType());
 }
 
+#ifdef TRITON_BUILD_TTIR_ONLY // --- START --- added for spyre
+// InterTileReduceOp custom assembly format.
+//
+// Syntax:
+//   tt.inter_tile_reduce
+//     partials(%a : tensor<...>, ...)
+//     [, identities(%b : tensor<...>, ...)]
+//     axis = "<name>" mode = "<mode>" combiner = "<comb>"
+//     [scatter_dimension = <i64>]
+//     [attr-dict]
+//     [-> (<result-types>)]
+//     [({ ... })]   <- combiner_region, only when combiner = ""
+//
+// operand_segment_sizes is set automatically.
+
+ParseResult InterTileReduceOp::parse(OpAsmParser &parser,
+                                     OperationState &result) {
+  SmallVector<OpAsmParser::UnresolvedOperand> partials, identities;
+  SmallVector<Type> partialTypes, identityTypes;
+
+  // partials(...)
+  if (parser.parseKeyword("partials") || parser.parseLParen())
+    return failure();
+  if (parser.parseOptionalRParen().failed()) {
+    do {
+      OpAsmParser::UnresolvedOperand operand;
+      Type ty;
+      if (parser.parseOperand(operand) || parser.parseColonType(ty))
+        return failure();
+      partials.push_back(operand);
+      partialTypes.push_back(ty);
+    } while (succeeded(parser.parseOptionalComma()));
+    if (parser.parseRParen())
+      return failure();
+  }
+
+  // optional , identities(...)
+  if (succeeded(parser.parseOptionalComma())) {
+    if (parser.parseKeyword("identities") || parser.parseLParen())
+      return failure();
+    if (parser.parseOptionalRParen().failed()) {
+      do {
+        OpAsmParser::UnresolvedOperand operand;
+        Type ty;
+        if (parser.parseOperand(operand) || parser.parseColonType(ty))
+          return failure();
+        identities.push_back(operand);
+        identityTypes.push_back(ty);
+      } while (succeeded(parser.parseOptionalComma()));
+      if (parser.parseRParen())
+        return failure();
+    }
+  }
+
+  // axis = "..." mode = "..." combiner = "..."
+  std::string axis, mode, combiner;
+  if (parser.parseKeyword("axis") || parser.parseEqual() ||
+      parser.parseString(&axis) ||
+      parser.parseKeyword("mode") || parser.parseEqual() ||
+      parser.parseString(&mode) ||
+      parser.parseKeyword("combiner") || parser.parseEqual() ||
+      parser.parseString(&combiner))
+    return failure();
+
+  result.addAttribute("axis",     StringAttr::get(parser.getContext(), axis));
+  result.addAttribute("mode",     StringAttr::get(parser.getContext(), mode));
+  result.addAttribute("combiner", StringAttr::get(parser.getContext(), combiner));
+
+  // optional scatter_dimension = <i64>
+  if (succeeded(parser.parseOptionalKeyword("scatter_dimension"))) {
+    int64_t sd;
+    if (parser.parseEqual() || parser.parseInteger(sd))
+      return failure();
+    result.addAttribute(
+        "scatter_dimension",
+        IntegerAttr::get(IntegerType::get(parser.getContext(), 64), sd));
+  }
+
+  // attr-dict (remaining attributes)
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  // optional -> (result-types)
+  SmallVector<Type> resultTypes;
+  if (succeeded(parser.parseOptionalArrow())) {
+    if (parser.parseLParen())
+      return failure();
+    if (parser.parseOptionalRParen().failed()) {
+      do {
+        Type ty;
+        if (parser.parseType(ty))
+          return failure();
+        resultTypes.push_back(ty);
+      } while (succeeded(parser.parseOptionalComma()));
+      if (parser.parseRParen())
+        return failure();
+    }
+  }
+
+  // Resolve operands
+  if (parser.resolveOperands(partials, partialTypes, parser.getNameLoc(),
+                              result.operands) ||
+      parser.resolveOperands(identities, identityTypes, parser.getNameLoc(),
+                              result.operands))
+    return failure();
+
+  // operand_segment_sizes required by AttrSizedOperandSegments
+  result.addAttribute(
+      InterTileReduceOp::getOperandSegmentSizeAttr(),
+      parser.getBuilder().getDenseI32ArrayAttr(
+          {static_cast<int32_t>(partials.size()),
+           static_cast<int32_t>(identities.size())}));
+
+  result.addTypes(resultTypes);
+
+  // optional combiner region
+  Region *region = result.addRegion();
+  OptionalParseResult regionResult = parser.parseOptionalRegion(*region);
+  if (regionResult.has_value() && failed(*regionResult))
+    return failure();
+
+  return success();
+}
+
+void InterTileReduceOp::print(OpAsmPrinter &printer) {
+  printer << " partials(";
+  llvm::interleaveComma(getPartials(), printer, [&](Value v) {
+    printer << v << " : " << v.getType();
+  });
+  printer << ")";
+
+  if (!getIdentities().empty()) {
+    printer << ", identities(";
+    llvm::interleaveComma(getIdentities(), printer, [&](Value v) {
+      printer << v << " : " << v.getType();
+    });
+    printer << ")";
+  }
+
+  printer << " axis = \"" << getAxis() << "\""
+          << " mode = \"" << getMode() << "\""
+          << " combiner = \"" << getCombiner() << "\"";
+
+  if (auto sd = getScatterDimension())
+    printer << " scatter_dimension = " << *sd;
+
+  printer.printOptionalAttrDict(
+      (*this)->getAttrs(),
+      /*elidedAttrs=*/{"axis", "mode", "combiner", "scatter_dimension",
+                       InterTileReduceOp::getOperandSegmentSizeAttr()});
+
+  if (!getResults().empty()) {
+    printer << " -> (";
+    llvm::interleaveComma(getResultTypes(), printer,
+                          [&](Type t) { printer << t; });
+    printer << ")";
+  }
+
+  if (!getCombinerRegion().empty()) {
+    printer << " ";
+    printer.printRegion(getCombinerRegion());
+  }
+}
+#endif // TRITON_BUILD_TTIR_ONLY // --- END --- added for spyre
+
 } // namespace triton
 } // namespace mlir
