@@ -3777,3 +3777,39 @@ def builtin_min(*args, propagate_nan=_NOTHING, _semantic=None):
     if min_val.type.is_block():
         warn("builtin min on non-scalar tensor values is deprecated, use tl.minimum instead")
     return min_val
+
+
+# --- START --- added for spyre
+@builtin
+def inter_tile(x, axis, combiner, mode, *, work_slices, dep_work_slices=None,
+               scatter_dimension=None, _semantic=None):
+    """(Spyre only) Cross-tile reduction over the given work-slice axis.
+
+    Lowers to a ``tt.inter_tile_reduce`` op carrying the work-slice metadata
+    as op attributes.  The ``LowerInterTile`` pass expands it into a
+    ``ktdp.inter_tile_produce`` + delivery op pair.
+
+    Args:
+        x:                 The per-tile partial tensor to reduce.
+        axis:              Work-slice dim name to reduce over (e.g. ``"in"``).
+        combiner:          Shorthand ``"add"`` / ``"max"`` / ``"mul"`` or ``""``
+                           for a custom reducer region (not yet supported from
+                           Python; use the MLIR layer directly).
+        mode:              One of ``"all_reduce"``, ``"reduce_to_one"``,
+                           ``"reduce_scatter"``, ``"broadcast"``.
+        work_slices:       ``tl.constexpr`` dict ``{tile_id: {dim: slice_idx}}``
+                           — the ``coreIdToWkSlice`` from the Spyre metadata.
+                           Integer keys only.  ``W`` (``numWkSlicesPerDim``) is
+                           derived: ``W[beta] = max(C[t][beta] for all t) + 1``.
+        dep_work_slices:   Optional ``tl.constexpr`` dict for per-tile
+                           dependencies (``depWkSlices``).
+        scatter_dimension: Required when ``mode = "reduce_scatter"``; the i64
+                           scatter dimension.
+
+    Only valid on the ``spyre`` backend — raises on any other target.
+    """
+    return _semantic.inter_tile(x, axis, combiner, mode,
+                                work_slices=work_slices,
+                                dep_work_slices=dep_work_slices,
+                                scatter_dimension=scatter_dimension)
+# --- END --- added for spyre

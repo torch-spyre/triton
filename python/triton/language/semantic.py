@@ -1919,3 +1919,62 @@ class TritonSemantic(Generic[TensorTy]):
                                                             [s.handle for s in strides], block_shape, is_signed_int,
                                                             padding)
         return tl.tensor_descriptor(handle, shape, strides, type)
+
+    # --- START --- added for spyre
+    def inter_tile(self, x, axis, combiner, mode, *, work_slices,
+                   dep_work_slices=None, scatter_dimension=None):
+        """Emit tt.inter_tile_reduce with work-slice op attributes."""
+        target = driver.active.get_current_target()
+        if target.backend != "spyre":
+            raise ValueError(
+                "tl.inter_tile is only supported on the 'spyre' "
+                f"backend, not '{target.backend}'")
+
+        axis = tl._unwrap_if_constexpr(axis)
+        combiner = tl._unwrap_if_constexpr(combiner)
+        mode = tl._unwrap_if_constexpr(mode)
+        scatter_dimension = tl._unwrap_if_constexpr(scatter_dimension)
+        work_slices = tl._unwrap_if_constexpr(work_slices)
+        dep_work_slices = tl._unwrap_if_constexpr(dep_work_slices)
+
+        # Normalize work_slices: keys may be int or str → canonical int keys.
+        C = {int(k): {str(ak): int(av) for ak, av in v.items()}
+             for k, v in work_slices.items()}
+
+        # Derive W (numWkSlicesPerDim) from C.
+        all_dims = list(next(iter(C.values())).keys()) if C else []
+        W = {dim: max(C[t][dim] for t in C) + 1 for dim in all_dims}
+
+        # Serialize W, C, D for the builder.
+        w_keys = list(W.keys())
+        w_vals = [W[k] for k in w_keys]
+
+        num_tiles = max(C.keys()) + 1 if C else 0
+        # Per-tile slice indices in tile-id order; missing tiles get zeros.
+        c_keys = all_dims
+        c_vals = [[C[t].get(dim, 0) for dim in c_keys]
+                  for t in range(num_tiles)]
+
+        dep_keys: list = []
+        dep_vals: list = []
+        if dep_work_slices is not None:
+            D = {str(k): [int(v) for v in vs]
+                 for k, vs in dep_work_slices.items()}
+            dep_keys = list(D.keys())
+            dep_vals = [D[k] for k in dep_keys]
+
+        scatter_dim_val = -1 if scatter_dimension is None else int(scatter_dimension)
+
+        handles = self.builder.create_inter_tile_reduce(
+            [x.handle] if not isinstance(x, (list, tuple)) else [v.handle for v in x],
+            axis, combiner, mode, scatter_dim_val,
+            w_keys, w_vals, c_keys, c_vals,
+            dep_keys, dep_vals,
+        )
+
+        if not handles:
+            return tl.tensor(None, tl.void)
+        if len(handles) == 1:
+            return tl.tensor(handles[0], tl.block_type(tl.float32, []))  # type filled by builder
+        return [tl.tensor(h, tl.block_type(tl.float32, [])) for h in handles]
+    # --- END --- added for spyre

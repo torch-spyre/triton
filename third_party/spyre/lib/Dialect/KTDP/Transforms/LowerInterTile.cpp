@@ -71,17 +71,17 @@ struct WorkSliceAttrs {
 };
 
 static FailureOr<WorkSliceAttrs>
-readWorkSliceAttrs(triton::FuncOp func, Operation *loc) {
-  auto W = func->getAttrOfType<DictionaryAttr>(kNumWkSlicesPerDim);
+readWorkSliceAttrs(triton::InterTileReduceOp op) {
+  auto W = op->getAttrOfType<DictionaryAttr>(kNumWkSlicesPerDim);
   if (!W)
-    return loc->emitError("missing '") << kNumWkSlicesPerDim
-                                       << "' function attribute (P3)";
-  auto C = func->getAttrOfType<ArrayAttr>(kCoreIdToWkSlice);
+    return op.emitError("missing '") << kNumWkSlicesPerDim
+                                     << "' op attribute (P3)";
+  auto C = op->getAttrOfType<ArrayAttr>(kCoreIdToWkSlice);
   if (!C)
-    return loc->emitError("missing '") << kCoreIdToWkSlice
-                                       << "' function attribute (P3)";
+    return op.emitError("missing '") << kCoreIdToWkSlice
+                                     << "' op attribute (P3)";
   // D is optional.
-  auto D = func->getAttrOfType<DictionaryAttr>(kDepWkSlices);
+  auto D = op->getAttrOfType<DictionaryAttr>(kDepWkSlices);
   return WorkSliceAttrs{W, C, D};
 }
 
@@ -463,8 +463,8 @@ struct LowerInterTilePass
       return op.emitError("inter_tile_reduce must be inside a tt.func");
 
 
-    // --- read work-slice attributes ---
-    auto attrsOrErr = readWorkSliceAttrs(func, op);
+    // --- read work-slice attributes (carried on the op, set by frontend) ---
+    auto attrsOrErr = readWorkSliceAttrs(op);
     if (failed(attrsOrErr)) return failure();
     WorkSliceAttrs attrs = *attrsOrErr;
 
