@@ -1008,6 +1008,59 @@ def TT_MakeTensorDescOp : TT_Op<"make_tensor_descriptor", [
 
 }
 
+// --- START --- added for spyre
+// Spyre-only inter-tile collective metadata op. Carries the intent of a
+// cross-tile combination of per-tile partial values; the LowerInterTile pass
+// expands it into the future-based ktdp.inter_tile_produce + delivery pair.
+// Inert on GPU: the tl.inter_tile builtin is guarded to the spyre target and
+// nothing else emits this op. The op definition is always tablegen'd (TableGen
+// defs cannot be #ifdef'd out of a shared dialect); its pybind builder is
+// guarded with #ifdef TRITON_BUILD_TTIR_ONLY. See CLAUDE.md "Guarding
+// Spyre-only additions".
+def TT_InterTileReduceOp : TT_Op<"inter_tile_reduce", [
+    AttrSizedOperandSegments
+]> {
+  let summary = "Spyre: cross-tile partial-combination metadata op";
+
+  let description = [{
+    `tt.inter_tile_reduce` names the intent of combining per-tile partial
+    values across the cooperating tiles identified by `axis`. The
+    `LowerInterTile` pass expands it into a `ktdp.inter_tile_produce` +
+    delivery op pair. No result; uses are replaced by the delivery op results.
+
+    Attributes:
+    - `axis`              : work-slice dim name (key into `numWkSlicesPerDim`).
+    - `mode`              : one of `all_reduce`, `reduce_to_one`,
+                            `reduce_scatter`, `broadcast`.
+    - `combiner`          : shorthand `"add"` / `"max"` / `"mul"`, or `""` for
+                            a custom reducer region. `broadcast` uses `""`.
+    - `scatter_dimension` : i64, required iff `mode = reduce_scatter`.
+
+    Operands:
+    - `partials`  : A per-tile partial tensors (already lowered to linalg/tensor
+                    values by LowerComputeOps; A >= 1).
+    - `identities`: A explicit identity tensors, required iff combiner is `""`
+                    (region form). Empty for shorthand combiners.
+
+    The op may carry a combiner region (2A block args → A yielded values via
+    `tt.reduce.return`) when `combiner` is `""`.
+  }];
+
+  let arguments = (ins
+    Variadic<AnyTensor>:$partials,
+    Variadic<AnyTensor>:$identities,
+    StrAttr:$axis,
+    StrAttr:$mode,
+    StrAttr:$combiner,
+    OptionalAttr<I64Attr>:$scatter_dimension
+  );
+  let results = (outs Variadic<AnyTensor>:$results);
+  let regions = (region AnyRegion:$combiner_region);
+
+  let hasCustomAssemblyFormat = 1;
+}
+// --- END --- added for spyre
+
 // The following ops, including `call`, `func`, and `return` are copied and modified from
 // https://github.com/llvm/llvm-project/blob/main/mlir/include/mlir/Dialect/Func/IR/FuncOps.td
 // We could revert it back once MLIR has a better inliner interface.
