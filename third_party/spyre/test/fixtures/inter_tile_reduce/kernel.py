@@ -6,6 +6,9 @@ all_reduce:
   inter_tile_add_kernel      -- ADD all_reduce (f32): flat 1D grid, 8 tiles,
                                 4 row-groups × 2 x-tiles per group.
   inter_tile_add_kernel_f16  -- same as above but fp16.
+  softmax_inter_tile         -- row-wise softmax (f16): 32 tiles, 2 out-groups
+                                × 16 mb-tiles; two all-reduces (rowmax, rowsum)
+                                across the mb-cohort.
 
 reduce_to_one:
   matmul_splitk_kernel       -- split-K matmul C[M,N]=A[M,K]@B[K,N], K split
@@ -177,3 +180,75 @@ def matmul_splitk_kernel(
 
         if pid_in == 0:
             c_desc.store([out * BLOCK_M, 0], result)
+
+
+@triton.jit
+def softmax_inter_tile(
+    output_ptr,
+    input_ptr,
+    M,
+    N,
+    BLOCK_ROWS: tl.constexpr,   # rows per core (M / NUM_OUT_TILES)
+    BLOCK_COLS: tl.constexpr,   # cols per core (N / NUM_MB_TILES)
+    NUM_MB_TILES: tl.constexpr, # number of mb-tiles (column-block tiles per row-group)
+    work_slices: tl.constexpr,  # list of {"mb": pid_mb, "out": pid_out} per tile
+):
+    """Row-wise softmax with two inter-tile all-reduces (rowmax, rowsum).
+
+    Grid layout (flat 1D, NUM_OUT_TILES × NUM_MB_TILES tiles):
+      tile_id = pid_out * NUM_MB_TILES + pid_mb
+      pid_out — selects the BLOCK_ROWS row-block (row group)
+      pid_mb  — selects the BLOCK_COLS column-block within the row-group
+
+    axis="out": tiles sharing the same "out" label cooperate (16-core mb-cohort).
+    The partial passed to tl.inter_tile has a unit leading dim [1, BLOCK_ROWS]
+    which LowerInterTile collapses to [BLOCK_ROWS] in the result.
+    """
+    pid = tl.program_id(0)
+    pid_out = pid // NUM_MB_TILES
+    pid_mb  = pid %  NUM_MB_TILES
+
+    row0 = pid_out * BLOCK_ROWS
+    col0 = pid_mb  * BLOCK_COLS
+
+    in_desc = tl.make_tensor_descriptor(
+        input_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_ROWS, BLOCK_COLS],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_ROWS, BLOCK_COLS],
+    )
+
+    x = in_desc.load([row0, col0])
+    x_f32 = x.to(tl.float32)
+
+    local_max = tl.max(x_f32, axis=1)
+    partial_max = tl.reshape(local_max, [1, BLOCK_ROWS])
+    rowmax = tl.inter_tile(
+        partial_max,
+        axis="out",
+        combiner="max",
+        mode="all_reduce",
+        work_slices=work_slices,
+    )
+
+    x_shifted = x_f32 - tl.reshape(rowmax, [BLOCK_ROWS, 1])
+    exp_x = tl.exp(x_shifted)
+
+    local_sum = tl.sum(exp_x, axis=1)
+    partial_sum = tl.reshape(local_sum, [1, BLOCK_ROWS])
+    rowsum = tl.inter_tile(
+        partial_sum,
+        axis="out",
+        combiner="add",
+        mode="all_reduce",
+        work_slices=work_slices,
+    )
+
+    softmax_out = exp_x / tl.reshape(rowsum, [BLOCK_ROWS, 1])
+    out_desc.store([row0, col0], softmax_out.to(tl.float16))

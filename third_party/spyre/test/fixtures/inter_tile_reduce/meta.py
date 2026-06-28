@@ -323,6 +323,94 @@ def _extra_checks_splitk(tester) -> None:
     tester.assert_absent("tt.inter_tile_reduce")
 
 
+# ---------------------------------------------------------------------------
+# softmax variant — two all-reduces (rowmax + rowsum) across mb-cohort
+# ---------------------------------------------------------------------------
+
+_SM_NUM_MB_TILES  = 16
+_SM_NUM_OUT_TILES = 2
+_SM_NUM_TILES     = _SM_NUM_MB_TILES * _SM_NUM_OUT_TILES  # 32
+
+# tile_id = pid_out * _SM_NUM_MB_TILES + pid_mb
+# axis="out": group g (out=g) owns tiles g*16 .. g*16+15 (contiguous).
+_SM_WORK_SLICES = [
+    {"mb": t % _SM_NUM_MB_TILES, "out": t // _SM_NUM_MB_TILES}
+    for t in range(_SM_NUM_TILES)
+]
+
+
+def make_inputs_softmax(M: int, N: int, **_kw) -> dict:
+    rng = np.random.default_rng(seed=0)
+    x = rng.standard_normal((M, N)).astype(np.float16)
+    return {"input_ptr": x, "output_ptr": np.zeros((M, N), dtype=np.float16)}
+
+
+def run_softmax(inputs: dict) -> np.ndarray:
+    x = inputs["input_ptr"].astype(np.float32)
+    x_shifted = x - x.max(axis=1, keepdims=True)
+    num = np.exp(x_shifted)
+    return (num / num.sum(axis=1, keepdims=True)).astype(np.float16)
+
+
+def _extra_checks_softmax(tester) -> None:
+    tester.assert_present("ktdp.inter_tile_produce")
+    tester.assert_present("ktdp.inter_tile_reduce")
+    tester.assert_count("ktdp.inter_tile_produce", 2)
+    tester.assert_count("ktdp.inter_tile_reduce", 2)
+    tester.assert_integer_set(
+        "ktdp.inter_tile_reduce", "consumer_tiles_per_group",
+        num_dims=1, num_symbols=1, num_constraints=2,
+    )
+    tester.assert_integer_set(
+        "ktdp.inter_tile_reduce", "groups",
+        num_dims=1, num_symbols=0, num_constraints=2,
+    )
+    tester.assert_result_type("ktdp.inter_tile_reduce", "tensor<256x")
+    tester.assert_absent("tt.inter_tile_reduce")
+
+
+VARIANTS["softmax"] = {
+    "tags": ["inter-tile-all-reduce", "softmax"],
+    "summary": (
+        "Row-wise softmax (f16): two all-reduces (rowmax + rowsum) across "
+        "a 16-core mb-cohort; 32 tiles, 2 out-groups × 16 mb-tiles."
+    ),
+    "doc": (
+        "Each core owns a [BLOCK_ROWS, BLOCK_COLS] column-block. "
+        "Two cross-tile all-reduces over the out-axis produce the true "
+        "per-row max and sum from partial column-block values. The grid "
+        "exactly covers [M, N] so no distribution loop is needed."
+    ),
+    "kernel_fn": kernel.softmax_inter_tile,
+    "SIGNATURE": {
+        "output_ptr":    "*fp16",
+        "input_ptr":     "*fp16",
+        "M":             "i32",
+        "N":             "i32",
+        "BLOCK_ROWS":    "i32",
+        "BLOCK_COLS":    "i32",
+        "NUM_MB_TILES":  "i32",
+        "work_slices":   None,
+    },
+    "constexpr":   ["BLOCK_ROWS", "BLOCK_COLS", "NUM_MB_TILES", "work_slices"],
+    "params": {
+        "M":            [512],
+        "N":            [1024],
+        "BLOCK_ROWS":   [256],
+        "BLOCK_COLS":   [64],
+        "NUM_MB_TILES": [_SM_NUM_MB_TILES],
+        "work_slices":  [_SM_WORK_SLICES],
+    },
+    "grid":        [_SM_NUM_TILES],
+    "parallel":    False,
+    "reference":   run_softmax,
+    "inputs":      make_inputs_softmax,
+    "output_key":  "output_ptr",
+    "rtol":        1e-2,
+    "extra_checks": _extra_checks_softmax,
+}
+
+
 VARIANTS["splitk"] = {
     "tags": ["split-k", "inter-tile-reduce-to-one"],
     "summary": (
