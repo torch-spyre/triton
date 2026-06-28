@@ -36,25 +36,37 @@ class LowerInterTileTester(SinglePassTester):
 
 
 def _row_major_core_map(num_slices: dict) -> list[dict]:
-    """Derive the standard mixed-radix (row-major) core map from slice counts.
+    """Derive a group-label core map from slice counts.
 
-    Axes are ordered as given; the last axis is the fastest-varying (innermost).
+    Under the new grouping semantics, tiles with the same full slice-dict entry
+    are in the same group.  For a multi-axis map the FIRST key is the group-label
+    axis (its value = group index); subsequent keys carry within-group positions.
     Total tiles = product of all slice counts.
+
+    Single-axis case: all tiles share the same value (label 0) → one group.
+    Multi-axis case: row-major ordering where the first key varies slowest.
 
     Examples::
 
-        _row_major_core_map({"x": 2})
-        # → [{"x": 0}, {"x": 1}]
+        _row_major_core_map({"x": 4})
+        # → [{"x": 0}, {"x": 0}, {"x": 0}, {"x": 0}]  — 1 group of 4
 
         _row_major_core_map({"x": 2, "y": 2})
         # → [{"x": 0, "y": 0}, {"x": 0, "y": 1},
-        #    {"x": 1, "y": 0}, {"x": 1, "y": 1}]
+        #    {"x": 1, "y": 0}, {"x": 1, "y": 1}]  — 2 groups of 2
     """
     axes = list(num_slices.keys())
     counts = list(num_slices.values())
     num_tiles = 1
     for c in counts:
         num_tiles *= c
+
+    if len(axes) == 1:
+        # Single-axis: all tiles in one group (same label 0).
+        return [{axes[0]: 0} for _ in range(num_tiles)]
+
+    # Multi-axis: first axis = group label (outermost / slowest), rest = within-group.
+    # Row-major: last axis varies fastest.
     core_map = []
     for t in range(num_tiles):
         entry = {}
@@ -109,7 +121,11 @@ def _op_attrs(num_slices: dict, core_map: list[dict] | None = None,
     if core_map is None:
         core_map = _row_major_core_map(num_slices)
 
-    nw = ", ".join(f'{k} = {v} : i64' for k, v in num_slices.items())
+    # Derive W from the actual core_map (max value per axis + 1).
+    all_axes = list(num_slices.keys())
+    W = {ax: max((t.get(ax, 0) for t in core_map), default=0) + 1
+         for ax in all_axes}
+    nw = ", ".join(f'{k} = {W[k]} : i64' for k in all_axes)
     nw_attr = "{" + nw + "}"
 
     def tile_dict(d):
@@ -160,8 +176,11 @@ class TestFoldAway(LowerInterTileTester):
                            "ktdp.inter_tile_reduce")
 
     def test_fold_away_on_non_innermost_axis(self):
-        """W[y]==1 triggers fold-away even when other axes have W>1."""
-        attrs = _op_attrs({"x": 4, "y": 1})
+        """gsize==1 on axis 'y' triggers fold-away (each tile is its own y-group)."""
+        # 4 tiles; each has a unique y-value → 4 y-groups of 1 tile each → fold-away.
+        attrs = _op_attrs({"x": 4, "y": 4},
+                          core_map=[{"x": 0, "y": 0}, {"x": 1, "y": 1},
+                                    {"x": 2, "y": 2}, {"x": 3, "y": 3}])
         self.run(f"""
         module {{
           tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
@@ -197,7 +216,7 @@ class TestGroupSets(LowerInterTileTester):
     ])
     def test_groups_present(self):
         """inter_tile_produce carries producer_tiles_per_group + groups."""
-        # 4 tiles, all reducing on axis "x" (gsize=4, ngroups=1)
+        # 4 tiles, 1 group (all same x-label), gsize=4, ngroups=1.
         attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
@@ -235,9 +254,9 @@ class TestGroupSets(LowerInterTileTester):
         self.assert_absent("tt.inter_tile_reduce")
 
     def test_groups_partition(self):
-        """Groups affine sets have the right shape for contiguous coop_α (s_α=1, innermost).
+        """Groups affine sets have the right shape for contiguous groups.
 
-        For gsize=4, ngroups=1:
+        For gsize=4, ngroups=1 (all tiles share x-label 0):
           producer_tiles_per_group = (i)[g] : 2 constraints (≥ lower, ≤ upper)
           groups = (g) : 2 constraints (g >= 0, g <= ngroups-1)
         Checks C1/Q3: the standard contiguous form used by all current fixtures.

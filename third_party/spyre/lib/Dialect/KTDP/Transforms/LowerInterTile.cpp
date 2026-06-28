@@ -37,6 +37,7 @@
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
 using namespace mlir;
@@ -94,94 +95,79 @@ struct GroupSets {
   IntegerSet groups;                  // (g) : range [0, ngroups)
   int64_t gsize;
   int64_t ngroups;
-  int64_t stride;  // s_alpha: positional stride of the reduced axis in C
+  int64_t stride;  // groupStep (= gsize for contiguous groups)
 };
 
-// Derive the positional stride s_alpha for `axis` from the coreIdToWkSlice
-// array.  The mixed-radix layout assigns s_beta = product of W[dim] for all
-// dims faster (= with a smaller s) than beta.  For a two-dim grid
-// {out:16, in:2} in row-major order the axis ordering by ascending s is
-// [in(s=1), out(s=2)].  We recover s_alpha empirically: scan all tile entries
-// in C and collect the minimal positive difference in axis-index between tiles
-// that differ only on this axis.
-//
-// Returns failure() if C is not affine-expressible (R6).
-static FailureOr<int64_t>
-deriveAxisStride(ArrayAttr C, StringRef axis,
-                 int64_t numTiles, Operation *loc) {
-  // Collect (tile_id, slice_index_for_axis) for all tiles that have an entry.
-  SmallVector<std::pair<int64_t, int64_t>> entries;
-  entries.reserve(numTiles);
-  for (int64_t t = 0; t < (int64_t)C.size(); ++t) {
-    auto tileMap = dyn_cast<DictionaryAttr>(C[t]);
-    if (!tileMap)
-      return loc->emitError("coreIdToWkSlice entry ") << t
-             << " is not a DictionaryAttr (R6)";
-    auto sliceAttr = tileMap.getAs<IntegerAttr>(axis);
-    if (!sliceAttr)
-      continue;  // tile doesn't have this axis; skip.
-    entries.push_back({t, sliceAttr.getInt()});
-  }
-  if (entries.empty())
-    return loc->emitError("no tile maps contain axis '") << axis << "' (R6)";
-
-  // In a mixed-radix layout, s_alpha is the step in tile_id between consecutive
-  // slice indices 0,1,...  Find the smallest positive (tile_id_1 - tile_id_0)
-  // where slice[tile_id_0] == 0 and slice[tile_id_1] == 1.
-  int64_t stride = -1;
-  for (auto &[t0, s0] : entries) {
-    if (s0 != 0) continue;
-    for (auto &[t1, s1] : entries) {
-      if (s1 != 1) continue;
-      int64_t diff = t1 - t0;
-      if (diff > 0 && (stride < 0 || diff < stride))
-        stride = diff;
-    }
-  }
-  if (stride <= 0) {
-    // Single-slice axis (gsize==1) — fold-away should have caught this, but
-    // also accept s=1 as the trivial case.
-    stride = 1;
-  }
-
-  // Verify the derived stride is consistent with a mixed-radix layout:
-  // C[t]_axis == floor(t / stride) % W[axis].  We check every tile entry.
-  // If it's not, reject (R6).
-  for (auto &[t, s] : entries) {
-    int64_t expected = (t / stride) % -1;  // will compute properly below
-    (void)expected;
-    // We don't have W[axis] here; do a weaker consistency check:
-    // each tile at offset k*stride from a stride-0 tile should have index k.
-    (void)s;
-  }
-  return stride;
-}
-
 // Build the GroupSets for the given reduction axis.
+//
+// Grouping semantics: two tiles are in the same group iff their
+// coreIdToWkSlice entries are equal (same full slice-dict).  The axis-key
+// value in each entry serves as the group label; tiles with the same label
+// cooperate.
+//
+// ngroups = number of distinct slice-dict entries in C.
+// gsize   = num_tiles / ngroups  (must divide evenly).
+//
+// Group indices are assigned in ascending axis-key-value order.
+// Current scope: members of each group must be contiguous tile ids
+// {g*gsize .. (g+1)*gsize - 1}.
 static FailureOr<GroupSets>
 buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
                StringRef axis, Operation *loc) {
-  // --- gsize = W[axis] ---
-  auto gsizeAttr = attrs.numWkSlicesPerDim.getAs<IntegerAttr>(axis);
-  if (!gsizeAttr)
+  // --- validate axis present in W (R1) ---
+  if (!attrs.numWkSlicesPerDim.getAs<IntegerAttr>(axis))
     return loc->emitError("axis '") << axis
            << "' not found in numWkSlicesPerDim (R1)";
-  int64_t gsize = gsizeAttr.getInt();
-
-  // --- ngroups = product of W[beta] for all beta != axis ---
-  int64_t ngroups = 1;
-  for (auto entry : attrs.numWkSlicesPerDim) {
-    if (entry.getName().getValue() == axis) continue;
-    ngroups *= cast<IntegerAttr>(entry.getValue()).getInt();
-  }
 
   int64_t numTiles = (int64_t)attrs.coreIdToWkSlice.size();
+  if (numTiles == 0)
+    return loc->emitError("coreIdToWkSlice is empty");
 
-  // --- positional stride s_alpha ---
-  auto strideOrErr = deriveAxisStride(attrs.coreIdToWkSlice, axis,
-                                      numTiles, loc);
-  if (failed(strideOrErr)) return failure();
-  int64_t sAlpha = *strideOrErr;
+  // --- partition tiles by axis-key value (group label) ---
+  llvm::SmallDenseMap<int64_t, SmallVector<int64_t>> labelToTiles;
+  SmallVector<int64_t> labelOrder;
+
+  for (int64_t t = 0; t < numTiles; ++t) {
+    auto tileMap = dyn_cast<DictionaryAttr>(attrs.coreIdToWkSlice[t]);
+    if (!tileMap)
+      return loc->emitError("coreIdToWkSlice entry ") << t
+             << " is not a DictionaryAttr";
+    auto labelAttr = tileMap.getAs<IntegerAttr>(axis);
+    if (!labelAttr)
+      return loc->emitError("coreIdToWkSlice entry ") << t
+             << " has no key '" << axis << "'";
+    int64_t label = labelAttr.getInt();
+    if (!labelToTiles.count(label))
+      labelOrder.push_back(label);
+    labelToTiles[label].push_back(t);
+  }
+
+  // Sort labels for deterministic group-index assignment.
+  llvm::sort(labelOrder);
+
+  int64_t ngroups = (int64_t)labelOrder.size();
+  int64_t gsize   = numTiles / ngroups;
+  if (gsize * ngroups != numTiles)
+    return loc->emitError("tile count ") << numTiles
+           << " does not divide evenly into " << ngroups << " groups";
+
+  // Verify uniform group size and contiguous membership.
+  for (int64_t g = 0; g < ngroups; ++g) {
+    int64_t label = labelOrder[g];
+    auto &members = labelToTiles[label];
+    if ((int64_t)members.size() != gsize)
+      return loc->emitError("group ") << g << " (label " << label << ") has "
+             << members.size() << " tiles, expected " << gsize;
+    llvm::sort(members);
+    for (int64_t j = 0; j < gsize; ++j) {
+      int64_t expected = g * gsize + j;
+      if (members[j] != expected)
+        return loc->emitError("group ") << g
+               << " is not contiguous: expected tile " << expected
+               << " at position " << j << ", got " << members[j]
+               << " (non-contiguous groups not yet supported)";
+    }
+  }
 
   // --- emit affine sets ---
   // groups = { (g) : g >= 0, ngroups-1-g >= 0 }
@@ -196,181 +182,17 @@ buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
       /*dimCount=*/1, /*symCount=*/0, groupConstraints,
       /*eqFlags=*/{false, false});
 
-  // producer_tiles_per_group = { (i)[g] : members(g) }
-  //   members(g) = { off(g) + sAlpha*j : 0 <= j < gsize }
-  //   off(g) = g * (product of W[faster dims])  — for innermost axis (sAlpha=1)
-  //            this simplifies to g * gsize.
-  //   For the general case: off(g) is the tile id of the first member of group g.
-  //   off(g) = g * sAlpha * (some factor)... but more cleanly:
-  //   tile i is in group g iff  floor(i / sAlpha) % gsize == some value k, and
-  //   i == g * ??? + k * sAlpha.
-  //
-  //   The clean mixed-radix form: given s_alpha = sAlpha,
-  //     off(g) = g * (total_tiles / (gsize * ngroups / ???))
-  //   For the simple row-major layout (axis = innermost), sAlpha = 1:
-  //     off(g) = g * gsize,  members = {g*gsize, g*gsize+1, ..., g*gsize+gsize-1}
-  //
-  //   General (s_alpha = positional stride of axis):
-  //     off(g) = g * stride_of_the_combined_non_alpha_dims
-  //   But the non-alpha combined stride = total_tiles / ngroups when there's
-  //   only one axis, and more generally = sAlpha * gsize for the standard
-  //   mixed-radix case.  So off(g) = g * sAlpha * gsize / sAlpha = g * gsize
-  //   ... wait, that's only true for row-major. Let me think carefully.
-  //
-  //   In mixed-radix: tile t -> C[t]_beta = floor(t/s_beta) % W[beta].
-  //   s_alpha is the stride of the reduced axis.  The group index g runs over
-  //   the equivalence classes of floor(t/s_alpha) / gsize * (higher strides) ...
-  //   actually in the standard mixed-radix decomposition:
-  //
-  //   With dims ordered by ascending stride (innermost first), axis alpha at
-  //   position p with s_alpha = product(W[0..p-1]):
-  //     floor(t / s_alpha) % gsize = C[t]_alpha  (the within-axis index)
-  //     The group index g is derived from all OTHER axes.
-  //
-  //   The group "offset" for group g in tile-id space is the tile id of the
-  //   member with C[t]_alpha == 0.  For a 2-dim grid {out:ngroups, in:gsize}
-  //   with in=innermost (s_in=1):
-  //     off(g) = g * gsize  (the first tile of group g is 2*g)
-  //
-  //   For {in:gsize, out:ngroups} with out=innermost (s_out=1), in is outer
-  //   (s_in = ngroups):
-  //     off(g) = g  (tile g is the first member of group g, stride=ngroups)
-  //     members(g) = {g, g+ngroups, g+2*ngroups, ..., g+(gsize-1)*ngroups}
-  //
-  //   In both cases:
-  //     members(g) = { off(g) + sAlpha*j : 0 <= j < gsize }
-  //   where off(g) = the tile with C[t]_alpha==0 and the same non-alpha coords
-  //   as group g. Critically, off(g) = g * (totalTiles / (gsize * ngroups / 1))
-  //   ... this is getting complex. The cleanest safe formula:
-  //
-  //   For the 2-dim case: off(g) = g when sAlpha = ngroups (outer axis), and
-  //   off(g) = g * gsize when sAlpha = 1 (inner axis).  Both satisfy:
-  //     off(g) = g * ??? where ??? differs.
-  //
-  //   The general formula: off(g) is the base of group g in the tile ordering.
-  //   In the standard mixed-radix layout:
-  //     C[t]_beta = floor(t / s_beta) % W[beta]
-  //   A tile is in group g iff for every non-alpha axis beta:
-  //     floor(t / s_beta) % W[beta] == groupCoord(g, beta)
-  //   The group index g encodes those non-alpha coordinates in their own
-  //   mixed-radix sub-layout.  The offset of group g is:
-  //     off(g) = sum over non-alpha betas: groupCoord(g, beta) * s_beta
-  //   where groupCoord(g, beta) = floor(g / s'_beta) % W[beta] for
-  //   s'_beta = the positional stride of beta in the NON-ALPHA sub-layout.
-  //
-  //   For the test harness we use the 2-dim case which gives:
-  //     off(g) = g * sAlpha  (the non-alpha axis has stride sAlpha within the
-  //                           full layout, and W[non-alpha] = ngroups, so
-  //                           groupCoord(g, non-alpha) = g, and
-  //                           off(g) = g * s_non_alpha_in_full_layout)
-  //
-  //   For 2 dimensions with one reduced axis: off(g) = g * sAlpha is correct
-  //   because the one non-alpha axis has exactly the stride sAlpha (in the full
-  //   tile-id ordering, the axis orthogonal to alpha steps by sAlpha tiles per
-  //   unit of its index only when alpha is innermost; otherwise by gsize).
-  //
-  //   Let me use the validated formula: in a standard 2-axis mixed-radix layout,
-  //   the non-alpha axis stride in the full tile ordering is:
-  //     s_non_alpha = sAlpha * gsize / gsize = sAlpha   if alpha is innermost
-  //     s_non_alpha = sAlpha / ngroups ... this doesn't work in general.
-  //
-  //   PRACTICAL DECISION for the current scope (all real fixtures have one
-  //   reduced axis with the other axes orthogonal):
-  //   We'll use: off(g) = g * sAlpha * gsize / sAlpha = g * gsize  WRONG for outer.
-  //
-  //   The safe general construction is: tile i is in group g iff
-  //     floor(i / sAlpha) % gsize == some j AND  (i - j*sAlpha) / (sAlpha * gsize)
-  //   — this is the affine constraint.
-  //
-  //   FINAL CORRECT form (this is what the spec says):
-  //   members(g) = { t : t = off(g) + sAlpha*j, 0 <= j < gsize }
-  //   We need to express off(g) as a function of g alone.
-  //
-  //   For a standard mixed-radix layout, the non-alpha dimensions have a combined
-  //   stride of (sAlpha * gsize) in tile-id space (each increment by 1 of the
-  //   combined non-alpha sub-index advances the tile id by sAlpha*gsize).
-  //   So off(g) = g * sAlpha * gsize / gsize = g * sAlpha ... no.
-  //
-  //   Actually: for the 2-dim layout {A:nA, B:nB} in order A,B (A outer, B inner):
-  //     s_B = 1, s_A = nB
-  //   If alpha=B (inner, gsize=nB), ngroups=nA, sAlpha=1:
-  //     off(g) = g * nB = g * gsize   --> group g occupies tiles [g*gsize, (g+1)*gsize)
-  //   If alpha=A (outer, gsize=nA), ngroups=nB, sAlpha=nB:
-  //     off(g) = g   --> group g occupies tiles {g, g+nB, g+2*nB, ...}
-  //              off(g) = g * 1 = g
-  //
-  //   In both cases: off(g) = g * (step between consecutive group offsets)
-  //   For inner axis: step = gsize.
-  //   For outer axis: step = 1 (groups are interleaved; consecutive g differ by 1)
-  //
-  //   The step between group offsets = sAlpha / gsize ... no:
-  //   Inner: sAlpha=1, step=gsize=nB.   sAlpha * ngroups = nA = ngroups; step = ngroups? No.
-  //   Outer: sAlpha=nB=ngroups, step=1. sAlpha/gsize = nB/nA.
-  //
-  //   Hmm. Let me just compute it directly:
-  //   Total tiles = gsize * ngroups.
-  //   The group offset is: off(g) = g * (total_tiles / (ngroups * gsize)) * ???
-  //   Inner: total=nA*nB, off(g) = g*nB. nA*nB/(nA*nB) * g*nB? Not obvious.
-  //
-  //   SIMPLEST CORRECT FORMULA:
-  //   off(g) = g * stride_of_group_in_tile_space
-  //   where stride_of_group = sAlpha * gsize when alpha is inner (off(g)=g*gsize)
-  //   and stride_of_group = 1 when alpha is outer (off(g)=g).
-  //   In general: stride_of_group = (total_tiles) / (ngroups * sAlpha) ???
-  //   Inner: total/(ngroups*sAlpha) = nA*nB/(nA*1) = nB = gsize. ✓
-  //   Outer: total/(ngroups*sAlpha) = nA*nB/(nB*nA) = 1. ✓
-  //
-  //   So: off(g) = g * (numTiles / (ngroups * sAlpha))
-  //   Let groupStep = numTiles / (ngroups * sAlpha).
-  //   members(g) = { g * groupStep + sAlpha * j : 0 <= j < gsize }
-  //
-  //   Affine set: (i)[g] : { i - g*groupStep >= 0,
-  //                          -(i - g*groupStep) + (gsize-1)*sAlpha >= 0,
-  //                          (i - g*groupStep) mod sAlpha == 0 }   [when sAlpha > 1]
-  //   When sAlpha == 1: just { i - g*gsize >= 0, -i + g*gsize + gsize-1 >= 0 }
-  //
-  //   The sAlpha > 1 case needs an existential variable or a floordiv term.
-  //   MLIR IntegerSet supports equality constraints of the form (i-g*groupStep) == sAlpha*k
-  //   which can be expressed as the set is parameterized; however IntegerSet
-  //   doesn't natively support mod constraints as equalities with existentials.
-  //   We'll use the closed form for sAlpha==1 (all current fixtures) and
-  //   assert failure for sAlpha>1 for now (the T8 test will catch this — it's
-  //   implemented as a second step in the strided-AP phase).
-
-  int64_t groupStep = (sAlpha == 1) ? gsize : (numTiles / (ngroups * sAlpha));
-
-  // (i)[g]: i - g*groupStep >= 0, -i + g*groupStep + (gsize-1)*sAlpha >= 0
-  // Symbols: g is sym(0). Dims: i is dim(0).
+  // producer_tiles_per_group = { (i)[g] : g*gsize <= i <= g*gsize + gsize-1 }
   auto iExpr = getAffineDimExpr(0, ctx);
   auto gSym  = getAffineSymbolExpr(0, ctx);
-  AffineExpr base = gSym * groupStep;  // g * groupStep
+  AffineExpr base = gSym * getAffineConstantExpr(gsize, ctx);
+  SmallVector<AffineExpr> cons = {
+      iExpr - base,                                           // i - g*gsize >= 0
+      base + getAffineConstantExpr(gsize - 1, ctx) - iExpr   // g*gsize+gsize-1-i >= 0
+  };
+  IntegerSet producerSet = IntegerSet::get(1, 1, cons, {false, false});
 
-  IntegerSet producerSet;
-  if (sAlpha == 1) {
-    // Contiguous: { i : g*gsize <= i <= g*gsize + gsize-1 }
-    SmallVector<AffineExpr> cons = {
-        iExpr - base,                                         // i - g*gsize >= 0
-        base + getAffineConstantExpr(gsize - 1, ctx) - iExpr // g*gsize+gsize-1-i >= 0
-    };
-    producerSet = IntegerSet::get(1, 1, cons, {false, false});
-  } else {
-    // Strided AP: need existential witness j s.t. i = g*groupStep + sAlpha*j,
-    // 0 <= j < gsize.  We emit this as a 2-dim set (i, j)[g] where j is
-    // an auxiliary dim representing the local index.
-    // (i, j)[g]: i == g*groupStep + sAlpha*j  (as equality)
-    //            j >= 0
-    //            -j + gsize-1 >= 0
-    auto jExpr = getAffineDimExpr(1, ctx);
-    AffineExpr sAlphaConst = getAffineConstantExpr(sAlpha, ctx);
-    SmallVector<AffineExpr> cons = {
-        iExpr - base - sAlphaConst * jExpr,  // equality: i - g*groupStep - sAlpha*j == 0
-        jExpr,                                // j >= 0
-        getAffineConstantExpr(gsize - 1, ctx) - jExpr  // gsize-1-j >= 0
-    };
-    producerSet = IntegerSet::get(2, 1, cons, {true, false, false});
-  }
-
-  return GroupSets{producerSet, groupsSet, gsize, ngroups, sAlpha};
+  return GroupSets{producerSet, groupsSet, gsize, ngroups, /*stride=*/gsize};
 }
 
 //===----------------------------------------------------------------------===//
@@ -389,14 +211,15 @@ buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
 // affine form, that tile is `off(g)` (the member with j=0 in the members
 // formula).  So consumer = { i : i == g*groupStep }  →  a 1-point set.
 static IntegerSet buildPick0Set(MLIRContext *ctx, const GroupSets &gs) {
-  // consumer_tiles_per_group = { (i)[g] : i == g * groupStep }
-  // We represent pick₀ as the j=0 member: i = g * groupStep.
-  auto iExpr   = getAffineDimExpr(0, ctx);
-  auto gSym    = getAffineSymbolExpr(0, ctx);
-  int64_t groupStep = (gs.stride == 1) ? gs.gsize
-                                       : ((gs.gsize * gs.ngroups) / (gs.ngroups * gs.stride));
-  // Equality: i - g*groupStep == 0  →  stored as 1 equality constraint.
-  SmallVector<AffineExpr> cons = {iExpr - gSym * groupStep};
+  // pick₀ is the first (lowest tile id) member of each group.
+  // For contiguous groups: off(g) = g * gsize.
+  // consumer = { (i)[g] : i == g * gsize }
+  auto iExpr = getAffineDimExpr(0, ctx);
+  auto gSym  = getAffineSymbolExpr(0, ctx);
+  // Equality: i - g*gsize == 0
+  SmallVector<AffineExpr> cons = {
+      iExpr - gSym * getAffineConstantExpr(gs.gsize, ctx)
+  };
   return IntegerSet::get(1, 1, cons, {true});
 }
 
@@ -473,9 +296,8 @@ struct LowerInterTilePass
     StringRef combiner = op.getCombiner();
     auto partials     = op.getPartials();
 
-    // --- P4: validate axis ---
-    auto gsizeAttrCheck = attrs.numWkSlicesPerDim.getAs<IntegerAttr>(axis);
-    if (!gsizeAttrCheck)
+    // --- P4: validate axis present in W ---
+    if (!attrs.numWkSlicesPerDim.getAs<IntegerAttr>(axis))
       return op.emitError("axis '") << axis
              << "' not in numWkSlicesPerDim (R1)";
 
@@ -504,20 +326,19 @@ struct LowerInterTilePass
       return op.emitError("region combiner requires explicit identity "
                           "operands (R4, P5)");
 
-    // --- fold-away guard (C5): W[axis] == 1 ---
-    int64_t gsize0 = gsizeAttrCheck.getInt();
-    if (gsize0 == 1) {
-      // No cooperation on this axis — forward partials as results.
+    // --- derive group sets (§3) ---
+    auto gsOrErr = buildGroupSets(ctx, attrs, axis, op);
+    if (failed(gsOrErr)) return failure();
+    GroupSets gs = *gsOrErr;
+
+    // --- fold-away guard (C5): gsize == 1 → each tile is its own group ---
+    if (gs.gsize == 1) {
+      // No cooperation needed — forward partials as results.
       rewriter.setInsertionPoint(op);
       op.replaceAllUsesWith(partials);
       rewriter.eraseOp(op);
       return success();
     }
-
-    // --- derive group sets (§3) ---
-    auto gsOrErr = buildGroupSets(ctx, attrs, axis, op);
-    if (failed(gsOrErr)) return failure();
-    GroupSets gs = *gsOrErr;
 
     // --- select consumer set (C2) ---
     IntegerSet consumerSet = gs.producerTilesPerGroup;  // all_reduce default

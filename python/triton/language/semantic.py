@@ -1937,9 +1937,14 @@ class TritonSemantic(Generic[TensorTy]):
         work_slices = tl._unwrap_if_constexpr(work_slices)
         dep_work_slices = tl._unwrap_if_constexpr(dep_work_slices)
 
-        # Normalize work_slices: keys may be int or str → canonical int keys.
+        # Normalize work_slices: accepts a list (indexed by tile id) or a dict
+        # (keyed by tile id).  Canonical form: C[int_tile_id] = {str_dim: int}.
+        if isinstance(work_slices, (list, tuple)):
+            items = enumerate(work_slices)
+        else:
+            items = work_slices.items()
         C = {int(k): {str(ak): int(av) for ak, av in v.items()}
-             for k, v in work_slices.items()}
+             for k, v in items}
 
         # Derive W (numWkSlicesPerDim) from C.
         all_dims = list(next(iter(C.values())).keys()) if C else []
@@ -1965,8 +1970,10 @@ class TritonSemantic(Generic[TensorTy]):
 
         scatter_dim_val = -1 if scatter_dimension is None else int(scatter_dimension)
 
+        partials = [x] if not isinstance(x, (list, tuple)) else list(x)
+
         handles = self.builder.create_inter_tile_reduce(
-            [x.handle] if not isinstance(x, (list, tuple)) else [v.handle for v in x],
+            [p.handle for p in partials],
             axis, combiner, mode, scatter_dim_val,
             w_keys, w_vals, c_keys, c_vals,
             dep_keys, dep_vals,
@@ -1974,7 +1981,14 @@ class TritonSemantic(Generic[TensorTy]):
 
         if not handles:
             return tl.tensor(None, tl.void)
+
+        # Result type: partial type with the first (unit) axis dropped.
+        def _result_type(partial):
+            shape = partial.type.shape  # e.g. [1, BLOCK_M, BLOCK_N]
+            return tl.block_type(partial.type.scalar, shape[1:])
+
         if len(handles) == 1:
-            return tl.tensor(handles[0], tl.block_type(tl.float32, []))  # type filled by builder
-        return [tl.tensor(h, tl.block_type(tl.float32, [])) for h in handles]
+            return tl.tensor(handles[0], _result_type(partials[0]))
+        return [tl.tensor(h, _result_type(p))
+                for h, p in zip(handles, partials)]
     # --- END --- added for spyre

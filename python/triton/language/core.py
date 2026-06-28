@@ -3797,10 +3797,13 @@ def inter_tile(x, axis, combiner, mode, *, work_slices, dep_work_slices=None,
                            Python; use the MLIR layer directly).
         mode:              One of ``"all_reduce"``, ``"reduce_to_one"``,
                            ``"reduce_scatter"``, ``"broadcast"``.
-        work_slices:       ``tl.constexpr`` dict ``{tile_id: {dim: slice_idx}}``
-                           — the ``coreIdToWkSlice`` from the Spyre metadata.
-                           Integer keys only.  ``W`` (``numWkSlicesPerDim``) is
-                           derived: ``W[beta] = max(C[t][beta] for all t) + 1``.
+        work_slices:       ``tl.constexpr`` list (or dict) of per-tile
+                           slice-index dicts — ``coreIdToWkSlice``.
+                           List form (preferred): ``[{dim: label}, ...]`` indexed
+                           by tile id; tiles with the same entry are in the same
+                           group.  Dict form ``{tile_id: {dim: label}}`` also
+                           accepted.  ``W`` (``numWkSlicesPerDim``) is derived:
+                           ``W[beta] = max(C[t][beta] for all t) + 1``.
         dep_work_slices:   Optional ``tl.constexpr`` dict for per-tile
                            dependencies (``depWkSlices``).
         scatter_dimension: Required when ``mode = "reduce_scatter"``; the i64
