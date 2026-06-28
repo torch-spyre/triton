@@ -559,6 +559,142 @@ class TestResultTypes(LowerInterTileTester):
         self.assert_absent("tt.inter_tile_reduce")
 
 
+# ---------------------------------------------------------------------------
+# work_slices encoding — multi-axis contiguous group layout
+# ---------------------------------------------------------------------------
+
+class TestWorkSlices(LowerInterTileTester):
+    """work_slices must encode the group-label axis so groups are contiguous."""
+
+    @pattern("work-slices", category="inter-tile", example=[
+        "# Multi-axis work_slices: group-label axis (first) varies slowest.",
+        "# tile_id = pid_out * NUM_MB_TILES + pid_mb",
+        "# work_slices[tile_id] = {'out': pid_out, 'mb': pid_mb}",
+        "# axis='out': tiles sharing the same 'out' value form one group.",
+        "# Groups must be contiguous in flat tile ordering for LowerInterTile.",
+        "result = tl.inter_tile(partial, axis='out', combiner='add', mode='all_reduce',",
+        "                       work_slices=work_slices)",
+    ])
+    def test_multi_axis_contiguous_groups(self):
+        """Multi-axis work_slices: group-label axis first, groups are contiguous.
+
+        2 out-groups × 2 mb-tiles (4 tiles total):
+          tile 0 → out=0, mb=0   tile 1 → out=0, mb=1
+          tile 2 → out=1, mb=0   tile 3 → out=1, mb=1
+
+        Reducing on axis="out" (label key): group 0 = tiles {0,1}, group 1 = {2,3}.
+        Both groups are contiguous, so LowerInterTile emits the standard
+        producer_tiles_per_group (2 constraints) + groups (2 constraints) form.
+        """
+        # Row-major: "out" outer (group label), "mb" inner (within-group).
+        attrs = _op_attrs({"out": 2, "mb": 2})
+        self.run(f"""
+        module {{
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          {{
+            %0 = tt.inter_tile_reduce
+                   partials(%p : tensor<1x8xf32>)
+                   axis = "out" mode = "all_reduce" combiner = "add"
+                   {attrs}
+                   -> (tensor<8xf32>)
+            tt.return %0 : tensor<8xf32>
+          }}
+        }}
+        """)
+        self.assert_present("ktdp.inter_tile_produce", "ktdp.inter_tile_reduce")
+        self.assert_integer_set("ktdp.inter_tile_produce", "producer_tiles_per_group",
+                                num_dims=1, num_symbols=1, num_constraints=2)
+        self.assert_integer_set("ktdp.inter_tile_produce", "groups",
+                                num_dims=1, num_symbols=0, num_constraints=2)
+
+    def test_single_axis_work_slices(self):
+        """Single-axis work_slices: all tiles share label 0 → one group."""
+        attrs = _op_attrs({"x": 4})
+        self.run(f"""
+        module {{
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          {{
+            %0 = tt.inter_tile_reduce
+                   partials(%p : tensor<1x8xf32>)
+                   axis = "x" mode = "all_reduce" combiner = "add"
+                   {attrs}
+                   -> (tensor<8xf32>)
+            tt.return %0 : tensor<8xf32>
+          }}
+        }}
+        """)
+        self.assert_present("ktdp.inter_tile_produce")
+        self.assert_integer_set("ktdp.inter_tile_produce", "groups",
+                                num_dims=1, num_symbols=0, num_constraints=2)
+
+
+# ---------------------------------------------------------------------------
+# Double all_reduce — two sequential tl.inter_tile calls in one kernel
+# ---------------------------------------------------------------------------
+
+class TestDoubleAllReduce(LowerInterTileTester):
+    """Two consecutive tt.inter_tile_reduce ops lower independently."""
+
+    @pattern("double-all-reduce", category="inter-tile", example=[
+        "# Two sequential all-reduces sharing the same work_slices (softmax pattern).",
+        "rowmax = tl.inter_tile(partial_max, axis='out', combiner='max', mode='all_reduce',",
+        "                       work_slices=work_slices)",
+        "rowsum = tl.inter_tile(partial_sum, axis='out', combiner='add', mode='all_reduce',",
+        "                       work_slices=work_slices)",
+        "# Both lower to independent produce/reduce pairs (2 × produce + 2 × reduce).",
+    ])
+    def test_two_all_reduces_emitted(self):
+        """Two tt.inter_tile_reduce ops → 2 produce + 2 reduce pairs."""
+        attrs = _op_attrs({"out": 2, "mb": 2})
+        self.run(f"""
+        module {{
+          tt.func @k(%pmax: tensor<1x8xf32>, %psum: tensor<1x8xf32>)
+              -> (tensor<8xf32>, tensor<8xf32>)
+          {{
+            %rowmax = tt.inter_tile_reduce
+                        partials(%pmax : tensor<1x8xf32>)
+                        axis = "out" mode = "all_reduce" combiner = "max"
+                        {attrs}
+                        -> (tensor<8xf32>)
+            %rowsum = tt.inter_tile_reduce
+                        partials(%psum : tensor<1x8xf32>)
+                        axis = "out" mode = "all_reduce" combiner = "add"
+                        {attrs}
+                        -> (tensor<8xf32>)
+            tt.return %rowmax, %rowsum : tensor<8xf32>, tensor<8xf32>
+          }}
+        }}
+        """)
+        self.assert_present("ktdp.inter_tile_produce", "ktdp.inter_tile_reduce")
+        self.assert_count("ktdp.inter_tile_produce", 2)
+        self.assert_count("ktdp.inter_tile_reduce", 2)
+        self.assert_absent("tt.inter_tile_reduce")
+
+    def test_two_all_reduces_independent(self):
+        """The two reduce ops carry independent combiner regions (max and add)."""
+        attrs = _op_attrs({"out": 2, "mb": 2})
+        self.run(f"""
+        module {{
+          tt.func @k(%pmax: tensor<1x8xf32>, %psum: tensor<1x8xf32>)
+              -> (tensor<8xf32>, tensor<8xf32>)
+          {{
+            %rowmax = tt.inter_tile_reduce
+                        partials(%pmax : tensor<1x8xf32>)
+                        axis = "out" mode = "all_reduce" combiner = "max"
+                        {attrs}
+                        -> (tensor<8xf32>)
+            %rowsum = tt.inter_tile_reduce
+                        partials(%psum : tensor<1x8xf32>)
+                        axis = "out" mode = "all_reduce" combiner = "add"
+                        {attrs}
+                        -> (tensor<8xf32>)
+            tt.return %rowmax, %rowsum : tensor<8xf32>, tensor<8xf32>
+          }}
+        }}
+        """)
+        self.assert_present("linalg.max", parent="ktdp.inter_tile_reduce")
+        self.assert_present("linalg.add", parent="ktdp.inter_tile_reduce")
+
 
 # ---------------------------------------------------------------------------
 # C6 / Q8 — No-op: module without tt.inter_tile_reduce is unchanged
