@@ -122,32 +122,29 @@ def matmul_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    NUM_IN_TILES: tl.constexpr,   # number of K-shard tiles per output block
-    work_slices: tl.constexpr,    # list of {"out": pid_out, "in": pid_in} per tile
+    NUM_IN_TILES: tl.constexpr,  # K-shards per output block
+    work_slices: tl.constexpr,   # list of {"out": pid_out, "in": pid_in} per tile
 ):
     """Split-K matmul: C[M,N] = A[M,K] @ B[K,N], K split across tiles.
 
     Grid layout (flat 1D, NUM_OUT_TILES × NUM_IN_TILES tiles):
-      tile_id = pid_out * NUM_IN_TILES + pid_in
-      pid_out — selects the [BLOCK_M, BLOCK_N] output block (distribution loop)
-      pid_in  — selects the K-shard (fixed per core)
+      tile_id = pid_out * NUM_IN_TILES + pid_in  ("out" outer / slowest)
+      work_slices[t] = {out: t//NUM_IN_TILES, in: t%NUM_IN_TILES}
+      pid_out — selects the [BLOCK_M, BLOCK_N] output block (fixed per tile)
+      pid_in  — selects the K-shard (fixed per tile)
 
-    Each tile accumulates its K-shard partial and contributes it to a
-    reduce_to_one on the in-axis.  pick₀ (pid_in==0) writes the result to C.
-    The outer loop over out_blocks handles arbitrary M for the fixed grid.
+    axis="out": groups are formed by tiles with the same "out" slice value.
+    Each group contains NUM_IN_TILES K-shard tiles for one output block.
+    reduce_to_one delivers the partial sum to pick₀ = tile with work_slices["in"]==0
+    within each group, i.e., pid_in==0.  Those tiles write the result to C.
+
+    Contiguous groups: out=0 → tiles {0..NUM_IN_TILES-1}, out=1 → next range, etc.
     """
     pid = tl.program_id(0)
-    num_cores = tl.num_programs(0)
     pid_out = pid // NUM_IN_TILES
     pid_in  = pid %  NUM_IN_TILES
 
     K_SHARD: tl.constexpr = K // NUM_IN_TILES // BLOCK_K  # BLOCK_K tiles per shard
-
-    out_blocks = tl.cdiv(M, BLOCK_M)
-    num_out_cores = num_cores // NUM_IN_TILES
-    out_blocks_per_core = tl.cdiv(out_blocks, num_out_cores)
-    out_start = pid_out * out_blocks_per_core
-    out_end   = tl.minimum(out_start + out_blocks_per_core, out_blocks)
 
     a_desc = tl.make_tensor_descriptor(
         a_ptr, shape=[M, K], strides=[K, 1], block_shape=[BLOCK_M, BLOCK_K],
@@ -161,25 +158,24 @@ def matmul_splitk_kernel(
 
     k_start = pid_in * K_SHARD
 
-    for out in range(out_start, out_end):
-        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        for k in range(k_start, k_start + K_SHARD):
-            a_tile = a_desc.load([out * BLOCK_M, k * BLOCK_K])
-            b_tile = b_desc.load([k * BLOCK_K, 0])
-            acc = tl.dot(a_tile, b_tile, acc)
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for k in range(k_start, k_start + K_SHARD):
+        a_tile = a_desc.load([pid_out * BLOCK_M, k * BLOCK_K])
+        b_tile = b_desc.load([k * BLOCK_K, 0])
+        acc = tl.dot(a_tile, b_tile, acc)
 
-        partial = tl.reshape(acc, [1, BLOCK_M, BLOCK_N])
+    partial = tl.reshape(acc, [1, BLOCK_M, BLOCK_N])
 
-        result = tl.inter_tile(
-            partial,
-            axis="in",
-            combiner="add",
-            mode="reduce_to_one",
-            work_slices=work_slices,
-        )
+    result = tl.inter_tile(
+        partial,
+        axis="out",
+        combiner="add",
+        mode="reduce_to_one",
+        work_slices=work_slices,
+    )
 
-        if pid_in == 0:
-            c_desc.store([out * BLOCK_M, 0], result)
+    if pid_in == 0:
+        c_desc.store([pid_out * BLOCK_M, 0], result)
 
 
 @triton.jit

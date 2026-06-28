@@ -269,13 +269,18 @@ VARIANTS = {
 # splitk variant — reduce_to_one
 # ---------------------------------------------------------------------------
 
-_SK_NUM_OUT_TILES = 2   # M / BLOCK_M
+_SK_NUM_OUT_TILES = 2   # output blocks (M / BLOCK_M)
 _SK_NUM_IN_TILES  = 2   # K-shard count
-_SK_NUM_TILES     = _SK_NUM_OUT_TILES * _SK_NUM_IN_TILES  # 4 flat tiles
+_SK_NUM_TILES     = _SK_NUM_OUT_TILES * _SK_NUM_IN_TILES  # 4
 
-# tile_id = pid_out * _SK_NUM_IN_TILES + pid_in
+# tile_id = pid_out * _SK_NUM_IN_TILES + pid_in  ("out" outer / slowest)
+# axis="out": groups formed by tiles with same "out" label.
+# Group out=0 → tiles {0,1}, group out=1 → tiles {2,3}  (contiguous ✓).
+# reduce_to_one pick₀ = min tile per group = tile 0 (out=0) + tile 2 (out=1).
+# pick₀ tiles have work_slices["in"]==0 ↔ pid_in==0, so kernel guard matches.
+# dfir_fixtures/splitk_M64_N512_K6144: out=8 groups × in=4 shards; same shape.
 _SK_WORK_SLICES = [
-    {"out": t % _SK_NUM_IN_TILES, "in": t // _SK_NUM_IN_TILES}
+    {"out": t // _SK_NUM_IN_TILES, "in": t % _SK_NUM_IN_TILES}
     for t in range(_SK_NUM_TILES)
 ]
 
@@ -414,41 +419,48 @@ VARIANTS["softmax"] = {
 VARIANTS["splitk"] = {
     "tags": ["reduce-to-one", "work-slices"],
     "summary": (
-        "Split-K matmul (f32): K split across 2 tiles per output block; "
+        "Split-K matmul (f32): K split across 2 in-tiles per output block; "
         "reduce_to_one on the in-axis returns the sum to pick₀."
     ),
     "doc": (
         "Demonstrates the inter-tile ``reduce_to_one`` pattern on a 2D matmul. "
-        "The K dimension is split across ``NUM_IN_TILES=2`` tiles; each tile "
-        "accumulates a K-shard partial and contributes it to a cross-tile "
-        "reduction.  Only pick₀ (``pid_in==0``) writes the result to C.\n\n"
-        "Grid: 4 flat tiles (2 output blocks × 2 K-shards).  The outer "
-        "distribution loop handles arbitrary M for the fixed grid."
+        "The K dimension is split across ``NUM_IN_TILES=2`` K-shard tiles per "
+        "output block; each tile accumulates its K-shard partial and contributes "
+        "it to a cross-tile reduction.  Only pick₀ (``pid_in==0``) writes the "
+        "result to C.\n\n"
+        "Grid: 4 flat tiles (2 output blocks × 2 K-shards).  "
+        "``work_slices[t] = {out: t//2, in: t%2}`` — ``out`` is outermost so "
+        "groups by ``out`` label are contiguous: out=0 → tiles {0,1}, "
+        "out=1 → {2,3}.  ``axis='out'`` reduces over the out-dimension (grouping "
+        "by output block); pick₀ per group = tile with ``in==0`` (pid_in==0), "
+        "which writes the result to the corresponding output block.\n\n"
+        "The production split-K case (``dfir_fixtures/splitk_M64_N512_K6144``) "
+        "has the same shape: 8 out-groups × 4 in-shards, with ``out`` outermost."
     ),
     "kernel_fn":    kernel.matmul_splitk_kernel,
     "SIGNATURE": {
-        "a_ptr":        "*fp32",
-        "b_ptr":        "*fp32",
-        "c_ptr":        "*fp32",
-        "M":            "i32",
-        "K":            "i32",
-        "N":            "i32",
-        "BLOCK_M":      "i32",
-        "BLOCK_K":      "i32",
-        "BLOCK_N":      "i32",
-        "NUM_IN_TILES": "i32",
-        "work_slices":  None,
+        "a_ptr":         "*fp32",
+        "b_ptr":         "*fp32",
+        "c_ptr":         "*fp32",
+        "M":             "i32",
+        "K":             "i32",
+        "N":             "i32",
+        "BLOCK_M":       "i32",
+        "BLOCK_K":       "i32",
+        "BLOCK_N":       "i32",
+        "NUM_IN_TILES":  "i32",
+        "work_slices":   None,
     },
     "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N", "NUM_IN_TILES", "work_slices"],
     "params": {
-        "M":            [32],
-        "K":            [32],
-        "N":            [16],
-        "BLOCK_M":      [16],
-        "BLOCK_K":      [8],
-        "BLOCK_N":      [16],
-        "NUM_IN_TILES": [_SK_NUM_IN_TILES],
-        "work_slices":  [_SK_WORK_SLICES],
+        "M":             [32],
+        "K":             [32],
+        "N":             [16],
+        "BLOCK_M":       [16],
+        "BLOCK_K":       [8],
+        "BLOCK_N":       [16],
+        "NUM_IN_TILES":  [_SK_NUM_IN_TILES],
+        "work_slices":   [_SK_WORK_SLICES],
     },
     "grid":         [_SK_NUM_TILES],
     "parallel":     True,
