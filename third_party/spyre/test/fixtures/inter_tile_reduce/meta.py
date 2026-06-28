@@ -1,20 +1,20 @@
 """SIGNATURE + VARIANTS for the inter_tile_reduce fixture.
 
-Multi-group ADD all_reduce: a 1D-grid kernel where each flat tile (out of 8)
-loads its column-block partial and participates in a cross-tile all_reduce
-along the x-axis.  Tiles are grouped into 4 row-groups of 2; every tile in a
-group receives the fully-reduced sum.
+Variants:
 
-Grid layout (flat 1D, 8 tiles):
-  tile 0: pid_m=0, pid_n=0  → x-slice 0
-  tile 1: pid_m=0, pid_n=1  → x-slice 1
-  tile 2: pid_m=1, pid_n=0  → x-slice 0
-  ...
-  tile 7: pid_m=3, pid_n=1  → x-slice 1
+all_reduce (default, f16):
+  Flat 1D grid of 8 tiles, 4 row-groups × 2 x-tiles per group.  Every tile
+  loads a column-block partial; all tiles in the same group cooperate via
+  ``tl.inter_tile(mode="all_reduce")`` so each receives the fully-reduced sum.
+  ``work_slices[tile_id]["x"]`` is the group label (0–3); ``W["x"]=4``,
+  ``gsize=2``.
 
-``work_slices`` is a list; tiles in the same group carry the same ``{"x": g}``
-entry (group label).  ``W["x"]=4`` (4 distinct labels), ``gsize=2``.
-``coreIdToWkSlice = [{x:0},{x:0},{x:1},{x:1},{x:2},{x:2},{x:3},{x:3}]``.
+reduce_to_one (splitk):
+  Split-K matmul C[M,N]=A[M,K]@B[K,N].  K split across ``NUM_IN_TILES=2``
+  tiles per output block; each tile accumulates its K-shard partial and
+  contributes it via ``tl.inter_tile(mode="reduce_to_one")`` on the in-axis.
+  Only pick₀ (``pid_in==0``) writes to C.  The outer distribution loop
+  handles arbitrary M for the fixed grid.
 
 See ``fixtures/README.md`` for the field reference.
 """
@@ -263,4 +263,110 @@ VARIANTS = {
         "rtol":          1e-2,
         "extra_checks":  _extra_checks_default,
     },
+}
+
+# ---------------------------------------------------------------------------
+# splitk variant — reduce_to_one
+# ---------------------------------------------------------------------------
+
+_SK_NUM_OUT_TILES = 2   # M / BLOCK_M
+_SK_NUM_IN_TILES  = 2   # K-shard count
+_SK_NUM_TILES     = _SK_NUM_OUT_TILES * _SK_NUM_IN_TILES  # 4 flat tiles
+
+# tile_id = pid_out * _SK_NUM_IN_TILES + pid_in
+_SK_WORK_SLICES = [
+    {"out": t % _SK_NUM_IN_TILES, "in": t // _SK_NUM_IN_TILES}
+    for t in range(_SK_NUM_TILES)
+]
+
+
+def make_inputs_splitk(M: int, K: int, N: int, **_kw) -> dict:
+    rng = np.random.default_rng(seed=0)
+    a = rng.standard_normal((M, K)).astype(np.float32)
+    b = rng.standard_normal((K, N)).astype(np.float32)
+    c = np.zeros((M, N), dtype=np.float32)
+    return {"a_ptr": a, "b_ptr": b, "c_ptr": c}
+
+
+def run_splitk(inputs: dict) -> np.ndarray:
+    return inputs["a_ptr"] @ inputs["b_ptr"]
+
+
+def _extra_checks_splitk(tester) -> None:
+    tester.assert_present("ktdp.inter_tile_produce")
+    tester.assert_present("ktdp.inter_tile_reduce")
+    tester.assert_integer_set(
+        "ktdp.inter_tile_produce", "producer_tiles_per_group",
+        num_dims=1, num_symbols=1, num_constraints=2,
+    )
+    tester.assert_integer_set(
+        "ktdp.inter_tile_produce", "groups",
+        num_dims=1, num_symbols=0, num_constraints=2,
+    )
+    tester.assert_result_type(
+        "ktdp.inter_tile_produce", "ktdp.tile_future<tensor<1x16x16x",
+    )
+    # reduce_to_one: single equality constraint — only pick₀ consumes
+    tester.assert_integer_set(
+        "ktdp.inter_tile_reduce", "consumer_tiles_per_group",
+        num_dims=1, num_symbols=1, num_constraints=1,
+    )
+    tester.assert_integer_set(
+        "ktdp.inter_tile_reduce", "groups",
+        num_dims=1, num_symbols=0, num_constraints=2,
+    )
+    tester.assert_result_type("ktdp.inter_tile_reduce", "tensor<16x16x")
+    tester.assert_result("ktdp.inter_tile_reduce", shape=[16, 16])
+    tester.assert_present("linalg.add", parent="ktdp.inter_tile_reduce")
+    tester.assert_present("ktdp.yield_partial", parent="ktdp.inter_tile_produce")
+    tester.assert_present("ktdp.yield_reduced", parent="ktdp.inter_tile_reduce")
+    tester.assert_absent("tt.inter_tile_reduce")
+
+
+VARIANTS["splitk"] = {
+    "tags": ["split-k", "inter-tile-reduce-to-one"],
+    "summary": (
+        "Split-K matmul (f32): K split across 2 tiles per output block; "
+        "reduce_to_one on the in-axis returns the sum to pick₀."
+    ),
+    "doc": (
+        "Demonstrates the inter-tile ``reduce_to_one`` pattern on a 2D matmul. "
+        "The K dimension is split across ``NUM_IN_TILES=2`` tiles; each tile "
+        "accumulates a K-shard partial and contributes it to a cross-tile "
+        "reduction.  Only pick₀ (``pid_in==0``) writes the result to C.\n\n"
+        "Grid: 4 flat tiles (2 output blocks × 2 K-shards).  The outer "
+        "distribution loop handles arbitrary M for the fixed grid."
+    ),
+    "kernel_fn":    kernel.matmul_splitk_kernel,
+    "SIGNATURE": {
+        "a_ptr":        "*fp32",
+        "b_ptr":        "*fp32",
+        "c_ptr":        "*fp32",
+        "M":            "i32",
+        "K":            "i32",
+        "N":            "i32",
+        "BLOCK_M":      "i32",
+        "BLOCK_K":      "i32",
+        "BLOCK_N":      "i32",
+        "NUM_IN_TILES": "i32",
+        "work_slices":  None,
+    },
+    "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N", "NUM_IN_TILES", "work_slices"],
+    "params": {
+        "M":            [32],
+        "K":            [32],
+        "N":            [16],
+        "BLOCK_M":      [16],
+        "BLOCK_K":      [8],
+        "BLOCK_N":      [16],
+        "NUM_IN_TILES": [_SK_NUM_IN_TILES],
+        "work_slices":  [_SK_WORK_SLICES],
+    },
+    "grid":         [_SK_NUM_TILES],
+    "parallel":     True,
+    "reference":    run_splitk,
+    "inputs":       make_inputs_splitk,
+    "output_key":   "c_ptr",
+    "rtol":         1e-3,
+    "extra_checks": _extra_checks_splitk,
 }
