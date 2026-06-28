@@ -15,7 +15,36 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 # Every tile in the group receives the fully reduced value
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:238` (`TestAllReduce.test_produce_reduce_pair_emitted`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:323` (`TestAllReduce.test_produce_reduce_pair_emitted`)</sup>
+
+**Round-trip evidence**
+
+- `inter_tile_reduce::default` — M=64, N=32, BLOCK_M=16, BLOCK_N=16, NUM_N_TILES=2, work_slices=[…8 items]
+- `inter_tile_reduce::f16` — M=64, N=32, BLOCK_M=16, BLOCK_N=16, NUM_N_TILES=2, work_slices=[…8 items] (also demonstrates: f16)
+- `inter_tile_reduce::softmax` — M=512, N=1024, BLOCK_ROWS=256, BLOCK_COLS=64, NUM_MB_TILES=16, work_slices=[…32 items] (also demonstrates: double-all-reduce, work-slices)
+
+## double-all-reduce
+
+### Supported
+
+#### ✅ `test_two_all_reduces_emitted`
+
+_Two tt.inter_tile_reduce ops → 2 produce + 2 reduce pairs_
+
+```python
+# Two sequential all-reduces sharing the same work_slices (softmax pattern).
+rowmax = tl.inter_tile(partial_max, axis='out', combiner='max', mode='all_reduce',
+                       work_slices=work_slices)
+rowsum = tl.inter_tile(partial_sum, axis='out', combiner='add', mode='all_reduce',
+                       work_slices=work_slices)
+# Both lower to independent produce/reduce pairs (2 × produce + 2 × reduce).
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:638` (`TestDoubleAllReduce.test_two_all_reduces_emitted`)</sup>
+
+**Round-trip evidence**
+
+- `inter_tile_reduce::softmax` — M=512, N=1024, BLOCK_ROWS=256, BLOCK_COLS=64, NUM_MB_TILES=16, work_slices=[…32 items] (also demonstrates: all-reduce, work-slices)
 
 ## fold-away
 
@@ -31,7 +60,7 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 # (axis 'x' has a single slice — no cross-tile communication)
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:134` (`TestFoldAway.test_single_tile_axis`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:153` (`TestFoldAway.test_single_tile_axis`)</sup>
 
 ## group-sets
 
@@ -47,7 +76,7 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 # producer_tiles_per_group + groups attrs emitted on inter_tile_produce
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:188` (`TestGroupSets.test_groups_present`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:212` (`TestGroupSets.test_groups_present`)</sup>
 
 ## no-op
 
@@ -60,7 +89,7 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 result = x + y  # plain arithmetic; no inter-tile reduction
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:407` (`TestNoOp.test_empty_module_unchanged`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:706` (`TestNoOp.test_empty_module_unchanged`)</sup>
 
 ## reduce-to-one
 
@@ -73,7 +102,11 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='reduce_to_one')
 # Only the designated tile (pick₀ per group) receives the reduced value
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:264` (`TestReduceToOne.test_reduce_to_one_emitted`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:394` (`TestReduceToOne.test_reduce_to_one_emitted`)</sup>
+
+**Round-trip evidence**
+
+- `inter_tile_reduce::splitk` — M=32, K=32, N=16, BLOCK_M=16, BLOCK_K=8, BLOCK_N=16, NUM_IN_TILES=2, work_slices=[{'out': 0, 'in': 0}, {'out': 1, 'in': 0}, {'out': 0, 'in': 1}, {'out': 1, 'in': 1}] (also demonstrates: work-slices)
 
 ## result-types
 
@@ -89,7 +122,7 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 # result: tensor<Nxf32>  — unit axis collapsed, rank decremented by 1
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:340` (`TestResultTypes.test_f32_result_type`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:476` (`TestResultTypes.test_f32_result_type`)</sup>
 
 ## shorthand-identity
 
@@ -97,16 +130,49 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 
 #### ✅ `test_add_identity`
 
-_add combiner → arith.constant 0.0 via linalg.fill_
+_add combiner → scalar arith.constant fed into linalg.fill (C3/Q4)_
 
 ```python
 result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 # Shorthand 'add' → identity 0.0 filled via linalg.fill + arith.constant
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:308` (`TestShorthandIdentity.test_add_identity`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:440` (`TestShorthandIdentity.test_add_identity`)</sup>
+
+## work-slices
+
+### Supported
+
+#### ✅ `test_multi_axis_contiguous_groups`
+
+_Multi-axis work_slices: group-label axis first, groups are contiguous_
+
+2 out-groups × 2 mb-tiles (4 tiles total):
+  tile 0 → out=0, mb=0   tile 1 → out=0, mb=1
+  tile 2 → out=1, mb=0   tile 3 → out=1, mb=1
+
+Reducing on axis="out" (label key): group 0 = tiles {0,1}, group 1 = {2,3}.
+Both groups are contiguous, so LowerInterTile emits the standard
+producer_tiles_per_group (2 constraints) + groups (2 constraints) form.
+
+```python
+# Multi-axis work_slices: group-label axis (first) varies slowest.
+# tile_id = pid_out * NUM_MB_TILES + pid_mb
+# work_slices[tile_id] = {'out': pid_out, 'mb': pid_mb}
+# axis='out': tiles sharing the same 'out' value form one group.
+# Groups must be contiguous in flat tile ordering for LowerInterTile.
+result = tl.inter_tile(partial, axis='out', combiner='add', mode='all_reduce',
+                       work_slices=work_slices)
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:569` (`TestWorkSlices.test_multi_axis_contiguous_groups`)</sup>
+
+**Round-trip evidence**
+
+- `inter_tile_reduce::softmax` — M=512, N=1024, BLOCK_ROWS=256, BLOCK_COLS=64, NUM_MB_TILES=16, work_slices=[…32 items] (also demonstrates: all-reduce, double-all-reduce)
+- `inter_tile_reduce::splitk` — M=32, K=32, N=16, BLOCK_M=16, BLOCK_K=8, BLOCK_N=16, NUM_IN_TILES=2, work_slices=[{'out': 0, 'in': 0}, {'out': 1, 'in': 0}, {'out': 0, 'in': 1}, {'out': 1, 'in': 1}] (also demonstrates: reduce-to-one)
 
 
 ---
 
-_Patterns without round-trip evidence: `all-reduce`, `fold-away`, `group-sets`, `no-op`, `reduce-to-one`, `result-types`, `shorthand-identity`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `fold-away`, `group-sets`, `no-op`, `result-types`, `shorthand-identity`. Add a tagged fixture variant to verify end-to-end._

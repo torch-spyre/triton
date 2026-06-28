@@ -189,7 +189,7 @@ SIGNATURE = {
 
 VARIANTS = {
     "default": {
-        "tags": ["inter-tile-all-reduce"],
+        "tags": ["all-reduce"],
         "summary": (
             "Multi-group ADD all_reduce (f32): 8 tiles × 4 row-groups × 2 "
             "x-tiles; every tile in a group receives the fully-reduced sum."
@@ -224,7 +224,7 @@ VARIANTS = {
         "extra_checks":  _extra_checks_default,
     },
     "f16": {
-        "tags": ["inter-tile-all-reduce", "f16"],
+        "tags": ["all-reduce", "f16"],
         "summary": (
             "Multi-group ADD all_reduce (f16): same topology as default but "
             "accumulating in half precision."
@@ -370,7 +370,7 @@ def _extra_checks_softmax(tester) -> None:
 
 
 VARIANTS["softmax"] = {
-    "tags": ["inter-tile-all-reduce", "softmax"],
+    "tags": ["all-reduce", "double-all-reduce", "work-slices"],
     "summary": (
         "Row-wise softmax (f16): two all-reduces (rowmax + rowsum) across "
         "a 16-core mb-cohort; 32 tiles, 2 out-groups × 16 mb-tiles."
@@ -412,7 +412,7 @@ VARIANTS["softmax"] = {
 
 
 VARIANTS["splitk"] = {
-    "tags": ["split-k", "inter-tile-reduce-to-one"],
+    "tags": ["reduce-to-one", "work-slices"],
     "summary": (
         "Split-K matmul (f32): K split across 2 tiles per output block; "
         "reduce_to_one on the in-axis returns the sum to pick₀."

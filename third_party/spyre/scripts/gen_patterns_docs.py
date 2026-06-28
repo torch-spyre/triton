@@ -32,11 +32,36 @@ _SPYRE_ROOT = _TRITON_ROOT / "third_party" / "spyre"
 _TEST_DIR = _SPYRE_ROOT / "test"
 _FIXTURES_DIR = _TEST_DIR / "fixtures"
 
-_SINGLE_PASS_TEST_FILES = (
-    _TEST_DIR / "test_lower_compute_ops.py",
-    _TEST_DIR / "test_distribute_work.py",
-    _TEST_DIR / "test_lower_desc_memory.py",
-)
+def _discover_test_files() -> list[Path]:
+    """Return test_*.py files under _TEST_DIR that are single-pass test files.
+
+    Detection: load each candidate module and check whether any class
+    inherits from ``SinglePassTester``.  That base class is the contract
+    for single-pass pattern tests; non-pass test files (fixture tests,
+    frontend-guard tests, etc.) do not subclass it and are excluded.
+    """
+    import inspect
+    # Bootstrap must have run before this is called so conftest is importable.
+    sys.path.insert(0, str(_TEST_DIR))
+    try:
+        from conftest import SinglePassTester
+    except Exception:
+        SinglePassTester = None
+
+    found = []
+    for path in sorted(_TEST_DIR.glob("test_*.py")):
+        try:
+            mod = _load_module(path)
+        except Exception:
+            continue
+        if SinglePassTester is not None and any(
+            inspect.isclass(obj)
+            and issubclass(obj, SinglePassTester)
+            and obj is not SinglePassTester
+            for obj in vars(mod).values()
+        ):
+            found.append(path)
+    return found
 
 _DEFAULT_DEST = _SPYRE_ROOT / "docs" / "patterns"
 
@@ -211,8 +236,14 @@ def _render_round_trip_block(variants: list[dict]) -> str:
     for v in shown:
         fixture = v["fixture"]
         key = v["key"]
+        def _fmt_param(k, vals):
+            v0 = vals[0]
+            if isinstance(v0, list) and len(v0) > 4:
+                return f"{k}=[…{len(v0)} items]"
+            return f"{k}={v0!r}"
+
         params_str = ", ".join(
-            f"{k}={vals[0]!r}" for k, vals in v["params"].items() if vals
+            _fmt_param(k, vals) for k, vals in v["params"].items() if vals
         ) if v["params"] else ""
         other_tags = [t for t in v["tags"] if t != v.get("_current_tag")]
         suffix = f" (also demonstrates: {', '.join(other_tags)})" if other_tags else ""
@@ -295,7 +326,7 @@ def _render_index(categories: list[str]) -> str:
 def collect_entries():
     from _patterns import extract_tagged_tests
     entries = []
-    for path in _SINGLE_PASS_TEST_FILES:
+    for path in _discover_test_files():
         mod = _load_module(path)
         entries.extend(extract_tagged_tests(mod))
     return entries
