@@ -30,19 +30,22 @@ def inter_tile_add_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_N_TILES: tl.constexpr,  # number of tiles along N (= x-axis group size)
-    work_slices: tl.constexpr,  # {tile_id: {"x": slice_idx}} for all tiles
+    work_slices: tl.constexpr,  # {tile_id: {"x": pid_m, "n": pid_n}} for all tiles
 ):
     """Each tile reduces its local row-block, then participates in a cross-tile
     all_reduce along the x-axis so every tile in the group receives the sum.
 
     Data layout (flat 1D grid of 8 tiles):
       tile_id = pid_m * NUM_N_TILES + pid_n
-      pid_m  ∈ {0..3}   → selects the BLOCK_M row-block
-      pid_n  ∈ {0..1}   → selects the BLOCK_N column-block
+      pid_m  ∈ {0..3}   → selects the BLOCK_M row-block (= "x" group label)
+      pid_n  ∈ {0..1}   → selects the BLOCK_N column-block (= "n" within-group)
+
+    Coordinates are recovered from work_slices via tl.wk_slice_coord rather than
+    the manual pid // / pid % radix, keeping the kernel topology-independent
+    (spec E4).
     """
-    pid = tl.program_id(0)          # flat tile id ∈ {0..7}
-    pid_m = pid // NUM_N_TILES      # row index
-    pid_n = pid %  NUM_N_TILES      # column index (= x-axis slice index)
+    pid_m = tl.wk_slice_coord(work_slices, "x")  # row index (group label)
+    pid_n = tl.wk_slice_coord(work_slices, "n")  # column index
 
     x_desc = tl.make_tensor_descriptor(
         x_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
@@ -84,9 +87,8 @@ def inter_tile_add_kernel_f16(
     work_slices: tl.constexpr,
 ):
     """f16 variant of inter_tile_add_kernel."""
-    pid = tl.program_id(0)
-    pid_m = pid // NUM_N_TILES
-    pid_n = pid %  NUM_N_TILES
+    pid_m = tl.wk_slice_coord(work_slices, "x")
+    pid_n = tl.wk_slice_coord(work_slices, "n")
 
     x_desc = tl.make_tensor_descriptor(
         x_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
@@ -133,6 +135,12 @@ def matmul_splitk_kernel(
       pid_out — selects the [BLOCK_M, BLOCK_N] output block (fixed per tile)
       pid_in  — selects the K-shard (fixed per tile)
 
+    The slice coordinates are recovered from ``work_slices`` itself via
+    ``tl.wk_slice_coord`` rather than the manual ``pid // NUM_IN_TILES`` /
+    ``pid % NUM_IN_TILES`` radix.  This keeps the kernel correct-by-construction
+    for any ``work_slices`` topology (spec E4): there is no hard-coded radix to
+    drift out of sync with the layout the pass reads.
+
     axis="out": groups are formed by tiles with the same "out" slice value.
     Each group contains NUM_IN_TILES K-shard tiles for one output block.
     reduce_to_one delivers the partial sum to pick₀ = tile with work_slices["in"]==0
@@ -140,9 +148,8 @@ def matmul_splitk_kernel(
 
     Contiguous groups: out=0 → tiles {0..NUM_IN_TILES-1}, out=1 → next range, etc.
     """
-    pid = tl.program_id(0)
-    pid_out = pid // NUM_IN_TILES
-    pid_in  = pid %  NUM_IN_TILES
+    pid_out = tl.wk_slice_coord(work_slices, "out")
+    pid_in  = tl.wk_slice_coord(work_slices, "in")
 
     K_SHARD: tl.constexpr = K // NUM_IN_TILES // BLOCK_K  # BLOCK_K tiles per shard
 
@@ -199,10 +206,12 @@ def softmax_inter_tile(
     axis="out": tiles sharing the same "out" label cooperate (16-core mb-cohort).
     The partial passed to tl.inter_tile has a unit leading dim [1, BLOCK_ROWS]
     which LowerInterTile collapses to [BLOCK_ROWS] in the result.
+
+    Coordinates are recovered from work_slices via tl.wk_slice_coord rather than
+    the manual pid // / pid % radix (spec E4).
     """
-    pid = tl.program_id(0)
-    pid_out = pid // NUM_MB_TILES
-    pid_mb  = pid %  NUM_MB_TILES
+    pid_out = tl.wk_slice_coord(work_slices, "out")
+    pid_mb  = tl.wk_slice_coord(work_slices, "mb")
 
     row0 = pid_out * BLOCK_ROWS
     col0 = pid_mb  * BLOCK_COLS

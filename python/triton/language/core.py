@@ -3815,4 +3815,36 @@ def inter_tile(x, axis, combiner, mode, *, work_slices, dep_work_slices=None,
                                 work_slices=work_slices,
                                 dep_work_slices=dep_work_slices,
                                 scatter_dimension=scatter_dimension)
+
+
+@builtin
+def wk_slice_coord(work_slices, axis, _semantic=None):
+    """(Spyre only) Runtime slice coordinate of the current tile on ``axis``.
+
+    Returns ``work_slices[tl.program_id(0)][axis]`` as a runtime ``i32`` scalar
+    — the same kind of runtime value ``tl.program_id`` produces (it is **not** a
+    ``constexpr``).  ``work_slices`` and ``axis`` are ``constexpr``; the per-axis
+    column ``[ws[axis] for ws in work_slices]`` is known at compile time and is
+    materialized into the TTIR as a small constant table, then indexed by
+    ``tl.program_id(0)`` at runtime.
+
+    This lets an inter-tile kernel recover its own slice coordinate (e.g. for a
+    ``reduce_to_one`` store guard or a descriptor offset) directly from the
+    ``work_slices`` topology, instead of hand-coding the radix
+    (``pid % NUM_IN_TILES``) which must otherwise be kept in sync with
+    ``work_slices`` by convention.  See spec E4.
+
+    Args:
+        work_slices: ``tl.constexpr`` list (or dict keyed by tile id) of per-tile
+                     slice-index dicts — the same value passed to
+                     :func:`inter_tile`.
+        axis:        ``tl.constexpr`` work-slice dim name to look up (e.g.
+                     ``"in"``).  Must be a key in every ``work_slices`` entry.
+
+    The kernel must be launched with ``prod(grid) == len(work_slices)`` so every
+    ``tl.program_id(0)`` indexes a real table row.
+
+    Only valid on the ``spyre`` backend — raises on any other target.
+    """
+    return _semantic.wk_slice_coord(work_slices, axis)
 # --- END --- added for spyre

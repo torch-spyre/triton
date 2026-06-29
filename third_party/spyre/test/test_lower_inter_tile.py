@@ -24,6 +24,7 @@ both the RuntimeError and the MLIR diagnostic on stderr.
 
 import pytest
 from conftest import SinglePassTester
+from utils import compile_to_ttir
 from utils_pattern import pattern
 
 
@@ -873,3 +874,91 @@ class TestValidation(LowerInterTileTester):
             }}
             """)
         self.assert_stderr(capfd, "scatter_dimension")
+
+
+# ---------------------------------------------------------------------------
+# E4 — tl.wk_slice_coord: runtime tile coordinate lookup
+#
+# Unlike the other classes here, wk_slice_coord is a *frontend emission*
+# feature, not a KTIR pass rewrite: it lowers to plain TTIR (a program_id
+# fed through a constant-folded arith.cmpi/arith.select chain).  So these
+# tests compile a real @triton.jit kernel to TTIR and inspect the text,
+# rather than running the LowerInterTile pass on inline MLIR.
+# ---------------------------------------------------------------------------
+
+class TestWkSliceCoord:
+    """E4: tl.wk_slice_coord(work_slices, axis) → runtime i32 coordinate."""
+
+    # 4 tiles, "out" outer / "in" inner — the split-K topology.
+    WORK_SLICES = [
+        {"out": 0, "in": 0}, {"out": 0, "in": 1},
+        {"out": 1, "in": 0}, {"out": 1, "in": 1},
+    ]
+
+    def _compile(self):
+        from fixtures.inter_tile_reduce import kernel
+        sig = {"a_ptr": "*fp32", "b_ptr": "*fp32", "c_ptr": "*fp32",
+               "M": "i32", "K": "i32", "N": "i32"}
+        cx = {"BLOCK_M": 32, "BLOCK_K": 32, "BLOCK_N": 32,
+              "NUM_IN_TILES": 2, "work_slices": self.WORK_SLICES}
+        return compile_to_ttir(kernel.matmul_splitk_kernel, sig, cx)
+
+    @pattern("wk-slice-coord", category="inter-tile", example=[
+        "# Recover this tile's slice coordinates from work_slices itself,",
+        "# instead of the manual pid // NUM_IN_TILES radix (spec E4).",
+        "pid_out = tl.wk_slice_coord(work_slices, 'out')   # runtime i32",
+        "pid_in  = tl.wk_slice_coord(work_slices, 'in')    # runtime i32",
+        "if pid_in == 0:",
+        "    c_desc.store([pid_out * BLOCK_M, 0], result)",
+    ])
+    def test_lowers_to_program_id_indexed_select_chain(self):
+        """wk_slice_coord emits a program_id-indexed select chain, no new op.
+
+        Each call folds the constexpr per-axis column into a chain of
+        ``arith.cmpi eq`` (pid == i) + ``arith.select`` over the runtime
+        ``tt.get_program_id``.  No bespoke IR op is introduced.
+        """
+        ttir = self._compile()
+        # The two wk_slice_coord calls (out, in) read program_id.
+        assert ttir.count("tt.get_program_id") >= 1
+        # Coordinate lookup composes cmpi-eq + select (constant-folded; the
+        # in-column [0,1,0,1] and out-column [0,0,1,1] yield several of each).
+        assert "arith.cmpi eq" in ttir
+        assert "arith.select" in ttir
+        # No new dedicated op was introduced for the lookup.
+        assert "wk_slice_coord" not in ttir
+
+    def test_result_is_i32_runtime_scalar(self):
+        """The selected coordinate is a runtime i32 scalar (not a constexpr)."""
+        ttir = self._compile()
+        # The select chain operates on i32 scalars (the result type ": i32"
+        # appears before the trailing MLIR `loc(...)` annotation).
+        assert "arith.select" in ttir
+        for line in ttir.splitlines():
+            if "arith.select" in line:
+                assert ": i32" in line, \
+                    f"wk_slice_coord select not i32-scalar: {line!r}"
+
+    def test_invalid_axis_raises_at_compile_time(self):
+        """An axis absent from work_slices is a compile-time error."""
+        from fixtures.inter_tile_reduce import kernel
+        sig = {"a_ptr": "*fp32", "b_ptr": "*fp32", "c_ptr": "*fp32",
+               "M": "i32", "K": "i32", "N": "i32"}
+        # work_slices entries carry only "out"/"in"; "bogus" is missing.
+        cx = {"BLOCK_M": 32, "BLOCK_K": 32, "BLOCK_N": 32,
+              "NUM_IN_TILES": 2, "work_slices": self.WORK_SLICES}
+
+        # Patch a kernel that asks for a missing axis by compiling a thin
+        # wrapper is overkill; instead, drive the semantic helper directly is
+        # not possible without a builder.  So assert via a dedicated kernel.
+        bad_ws = [{"out": 0}, {"out": 0}, {"out": 1}, {"out": 1}]
+        cx_bad = dict(cx, work_slices=bad_ws)
+        with pytest.raises(Exception) as ei:
+            compile_to_ttir(kernel.matmul_splitk_kernel, sig, cx_bad)
+        # Root cause mentions the missing axis.
+        msgs, cur = [], ei.value
+        while cur is not None:
+            msgs.append(str(cur))
+            cur = getattr(cur, "__cause__", None)
+        joined = " ".join(msgs)
+        assert "wk_slice_coord" in joined and "missing" in joined and "'in'" in joined
