@@ -1991,4 +1991,59 @@ class TritonSemantic(Generic[TensorTy]):
             return tl.tensor(handles[0], _result_type(partials[0]))
         return [tl.tensor(h, _result_type(p))
                 for h, p in zip(handles, partials)]
+
+    def wk_slice_coord(self, work_slices, axis):
+        """Return work_slices[program_id(0)][axis] as a runtime i32 scalar.
+
+        ``work_slices`` and ``axis`` are constexpr, so the per-tile coordinate
+        column ``coords = [ws[axis] for ws in work_slices]`` is known at compile
+        time.  The runtime ``program_id(0)`` selects which entry the executing
+        tile reads.  Since the frontend has no dense-constant-array builder, the
+        lookup is composed as a chain of scalar selects on the scalar pid::
+
+            coord = 0
+            for i, c in enumerate(coords):
+                coord = (pid == i) ? c : coord
+
+        All operands are i32 scalars, so the result is a runtime i32 scalar — no
+        tensors, no reduction (spec E4).
+        """
+        target = driver.active.get_current_target()
+        if target.backend != "spyre":
+            raise ValueError(
+                "tl.wk_slice_coord is only supported on the 'spyre' "
+                f"backend, not '{target.backend}'")
+
+        axis = tl._unwrap_if_constexpr(axis)
+        work_slices = tl._unwrap_if_constexpr(work_slices)
+
+        # Normalize to a tile-id-ordered list of slice-index dicts (accepts a
+        # list indexed by tile id, or a dict keyed by tile id) — same surface
+        # as tl.inter_tile's work_slices.
+        if isinstance(work_slices, (list, tuple)):
+            entries = list(work_slices)
+        else:
+            num = max(int(k) for k in work_slices) + 1 if work_slices else 0
+            entries = [work_slices[t] for t in range(num)]
+
+        if not entries:
+            raise ValueError("tl.wk_slice_coord: work_slices is empty")
+
+        # Extract the per-axis column; every tile must declare the axis.
+        coords = []
+        for t, ws in enumerate(entries):
+            if axis not in ws:
+                raise ValueError(
+                    f"tl.wk_slice_coord: axis {axis!r} missing from "
+                    f"work_slices[{t}] = {dict(ws)!r}")
+            coords.append(int(ws[axis]))
+
+        pid = self.program_id(0)  # runtime i32 scalar
+
+        # Fold the constant column into a scalar select chain indexed by pid.
+        coord = self.scalar_constant(0, tl.int32)
+        for i, c in enumerate(coords):
+            is_i = self.equal(pid, self.scalar_constant(i, tl.int32))
+            coord = self.where(is_i, self.scalar_constant(c, tl.int32), coord)
+        return coord
     # --- END --- added for spyre

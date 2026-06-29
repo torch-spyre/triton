@@ -35,10 +35,15 @@ _NUM_N_TILES  = 2   # tiles per group (gsize)
 _NUM_TILES    = _NUM_M_GROUPS * _NUM_N_TILES  # 8 flat tiles
 
 # work_slices: list indexed by tile_id; each entry is the full slice-index dict.
-# Tiles in the same group carry the same slice dict (group label).
-# tile_id = pid_m * _NUM_N_TILES + pid_n  →  group = pid_m  →  x-label = pid_m
-# Groups: {0,1}, {2,3}, {4,5}, {6,7} (each pid_m pair)
-_WORK_SLICES = [{"x": t // _NUM_N_TILES} for t in range(_NUM_TILES)]
+# tile_id = pid_m * _NUM_N_TILES + pid_n
+#   "x" = pid_m  → group label (reduction axis); groups {0,1}, {2,3}, {4,5}, {6,7}
+#   "n" = pid_n  → within-group column index
+# Both coordinates are carried so the kernel can recover them via
+# tl.wk_slice_coord instead of the manual pid // / pid % radix (spec E4).
+_WORK_SLICES = [
+    {"x": t // _NUM_N_TILES, "n": t % _NUM_N_TILES}
+    for t in range(_NUM_TILES)
+]
 
 # ---------------------------------------------------------------------------
 # Reference oracle + input builder

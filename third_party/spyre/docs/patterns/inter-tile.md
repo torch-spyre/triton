@@ -15,7 +15,7 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 # Every tile in the group receives the fully reduced value
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:323` (`TestAllReduce.test_produce_reduce_pair_emitted`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:324` (`TestAllReduce.test_produce_reduce_pair_emitted`)</sup>
 
 **Round-trip evidence**
 
@@ -40,7 +40,7 @@ rowsum = tl.inter_tile(partial_sum, axis='out', combiner='add', mode='all_reduce
 # Both lower to independent produce/reduce pairs (2 × produce + 2 × reduce).
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:638` (`TestDoubleAllReduce.test_two_all_reduces_emitted`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:639` (`TestDoubleAllReduce.test_two_all_reduces_emitted`)</sup>
 
 **Round-trip evidence**
 
@@ -60,7 +60,7 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 # (axis 'x' has a single slice — no cross-tile communication)
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:153` (`TestFoldAway.test_single_tile_axis`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:154` (`TestFoldAway.test_single_tile_axis`)</sup>
 
 ## group-sets
 
@@ -76,7 +76,7 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 # producer_tiles_per_group + groups attrs emitted on inter_tile_produce
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:212` (`TestGroupSets.test_groups_present`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:213` (`TestGroupSets.test_groups_present`)</sup>
 
 ## no-op
 
@@ -89,7 +89,7 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 result = x + y  # plain arithmetic; no inter-tile reduction
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:706` (`TestNoOp.test_empty_module_unchanged`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:707` (`TestNoOp.test_empty_module_unchanged`)</sup>
 
 ## reduce-to-one
 
@@ -102,7 +102,7 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='reduce_to_one')
 # Only the designated tile (pick₀ per group) receives the reduced value
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:394` (`TestReduceToOne.test_reduce_to_one_emitted`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:395` (`TestReduceToOne.test_reduce_to_one_emitted`)</sup>
 
 **Round-trip evidence**
 
@@ -122,7 +122,7 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 # result: tensor<Nxf32>  — unit axis collapsed, rank decremented by 1
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:476` (`TestResultTypes.test_f32_result_type`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:477` (`TestResultTypes.test_f32_result_type`)</sup>
 
 ## shorthand-identity
 
@@ -137,7 +137,30 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 # Shorthand 'add' → identity 0.0 filled via linalg.fill + arith.constant
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:440` (`TestShorthandIdentity.test_add_identity`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:441` (`TestShorthandIdentity.test_add_identity`)</sup>
+
+## wk-slice-coord
+
+### Supported
+
+#### ✅ `test_lowers_to_program_id_indexed_select_chain`
+
+_wk_slice_coord emits a program_id-indexed select chain, no new op_
+
+Each call folds the constexpr per-axis column into a chain of
+``arith.cmpi eq`` (pid == i) + ``arith.select`` over the runtime
+``tt.get_program_id``.  No bespoke IR op is introduced.
+
+```python
+# Recover this tile's slice coordinates from work_slices itself,
+# instead of the manual pid // NUM_IN_TILES radix (spec E4).
+pid_out = tl.wk_slice_coord(work_slices, 'out')   # runtime i32
+pid_in  = tl.wk_slice_coord(work_slices, 'in')    # runtime i32
+if pid_in == 0:
+    c_desc.store([pid_out * BLOCK_M, 0], result)
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:906` (`TestWkSliceCoord.test_lowers_to_program_id_indexed_select_chain`)</sup>
 
 ## work-slices
 
@@ -165,7 +188,7 @@ result = tl.inter_tile(partial, axis='out', combiner='add', mode='all_reduce',
                        work_slices=work_slices)
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:569` (`TestWorkSlices.test_multi_axis_contiguous_groups`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:570` (`TestWorkSlices.test_multi_axis_contiguous_groups`)</sup>
 
 **Round-trip evidence**
 
@@ -175,4 +198,4 @@ result = tl.inter_tile(partial, axis='out', combiner='add', mode='all_reduce',
 
 ---
 
-_Patterns without round-trip evidence: `fold-away`, `group-sets`, `no-op`, `result-types`, `shorthand-identity`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `fold-away`, `group-sets`, `no-op`, `result-types`, `shorthand-identity`, `wk-slice-coord`. Add a tagged fixture variant to verify end-to-end._
