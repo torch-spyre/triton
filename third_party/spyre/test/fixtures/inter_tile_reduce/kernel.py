@@ -30,7 +30,7 @@ def inter_tile_add_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_N_TILES: tl.constexpr,  # number of tiles along N (= x-axis group size)
-    work_slices: tl.constexpr,  # {tile_id: {"x": pid_m, "n": pid_n}} for all tiles
+    WORK_SLICES: tl.constexpr,  # {tile_id: {"x": pid_m, "n": pid_n}} for all tiles
 ):
     """Each tile reduces its local row-block, then participates in a cross-tile
     all_reduce along the x-axis so every tile in the group receives the sum.
@@ -40,12 +40,12 @@ def inter_tile_add_kernel(
       pid_m  ∈ {0..3}   → selects the BLOCK_M row-block (= "x" group label)
       pid_n  ∈ {0..1}   → selects the BLOCK_N column-block (= "n" within-group)
 
-    Coordinates are recovered from work_slices via tl.wk_slice_coord rather than
+    Coordinates are recovered from WORK_SLICES via tl.wk_slice_coord rather than
     the manual pid // / pid % radix, keeping the kernel topology-independent
     (spec E4).
     """
-    pid_m = tl.wk_slice_coord(work_slices, "x")  # row index (group label)
-    pid_n = tl.wk_slice_coord(work_slices, "n")  # column index
+    pid_m = tl.wk_slice_coord(WORK_SLICES, "x")  # row index (group label)
+    pid_n = tl.wk_slice_coord(WORK_SLICES, "n")  # column index
 
     x_desc = tl.make_tensor_descriptor(
         x_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
@@ -63,13 +63,13 @@ def inter_tile_add_kernel(
     partial = tl.reshape(partial_2d, [1, BLOCK_M, BLOCK_N])  # unit leading dim
 
     # Cross-tile reduction: all tiles in the same row group (same pid_m)
-    # cooperate.  work_slices carries the W/C metadata for the pass.
+    # cooperate.  WORK_SLICES carries the W/C metadata for the pass.
     result = tl.inter_tile(
         partial,
         axis="x",
         combiner="add",
         mode="all_reduce",
-        work_slices=work_slices,
+        work_slices=WORK_SLICES,
     )  # tensor<BLOCK_M x BLOCK_N x f32> (unit dim collapsed by the pass)
 
     out_desc.store([offset_m, offset_n], result)
@@ -84,11 +84,11 @@ def inter_tile_add_kernel_f16(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_N_TILES: tl.constexpr,
-    work_slices: tl.constexpr,
+    WORK_SLICES: tl.constexpr,
 ):
     """f16 variant of inter_tile_add_kernel."""
-    pid_m = tl.wk_slice_coord(work_slices, "x")
-    pid_n = tl.wk_slice_coord(work_slices, "n")
+    pid_m = tl.wk_slice_coord(WORK_SLICES, "x")
+    pid_n = tl.wk_slice_coord(WORK_SLICES, "n")
 
     x_desc = tl.make_tensor_descriptor(
         x_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
@@ -107,7 +107,7 @@ def inter_tile_add_kernel_f16(
         axis="x",
         combiner="add",
         mode="all_reduce",
-        work_slices=work_slices,
+        work_slices=WORK_SLICES,
     )
 
     out_desc.store([offset_m, offset_n], result)
@@ -125,31 +125,31 @@ def matmul_splitk_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_IN_TILES: tl.constexpr,  # K-shards per output block
-    work_slices: tl.constexpr,   # list of {"out": pid_out, "in": pid_in} per tile
+    WORK_SLICES: tl.constexpr,   # list of {"out": pid_out, "in": pid_in} per tile
 ):
     """Split-K matmul: C[M,N] = A[M,K] @ B[K,N], K split across tiles.
 
     Grid layout (flat 1D, NUM_OUT_TILES × NUM_IN_TILES tiles):
       tile_id = pid_out * NUM_IN_TILES + pid_in  ("out" outer / slowest)
-      work_slices[t] = {out: t//NUM_IN_TILES, in: t%NUM_IN_TILES}
+      WORK_SLICES[t] = {out: t//NUM_IN_TILES, in: t%NUM_IN_TILES}
       pid_out — selects the [BLOCK_M, BLOCK_N] output block (fixed per tile)
       pid_in  — selects the K-shard (fixed per tile)
 
-    The slice coordinates are recovered from ``work_slices`` itself via
+    The slice coordinates are recovered from ``WORK_SLICES`` itself via
     ``tl.wk_slice_coord`` rather than the manual ``pid // NUM_IN_TILES`` /
     ``pid % NUM_IN_TILES`` radix.  This keeps the kernel correct-by-construction
-    for any ``work_slices`` topology (spec E4): there is no hard-coded radix to
+    for any ``WORK_SLICES`` topology (spec E4): there is no hard-coded radix to
     drift out of sync with the layout the pass reads.
 
     axis="out": groups are formed by tiles with the same "out" slice value.
     Each group contains NUM_IN_TILES K-shard tiles for one output block.
-    reduce_to_one delivers the partial sum to pick₀ = tile with work_slices["in"]==0
+    reduce_to_one delivers the partial sum to pick₀ = tile with WORK_SLICES["in"]==0
     within each group, i.e., pid_in==0.  Those tiles write the result to C.
 
     Contiguous groups: out=0 → tiles {0..NUM_IN_TILES-1}, out=1 → next range, etc.
     """
-    pid_out = tl.wk_slice_coord(work_slices, "out")
-    pid_in  = tl.wk_slice_coord(work_slices, "in")
+    pid_out = tl.wk_slice_coord(WORK_SLICES, "out")
+    pid_in  = tl.wk_slice_coord(WORK_SLICES, "in")
 
     K_SHARD: tl.constexpr = K // NUM_IN_TILES // BLOCK_K  # BLOCK_K tiles per shard
 
@@ -178,7 +178,7 @@ def matmul_splitk_kernel(
         axis="out",
         combiner="add",
         mode="reduce_to_one",
-        work_slices=work_slices,
+        work_slices=WORK_SLICES,
     )
 
     if pid_in == 0:
@@ -194,7 +194,7 @@ def softmax_inter_tile(
     BLOCK_ROWS: tl.constexpr,   # rows per core (M / NUM_OUT_TILES)
     BLOCK_COLS: tl.constexpr,   # cols per core (N / NUM_MB_TILES)
     NUM_MB_TILES: tl.constexpr, # number of mb-tiles (column-block tiles per row-group)
-    work_slices: tl.constexpr,  # list of {"mb": pid_mb, "out": pid_out} per tile
+    WORK_SLICES: tl.constexpr,  # list of {"mb": pid_mb, "out": pid_out} per tile
 ):
     """Row-wise softmax with two inter-tile all-reduces (rowmax, rowsum).
 
@@ -207,11 +207,11 @@ def softmax_inter_tile(
     The partial passed to tl.inter_tile has a unit leading dim [1, BLOCK_ROWS]
     which LowerInterTile collapses to [BLOCK_ROWS] in the result.
 
-    Coordinates are recovered from work_slices via tl.wk_slice_coord rather than
+    Coordinates are recovered from WORK_SLICES via tl.wk_slice_coord rather than
     the manual pid // / pid % radix (spec E4).
     """
-    pid_out = tl.wk_slice_coord(work_slices, "out")
-    pid_mb  = tl.wk_slice_coord(work_slices, "mb")
+    pid_out = tl.wk_slice_coord(WORK_SLICES, "out")
+    pid_mb  = tl.wk_slice_coord(WORK_SLICES, "mb")
 
     row0 = pid_out * BLOCK_ROWS
     col0 = pid_mb  * BLOCK_COLS
@@ -239,7 +239,7 @@ def softmax_inter_tile(
         axis="out",
         combiner="max",
         mode="all_reduce",
-        work_slices=work_slices,
+        work_slices=WORK_SLICES,
     )
 
     x_shifted = x_f32 - tl.reshape(rowmax, [BLOCK_ROWS, 1])
@@ -252,7 +252,7 @@ def softmax_inter_tile(
         axis="out",
         combiner="add",
         mode="all_reduce",
-        work_slices=work_slices,
+        work_slices=WORK_SLICES,
     )
 
     softmax_out = exp_x / tl.reshape(rowsum, [BLOCK_ROWS, 1])

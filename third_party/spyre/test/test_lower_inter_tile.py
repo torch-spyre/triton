@@ -900,7 +900,7 @@ class TestWkSliceCoord:
         sig = {"a_ptr": "*fp32", "b_ptr": "*fp32", "c_ptr": "*fp32",
                "M": "i32", "K": "i32", "N": "i32"}
         cx = {"BLOCK_M": 32, "BLOCK_K": 32, "BLOCK_N": 32,
-              "NUM_IN_TILES": 2, "work_slices": self.WORK_SLICES}
+              "NUM_IN_TILES": 2, "WORK_SLICES": self.WORK_SLICES}
         return compile_to_ttir(kernel.matmul_splitk_kernel, sig, cx)
 
     @pattern("wk-slice-coord", category="inter-tile", example=[
@@ -946,13 +946,13 @@ class TestWkSliceCoord:
                "M": "i32", "K": "i32", "N": "i32"}
         # work_slices entries carry only "out"/"in"; "bogus" is missing.
         cx = {"BLOCK_M": 32, "BLOCK_K": 32, "BLOCK_N": 32,
-              "NUM_IN_TILES": 2, "work_slices": self.WORK_SLICES}
+              "NUM_IN_TILES": 2, "WORK_SLICES": self.WORK_SLICES}
 
         # Patch a kernel that asks for a missing axis by compiling a thin
         # wrapper is overkill; instead, drive the semantic helper directly is
         # not possible without a builder.  So assert via a dedicated kernel.
         bad_ws = [{"out": 0}, {"out": 0}, {"out": 1}, {"out": 1}]
-        cx_bad = dict(cx, work_slices=bad_ws)
+        cx_bad = dict(cx, WORK_SLICES=bad_ws)
         with pytest.raises(Exception) as ei:
             compile_to_ttir(kernel.matmul_splitk_kernel, sig, cx_bad)
         # Root cause mentions the missing axis.

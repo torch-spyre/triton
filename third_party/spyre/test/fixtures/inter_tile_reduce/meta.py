@@ -51,9 +51,9 @@ _WORK_SLICES = [
 
 def make_inputs(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
                 NUM_N_TILES: int = _NUM_N_TILES,
-                work_slices=None, **_kw) -> dict:
+                WORK_SLICES=None, **_kw) -> dict:
     """Build pointer-tensor inputs for inter_tile_add_kernel (f32)."""
-    del BLOCK_M, BLOCK_N, NUM_N_TILES, work_slices, _kw
+    del BLOCK_M, BLOCK_N, NUM_N_TILES, WORK_SLICES, _kw
     rng = np.random.default_rng(42)
     x = rng.standard_normal((M, N)).astype(np.float32)
     output = np.zeros((M, N), dtype=np.float32)
@@ -62,9 +62,9 @@ def make_inputs(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
 
 def make_inputs_f16(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
                     NUM_N_TILES: int = _NUM_N_TILES,
-                    work_slices=None, **_kw) -> dict:
+                    WORK_SLICES=None, **_kw) -> dict:
     """Build pointer-tensor inputs for inter_tile_add_kernel (f16)."""
-    del BLOCK_M, BLOCK_N, NUM_N_TILES, work_slices, _kw
+    del BLOCK_M, BLOCK_N, NUM_N_TILES, WORK_SLICES, _kw
     rng = np.random.default_rng(42)
     x = rng.standard_normal((M, N)).astype(np.float16)
     output = np.zeros((M, N), dtype=np.float16)
@@ -185,7 +185,7 @@ SIGNATURE = {
     "BLOCK_M":     "i32",
     "BLOCK_N":     "i32",
     "NUM_N_TILES": "i32",
-    "work_slices": None,   # constexpr dict — not a KTIR runtime arg
+    "WORK_SLICES": None,   # constexpr dict — not a KTIR runtime arg
 }
 
 # ---------------------------------------------------------------------------
@@ -208,18 +208,18 @@ VARIANTS = {
             "a ``linalg.add`` combiner over the ``1×BLOCK_M×BLOCK_N`` partials.\n\n"
             "The result for each tile is the element-wise sum of the two "
             "column-blocks in its group (unit leading dim collapsed by the reduce "
-            "result type).  ``work_slices`` is a compile-time list; "
+            "result type).  ``WORK_SLICES`` is a compile-time list; "
             "``LowerInterTile`` derives groups by equality of the slice dict."
         ),
         "kernel_fn":    kernel.inter_tile_add_kernel,
-        "constexpr":    ["BLOCK_M", "BLOCK_N", "NUM_N_TILES", "work_slices"],
+        "constexpr":    ["BLOCK_M", "BLOCK_N", "NUM_N_TILES", "WORK_SLICES"],
         "params": {
             "M":           [64],
             "N":           [32],
             "BLOCK_M":     [16],
             "BLOCK_N":     [16],
             "NUM_N_TILES": [_NUM_N_TILES],
-            "work_slices": [_WORK_SLICES],
+            "WORK_SLICES": [_WORK_SLICES],
         },
         "grid":          [_NUM_TILES],
         "parallel":      False,  # one block per tile, no distribution loop
@@ -249,16 +249,16 @@ VARIANTS = {
             "BLOCK_M":     "i32",
             "BLOCK_N":     "i32",
             "NUM_N_TILES": "i32",
-            "work_slices": None,
+            "WORK_SLICES": None,
         },
-        "constexpr":    ["BLOCK_M", "BLOCK_N", "NUM_N_TILES", "work_slices"],
+        "constexpr":    ["BLOCK_M", "BLOCK_N", "NUM_N_TILES", "WORK_SLICES"],
         "params": {
             "M":           [64],
             "N":           [32],
             "BLOCK_M":     [16],
             "BLOCK_N":     [16],
             "NUM_N_TILES": [_NUM_N_TILES],
-            "work_slices": [_WORK_SLICES],
+            "WORK_SLICES": [_WORK_SLICES],
         },
         "grid":          [_NUM_TILES],
         "parallel":      False,
@@ -400,16 +400,16 @@ VARIANTS["softmax"] = {
         "BLOCK_ROWS":    "i32",
         "BLOCK_COLS":    "i32",
         "NUM_MB_TILES":  "i32",
-        "work_slices":   None,
+        "WORK_SLICES":   None,
     },
-    "constexpr":   ["BLOCK_ROWS", "BLOCK_COLS", "NUM_MB_TILES", "work_slices"],
+    "constexpr":   ["BLOCK_ROWS", "BLOCK_COLS", "NUM_MB_TILES", "WORK_SLICES"],
     "params": {
         "M":            [512],
         "N":            [1024],
         "BLOCK_ROWS":   [256],
         "BLOCK_COLS":   [64],
         "NUM_MB_TILES": [_SM_NUM_MB_TILES],
-        "work_slices":  [_SM_WORK_SLICES],
+        "WORK_SLICES":  [_SM_WORK_SLICES],
     },
     "grid":        [_SM_NUM_TILES],
     "parallel":    False,
@@ -434,7 +434,7 @@ VARIANTS["splitk"] = {
         "it to a cross-tile reduction.  Only pick₀ (``pid_in==0``) writes the "
         "result to C.\n\n"
         "Grid: 4 flat tiles (2 output blocks × 2 K-shards).  "
-        "``work_slices[t] = {out: t//2, in: t%2}`` — ``out`` is outermost so "
+        "``WORK_SLICES[t] = {out: t//2, in: t%2}`` — ``out`` is outermost so "
         "groups by ``out`` label are contiguous: out=0 → tiles {0,1}, "
         "out=1 → {2,3}.  ``axis='out'`` reduces over the out-dimension (grouping "
         "by output block); pick₀ per group = tile with ``in==0`` (pid_in==0), "
@@ -454,9 +454,9 @@ VARIANTS["splitk"] = {
         "BLOCK_K":       "i32",
         "BLOCK_N":       "i32",
         "NUM_IN_TILES":  "i32",
-        "work_slices":   None,
+        "WORK_SLICES":   None,
     },
-    "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N", "NUM_IN_TILES", "work_slices"],
+    "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N", "NUM_IN_TILES", "WORK_SLICES"],
     "params": {
         "M":             [32],
         "K":             [32],
@@ -465,7 +465,7 @@ VARIANTS["splitk"] = {
         "BLOCK_K":       [8],
         "BLOCK_N":       [16],
         "NUM_IN_TILES":  [_SK_NUM_IN_TILES],
-        "work_slices":   [_SK_WORK_SLICES],
+        "WORK_SLICES":   [_SK_WORK_SLICES],
     },
     "grid":         [_SK_NUM_TILES],
     "parallel":     True,
