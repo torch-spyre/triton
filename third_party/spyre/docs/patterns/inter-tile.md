@@ -19,9 +19,9 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')
 
 **Round-trip evidence**
 
-- `inter_tile_reduce::default` — M=64, N=32, BLOCK_M=16, BLOCK_N=16, NUM_N_TILES=2, work_slices=[…8 items]
-- `inter_tile_reduce::f16` — M=64, N=32, BLOCK_M=16, BLOCK_N=16, NUM_N_TILES=2, work_slices=[…8 items] (also demonstrates: f16)
-- `inter_tile_reduce::softmax` — M=512, N=1024, BLOCK_ROWS=256, BLOCK_COLS=64, NUM_MB_TILES=16, work_slices=[…32 items] (also demonstrates: double-all-reduce, work-slices)
+- `inter_tile_reduce::default` — M=64, N=32, BLOCK_M=16, BLOCK_N=16, NUM_N_TILES=2, WORK_SLICES=[…8 items]
+- `inter_tile_reduce::f16` — M=64, N=32, BLOCK_M=16, BLOCK_N=16, NUM_N_TILES=2, WORK_SLICES=[…8 items] (also demonstrates: f16)
+- `inter_tile_reduce::softmax` — M=512, N=1024, BLOCK_ROWS=256, BLOCK_COLS=64, NUM_MB_TILES=16, WORK_SLICES=[…32 items] (also demonstrates: double-all-reduce, work-slices)
 
 ## double-all-reduce
 
@@ -44,7 +44,7 @@ rowsum = tl.inter_tile(partial_sum, axis='out', combiner='add', mode='all_reduce
 
 **Round-trip evidence**
 
-- `inter_tile_reduce::softmax` — M=512, N=1024, BLOCK_ROWS=256, BLOCK_COLS=64, NUM_MB_TILES=16, work_slices=[…32 items] (also demonstrates: all-reduce, work-slices)
+- `inter_tile_reduce::softmax` — M=512, N=1024, BLOCK_ROWS=256, BLOCK_COLS=64, NUM_MB_TILES=16, WORK_SLICES=[…32 items] (also demonstrates: all-reduce, work-slices)
 
 ## fold-away
 
@@ -106,7 +106,7 @@ result = tl.inter_tile(partial, axis='x', combiner='add', mode='reduce_to_one')
 
 **Round-trip evidence**
 
-- `inter_tile_reduce::splitk` — M=32, K=32, N=16, BLOCK_M=16, BLOCK_K=8, BLOCK_N=16, NUM_IN_TILES=2, work_slices=[{'out': 0, 'in': 0}, {'out': 0, 'in': 1}, {'out': 1, 'in': 0}, {'out': 1, 'in': 1}] (also demonstrates: work-slices)
+- `inter_tile_reduce::splitk` — M=32, K=32, N=16, BLOCK_M=16, BLOCK_K=8, BLOCK_N=16, NUM_IN_TILES=2, WORK_SLICES=[{'out': 0, 'in': 0}, {'out': 0, 'in': 1}, {'out': 1, 'in': 0}, {'out': 1, 'in': 1}] (also demonstrates: work-slices)
 
 ## result-types
 
@@ -192,8 +192,8 @@ result = tl.inter_tile(partial, axis='out', combiner='add', mode='all_reduce',
 
 **Round-trip evidence**
 
-- `inter_tile_reduce::softmax` — M=512, N=1024, BLOCK_ROWS=256, BLOCK_COLS=64, NUM_MB_TILES=16, work_slices=[…32 items] (also demonstrates: all-reduce, double-all-reduce)
-- `inter_tile_reduce::splitk` — M=32, K=32, N=16, BLOCK_M=16, BLOCK_K=8, BLOCK_N=16, NUM_IN_TILES=2, work_slices=[{'out': 0, 'in': 0}, {'out': 0, 'in': 1}, {'out': 1, 'in': 0}, {'out': 1, 'in': 1}] (also demonstrates: reduce-to-one)
+- `inter_tile_reduce::softmax` — M=512, N=1024, BLOCK_ROWS=256, BLOCK_COLS=64, NUM_MB_TILES=16, WORK_SLICES=[…32 items] (also demonstrates: all-reduce, double-all-reduce)
+- `inter_tile_reduce::splitk` — M=32, K=32, N=16, BLOCK_M=16, BLOCK_K=8, BLOCK_N=16, NUM_IN_TILES=2, WORK_SLICES=[{'out': 0, 'in': 0}, {'out': 0, 'in': 1}, {'out': 1, 'in': 0}, {'out': 1, 'in': 1}] (also demonstrates: reduce-to-one)
 
 
 ---
