@@ -9,7 +9,7 @@ add_triton_library(KTDPTransforms
   KTDPTransformsIncGen
 
   LINK_LIBS PUBLIC
-  MLIRKtdp
+  KTIR::KtdpDialect
   TritonIR
   MLIRIR
   MLIRPass
