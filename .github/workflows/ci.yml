@@ -97,7 +97,7 @@ jobs:
       # succeeded — a failing run never reaches here, so it cannot falsely green
       # a broken commit.
       - name: Update failing check run to success
-        if: ${{ inputs.ktir_cpu_ref != '' }}
+        if: ${{ success() && inputs.ktir_cpu_ref != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
