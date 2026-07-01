@@ -29,23 +29,23 @@ def inter_tile_add_kernel(
     N,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    NUM_N_TILES: tl.constexpr,  # number of tiles along N (= x-axis group size)
-    WORK_SLICES: tl.constexpr,  # {tile_id: {"x": pid_m, "n": pid_n}} for all tiles
+    NUM_N_TILES: tl.constexpr,  # number of tiles along N (= reduction axis group size)
+    WORK_SLICES: tl.constexpr,  # list of {"x": pid_m, "n": pid_n} per tile
 ):
     """Each tile reduces its local row-block, then participates in a cross-tile
-    all_reduce along the x-axis so every tile in the group receives the sum.
+    all_reduce along the n-axis so every tile in the group receives the sum.
 
     Data layout (flat 1D grid of 8 tiles):
       tile_id = pid_m * NUM_N_TILES + pid_n
-      pid_m  ∈ {0..3}   → selects the BLOCK_M row-block (= "x" group label)
-      pid_n  ∈ {0..1}   → selects the BLOCK_N column-block (= "n" within-group)
+      pid_m  ∈ {0..3}   → selects the BLOCK_M row-block (= "x", the group key)
+      pid_n  ∈ {0..1}   → selects the BLOCK_N column-block (= "n", reduction axis)
 
-    Coordinates are recovered from WORK_SLICES via tl.wk_slice_coord rather than
-    the manual pid // / pid % radix, keeping the kernel topology-independent
-    (spec E4).
+    axis="n": tiles that differ only on "n" cooperate (same row-group, different
+    column blocks). Coordinates are recovered from WORK_SLICES via tl.wk_slice_coord
+    rather than the manual pid // / pid % radix (spec E4).
     """
-    pid_m = tl.wk_slice_coord(WORK_SLICES, "x")  # row index (group label)
-    pid_n = tl.wk_slice_coord(WORK_SLICES, "n")  # column index
+    pid_m = tl.wk_slice_coord(WORK_SLICES, "x")  # row index (group key, constant per group)
+    pid_n = tl.wk_slice_coord(WORK_SLICES, "n")  # column index (reduction axis)
 
     x_desc = tl.make_tensor_descriptor(
         x_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
@@ -66,7 +66,7 @@ def inter_tile_add_kernel(
     # cooperate.  WORK_SLICES carries the W/C metadata for the pass.
     result = tl.inter_tile(
         partial,
-        axis="x",
+        axis="n",
         combiner="add",
         mode="all_reduce",
         work_slices=WORK_SLICES,
@@ -104,7 +104,7 @@ def inter_tile_add_kernel_f16(
 
     result = tl.inter_tile(
         partial,
-        axis="x",
+        axis="n",
         combiner="add",
         mode="all_reduce",
         work_slices=WORK_SLICES,
@@ -141,9 +141,9 @@ def matmul_splitk_kernel(
     for any ``WORK_SLICES`` topology (spec E4): there is no hard-coded radix to
     drift out of sync with the layout the pass reads.
 
-    axis="out": groups are formed by tiles with the same "out" slice value.
-    Each group contains NUM_IN_TILES K-shard tiles for one output block.
-    reduce_to_one delivers the partial sum to pick₀ = tile with WORK_SLICES["in"]==0
+    axis="in": tiles that differ only on "in" (K-shards) but share the same "out"
+    cooperate. Each group contains NUM_IN_TILES tiles for one output block.
+    reduce_to_one delivers the partial sum to pick₀ = tile with C[t]["in"]==0
     within each group, i.e., pid_in==0.  Those tiles write the result to C.
 
     Contiguous groups: out=0 → tiles {0..NUM_IN_TILES-1}, out=1 → next range, etc.
@@ -175,7 +175,7 @@ def matmul_splitk_kernel(
 
     result = tl.inter_tile(
         partial,
-        axis="out",
+        axis="in",
         combiner="add",
         mode="reduce_to_one",
         work_slices=WORK_SLICES,
@@ -203,9 +203,9 @@ def softmax_inter_tile(
       pid_out — selects the BLOCK_ROWS row-block (row group)
       pid_mb  — selects the BLOCK_COLS column-block within the row-group
 
-    axis="out": tiles sharing the same "out" label cooperate (16-core mb-cohort).
-    The partial passed to tl.inter_tile has a unit leading dim [1, BLOCK_ROWS]
-    which LowerInterTile collapses to [BLOCK_ROWS] in the result.
+    axis="mb": tiles that differ only on "mb" (column-blocks) but share the same "out"
+    row-group cooperate (16-core mb-cohort). The partial passed to tl.inter_tile has
+    a unit leading dim [1, BLOCK_ROWS] which LowerInterTile collapses to [BLOCK_ROWS].
 
     Coordinates are recovered from WORK_SLICES via tl.wk_slice_coord rather than
     the manual pid // / pid % radix (spec E4).
@@ -236,7 +236,7 @@ def softmax_inter_tile(
     partial_max = tl.reshape(local_max, [1, BLOCK_ROWS])
     rowmax = tl.inter_tile(
         partial_max,
-        axis="out",
+        axis="mb",
         combiner="max",
         mode="all_reduce",
         work_slices=WORK_SLICES,
@@ -249,7 +249,7 @@ def softmax_inter_tile(
     partial_sum = tl.reshape(local_sum, [1, BLOCK_ROWS])
     rowsum = tl.inter_tile(
         partial_sum,
-        axis="out",
+        axis="mb",
         combiner="add",
         mode="all_reduce",
         work_slices=WORK_SLICES,
