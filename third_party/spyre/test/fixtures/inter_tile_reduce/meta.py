@@ -36,8 +36,8 @@ _NUM_TILES    = _NUM_M_GROUPS * _NUM_N_TILES  # 8 flat tiles
 
 # work_slices: list indexed by tile_id; each entry is the full slice-index dict.
 # tile_id = pid_m * _NUM_N_TILES + pid_n
-#   "x" = pid_m  → group label (reduction axis); groups {0,1}, {2,3}, {4,5}, {6,7}
-#   "n" = pid_n  → within-group column index
+#   "x" = pid_m  → group key (constant within group); groups {0,1}, {2,3}, {4,5}, {6,7}
+#   "n" = pid_n  → reduction axis (tiles differing on "n" cooperate)
 # Both coordinates are carried so the kernel can recover them via
 # tl.wk_slice_coord instead of the manual pid // / pid % radix (spec E4).
 _WORK_SLICES = [
@@ -279,9 +279,9 @@ _SK_NUM_IN_TILES  = 2   # K-shard count
 _SK_NUM_TILES     = _SK_NUM_OUT_TILES * _SK_NUM_IN_TILES  # 4
 
 # tile_id = pid_out * _SK_NUM_IN_TILES + pid_in  ("out" outer / slowest)
-# axis="out": groups formed by tiles with same "out" label.
+# axis="in": tiles that differ on "in" (K-shard) but share the same "out" cooperate.
 # Group out=0 → tiles {0,1}, group out=1 → tiles {2,3}  (contiguous ✓).
-# reduce_to_one pick₀ = min tile per group = tile 0 (out=0) + tile 2 (out=1).
+# reduce_to_one pick₀ = tile with C[t]["in"]==0 per group = tile 0 + tile 2.
 # pick₀ tiles have work_slices["in"]==0 ↔ pid_in==0, so kernel guard matches.
 # dfir_fixtures/splitk_M64_N512_K6144: out=8 groups × in=4 shards; same shape.
 _SK_WORK_SLICES = [
@@ -342,7 +342,8 @@ _SM_NUM_OUT_TILES = 2
 _SM_NUM_TILES     = _SM_NUM_MB_TILES * _SM_NUM_OUT_TILES  # 32
 
 # tile_id = pid_out * _SM_NUM_MB_TILES + pid_mb
-# axis="out": group g (out=g) owns tiles g*16 .. g*16+15 (contiguous).
+# axis="mb": tiles that differ on "mb" (column-block) but share "out" cooperate;
+#   group g (out=g) owns tiles g*16 .. g*16+15 (contiguous).
 _SM_WORK_SLICES = [
     {"mb": t % _SM_NUM_MB_TILES, "out": t // _SM_NUM_MB_TILES}
     for t in range(_SM_NUM_TILES)
@@ -387,7 +388,7 @@ VARIANTS["softmax"] = {
     ),
     "doc": (
         "Each core owns a [BLOCK_ROWS, BLOCK_COLS] column-block. "
-        "Two cross-tile all-reduces over the out-axis produce the true "
+        "Two cross-tile all-reduces over the mb-axis produce the true "
         "per-row max and sum from partial column-block values. The grid "
         "exactly covers [M, N] so no distribution loop is needed."
     ),
@@ -435,10 +436,10 @@ VARIANTS["splitk"] = {
         "result to C.\n\n"
         "Grid: 4 flat tiles (2 output blocks × 2 K-shards).  "
         "``WORK_SLICES[t] = {out: t//2, in: t%2}`` — ``out`` is outermost so "
-        "groups by ``out`` label are contiguous: out=0 → tiles {0,1}, "
-        "out=1 → {2,3}.  ``axis='out'`` reduces over the out-dimension (grouping "
-        "by output block); pick₀ per group = tile with ``in==0`` (pid_in==0), "
-        "which writes the result to the corresponding output block.\n\n"
+        "tiles with the same ``out`` are contiguous: out=0 → tiles {0,1}, "
+        "out=1 → {2,3}.  ``axis='in'`` names the reduction dim (K-shard); tiles "
+        "differing only on ``in`` cooperate. pick₀ per group = tile with ``in==0`` "
+        "(pid_in==0), which writes the result to the corresponding output block.\n\n"
         "The production split-K case (``dfir_fixtures/splitk_M64_N512_K6144``) "
         "has the same shape: 8 out-groups × 4 in-shards, with ``out`` outermost."
     ),

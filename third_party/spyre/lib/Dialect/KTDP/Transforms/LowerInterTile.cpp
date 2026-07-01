@@ -37,8 +37,8 @@
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include <map>
 
 using namespace mlir;
 
@@ -100,64 +100,86 @@ struct GroupSets {
 
 // Build the GroupSets for the given reduction axis.
 //
-// Grouping semantics: two tiles are in the same group iff their
-// coreIdToWkSlice entries are equal (same full slice-dict).  The axis-key
-// value in each entry serves as the group label; tiles with the same label
-// cooperate.
+// Grouping semantics (coop_α): two tiles cooperate iff they agree on every
+// dim except `axis`.  `axis` is the *reduction* dim — the dim that varies
+// within a group.  Tiles with the same non-axis slice-index tuple form one
+// group; `gsize = W[axis]` is the number of cooperating tiles per group, and
+// `ngroups = numTiles / gsize`.
 //
-// ngroups = number of distinct slice-dict entries in C.
-// gsize   = num_tiles / ngroups  (must divide evenly).
-//
-// Group indices are assigned in ascending axis-key-value order.
 // Current scope: members of each group must be contiguous tile ids
 // {g*gsize .. (g+1)*gsize - 1}.
 static FailureOr<GroupSets>
 buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
                StringRef axis, Operation *loc) {
   // --- validate axis present in W (R1) ---
-  if (!attrs.numWkSlicesPerDim.getAs<IntegerAttr>(axis))
+  auto gsizeAttr = attrs.numWkSlicesPerDim.getAs<IntegerAttr>(axis);
+  if (!gsizeAttr)
     return loc->emitError("axis '") << axis
            << "' not found in numWkSlicesPerDim (R1)";
+  int64_t gsize = gsizeAttr.getInt();
 
   int64_t numTiles = (int64_t)attrs.coreIdToWkSlice.size();
   if (numTiles == 0)
     return loc->emitError("coreIdToWkSlice is empty");
 
-  // --- partition tiles by axis-key value (group label) ---
-  llvm::SmallDenseMap<int64_t, SmallVector<int64_t>> labelToTiles;
-  SmallVector<int64_t> labelOrder;
+  if (numTiles % gsize != 0)
+    return loc->emitError("tile count ") << numTiles
+           << " does not divide evenly by gsize=" << gsize
+           << " for axis '" << axis << "'";
+  int64_t ngroups = numTiles / gsize;
+
+  // --- partition tiles by non-axis slice-index tuple (coop_α) ---
+  // Two tiles are in the same group iff their slice dicts agree on all dims
+  // except `axis`.  We encode the non-axis tuple as a sorted string key for
+  // map lookup.
+  std::map<std::string, SmallVector<int64_t>> tupleToTiles;
+  SmallVector<std::string> tupleOrder;
 
   for (int64_t t = 0; t < numTiles; ++t) {
     auto tileMap = dyn_cast<DictionaryAttr>(attrs.coreIdToWkSlice[t]);
     if (!tileMap)
       return loc->emitError("coreIdToWkSlice entry ") << t
              << " is not a DictionaryAttr";
-    auto labelAttr = tileMap.getAs<IntegerAttr>(axis);
-    if (!labelAttr)
+    // Validate axis key present.
+    if (!tileMap.getAs<IntegerAttr>(axis))
       return loc->emitError("coreIdToWkSlice entry ") << t
              << " has no key '" << axis << "'";
-    int64_t label = labelAttr.getInt();
-    if (!labelToTiles.count(label))
-      labelOrder.push_back(label);
-    labelToTiles[label].push_back(t);
+    // Build non-axis tuple key (sorted by attr name for determinism).
+    std::string key;
+    llvm::raw_string_ostream os(key);
+    SmallVector<std::pair<StringRef, int64_t>> nonAxisPairs;
+    for (auto namedAttr : tileMap) {
+      if (namedAttr.getName().strref() == axis) continue;
+      auto intAttr = dyn_cast<IntegerAttr>(namedAttr.getValue());
+      if (!intAttr)
+        return loc->emitError("coreIdToWkSlice entry ") << t
+               << ": value for key '" << namedAttr.getName() << "' is not i64";
+      nonAxisPairs.push_back({namedAttr.getName().strref(), intAttr.getInt()});
+    }
+    llvm::sort(nonAxisPairs, [](auto &a, auto &b) { return a.first < b.first; });
+    for (auto &[k, v] : nonAxisPairs)
+      os << k << "=" << v << ";";
+    os.flush();
+    if (!tupleToTiles.count(key))
+      tupleOrder.push_back(key);
+    tupleToTiles[key].push_back(t);
   }
 
-  // Sort labels for deterministic group-index assignment.
-  llvm::sort(labelOrder);
+  // Sort group keys for deterministic group-index assignment.
+  llvm::sort(tupleOrder);
 
-  int64_t ngroups = (int64_t)labelOrder.size();
-  int64_t gsize   = numTiles / ngroups;
-  if (gsize * ngroups != numTiles)
-    return loc->emitError("tile count ") << numTiles
-           << " does not divide evenly into " << ngroups << " groups";
+  if ((int64_t)tupleOrder.size() != ngroups)
+    return loc->emitError("expected ") << ngroups
+           << " groups (numTiles/W[axis]=" << numTiles << "/" << gsize
+           << ") but found " << tupleOrder.size()
+           << " distinct non-axis tuples";
 
   // Verify uniform group size and contiguous membership.
   for (int64_t g = 0; g < ngroups; ++g) {
-    int64_t label = labelOrder[g];
-    auto &members = labelToTiles[label];
+    auto &members = tupleToTiles[tupleOrder[g]];
     if ((int64_t)members.size() != gsize)
-      return loc->emitError("group ") << g << " (label " << label << ") has "
-             << members.size() << " tiles, expected " << gsize;
+      return loc->emitError("group ") << g << " has " << members.size()
+             << " tiles, expected gsize=" << gsize;
     llvm::sort(members);
     for (int64_t j = 0; j < gsize; ++j) {
       int64_t expected = g * gsize + j;
