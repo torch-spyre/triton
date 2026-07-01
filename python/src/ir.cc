@@ -1875,6 +1875,95 @@ void init_triton_ir(py::module &&m) {
                                                   paddingOption);
            });
 
+#ifdef TRITON_BUILD_TTIR_ONLY // --- added for spyre
+  // Spyre-only: emit tt.inter_tile_reduce with work-slice op attributes.
+  // Python layer derives W from C and serializes both into flat parallel lists.
+  //
+  // w_keys / w_vals   : numWkSlicesPerDim (axis → count)
+  // c_keys            : axis names (same order for every tile)
+  // c_vals            : per-tile slice indices, c_vals[tile][axis_idx]
+  // dep_keys / dep_vals: depWkSlices (consumer-local-idx str → [producer-local-idxs])
+  TritonOpBuilderBinding.def(
+      "create_inter_tile_reduce",
+      [](TritonOpBuilder &self,
+         std::vector<Value> &partials,
+         std::string axis, std::string combiner, std::string mode,
+         int64_t scatter_dimension,
+         std::vector<std::string> &w_keys, std::vector<int64_t> &w_vals,
+         std::vector<std::string> &c_keys,
+         std::vector<std::vector<int64_t>> &c_vals,
+         std::vector<std::string> &dep_keys,
+         std::vector<std::vector<int64_t>> &dep_vals)
+          -> std::vector<Value> {
+        auto &builder = self.getBuilder();
+        MLIRContext *ctx = builder.getContext();
+        auto i64Ty = IntegerType::get(ctx, 64);
+
+        // --- numWkSlicesPerDim (W) ---
+        SmallVector<NamedAttribute> wAttrs;
+        for (size_t i = 0; i < w_keys.size(); ++i)
+          wAttrs.push_back({StringAttr::get(ctx, w_keys[i]),
+                            IntegerAttr::get(i64Ty, w_vals[i])});
+        auto numWkSlicesPerDim = DictionaryAttr::get(ctx, wAttrs);
+
+        // --- coreIdToWkSlice (C) ---
+        SmallVector<Attribute> tileAttrs;
+        for (auto &tileVals : c_vals) {
+          SmallVector<NamedAttribute> tileMap;
+          for (size_t j = 0; j < c_keys.size(); ++j)
+            tileMap.push_back({StringAttr::get(ctx, c_keys[j]),
+                               IntegerAttr::get(i64Ty, tileVals[j])});
+          tileAttrs.push_back(DictionaryAttr::get(ctx, tileMap));
+        }
+        auto coreIdToWkSlice = ArrayAttr::get(ctx, tileAttrs);
+
+        // --- depWkSlices (D, optional) ---
+        DictionaryAttr depWkSlices;
+        if (!dep_keys.empty()) {
+          SmallVector<NamedAttribute> depAttrs;
+          for (size_t i = 0; i < dep_keys.size(); ++i) {
+            SmallVector<Attribute> prodIdxs;
+            for (int64_t v : dep_vals[i])
+              prodIdxs.push_back(IntegerAttr::get(i64Ty, v));
+            depAttrs.push_back({StringAttr::get(ctx, dep_keys[i]),
+                                 ArrayAttr::get(ctx, prodIdxs)});
+          }
+          depWkSlices = DictionaryAttr::get(ctx, depAttrs);
+        }
+
+        // --- result types: inferred from partials (same type, rank collapsed by pass) ---
+        SmallVector<Type> resultTypes;
+        for (auto &p : partials) {
+          auto rTy = cast<RankedTensorType>(p.getType());
+          // Drop the leading unit dimension (the within-group tile axis).
+          SmallVector<int64_t> shape(rTy.getShape().begin() + 1,
+                                     rTy.getShape().end());
+          resultTypes.push_back(
+              RankedTensorType::get(shape, rTy.getElementType()));
+        }
+
+        // --- optional scatter_dimension ---
+        IntegerAttr scatterDimAttr;
+        if (scatter_dimension >= 0)
+          scatterDimAttr = IntegerAttr::get(i64Ty, scatter_dimension);
+
+        auto op = self.create<triton::InterTileReduceOp>(
+            resultTypes,
+            /*partials=*/ValueRange(partials),
+            /*identities=*/ValueRange{},
+            axis, mode, combiner,
+            scatterDimAttr,
+            numWkSlicesPerDim,
+            coreIdToWkSlice,
+            depWkSlices);
+
+        std::vector<Value> results;
+        for (auto r : op.getResults())
+          results.push_back(r);
+        return results;
+      });
+#endif // --- added for spyre
+
   // Add custom operations.
   for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
     for (const auto &op : plugin.listOps()) {
