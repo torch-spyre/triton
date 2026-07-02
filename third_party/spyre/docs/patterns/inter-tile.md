@@ -33,9 +33,9 @@ _Two tt.inter_tile_reduce ops → 2 produce + 2 reduce pairs_
 
 ```python
 # Two sequential all-reduces sharing the same work_slices (softmax pattern).
-rowmax = tl.inter_tile(partial_max, axis='out', combiner='max', mode='all_reduce',
+rowmax = tl.inter_tile(partial_max, axis='mb', combiner='max', mode='all_reduce',
                        work_slices=work_slices)
-rowsum = tl.inter_tile(partial_sum, axis='out', combiner='add', mode='all_reduce',
+rowsum = tl.inter_tile(partial_sum, axis='mb', combiner='add', mode='all_reduce',
                        work_slices=work_slices)
 # Both lower to independent produce/reduce pairs (2 × produce + 2 × reduce).
 ```
@@ -168,23 +168,23 @@ if pid_in == 0:
 
 #### ✅ `test_multi_axis_contiguous_groups`
 
-_Multi-axis work_slices: group-label axis first, groups are contiguous_
+_Multi-axis work_slices: reduction axis last (within-group), groups contiguous_
 
-2 out-groups × 2 mb-tiles (4 tiles total):
-  tile 0 → out=0, mb=0   tile 1 → out=0, mb=1
-  tile 2 → out=1, mb=0   tile 3 → out=1, mb=1
+2 mb-groups × 2 out-tiles (4 tiles total):
+  tile 0 → mb=0, out=0   tile 1 → mb=0, out=1
+  tile 2 → mb=1, out=0   tile 3 → mb=1, out=1
 
-Reducing on axis="out" (label key): group 0 = tiles {0,1}, group 1 = {2,3}.
+axis="out" (reduction dim): group 0 = tiles {0,1}, group 1 = {2,3}.
 Both groups are contiguous, so LowerInterTile emits the standard
 producer_tiles_per_group (2 constraints) + groups (2 constraints) form.
 
 ```python
-# Multi-axis work_slices: group-label axis (first) varies slowest.
+# Multi-axis work_slices: group-key axis (first) varies slowest.
 # tile_id = pid_out * NUM_MB_TILES + pid_mb
 # work_slices[tile_id] = {'out': pid_out, 'mb': pid_mb}
-# axis='out': tiles sharing the same 'out' value form one group.
+# axis='mb': tiles differing only on 'mb' (same 'out') cooperate.
 # Groups must be contiguous in flat tile ordering for LowerInterTile.
-result = tl.inter_tile(partial, axis='out', combiner='add', mode='all_reduce',
+result = tl.inter_tile(partial, axis='mb', combiner='add', mode='all_reduce',
                        work_slices=work_slices)
 ```
 

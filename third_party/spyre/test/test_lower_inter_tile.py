@@ -638,9 +638,9 @@ class TestDoubleAllReduce(LowerInterTileTester):
 
     @pattern("double-all-reduce", category="inter-tile", example=[
         "# Two sequential all-reduces sharing the same work_slices (softmax pattern).",
-        "rowmax = tl.inter_tile(partial_max, axis='out', combiner='max', mode='all_reduce',",
+        "rowmax = tl.inter_tile(partial_max, axis='mb', combiner='max', mode='all_reduce',",
         "                       work_slices=work_slices)",
-        "rowsum = tl.inter_tile(partial_sum, axis='out', combiner='add', mode='all_reduce',",
+        "rowsum = tl.inter_tile(partial_sum, axis='mb', combiner='add', mode='all_reduce',",
         "                       work_slices=work_slices)",
         "# Both lower to independent produce/reduce pairs (2 × produce + 2 × reduce).",
     ])
