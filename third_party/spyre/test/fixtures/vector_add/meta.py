@@ -157,6 +157,15 @@ VARIANTS = {
                             shape_not=[1024]),
         ),
     },
+    "nonaligned": {
+        # n_elements=2097153: num_blocks=2049, not divisible by 32 cores.
+        # tl.minimum clamp fires on the last core's block range.
+        "base":   "default",
+        "params": {"n_elements": [2097153], "BLOCK_SIZE": [1024]},
+        "extra_checks": lambda t: (
+            t.assert_result("ktdp.construct_memory_view", shape_not=[1024]),
+        ),
+    },
     "dynamic": {
         # PR #86: flip n_elements from constexpr to runtime i32. Produces
         # memref<?xf32> in KTIR. Inherits ``params`` and everything else
@@ -233,6 +242,15 @@ VARIANTS = {
                                  "memref<?x?xf32>"),
         ),
     },
+    "2d_nonaligned": {
+        # M=520: m_blocks=33, not divisible by 32 cores → clamp fires.
+        "base":   "2d",
+        "params": {"M": [520], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16]},
+        "extra_checks": lambda t: (
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<520x32xf32>"),
+        ),
+    },
     # --- 3D variants ---
     "3d": {
         "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-1d", "num-programs-fold"],
@@ -283,6 +301,18 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?x?xf32>"),
+        ),
+    },
+    "3d_nonaligned": {
+        # M=65: m_blocks=9, not divisible by 32 cores → clamp fires.
+        "base":   "3d",
+        "params": {
+            "M": [65], "N": [32], "P": [16],
+            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
+        },
+        "extra_checks": lambda t: (
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<65x32x16xf32>"),
         ),
     },
     # --- 2D grid variants ---

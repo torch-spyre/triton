@@ -172,6 +172,20 @@ VARIANTS = {
             t.assert_result_type("ktdp.construct_memory_view", "memref<512x64xf32>"),
         ),
     },
+    "nonaligned": {
+        # M=520: m_blocks=33, not divisible by 32 cores.
+        # ceil(33/32)=2 for core 0; tl.minimum clamp fires on the last core.
+        "base":   "default",
+        "params": {
+            "M": [520], "K": [64], "N": [256],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+        "extra_checks": lambda t: (
+            t.assert_present("linalg.matmul"),
+            t.assert_absent("tt.dot"),
+            t.assert_result_type("ktdp.construct_memory_view", "memref<520x64xf32>"),
+        ),
+    },
     "dynamic": {
         # Dynamic: M, K, N are runtime i32 → memref<?x?xf32>.
         "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot", "program-id-2d", "num-programs-fold"],
@@ -192,6 +206,14 @@ VARIANTS = {
             t.assert_present("linalg.matmul"),
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
         ),
+    },
+    "dynamic_nonaligned": {
+        # M=500: non-divisible by 32 → clamp fires in the dynamic-bounds path.
+        "base":   "dynamic",
+        "params": {
+            "M": [500], "K": [64], "N": [256],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
     },
     # --- BMM (batched) variants ---
     "bmm": {
@@ -231,6 +253,15 @@ VARIANTS = {
             t.assert_present("linalg.batch_matmul"),
             t.assert_absent("tt.dot"),
         ),
+    },
+    "bmm_nonaligned": {
+        # B=5: b_blocks=5, bm_blocks=5*8=40, not divisible by 32 cores.
+        # tl.minimum clamp fires on the static bm distribution.
+        "base":   "bmm",
+        "params": {
+            "B": [5], "M": [128], "K": [32], "N": [64],
+            "BLOCK_B": [1], "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
     },
     # --- 2D grid variant ---
     "2d_grid": {
@@ -289,6 +320,18 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_present("linalg.matmul"),
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
+        ),
+    },
+    "2d_grid_nonaligned": {
+        # M=260: m_blocks=17, not divisible by 4 M-cores → clamp fires.
+        "base":   "2d_grid",
+        "params": {
+            "M": [260], "K": [64], "N": [128],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+        "extra_checks": lambda t: (
+            t.assert_present("linalg.matmul"),
+            t.assert_result_type("ktdp.construct_memory_view", "memref<260x64xf32>"),
         ),
     },
     # --- BMM 3D grid variants ---
@@ -350,6 +393,14 @@ VARIANTS = {
             t.assert_present("linalg.batch_matmul"),
             t.assert_absent("tt.dot"),
         ),
+    },
+    "bmm_3d_grid_nonaligned": {
+        # B=5: b_blocks=5, not divisible by 2 B-cores → clamp fires on B axis.
+        "base":   "bmm_3d_grid",
+        "params": {
+            "B": [5], "M": [64], "K": [32], "N": [64],
+            "BLOCK_B": [1], "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
     },
     # --- BMM addptr variants (disabled: tt.addptr-into-descriptor gap) ---
     # These exercise the per-batch pointer arithmetic pattern
