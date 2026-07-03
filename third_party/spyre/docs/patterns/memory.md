@@ -64,12 +64,12 @@ Expected diagnostics:
 **Round-trip evidence**
 
 - `gather::default` — M=1024, N=64, K_INDICES=32, BLOCK_COLS=32, y_offset=16
-- `gather::y_offset_zero` — M=256, N=32, K_INDICES=16, BLOCK_COLS=16, y_offset=0
-- `gather::full_row` — M=128, N=16, K_INDICES=16, BLOCK_COLS=16, y_offset=0
-- `gather::min_block_cols` — M=64, N=64, K_INDICES=8, BLOCK_COLS=8, y_offset=32
-- `gather::slice_at_end` — M=256, N=64, K_INDICES=16, BLOCK_COLS=16, y_offset=48
+- `gather::2d` — M=1024, N=128, K_INDICES=64, BLOCK_ROWS=8, BLOCK_COLS=16 (also demonstrates: program-id-2d, num-programs-fold)
+- `gather::2d_serial`
+- `gather::2d_large_table_serial`
+- `gather::2d_index_gather` — M=1024, N=64, S0=8, S1=4, BLOCK_COLS=32, y_offset=16 (also demonstrates: descriptor-gather-2d-indices)
 
-_+ 10 more variants_
+_+ 2 more variants_
 
 ## descriptor-gather-2d-indices
 
@@ -125,7 +125,6 @@ data = tl.descriptor_gather(desc, x_offsets, y_offset)
 **Round-trip evidence**
 
 - `gather::2d_index_3d_block` — CACHE_SZ=16, HEAD=6, D=8, B=4, L=8, BLOCK_B=2, BLOCK_L=4, BLOCK_H=2, h_offset=2 (also demonstrates: descriptor-gather)
-- `gather::2d_index_3d_block_large` — CACHE_SZ=32768, HEAD=32, D=128, B=12, L=256, BLOCK_B=2, BLOCK_L=64, BLOCK_H=4, h_offset=8 (also demonstrates: descriptor-gather)
 
 ## descriptor-gather-2d-indices-subscripts
 
@@ -459,9 +458,9 @@ tile = tl.descriptor_load(desc, [pid_m * BLOCK_M, pid_k * BLOCK_K])
 **Round-trip evidence**
 
 - `matmul::dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-2d, num-programs-fold)
-- `matmul::bmm_dynamic` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, dot, program-id-1d, num-programs-fold)
-- `matmul::2d_grid_dynamic` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, dot, program-id-2d)
-- `matmul::bmm_3d_grid_dynamic` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, dot, program-id-3d)
+- `matmul::bmm_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-1d, num-programs-fold)
+- `matmul::2d_grid_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-2d)
+- `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-3d)
 - `vector_add::dynamic` (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
 
 _+ 4 more variants_
@@ -691,8 +690,8 @@ tl.descriptor_scatter(dst_desc, indices, y_offset, value)
 
 **Round-trip evidence**
 
-- `gather::scatter_3d` — M=256, BLOCK_SIZE=16, HEAD_DIM=64, K_INDICES=32
-- `gather::scatter_3d_partial` — M=256, NUM_TOKENS=64, TOKEN_BLOCK=16, HEAD_DIM=64, K_INDICES=32
+- `gather::scatter_3d`
+- `gather::scatter_3d_partial`
 
 ## descriptor-store-dynamic
 
@@ -711,9 +710,9 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])
 **Round-trip evidence**
 
 - `matmul::dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-2d, num-programs-fold)
-- `matmul::bmm_dynamic` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-dynamic, dot, program-id-1d, num-programs-fold)
-- `matmul::2d_grid_dynamic` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-dynamic, dot, program-id-2d)
-- `matmul::bmm_3d_grid_dynamic` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-dynamic, dot, program-id-3d)
+- `matmul::bmm_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-1d, num-programs-fold)
+- `matmul::2d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-2d)
+- `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-3d)
 - `vector_add::dynamic` (also demonstrates: descriptor-load-dynamic, program-id-1d, num-programs-fold)
 
 _+ 4 more variants_
