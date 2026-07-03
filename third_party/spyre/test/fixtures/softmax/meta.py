@@ -109,6 +109,11 @@ VARIANTS = {
             t.assert_present("linalg.broadcast"),
         ),
     },
+    "few_rows": {
+        # M=16: only 16 rows across 32 cores → 16 cores are idle (zero-trip loop).
+        "base":   "default",
+        "params": {"M": [16], "N": [1024], "BLOCK_SIZE": [1024]},
+    },
     "nonaligned": {
         # M=1000: rows_per_core=ceil(1000/32)=32 for most cores, but the last
         # core's range overshoots 1000 → tl.minimum clamp fires.

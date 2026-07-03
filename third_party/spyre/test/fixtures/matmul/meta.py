@@ -172,6 +172,20 @@ VARIANTS = {
             t.assert_result_type("ktdp.construct_memory_view", "memref<512x64xf32>"),
         ),
     },
+    "single_tile": {
+        # M=16=BLOCK_M: only 1 M-tile total across 32 cores.
+        # 31 cores produce a zero-trip scf.for range.
+        "base":   "default",
+        "params": {
+            "M": [16], "K": [64], "N": [256],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+        "extra_checks": lambda t: (
+            t.assert_present("linalg.matmul"),
+            t.assert_absent("tt.dot"),
+            t.assert_result_type("ktdp.construct_memory_view", "memref<16x64xf32>"),
+        ),
+    },
     "nonaligned": {
         # M=520: m_blocks=33, not divisible by 32 cores.
         # ceil(33/32)=2 for core 0; tl.minimum clamp fires on the last core.

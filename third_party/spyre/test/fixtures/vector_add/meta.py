@@ -157,6 +157,16 @@ VARIANTS = {
                             shape_not=[1024]),
         ),
     },
+    "single_block": {
+        # n_elements=1024=BLOCK_SIZE: only 1 block total.
+        # 31 cores produce a zero-trip scf.for range.
+        # extra_checks omitted: n_elements==BLOCK_SIZE so the full-tensor view
+        # and the tile have the same size; the inherited shape_not check would
+        # be vacuously false.
+        "base":         "default",
+        "params":       {"n_elements": [1024], "BLOCK_SIZE": [1024]},
+        "extra_checks": None,
+    },
     "nonaligned": {
         # n_elements=2097153: num_blocks=2049, not divisible by 32 cores.
         # tl.minimum clamp fires on the last core's block range.
@@ -313,6 +323,19 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<65x32x16xf32>"),
+        ),
+    },
+    "3d_active_cores": {
+        # M=256: m_blocks=32, all 32 cores get exactly 1 M-tile.
+        # The 3d default has M=64 (only 8 active cores).
+        "base":   "3d",
+        "params": {
+            "M": [256], "N": [32], "P": [16],
+            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
+        },
+        "extra_checks": lambda t: (
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<256x32x16xf32>"),
         ),
     },
     # --- 2D grid variants ---
