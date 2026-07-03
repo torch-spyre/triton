@@ -295,6 +295,15 @@ VARIANTS = {
             "BLOCK_B": [1], "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
         },
     },
+    "bmm_multi_bm": {
+        # B=8, M=256: bm_blocks=8*(256/16)=128, bm_per_core=4.
+        # The outer BM loop runs 4 iterations per core.
+        "base":   "bmm",
+        "params": {
+            "B": [8], "M": [256], "K": [32], "N": [64],
+            "BLOCK_B": [1], "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+    },
     # --- 2D grid variant ---
     "2d_grid": {
         "tags": ["descriptor-load-static", "descriptor-store-static", "dot", "program-id-2d"],
@@ -352,6 +361,20 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_present("linalg.matmul"),
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
+        ),
+    },
+    "2d_grid_both_axes": {
+        # N=256 with grid=[4,4]: n_blocks=16, n_blocks_per_core=4.
+        # Both M and N distribution loops run multi-iteration simultaneously.
+        "base":   "2d_grid",
+        "params": {
+            "M": [256], "K": [64], "N": [256],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+        "grid":         [4, 4],
+        "extra_checks": lambda t: (
+            t.assert_present("linalg.matmul"),
+            t.assert_result_type("ktdp.construct_memory_view", "memref<256x64xf32>"),
         ),
     },
     "2d_grid_nonaligned": {

@@ -165,6 +165,12 @@ VARIANTS = {
         "base":   "multi_tile",
         "params": {"M": [1000], "N": [1024], "BLOCK_N": [64]},
     },
+    "multi_tile_small_block": {
+        # BLOCK_N=32: n_tiles=1024/32=32 inner iterations per pass (vs 16).
+        # Tests the N-tile inner loops at higher trip count.
+        "base":   "multi_tile",
+        "params": {"M": [1024], "N": [1024], "BLOCK_N": [32]},
+    },
     "2pass": {
         # Online softmax: 2-pass, BLOCK_M × BLOCK_N tiled. Redeclares
         # SIGNATURE because 2pass adds BLOCK_M alongside BLOCK_N.
