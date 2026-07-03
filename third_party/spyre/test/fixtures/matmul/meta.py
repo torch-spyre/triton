@@ -221,6 +221,24 @@ VARIANTS = {
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
         ),
     },
+    "dynamic_small": {
+        # Different shape than the static default: verifies the compiled
+        # dynamic kernel runs correctly at a smaller (M, K, N).
+        "base":   "dynamic",
+        "params": {
+            "M": [128], "K": [32], "N": [64],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+    },
+    "dynamic_large": {
+        # Larger shape: confirms the dynamic kernel scales beyond the
+        # static default's (512, 64, 256).
+        "base":   "dynamic",
+        "params": {
+            "M": [1024], "K": [128], "N": [512],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+    },
     "dynamic_nonaligned": {
         # M=500: non-divisible by 32 → clamp fires in the dynamic-bounds path.
         "base":   "dynamic",

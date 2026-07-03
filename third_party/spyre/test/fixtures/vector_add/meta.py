@@ -203,6 +203,12 @@ VARIANTS = {
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x"),
         ),
     },
+    "dynamic_small": {
+        # Different shape: verifies the compiled dynamic kernel runs at a
+        # smaller n_elements than the static default.
+        "base":   "dynamic",
+        "params": {"n_elements": [4096], "BLOCK_SIZE": [1024]},
+    },
     # --- 2D variants ---
     "2d": {
         "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-1d", "num-programs-fold"],
@@ -260,6 +266,12 @@ VARIANTS = {
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<520x32xf32>"),
         ),
+    },
+    "2d_dynamic_alt": {
+        # Different N than the static 2d sibling: confirms the compiled
+        # dynamic kernel runs at a shape distinct from its static sibling.
+        "base":   "2d_dynamic",
+        "params": {"M": [256], "N": [64], "BLOCK_M": [16], "BLOCK_N": [16]},
     },
     # --- 3D variants ---
     "3d": {
