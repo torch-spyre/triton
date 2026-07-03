@@ -237,7 +237,8 @@ VARIANTS = {
         ),
     },
     "2d_dynamic": {
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
+        "base":      "2d",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
         "summary": (
             "2D elementwise add where both `M` and `N` are runtime "
             "arguments."
@@ -248,11 +249,7 @@ VARIANTS = {
             "lowers to `memref<?x?xf32>`, so the compiled kernel runs "
             "unchanged across a range of matrix shapes."
         ),
-        "kernel_fn":    kernel.add_kernel_2d,
-        "SIGNATURE":    _SIG_2D,
         "constexpr":    ["BLOCK_M", "BLOCK_N"],
-        "params":       {"M": [512], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16]},
-        "inputs":       make_inputs_2d,
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?xf32>"),
@@ -302,7 +299,8 @@ VARIANTS = {
         ),
     },
     "3d_dynamic": {
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
+        "base":      "3d",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
         "summary": (
             "3D elementwise add where `M`, `N`, `P` are all runtime "
             "arguments."
@@ -312,14 +310,7 @@ VARIANTS = {
             "dimensions arrive as runtime `i32` arguments. The "
             "descriptor lowers to `memref<?x?x?xf32>`."
         ),
-        "kernel_fn":    kernel.add_kernel_3d,
-        "SIGNATURE":    _SIG_3D,
         "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P"],
-        "params":       {
-            "M": [64], "N": [32], "P": [16],
-            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
-        },
-        "inputs":       make_inputs_3d,
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?x?xf32>"),
@@ -375,7 +366,8 @@ VARIANTS = {
         ),
     },
     "2d_grid_dynamic": {
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-2d", "num-programs-fold"],
+        "base":      "2d_grid",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-2d", "num-programs-fold"],
         "summary": (
             "2D grid with runtime `M` and `N`: distribution loop structure, "
             "dynamic descriptor shapes."
@@ -384,12 +376,7 @@ VARIANTS = {
             "Same as `2d_grid` but `M` and `N` are runtime `i32` arguments. "
             "Descriptors lower to `memref<?x?xf32>`."
         ),
-        "kernel_fn":    kernel.add_kernel_2d_grid,
-        "SIGNATURE":    _SIG_2D,
         "constexpr":    ["BLOCK_M", "BLOCK_N"],
-        "params":       {"M": [256], "N": [128], "BLOCK_M": [16], "BLOCK_N": [16]},
-        "grid":         [4, 8],
-        "inputs":       make_inputs_2d,
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?xf32>"),
@@ -423,7 +410,8 @@ VARIANTS = {
         ),
     },
     "3d_grid_dynamic": {
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-3d", "num-programs-fold"],
+        "base":      "3d_grid",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-3d", "num-programs-fold"],
         "summary": (
             "3D grid with runtime `M`, `N`, `P`: distribution loop structure, "
             "dynamic descriptor shapes."
@@ -432,15 +420,7 @@ VARIANTS = {
             "Same as `3d_grid` but `M`, `N`, `P` are runtime `i32` arguments. "
             "Descriptors lower to `memref<?x?x?xf32>`."
         ),
-        "kernel_fn":    kernel.add_kernel_3d_grid,
-        "SIGNATURE":    _SIG_3D,
         "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P"],
-        "params":       {
-            "M": [64], "N": [32], "P": [16],
-            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
-        },
-        "grid":         [2, 4, 4],
-        "inputs":       make_inputs_3d,
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?x?xf32>"),

@@ -813,8 +813,7 @@ VARIANTS = {
         # only show up when y_offset != 0.  This variant pins the
         # y_offset=0 path so a regression that special-cases zero
         # doesn't slip through.
-        "kernel_fn":  kernel.gather_kernel,
-        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS"],
+        "base":   "default",
         "params": {
             "M":          [256],
             "N":          [32],
@@ -822,12 +821,7 @@ VARIANTS = {
             "BLOCK_COLS": [16],
             "y_offset":   [0],
         },
-        "tags":       ["descriptor-gather"],
-        "grid":       [32],
-        "parallel":   False,
-        "reference":  run,
-        "inputs":     make_inputs_y_offset_zero,
-        "output_key": "out_ptr",
+        "inputs": make_inputs_y_offset_zero,
     },
     "full_row": {
         # BLOCK_COLS == N (full-row gather).  This is the embedding
@@ -836,8 +830,7 @@ VARIANTS = {
         # slicing.  Catches a bug where the column slice machinery
         # incorrectly assumes a strict subset (e.g. an off-by-one in
         # the slice-end check).
-        "kernel_fn":  kernel.gather_kernel,
-        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS"],
+        "base":   "default",
         "params": {
             "M":          [128],
             "N":          [16],
@@ -845,12 +838,7 @@ VARIANTS = {
             "BLOCK_COLS": [16],
             "y_offset":   [0],
         },
-        "tags":       ["descriptor-gather"],
-        "grid":       [32],
-        "parallel":   False,
-        "reference":  run,
-        "inputs":     make_inputs_full_row,
-        "output_key": "out_ptr",
+        "inputs": make_inputs_full_row,
     },
     "min_block_cols": {
         # Smallest legal sizes per the verifier: K_INDICES=8 (verifier
@@ -861,8 +849,7 @@ VARIANTS = {
         # alone wouldn't catch a bug that triggers only at the
         # smallest legal block.  Allows duplicates so an aliasing bug
         # at the minimum size shows up.
-        "kernel_fn":  kernel.gather_kernel,
-        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS"],
+        "base":   "default",
         "params": {
             "M":          [64],
             "N":          [64],
@@ -870,12 +857,7 @@ VARIANTS = {
             "BLOCK_COLS": [8],
             "y_offset":   [32],
         },
-        "tags":       ["descriptor-gather"],
-        "grid":       [32],
-        "parallel":   False,
-        "reference":  run,
-        "inputs":     make_inputs_min_block_cols,
-        "output_key": "out_ptr",
+        "inputs": make_inputs_min_block_cols,
     },
     "slice_at_end": {
         # y_offset + BLOCK_COLS == N exactly — slice ends at the
@@ -884,8 +866,7 @@ VARIANTS = {
         # mix-up would read column N (out of bounds) only at this
         # extreme.  The default variant has y_offset+BLOCK_COLS=48 < N=64,
         # so it leaves slack and would not detect the bug.
-        "kernel_fn":  kernel.gather_kernel,
-        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS"],
+        "base":   "default",
         "params": {
             "M":          [256],
             "N":          [64],
@@ -893,12 +874,7 @@ VARIANTS = {
             "BLOCK_COLS": [16],
             "y_offset":   [48],
         },
-        "tags":       ["descriptor-gather"],
-        "grid":       [32],
-        "parallel":   False,
-        "reference":  run,
-        "inputs":     make_inputs_slice_at_end,
-        "output_key": "out_ptr",
+        "inputs": make_inputs_slice_at_end,
     },
     "wide_slice": {
         # Wider source row (N=256) and larger BLOCK_COLS=128.  Probes
@@ -907,8 +883,7 @@ VARIANTS = {
         # tile-shape computation that only manifests above some size
         # (e.g. an int16 truncation, an alignment assumption) would
         # show up here.
-        "kernel_fn":  kernel.gather_kernel,
-        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS"],
+        "base":   "default",
         "params": {
             "M":          [128],
             "N":          [256],
@@ -916,12 +891,7 @@ VARIANTS = {
             "BLOCK_COLS": [128],
             "y_offset":   [64],
         },
-        "tags":       ["descriptor-gather"],
-        "grid":       [32],
-        "parallel":   False,
-        "reference":  run,
-        "inputs":     make_inputs_wide_slice,
-        "output_key": "out_ptr",
+        "inputs": make_inputs_wide_slice,
     },
     "large_k": {
         # Larger K_INDICES (128) than any other variant.  The kernel
@@ -929,8 +899,7 @@ VARIANTS = {
         # the index buffer + the descriptor_gather fan-out at higher
         # row count, without changing the lowering path.  Duplicates
         # allowed so the larger fan-out also exercises aliasing.
-        "kernel_fn":  kernel.gather_kernel,
-        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS"],
+        "base":   "default",
         "params": {
             "M":          [512],
             "N":          [64],
@@ -938,12 +907,7 @@ VARIANTS = {
             "BLOCK_COLS": [32],
             "y_offset":   [16],
         },
-        "tags":       ["descriptor-gather"],
-        "grid":       [32],
-        "parallel":   False,
-        "reference":  run,
-        "inputs":     make_inputs_large_k,
-        "output_key": "out_ptr",
+        "inputs": make_inputs_large_k,
     },
     # ------------------------------------------------------------------
     # 2D-tiled variants.  Use ``gather_2d_kernel`` (separate kernel_fn,
@@ -1012,26 +976,10 @@ VARIANTS = {
         #
         # Same data shape as ``2d`` so the numerical comparison reuses
         # the same NumPy oracle without per-variant plumbing.
-        "kernel_fn":    kernel.gather_2d_kernel,
-        "SIGNATURE":    _SIG_2D,
-        "constexpr":    [
-            "M", "N", "K_INDICES",
-            "BLOCK_ROWS", "BLOCK_COLS",
-        ],
-        "params": {
-            "M":          [1024],
-            "N":          [128],
-            "K_INDICES":  [64],
-            "BLOCK_ROWS": [8],
-            "BLOCK_COLS": [16],
-        },
-        "tags":         ["descriptor-gather"],
-        "grid":         [1, 1],
-        "parallel":     False,
-        "reference":    run_2d,
-        "inputs":       make_inputs_2d,
-        "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
+        "base":     "2d",
+        "tags":     ["descriptor-gather"],
+        "grid":     [1, 1],
+        "parallel": False,
     },
     "2d_large_table": {
         # Same distribution at larger source dims: 64 indices x 256 cols,
@@ -1040,12 +988,7 @@ VARIANTS = {
         # the distribution pattern. Confirms the lowering is robust to
         # ~4x larger M and 2x wider N+BLOCK_COLS without changing the
         # number of tiles per core.
-        "kernel_fn":    kernel.gather_2d_kernel,
-        "SIGNATURE":    _SIG_2D,
-        "constexpr":    [
-            "M", "N", "K_INDICES",
-            "BLOCK_ROWS", "BLOCK_COLS",
-        ],
+        "base":   "2d",
         "params": {
             "M":          [4096],
             "N":          [256],
@@ -1053,38 +996,16 @@ VARIANTS = {
             "BLOCK_ROWS": [8],
             "BLOCK_COLS": [32],
         },
-        "tags":         ["descriptor-gather", "program-id-2d", "num-programs-fold"],
-        "grid":         [4, 8],
-        "parallel":     True,
-        "reference":    run_2d,
-        "inputs":       make_inputs_2d_large_table,
-        "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
+        "inputs": make_inputs_2d_large_table,
     },
     "2d_large_table_serial": {
         # ``2d_large_table`` data shape on a 1-core grid. Same intent
         # as ``2d_serial``: pin the degenerate tiling path numerically
         # at the larger source dims, no work-distribution check.
-        "kernel_fn":    kernel.gather_2d_kernel,
-        "SIGNATURE":    _SIG_2D,
-        "constexpr":    [
-            "M", "N", "K_INDICES",
-            "BLOCK_ROWS", "BLOCK_COLS",
-        ],
-        "params": {
-            "M":          [4096],
-            "N":          [256],
-            "K_INDICES":  [64],
-            "BLOCK_ROWS": [8],
-            "BLOCK_COLS": [32],
-        },
-        "tags":         ["descriptor-gather"],
-        "grid":         [1, 1],
-        "parallel":     False,
-        "reference":    run_2d,
-        "inputs":       make_inputs_2d_large_table,
-        "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
+        "base":     "2d_large_table",
+        "tags":     ["descriptor-gather"],
+        "grid":     [1, 1],
+        "parallel": False,
     },
     # ------------------------------------------------------------------
     # Rank-N (N ≥ 3) gather / scatter variants.
@@ -1175,22 +1096,13 @@ VARIANTS = {
         # Write-back mirror of the "3d" variant.  Reads K_INDICES blocks from
         # data_ptr and scatters them into dst_ptr[M, BLOCK_SIZE, HEAD_DIM].
         # Uses unique indices (no aliasing) so the oracle is deterministic.
-        "kernel_fn":    kernel.scatter_3d_kernel,
-        "SIGNATURE":    _SIG_SCATTER_3D,
-        "constexpr":    ["M", "BLOCK_SIZE", "HEAD_DIM", "K_INDICES"],
-        "params": {
-            "M":          [256],
-            "BLOCK_SIZE": [16],
-            "HEAD_DIM":   [64],
-            "K_INDICES":  [32],
-        },
-        "tags":         ["descriptor-scatter-nd"],
-        "grid":         [32],
-        "parallel":     False,
-        "reference":    run_scatter_3d,
-        "inputs":       make_inputs_scatter_3d,
-        "output_key":   "dst_ptr",
-        "extra_checks": _EXTRA_CHECKS,
+        "base":       "3d",
+        "kernel_fn":  kernel.scatter_3d_kernel,
+        "SIGNATURE":  _SIG_SCATTER_3D,
+        "tags":       ["descriptor-scatter-nd"],
+        "reference":  run_scatter_3d,
+        "inputs":     make_inputs_scatter_3d,
+        "output_key": "dst_ptr",
     },
     # ------------------------------------------------------------------
     # Partial-extent rank-3 variants: block dim 1 is a strict divisor of
@@ -1235,23 +1147,13 @@ VARIANTS = {
         # structure, so gather/scatter exercise symmetric partial-extent
         # windowed access. Mirror's _PARTIAL_EXTRA_CHECKS pins that the
         # scatter's indirect access tile also lands inside the scf.for.
-        "kernel_fn":    kernel.scatter_3d_partial_kernel,
-        "SIGNATURE":    _SIG_SCATTER_3D_PARTIAL,
-        "constexpr":    ["M", "NUM_TOKENS", "TOKEN_BLOCK", "HEAD_DIM", "K_INDICES"],
-        "params": {
-            "M":           [256],
-            "NUM_TOKENS":  [64],
-            "TOKEN_BLOCK": [16],
-            "HEAD_DIM":    [64],
-            "K_INDICES":   [32],
-        },
-        "tags":         ["descriptor-scatter-nd"],
-        "grid":         [32],
-        "parallel":     False,
-        "reference":    run_scatter_3d_partial,
-        "inputs":       make_inputs_scatter_3d_partial,
-        "output_key":   "dst_ptr",
-        "extra_checks": _PARTIAL_EXTRA_CHECKS,
+        "base":       "3d_partial",
+        "kernel_fn":  kernel.scatter_3d_partial_kernel,
+        "SIGNATURE":  _SIG_SCATTER_3D_PARTIAL,
+        "tags":       ["descriptor-scatter-nd"],
+        "reference":  run_scatter_3d_partial,
+        "inputs":     make_inputs_scatter_3d_partial,
+        "output_key": "dst_ptr",
     },
     # ------------------------------------------------------------------
     # rank-2 x_offsets (index-grid) variants.  Use the single-program
@@ -1352,9 +1254,7 @@ VARIANTS = {
         # block [1, 4, 128]: reads in[idx[i,j], 8:12, :] -> [2, 64, 4, 128]
         # tile, stored into the corner of a [12, 256, 32, 128] output.
         # h_offset=8 (non-zero) on the inner D1=32 axis.
-        "kernel_fn":    kernel.gather_2d_index_3d_block_kernel,
-        "SIGNATURE":    _SIG_2D_INDEX_4D,
-        "constexpr":    ["CACHE_SZ", "HEAD", "D", "B", "L", "BLOCK_B", "BLOCK_L", "BLOCK_H"],
+        "base":      "2d_index_3d_block",
         "params": {
             "CACHE_SZ": [32768],
             "HEAD":     [32],
@@ -1366,12 +1266,7 @@ VARIANTS = {
             "BLOCK_H":  [4],
             "h_offset": [8],
         },
-        "tags":         ["descriptor-gather", "descriptor-gather-2d-indices-3d-block"],
-        "grid":         [32],
-        "parallel":     False,
-        "reference":    functools.partial(run_2d_index_3d_block, BLOCK_B=2, BLOCK_L=64, BLOCK_H=4),
-        "inputs":       make_inputs_2d_index_3d_block_large,
-        "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
+        "reference": functools.partial(run_2d_index_3d_block, BLOCK_B=2, BLOCK_L=64, BLOCK_H=4),
+        "inputs":    make_inputs_2d_index_3d_block_large,
     },
 }
