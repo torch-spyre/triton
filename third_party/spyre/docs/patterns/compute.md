@@ -244,6 +244,8 @@ Expected diagnostics:
 
 **Round-trip evidence**
 
+- `reduce::default` — M=512, N=64, BLOCK_M=16, IN_LAYOUT=0, OUT_LAYOUT=0 (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d, num-programs-fold)
+- `reduce::spyre_stick` — M=64, N=256, BLOCK_M=64, IN_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], OUT_LAYOUT=[(0, 'floordiv', 64), (0, 'mod', 64)] (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d, spyre-tensor-layout)
 - `softmax::default` — M=1024, N=1024, BLOCK_SIZE=1024 (also demonstrates: descriptor-load-static, descriptor-store-static, broadcast, program-id-1d, num-programs-fold)
 - `softmax::multi_tile` — M=1024, N=1024, BLOCK_N=64 (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d, num-programs-fold)
 - `softmax::2pass` — M=1024, N=1024, BLOCK_M=4, BLOCK_N=64 (also demonstrates: descriptor-load-static, descriptor-store-static, broadcast, program-id-1d, num-programs-fold)

@@ -587,7 +587,7 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>
 - `matmul::spyre_stick_parallel` — M=64, K=64, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-store-static, dot, program-id-1d, spyre-tensor-layout)
 - `matmul::spyre_stick_k` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-store-static, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 11 more variants_
+_+ 13 more variants_
 
 ## descriptor-offset-base
 
@@ -831,7 +831,24 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
 - `matmul::spyre_stick_parallel` — M=64, K=64, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, dot, program-id-1d, spyre-tensor-layout)
 - `matmul::spyre_stick_k` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 11 more variants_
+_+ 13 more variants_
+
+## physical-layout-double-rescale-guard
+
+### Supported
+
+#### ✅ `test_two_descriptors_one_loop`
+
+```python
+# Two annotated descriptors (A, B), both stick-on-K with f=2,
+# both reading from the same muli(iv, 128) K offset inside one scf.for.
+# The pass rescales the shared loop exactly once: bound = 4, step = 2.
+# (Not twice: bound != 8, step != 4.)
+tl.spyre_tensor_layout(a_desc, [(1,'floordiv',64), 0, (1,'mod',64)])
+tl.spyre_tensor_layout(b_desc, [(0,'floordiv',64), 1, (0,'mod',64)])
+```
+
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:1076` (`TestDoubleRescaleGuard.test_two_descriptors_one_loop`)</sup>
 
 ## physical-layout-gather
 
@@ -848,7 +865,24 @@ tl.spyre_tensor_layout(desc, [(1, 'floordiv', 64), 0, (1, 'mod', 64)])
 tile = tl.descriptor_gather(desc, x_offsets, y)   # memory view physicalized
 ```
 
-<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:221` (`TestGather.test_gather_marker_erased`)</sup>
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:237` (`TestGather.test_gather_marker_erased`)</sup>
+
+## physical-layout-loop-rescale
+
+### Supported
+
+#### ✅ `test_block_wider_than_one_stick`
+
+```python
+# f>1: BLOCK_K=128, S=64 -> f=2. The outer loop iterates over K-blocks.
+# The pass rescales: bound *= f, step = f, muli multiplier reduced to S.
+a_desc = tl.make_tensor_descriptor(a_ptr, shape=[M,K], strides=[K,1],
+                                   block_shape=[64, 128])  # BLOCK_K=128
+tl.spyre_tensor_layout(a_desc, [(1,'floordiv',64), 0, (1,'mod',64)])
+# scf.for %iv = 0 to (num_k * 2) step 2: muli(%iv, 64) -> K offset
+```
+
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:976` (`TestLoopRescale.test_block_wider_than_one_stick`)</sup>
 
 ## physical-layout-matmul-k-split
 
@@ -864,7 +898,7 @@ tl.spyre_tensor_layout(a_desc, [(1,'floordiv',64), 0, (1,'mod',64)])
 acc = tl.dot(a_tile, b_tile, acc)   # K-stick loop synthesized by pass
 ```
 
-<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:406` (`TestMatmulKSplit.test_matmul_k_split_lowers`)</sup>
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:466` (`TestMatmulKSplit.test_matmul_k_split_lowers`)</sup>
 
 ## physical-layout-matmul-single-stick
 
@@ -880,7 +914,25 @@ a_desc = tl.make_tensor_descriptor(a_ptr, shape=[M,K], strides=[K,1],
 tl.spyre_tensor_layout(a_desc, [(0,'floordiv',64), 1, (0,'mod',64)])
 ```
 
-<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:322` (`TestMatmulSingleStick.test_matmul_single_stick_lowers`)</sup>
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:382` (`TestMatmulSingleStick.test_matmul_single_stick_lowers`)</sup>
+
+## physical-layout-reduce-stick
+
+### Supported
+
+#### ✅ `test_rank1_sink_insert_slice`
+
+```python
+in_desc  = tl.make_tensor_descriptor(in_ptr,  shape=[M, N], strides=[N, 1],
+                                     block_shape=[BLOCK_M, N])
+out_desc = tl.make_tensor_descriptor(out_ptr, shape=[M],    strides=[1],
+                                     block_shape=[BLOCK_M])
+tl.spyre_tensor_layout(in_desc,  [(1,'floordiv',64), 0, (1,'mod',64)])
+tl.spyre_tensor_layout(out_desc, [(0,'floordiv',64), (0,'mod',64)])
+# sink stage: linalg.reduce result scattered into [M//S, S] via insert_slice
+```
+
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:828` (`TestReduceStick.test_rank1_sink_insert_slice`)</sup>
 
 ## physical-layout-rewrite
 
@@ -898,7 +950,7 @@ tl.spyre_tensor_layout(desc, [(1, 'floordiv', 64),  # N // 64 (stick index)
                               (1, 'mod', 64)])       # N % 64  (stick lane)
 ```
 
-<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:92` (`TestStaticLayout.test_memory_view_is_physical_rank3`)</sup>
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:108` (`TestStaticLayout.test_memory_view_is_physical_rank3`)</sup>
 
 ### Rejected
 
@@ -913,7 +965,7 @@ tl.spyre_tensor_layout(desc, lay)        # ❌ raises CompilationError
 tl.spyre_tensor_layout(desc, [(1, 'floordiv', 64), 0, (1, 'mod', 64)])  # ✅
 ```
 
-<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:671` (`TestInlineOnly.test_layout_via_local_fails`)</sup>
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:1291` (`TestInlineOnly.test_layout_via_local_fails`)</sup>
 
 ## physical-layout-store-annotated-output
 
@@ -930,9 +982,9 @@ tl.spyre_tensor_layout(c_desc, [(1,'floordiv',64), 0, (1,'mod',64)])
 # The store data_tile is replaced by a physical [N//64,M,64] tensor.
 ```
 
-<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:490` (`TestMatmulAnnotatedOutput.test_annotated_output_lowers`)</sup>
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:603` (`TestMatmulAnnotatedOutput.test_annotated_output_lowers`)</sup>
 
 
 ---
 
-_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-load-dynamic-from-scalar-load`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`, `physical-layout-gather`, `physical-layout-matmul-k-split`, `physical-layout-matmul-single-stick`, `physical-layout-rewrite`, `physical-layout-store-annotated-output`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-load-dynamic-from-scalar-load`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`, `physical-layout-double-rescale-guard`, `physical-layout-gather`, `physical-layout-loop-rescale`, `physical-layout-matmul-k-split`, `physical-layout-matmul-single-stick`, `physical-layout-reduce-stick`, `physical-layout-rewrite`, `physical-layout-store-annotated-output`. Add a tagged fixture variant to verify end-to-end._
