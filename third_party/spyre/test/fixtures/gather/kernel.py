@@ -5,7 +5,7 @@ embedding lookups and block-indexed fetches: given a 1D index tensor of
 row positions, read those rows from a source tensor into a contiguous
 output tile.
 
-Two ``@triton.jit`` functions for rank-2 sources:
+Three ``@triton.jit`` functions for rank-2 and rank-1 sources:
 
 - :func:`gather_kernel`    — single-program: one kernel invocation
                               consumes the whole index array and writes
@@ -16,6 +16,18 @@ Two ``@triton.jit`` functions for rank-2 sources:
                               Adds a ``BLOCK_ROWS`` constexpr; gathers
                               the full row width by column-tiling
                               instead of taking a fixed slice.
+- :func:`gather_1d_kernel` — multi-program 1D-source gather:
+                              ``out[i] = in[idx[i]]`` over a 1D source
+                              vector, distributed across a 1D core grid
+                              (``grid=[32]``). The source vector ``in[K]``
+                              is modelled internally as a ``[K, 1]`` column
+                              matrix because ``tt.descriptor_gather``
+                              requires a rank-≥2 descriptor with a
+                              leading-1 block dim — there is no rank-1
+                              gather op in the dialect. The rank-2
+                              ``[BLOCK_ROWS, 1]`` gather result is
+                              reshaped to rank-1 ``[BLOCK_ROWS]`` before
+                              storing back to a 1D output buffer.
 
 Four ``@triton.jit`` functions for rank-N (N ≥ 3) sources:
 
@@ -222,6 +234,93 @@ def gather_2d_kernel(
             idx = idx_desc.load([offset_m])
             tile = in_desc.gather(idx, offset_n)
             out_desc.store([offset_m, offset_n], tile)
+
+
+@triton.jit
+def gather_1d_kernel(
+    in_ptr,
+    out_ptr,
+    idx_ptr,
+    K: tl.constexpr,
+    K_INDICES: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """1D-source gather distributed across a 1D core grid.
+
+    Implements ``out[i] = in[idx[i]]`` where ``in`` is a 1D vector of
+    length ``K`` and ``idx`` is a 1D index array of length ``K_INDICES``.
+    The kernel runs on ``grid=[32]``; each ``tl.program_id(0)`` instance
+    handles ``cdiv(K_INDICES, BLOCK_ROWS) / num_programs(0)`` index-tiles.
+
+    Vocabulary:
+      - ``K``         — length of the source vector ``in[K]``.
+      - ``K_INDICES`` — number of indices to gather (length of ``idx``
+                        and of the output buffer).
+      - ``BLOCK_ROWS`` — index-tile size: each call to ``in_desc.gather``
+                         consumes ``BLOCK_ROWS`` indices. Must be ≥ 8 per
+                         the frontend gather verifier.
+
+    Why a ``[K, 1]`` column-matrix view of ``in`` instead of a rank-1
+    descriptor: ``tt.descriptor_gather`` requires the descriptor block
+    to be at least rank-2 with a leading-1 dim (the indirect axis). A
+    rank-1 descriptor like ``<BLOCK_ROWS x f32>`` is rejected by the
+    op verifier (see
+    ``test_lower_desc_memory.py::test_gather_rank1_block_rejected``).
+    Modelling the same K elements as ``[K, 1]`` with ``block_shape=[1, 1]``
+    satisfies the verifier: dim 0 (size K) is the indirect axis and dim 1
+    (size 1) is the per-row scalar payload. The gather result is rank-2
+    ``[BLOCK_ROWS, 1]``; we ``tl.reshape`` it to rank-1 ``[BLOCK_ROWS]``
+    so the output buffer can stay 1D.
+
+    ``y_offset`` is hardcoded to 0 — there is no column slicing on a
+    width-1 row.
+
+    Preconditions (not checked):
+      - ``BLOCK_ROWS >= 8`` (frontend gather verifier).
+      - ``K_INDICES % BLOCK_ROWS == 0`` and
+        ``cdiv(K_INDICES, BLOCK_ROWS) % num_programs(0) == 0`` so each
+        core owns an integer number of full tiles (no masking needed).
+      - ``max(idx) < K`` (no out-of-range gather).
+    """
+    pid = tl.program_id(0)
+    num_cores = tl.num_programs(0)
+
+    m_blocks = tl.cdiv(K_INDICES, BLOCK_ROWS)
+    blocks_per_core = tl.cdiv(m_blocks, num_cores)
+
+    idx_desc = tl.make_tensor_descriptor(
+        idx_ptr,
+        shape=[K_INDICES],
+        strides=[1],
+        block_shape=[BLOCK_ROWS],
+    )
+    # Source vector modelled as [K, 1]; block <1, 1> picks one scalar
+    # per gathered row. The leading 1 in the block satisfies the
+    # gather verifier's "block dim 0 == 1" rule.
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[K, 1],
+        strides=[1, 1],
+        block_shape=[1, 1],
+    )
+    # Output is 1D — same shape as idx.
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[K_INDICES],
+        strides=[1],
+        block_shape=[BLOCK_ROWS],
+    )
+
+    m_start = pid * blocks_per_core
+    m_end = tl.minimum(m_start + blocks_per_core, m_blocks)
+    for m in range(m_start, m_end):
+        offset_m = m * BLOCK_ROWS
+        idx = idx_desc.load([offset_m])
+        # Rank-2 [BLOCK_ROWS, 1] gather result.
+        tile_2d = in_desc.gather(idx, 0)
+        # Collapse to rank-1 [BLOCK_ROWS] so it matches out_desc.
+        tile_1d = tl.reshape(tile_2d, [BLOCK_ROWS])
+        out_desc.store([offset_m], tile_1d)
 
 
 # ---------------------------------------------------------------------------
@@ -646,8 +745,6 @@ def gather_2d_index_kernel(
     ``docs/impl-strategy-2d-x-offsets.md``), then a ``ktdp.load`` of the
     rank-3 ``[S0, S1, BLOCK_COLS]`` result tile.
     """
-    # 2-D index grid, staged via a rank-2 descriptor_load (the only
-    # provenance the gather lowering traces).
     idx_desc = tl.make_tensor_descriptor(
         idx_ptr,
         shape=[S0, S1],
@@ -714,8 +811,6 @@ def gather_scatter_2d_index_kernel(
     )
     data = in_desc.gather(idx, y_offset)           # tensor<S0 x S1 x BLOCK_COLS>
 
-    # Same single-row template descriptor for the scatter target; the
-    # 2-D index grid fans the payload back out to the addressed rows.
     out_desc = tl.make_tensor_descriptor(
         out_ptr,
         shape=[M, N],
@@ -765,7 +860,6 @@ def gather_2d_index_3d_block_kernel(
     ``[B, L, BLOCK_H, D2]`` output table (the index grid's full extent on
     dims 0-1, the source's inner dims on 2-3).
     """
-    # 2-D index grid, staged via a rank-2 descriptor_load.
     idx_desc = tl.make_tensor_descriptor(
         idx_ptr,
         shape=[B, L],
@@ -774,7 +868,6 @@ def gather_2d_index_3d_block_kernel(
     )
     idx = idx_desc.load([0, 0])                    # tensor<S0 x S1 x i32>
 
-    # Rank-3 source: block [1, BLOCK_H, D] (leading 1 = the fanned-out page).
     in_desc = tl.make_tensor_descriptor(
         in_ptr,
         shape=[CACHE_SZ, HEAD, D],
