@@ -1,10 +1,13 @@
-# Torch-Spyre Integration with Triton
+# Torch-Spyre Integration with Triton and ktir-cpu
 
 This document describes how to drive the Triton Spyre backend from PyTorch via
 `torch.compile`, using [torch-spyre](https://github.com/tnakaike/torch-spyre).
 When `TORCH_SPYRE_TRITON=1` is set, `torch.compile` routes fused elementwise /
 reduction ops through Triton, which the Spyre backend lowers TTIR → KTIR for the
-device.
+device. Setting `TORCH_SPYRE_KTIR_CPU=1` additionally executes the lowered KTIR
+on [ktir-cpu](https://github.com/torch-spyre/ktir-cpu), the NumPy-based KTIR
+interpreter, so kernels can be run and validated without physical Spyre
+hardware.
 
 ## Build torch-spyre
 
@@ -14,6 +17,46 @@ Build the [`dev/triton` fork](https://github.com/tnakaike/torch-spyre/tree/dev/t
 
 Follow the [install procedure](https://github.com/torch-spyre/triton#install)
 in the Triton README.
+
+## Build ktir-cpu
+
+[ktir-cpu](https://github.com/torch-spyre/ktir-cpu) is the NumPy-based KTIR
+interpreter that runs the lowered kernels without Spyre hardware. Clone it next
+to this Triton checkout:
+
+```bash
+git clone https://github.com/torch-spyre/ktir-cpu
+```
+
+The important part is **which** `mlir_ktdp` (the KTIR MLIR frontend / parser)
+ktir-cpu is built against. It must be compiled from the
+`ktir-mlir-frontend` submodule **embedded in this Triton repo**
+(`third_party/spyre/ktir-mlir-frontend`), against the **same LLVM/MLIR that
+Triton was built with**. Building it any other way — for example, letting
+ktir-cpu pull its own `ktir-mlir-frontend` via the `[mlir-frontend]` extra —
+pins a different frontend commit and links a second copy of MLIR, which either
+mismatches the lowering under test or crashes with duplicate MLIR global state.
+
+From the ktir-cpu checkout, build `mlir_ktdp` from Triton's embedded frontend
+and then install ktir-cpu itself. Point `MLIR_DIR` at the `lib/cmake/mlir`
+directory of the LLVM build used for Triton (the tree `LLVM_SYSPATH` referenced
+during the Triton install):
+
+```bash
+cd ktir-cpu
+
+# Path to Triton's embedded KTIR MLIR frontend and the MLIR it must build against.
+TRITON_DIR=<path to this triton checkout>
+FRONTEND_DIR="$TRITON_DIR/third_party/spyre/ktir-mlir-frontend"
+MLIR_DIR=<Triton's LLVM build>/lib/cmake/mlir
+
+# Build mlir_ktdp against Triton's MLIR so the parser matches the lowering.
+CMAKE_ARGS="-DMLIR_DIR=$MLIR_DIR" uv pip install "$FRONTEND_DIR"
+
+# Install ktir-cpu (editable, with dev extras). Do NOT add the [mlir-frontend]
+# extra — mlir_ktdp is already installed from Triton's frontend above.
+uv pip install -e ".[dev]"
+```
 
 ## Run a Python program on torch-spyre and Triton
 
@@ -62,6 +105,9 @@ export TRITON_DUMP_DIR=`pwd`/triton-dump  # destination for the Triton IR dumps
 export UNROLL_LOOPS=0                  # keep loops rolled in the generated kernel
 
 export TORCH_SPYRE_TRITON=1            # route torch.compile through the Triton path
+export TORCH_SPYRE_KTIR_CPU=1          # execute the lowered KTIR on ktir-cpu
+export FLEX_DEVICE=MOCK                # use the mock device (no Spyre hardware)
+export FLEX_COMPUTE=NULL               # null compute backend for the mock device
 
 # Clean stale artifacts from previous runs
 rm -rf triton-dump
