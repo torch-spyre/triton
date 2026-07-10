@@ -6,10 +6,10 @@ include "mlir/Pass/PassBase.td"
 // ============================================================================
 // Pass pipeline: TTIR → KTIR
 //
-//   LowerDescriptorMemory   [LowerPointerChainMemory]
-//           └──────────────┬──────────────┘
-//                          ↓
-//                   LowerComputeOps
+//   LowerDescriptorMemory   LowerScalarLoad   [LowerPointerChainMemory]
+//           └──────────────────┬──────────────────┘
+//                              ↓
+//                       LowerComputeOps
 //                          |
 //                   ConvertFunctions
 //                          |
@@ -44,6 +44,41 @@ def LowerDescriptorMemory : Pass<"lower-descriptor-memory", "mlir::ModuleOp"> {
         "mlir::ktdp::KtdpDialect",
         "mlir::arith::ArithDialect",
         "mlir::memref::MemRefDialect"
+    ];
+}
+
+def LowerScalarLoad : Pass<"lower-scalar-load", "mlir::ModuleOp"> {
+    let summary = "Lower a scalar tt.load (pointer in, scalar result) to ktdp memory ops.";
+    let description = [{
+        Input: TTIR — triton, arith dialects; !tt.ptr types. Matches only a
+        tt.load whose pointer operand is scalar (!tt.ptr<ElemT>, not a
+        tensor of pointers) — the tensor-of-pointers form is out of scope
+        and left legal for a future [LowerPointerChainMemory].
+
+        Lowering:
+        - scalar tt.addptr chain feeding the matched tt.load → folded into
+          a single index offset (plain adds, no element-size scaling)
+        - scalar tt.load → rank-0 ktdp.construct_memory_view +
+          rank-0 ktdp.construct_access_tile + ktdp.load + tensor.extract
+        - masked scalar tt.load → the mask must be a compile-time constant
+          (a materialized arith.constant i1); constant-true drops straight
+          through to the unconditional read, constant-false skips the read
+          and yields `other` or a materialized zero of the element type.
+          Spyre has no runtime control-flow divergence, so a mask that
+          might depend on runtime data — including a comparison of two
+          constants — is refused with a diagnostic and fails the pass; no
+          scf.if or other runtime branch on the mask is ever emitted.
+        - tt.addptr ops left dead by the fold are swept by cleanup
+
+        Output: tensor-of-pointers tt.load, and all other triton ops this
+        pass doesn't handle, remain unchanged. New ktdp, arith, and tensor
+        ops are introduced.
+    }];
+
+    let dependentDialects = [
+        "mlir::ktdp::KtdpDialect",
+        "mlir::arith::ArithDialect",
+        "mlir::tensor::TensorDialect"
     ];
 }
 
