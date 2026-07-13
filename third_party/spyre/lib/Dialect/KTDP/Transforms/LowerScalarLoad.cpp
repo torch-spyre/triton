@@ -290,10 +290,19 @@ struct LowerScalarLoadPass
     }
 
     // The address fold in `resolveScalarAddress` leaves any consumed
-    // `tt.addptr` chain in place with no remaining uses; sweep it (and
-    // any other now-dead op) here rather than relying on the pipeline's
-    // later canonicalize/CSE stage, mirroring `LowerComputeOps.cpp`.
-    mlir::triton::ktdp::cleanupDeadOps(module);
+    // `tt.addptr` chain in place with no remaining uses; sweep exactly
+    // those (and nothing else) here rather than relying on the pipeline's
+    // later canonicalize/CSE stage. The predicate scopes the sweep by op
+    // type, not by provenance: it erases *any* trivially-dead `AddPtrOp`
+    // (whether left dead by this fold or already dead in the input
+    // kernel), but it will never delete a dead op of any other type — in
+    // particular, it will not delete this pass's own freshly emitted read
+    // chain in the (rare) case the loaded scalar has no consumer. That
+    // chain, and any other type of dead-code fallout, is left for
+    // canonicalize/CSE, same as `LowerDescriptorMemory.cpp` already does
+    // for its own leftover dead casts.
+    mlir::triton::ktdp::cleanupDeadOps(
+        module, [](Operation *op) { return isa<triton::AddPtrOp>(op); });
   }
 };
 

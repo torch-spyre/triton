@@ -56,10 +56,9 @@ class TestScalarLoad(LowerScalarLoadTester):
         and used directly as the rank-0 memory view's offset — no
         `arith.addi` folding is needed since there's no `tt.addptr` chain.
 
-        The loaded value is sunk into a `tt.store` (left untouched by this
-        pass — raw scalar stores are out of scope) purely so it isn't dead;
-        every op this pass emits is `Pure`, so an unused load's whole chain
-        would otherwise be swept by the pass's own `cleanupDeadOps` call.
+        The loaded value is stored back out via `tt.store` (left untouched
+        by this pass — raw scalar stores are out of scope), matching how a
+        scalar load is typically consumed in a real kernel.
         """
         self.run("""
         module {
@@ -183,8 +182,11 @@ class TestScalarLoad(LowerScalarLoadTester):
         }
         """)
         self.assert_absent("ktdp.load", "scf.if", "tt.load")
-        # No zero constant is materialized — %other is used directly.
-        self.assert_absent("arith.constant")
+        # No zero fallback constant is materialized — %other is used
+        # directly. The one surviving `arith.constant` is the now-dead mask
+        # value (%mask), left for the pipeline's later canonicalize/CSE
+        # rather than swept here — see LowerScalarLoad.cpp's narrowed cleanup.
+        self.assert_count("arith.constant", 1, cmp="eq")
 
     @pattern("scalar-load-masked-constant-false-no-other", category="memory", example=[
         "x = tl.load(ptr, mask=False)  # compile-time-false guard, implicit zero fallback",
