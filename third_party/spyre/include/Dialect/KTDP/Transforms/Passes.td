@@ -87,7 +87,7 @@ def LowerScalarLoad : Pass<"lower-scalar-load", "mlir::ModuleOp"> {
 def LowerComputeOps : Pass<"lower-compute-ops", "mlir::ModuleOp"> {
     let summary = "Lower tt compute/shape ops to linalg/tensor ops.";
     let description = [{
-        Input: triton + ktdp + arith + memref + scf dialects.
+        Input: triton + ktdp + arith + memref + tensor + scf dialects.
 
         Lowering (Group A — shape manipulation):
         - tt.splat → linalg.fill

@@ -60,10 +60,21 @@ namespace {
 // Helpers
 //===----------------------------------------------------------------------===//
 
-/// True iff `ptr` is a scalar Triton pointer (`!tt.ptr<ElemT>`), as opposed
-/// to a tensor of pointers. Only the scalar form is handled by this pass.
+/// True iff `ptr` is a scalar Triton pointer (`!tt.ptr<ElemT>`) whose
+/// pointee is an integer or float type, as opposed to a tensor of pointers
+/// or a pointer-to-pointer (`!tt.ptr<!tt.ptr<ElemT>>` — valid Triton IR,
+/// since `PointerType::verify` only rejects tensor pointees, not pointer
+/// pointees). Only integer/float pointees are lowerable by this pass:
+/// `buildScalarMemoryView` requires a `MemRefElementTypeInterface` element
+/// type, and the constant-false-without-`other` fallback requires
+/// `getZeroAttr` to have a case for the element type — neither holds for
+/// `PointerType`.
 static bool isScalarPtr(Value ptr) {
-  return isa<triton::PointerType>(ptr.getType());
+  auto ptrTy = dyn_cast<triton::PointerType>(ptr.getType());
+  if (!ptrTy)
+    return false;
+  Type pointee = ptrTy.getPointeeType();
+  return isa<IntegerType, FloatType>(pointee);
 }
 
 /// Try to extract a compile-time bool from an SSA value produced by
@@ -211,8 +222,10 @@ struct ConvertScalarLoad : public OpConversionPattern<triton::LoadOp> {
     // when `other` is absent. No runtime branch is ever emitted on the
     // mask value.
     std::optional<bool> constMask = getConstantMask(mask);
-    assert(constMask.has_value() &&
-           "non-constant mask should have been rejected by the precheck");
+    if (!constMask)
+      return rewriter.notifyMatchFailure(
+          op, "masked scalar tt.load has a non-constant mask — "
+              "Spyre has no runtime control-flow divergence");
 
     if (*constMask) {
       Value scalar = emitScalarRead(rewriter, loc, baseIndex, elemType);

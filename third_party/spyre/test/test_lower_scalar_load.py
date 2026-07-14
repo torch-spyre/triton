@@ -38,12 +38,15 @@ class TestScalarLoad(LowerScalarLoadTester):
     #
     # test_bare_pointer                       — no addptr chain, no mask
     # test_addptr_chain_folded                — scalar tt.addptr offsets folded, no scaling
-    # test_elem_type[i32/f16]                 — pass is not element-type-specific
+    # test_addptr_chain_multi_hop             — two chained tt.addptr ops fold into one chain
+    # test_elem_type[i32/i16/f16/f32/bf16]    — pass is not element-type-specific
     # test_masked_constant_true                — constant-true mask, unconditional read
     # test_masked_constant_false_with_other    — constant-false mask, yields `other`, no read
     # test_masked_constant_false_without_other — constant-false mask, yields zero, no read
     # test_masked_runtime_rejected              — non-constant mask, pass refuses to lower
+    # test_masked_cmpi_rejected                 — cmpi of two constants, still refused
     # test_tensor_of_pointers_untouched         — out of scope, stays legal
+    # test_ptr_to_ptr_untouched                 — non-numeric pointee, stays legal
 
     @pattern("scalar-load-bare", category="memory", example=[
         "x = tl.load(ptr)  # ptr: tl.pointer_type(tl.float16), scalar load",
@@ -122,10 +125,41 @@ class TestScalarLoad(LowerScalarLoadTester):
         self.assert_operand("ktdp.construct_memory_view", 0,
                             defined_by="arith.addi", type_substr="index")
 
-    @pytest.mark.parametrize("elem", ["i32", "f16"])
+    @pattern("scalar-load-addptr-chain-multi", category="memory", example=[
+        "p = ptr + a         # tt.addptr, offset in elements",
+        "p = p + b            # a second tt.addptr on the shifted pointer",
+        "x = tl.load(p)        # scalar load through the twice-shifted pointer",
+    ])
+    def test_addptr_chain_multi_hop(self):
+        """`resolveScalarAddress` loops over an arbitrary-length `tt.addptr`
+        chain, not just a single hop: two chained `tt.addptr` ops must fold
+        into one `arith.addi` chain (two adds), with both `tt.addptr` ops
+        swept as dead by `cleanupDeadOps`.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>, %a: i32, %b: i32, %out: !tt.ptr<f16>) {
+            %p0 = tt.addptr %ptr, %a : !tt.ptr<f16>, i32
+            %p1 = tt.addptr %p0, %b : !tt.ptr<f16>, i32
+            %v = tt.load %p1 : !tt.ptr<f16>
+            tt.store %out, %v : !tt.ptr<f16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_memory_view", "ktdp.load")
+        self.assert_absent("tt.load", "tt.addptr")
+        self.assert_present("arith.index_cast", "arith.addi")
+        self.assert_absent("arith.muli")
+        self.assert_count("arith.addi", 2, cmp="eq")
+        self.assert_operand("ktdp.construct_memory_view", 0,
+                            defined_by="arith.addi", type_substr="index")
+
+    @pytest.mark.parametrize("elem", ["i32", "i16", "f16", "f32", "bf16"])
     def test_elem_type(self, elem):
-        """The pass is not element-type-specific: i32 and f16 both lower to
-        the same rank-0 chain, just with a different element type.
+        """The pass is not element-type-specific: integer and float types
+        of various widths all lower to the same rank-0 chain, just with a
+        different element type.
         """
         self.run(f"""
         module {{
@@ -210,6 +244,13 @@ class TestScalarLoad(LowerScalarLoadTester):
         self.assert_present("arith.constant")
         self.assert_operand("tt.store", 1, defined_by="arith.constant")
 
+    @pattern("scalar-load-masked-runtime", category="memory", negative=True, example=[
+        "# NOT supported: mask depends on a runtime value.",
+        "# Spyre has no runtime control-flow divergence, so a masked",
+        "# scalar load's mask must be a compile-time constant.",
+        "mask = idx < n_elements  # REJECTED — not a materialized constant",
+        "x = tl.load(ptr, mask=mask, other=0.0)",
+    ])
     def test_masked_runtime_rejected(self, capfd):
         """A mask that isn't a materialized `arith.constant` — here a
         function argument, but the same refusal applies to e.g. a `cmpi` of
@@ -231,6 +272,41 @@ class TestScalarLoad(LowerScalarLoadTester):
             """)
         self.assert_stderr(capfd, "mask must be a compile-time constant")
 
+    @pattern("scalar-load-masked-runtime", category="memory", negative=True, example=[
+        "# NOT supported: a comparison of two constants is not folded —",
+        "# only a literal materialized arith.constant counts as a",
+        "# compile-time-constant mask.",
+        "mask = 3 < 5  # REJECTED even though both operands are constants",
+        "x = tl.load(ptr, mask=mask, other=0.0)",
+    ])
+    def test_masked_cmpi_rejected(self, capfd):
+        """A mask built from `arith.cmpi` of two constants is *not* folded
+        by `getConstantMask` — only a literal `arith.constant` counts. This
+        pins the "we don't fold comparisons, only literal constants"
+        behavior documented on `getConstantMask`, distinct from the
+        function-argument case covered by `test_masked_runtime_rejected`.
+        """
+        with pytest.raises(RuntimeError, match="PassManager::run failed"):
+            self.run("""
+            module {
+              tt.func @k(%ptr: !tt.ptr<f16>, %other: f16, %out: !tt.ptr<f16>) {
+                %a = arith.constant 3 : i32
+                %b = arith.constant 5 : i32
+                %mask = arith.cmpi slt, %a, %b : i32
+                %v = tt.load %ptr, %mask, %other : !tt.ptr<f16>
+                tt.store %out, %v : !tt.ptr<f16>
+                tt.return
+              }
+            }
+            """)
+        self.assert_stderr(capfd, "mask must be a compile-time constant")
+
+    @pattern("scalar-load-tensor-of-ptrs", category="memory", negative=True, example=[
+        "# NOT handled by this pass: pointer operand is a tensor of",
+        "# pointers, not a bare scalar !tt.ptr — that path belongs to",
+        "# the separate, still-unimplemented [LowerPointerChainMemory].",
+        "x = tl.load(ptr + tl.arange(0, BLOCK))  # tensor-of-pointers load",
+    ])
     def test_tensor_of_pointers_untouched(self):
         """A tensor-of-pointers `tt.load` (pointer operand shaped as a
         tensor of `!tt.ptr<ElemT>`, not a bare scalar pointer) is out of
@@ -248,3 +324,25 @@ class TestScalarLoad(LowerScalarLoadTester):
         """)
         self.assert_present("tt.load")
         self.assert_absent("ktdp.construct_memory_view", "ktdp.construct_access_tile")
+
+    def test_ptr_to_ptr_untouched(self):
+        """A pointer-to-pointer `tt.load` (`!tt.ptr<!tt.ptr<f16>>` — valid
+        Triton IR, since `PointerType::verify` only rejects tensor
+        pointees, not pointer pointees) must be left legal/untouched, not
+        matched by `isScalarPtr`. Only integer/float pointees are
+        lowerable: the rank-0 `memref`/`tensor` chain requires a
+        `MemRefElementTypeInterface` element type, and the zero-fallback
+        path requires `getZeroAttr` to have a case for it — neither holds
+        for `PointerType`.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<!tt.ptr<f16>>, %out: !tt.ptr<!tt.ptr<f16>>) {
+            %v = tt.load %ptr : !tt.ptr<!tt.ptr<f16>>
+            tt.store %out, %v : !tt.ptr<!tt.ptr<f16>>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("tt.load")
+        self.assert_absent("ktdp.construct_memory_view")
