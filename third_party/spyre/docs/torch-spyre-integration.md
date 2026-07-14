@@ -13,6 +13,13 @@ hardware.
 
 Build the [`dev/triton` fork](https://github.com/tnakaike/torch-spyre/tree/dev/triton).
 
+> **Note:** The ktir-cpu execution path (`TORCH_SPYRE_KTIR_CPU=1`) is currently
+> only available on this fork's `dev/triton` branch and has not yet been merged
+> into `torch-spyre/torch-spyre` main. Without it, `async_compile.triton()`
+> returns `None` and every run fails immediately with
+> `'NoneType' object has no attribute 'run'`. Once merged, this note will be
+> removed.
+
 ## Build Triton
 
 Follow the [install procedure](https://github.com/torch-spyre/triton#install)
@@ -158,7 +165,7 @@ After a run, `./results/<OUT_DIR>/` contains the collected artifacts:
 | `fx_graph_readable.py`, `fx_graph_runnable.py`, `fx_graph_transformed.py` | `TORCH_COMPILE_DEBUG=1` | The captured FX graph (readable and standalone-runnable forms) and the post-transform graph. |
 | `ir_pre_fusion.txt`, `ir_post_fusion.txt` | `TORCH_COMPILE_DEBUG=1` | Inductor's scheduler IR before and after fusion. |
 | `inductor_provenance_tracking_node_mappings.json` | `TORCH_COMPILE_DEBUG=1` | Provenance mapping from generated code back to FX/IR nodes. |
-| `opspec_kernel_*.json` | `SPYRE_INDUCTOR_LOG*` | The torch-spyre `OpSpec` — device dtype, tiled device sizes, and device coordinate expressions for each arg. |
+| `opspec_kernel_*.py` | `SPYRE_INDUCTOR_LOG*` | The torch-spyre `OpSpec` as a Python literal (`OpSpec(...)` / `sympify(...)` constructors, not JSON) — device dtype, tiled device sizes, and device coordinate expressions for each arg. |
 | `triton_*.ttir` | `TRITON_KERNEL_DUMP=1` → `TRITON_DUMP_DIR` | The Triton TTIR for each generated kernel. |
 | `triton_*.ktir` | `TRITON_KERNEL_DUMP=1` → `TRITON_DUMP_DIR` | The KTIR (KTDP dialect) the Spyre backend lowered the kernel to. |
 
