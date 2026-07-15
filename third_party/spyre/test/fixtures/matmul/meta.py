@@ -626,6 +626,42 @@ VARIANTS = {
             t.assert_absent("tt.dot"),
         ),
     },
+    # BMM with Spyre activation/weight layouts: A/C use S x D/64 x B x 64
+    # (M leading, B sandwiched between floor and lane), B_op uses N/64 x B x K x 64.
+    "bmm_spyre_stick_activation": {
+        "tags": ["descriptor-load-static", "descriptor-store-static", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "Batch matmul with Spyre activation/weight layouts: A/C have "
+            "M leading (S x D/64 x B x 64), B_op has N/64 x B x K x 64. "
+            "Exercises the hardware's actual data layout for activations."
+        ),
+        "kernel_fn":    kernel.bmm_matmul_kernel,
+        "SIGNATURE":    _SIG_BMM_SPYRE,
+        "constexpr":    ["B", "M", "K", "N", "BLOCK_B", "BLOCK_M", "BLOCK_K",
+                         "BLOCK_N", "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            "B": [4], "M": [64], "K": [128], "N": [64],
+            "BLOCK_B": [4], "BLOCK_M": [64], "BLOCK_K": [128], "BLOCK_N": [64],
+            # A[B,M,K] stick-on-K (dim 2): phys [M, K/S, B, K%S]
+            "A_LAYOUT": [[1, (2, "floordiv", _SB("a_ptr")), 0, (2, "mod", _SB("a_ptr"))]],
+            # B_operand[B,K,N] stick-on-N (dim 2): phys [N/S, B, K, N%S]
+            "B_LAYOUT": [[(2, "floordiv", _SB("b_ptr")), 0, 1, (2, "mod", _SB("b_ptr"))]],
+            # C[B,M,N] stick-on-N (dim 2): phys [M, N/S, B, N%S]
+            "C_LAYOUT": [[1, (2, "floordiv", _SB("c_ptr")), 0, (2, "mod", _SB("c_ptr"))]],
+        },
+        "grid":         [1],
+        "reference":    run_bmm,
+        "inputs":       functools.partial(make_inputs_bmm, dtype=np.float16),
+        "output_key":   "c_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+        "extra_checks": lambda t: (
+            t.assert_present("linalg.batch_matmul"),
+            t.assert_absent("tt.dot"),
+            t.assert_absent("tt.spyre_tensor_layout"),
+        ),
+    },
     # --- BMM 3D grid variants ---
     "bmm_3d_grid": {
         "tags": ["descriptor-load-static", "descriptor-store-static", "dot", "program-id-3d"],

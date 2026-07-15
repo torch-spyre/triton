@@ -783,6 +783,62 @@ struct RewriteDescriptorLayoutPass
   //    has loopDims. When none do, demote all StickifiedBlock to WholeBlock so
   //    extractOpSlice never uses a null IV. (Must run after resolution because
   //    opExtents must reflect the demoted kind.)
+  // Compute the permutation that reorders opTileDims from physical to canonical
+  // axis order. Returns empty vector if already identity (no transpose needed).
+  //
+  // canonicalAxes defines the expected role at each logical position.
+  // opTileDims are in physical order; each has role dimRoles[opTileDims[j]].
+  // We reorder the physical dims so their roles match canonicalAxes.
+  //
+  // Algorithm: for each canonical position c, find which physical opTileDim
+  // index j has the matching role. perm[j] = c (physical j goes to output c).
+  // For reduction dims (role == -1), match left-to-right among unmatched.
+  static SmallVector<int64_t> computeTransposePerm(
+      ArrayRef<int> opTileDims,
+      ArrayRef<int64_t> dimRoles,
+      ArrayRef<int64_t> canonicalAxes) {
+    unsigned nTile = opTileDims.size();
+    SmallVector<int64_t> perm(nTile, -1);
+    SmallVector<bool> used(nTile, false);
+
+    // First pass: match parallel dims (role >= 0) — unique role values.
+    for (unsigned c = 0; c < nTile; ++c) {
+      int64_t canonRole = canonicalAxes[c];
+      if (canonRole == -1) continue;
+      for (unsigned j = 0; j < nTile; ++j) {
+        if (!used[j] && dimRoles[opTileDims[j]] == canonRole) {
+          perm[j] = (int64_t)c;
+          used[j] = true;
+          break;
+        }
+      }
+    }
+    // Second pass: match reduction dims (role == -1) left-to-right.
+    for (unsigned c = 0; c < nTile; ++c) {
+      if (canonicalAxes[c] != -1) continue;
+      for (unsigned j = 0; j < nTile; ++j) {
+        if (!used[j] && dimRoles[opTileDims[j]] == -1) {
+          perm[j] = (int64_t)c;
+          used[j] = true;
+          break;
+        }
+      }
+    }
+    // Check if identity.
+    bool isIdentity = true;
+    for (unsigned j = 0; j < nTile; ++j)
+      if (perm[j] != (int64_t)j) { isIdentity = false; break; }
+    return isIdentity ? SmallVector<int64_t>{} : perm;
+  }
+
+  // Invert a permutation vector.
+  static SmallVector<int64_t> invertPerm(ArrayRef<int64_t> perm) {
+    SmallVector<int64_t> inv(perm.size());
+    for (unsigned i = 0; i < perm.size(); ++i)
+      inv[perm[i]] = i;
+    return inv;
+  }
+
   // Resolve per-operand transpose, extents, and output-axis contribution. All
   // einsum knowledge (canonicalAxes) is consumed here; emitSourceStage works
   // from resolved fields only and never touches the spec again.
@@ -793,50 +849,8 @@ struct RewriteDescriptorLayoutPass
       OperandPlan &plan = plans[i];
       const SourceOperandSpec &opSpec = spec.operands[i];
 
-      // Derive transposePerm: permutation from physical opTileDim order to
-      // canonical axis order (matching the operand's canonicalAxes layout).
-      //
-      // canonicalAxes defines the expected role at each logical position.
-      // opTileDims are in physical order; each has role dimRoles[p].
-      // We need to reorder the physical dims so their roles match canonicalAxes.
-      //
-      // Algorithm: for each canonical position c, find which physical opTileDim
-      // index j has the matching role. perm[j] = c (physical j goes to output c).
-      // For reduction dims (role == -1), match left-to-right among unmatched.
-      {
-        unsigned nTile = plan.opTileDims.size();
-        SmallVector<int64_t> perm(nTile, -1);
-        SmallVector<bool> used(nTile, false);
-
-        // First pass: match parallel dims (role >= 0) — unique role values.
-        for (unsigned c = 0; c < nTile; ++c) {
-          int64_t canonRole = opSpec.canonicalAxes[c];
-          if (canonRole == -1) continue;
-          for (unsigned j = 0; j < nTile; ++j) {
-            if (!used[j] && plan.dimRoles[plan.opTileDims[j]] == canonRole) {
-              perm[j] = (int64_t)c;
-              used[j] = true;
-              break;
-            }
-          }
-        }
-        // Second pass: match reduction dims (role == -1) left-to-right.
-        for (unsigned c = 0; c < nTile; ++c) {
-          if (opSpec.canonicalAxes[c] != -1) continue;
-          for (unsigned j = 0; j < nTile; ++j) {
-            if (!used[j] && plan.dimRoles[plan.opTileDims[j]] == -1) {
-              perm[j] = (int64_t)c;
-              used[j] = true;
-              break;
-            }
-          }
-        }
-        // Check if identity.
-        bool isIdentity = true;
-        for (unsigned j = 0; j < nTile; ++j)
-          if (perm[j] != (int64_t)j) { isIdentity = false; break; }
-        plan.transposePerm = isIdentity ? SmallVector<int64_t>{} : perm;
-      }
+      plan.transposePerm = computeTransposePerm(
+          plan.opTileDims, plan.dimRoles, opSpec.canonicalAxes);
 
       plan.opExtents.clear();
       for (int p : plan.opTileDims)
@@ -969,16 +983,20 @@ struct RewriteDescriptorLayoutPass
     auto accTy = RankedTensorType::get(accDims, accElemTy);
 
     // Transpose helper — emit linalg.transpose with the given permutation.
+    // The pass stores perms in "input→output" form (perm[i] = output dim for
+    // input dim i), but linalg.transpose uses "output←input" form (perm[i] =
+    // input dim that feeds output dim i). Invert here so call sites stay simple.
     auto emitTranspose = [&](Value src, ArrayRef<int64_t> perm) -> Value {
       auto srcTy = cast<RankedTensorType>(src.getType());
-      SmallVector<int64_t> outShape(perm.size());
-      for (unsigned i = 0; i < perm.size(); ++i)
-        outShape[perm[i]] = srcTy.getDimSize(i);
+      auto mlirPerm = invertPerm(perm);
+      SmallVector<int64_t> outShape(mlirPerm.size());
+      for (unsigned i = 0; i < mlirPerm.size(); ++i)
+        outShape[i] = srcTy.getDimSize(mlirPerm[i]);
       auto outTy = RankedTensorType::get(outShape, srcTy.getElementType());
       Value empty = tensor::EmptyOp::create(b, loc, outTy.getShape(),
                                             srcTy.getElementType());
       return linalg::TransposeOp::create(b, loc, src, empty,
-          b.getDenseI64ArrayAttr(perm)).getResult()[0];
+          b.getDenseI64ArrayAttr(mlirPerm)).getResult()[0];
     };
 
     // Determine the stick loop trip count (stickFactor).
@@ -1109,19 +1127,79 @@ struct RewriteDescriptorLayoutPass
       return st.emitError(
           "spyre_tensor_layout: store sink stage: unexpected reduction dim");
 
-    // Guard: opTile dims must appear in ascending logical-dim order so that
-    // the logical extract below matches physical insertion without a transpose.
+    // Compute a full-rank permutation to reorder the logical input tile from
+    // canonical (ascending logical-dim) order to the physical dim appearance
+    // order. This ensures extracted slices match the physical sink layout.
+    //
+    // Build the permutation by scanning all physical dims (opTile + floor) in
+    // ascending physical order and recording the logical dim they map to. The
+    // order of first appearance of each logical dim gives the target position.
+    unsigned logRank = dPlan.coords.logicalRank;
+    SmallVector<int64_t> sinkPerm; // logDim → position in transposed tile
     {
-      int64_t prevLogDim = -1;
-      for (int p : dPlan.opTileDims) {
-        int64_t logDim = dPlan.dimRoles[p];
-        if (logDim < prevLogDim)
-          return st.emitError(
-              "spyre_tensor_layout: store sink stage: output opTile dims are "
-              "not in ascending logical-dim order (transpose not yet supported)");
-        prevLogDim = logDim;
+      // Collect (physDimIdx, logDim) for opTile dims ONLY, sorted by physIdx.
+      // Floor dims are excluded because their logical dim is already represented
+      // by the lane dim (which is in opTileDims). The transpose must align the
+      // logical tile so that after stick-extraction along the floor's logical dim,
+      // the resulting slice matches the physical non-floor layout (the lane
+      // position, not the floor position, determines where that logical dim sits).
+      SmallVector<std::pair<int, int64_t>> physOrder;
+      for (int p : dPlan.opTileDims)
+        physOrder.push_back({p, dPlan.dimRoles[p]});
+      llvm::sort(physOrder, [](auto &a, auto &b) { return a.first < b.first; });
+
+      // Deduplicate logical dims (keep first appearance = physical order).
+      SmallVector<int64_t> orderedLogDims;
+      SmallVector<bool> seen(logRank, false);
+      for (auto &[_, ld] : physOrder) {
+        if (ld >= 0 && (unsigned)ld < logRank && !seen[ld]) {
+          orderedLogDims.push_back(ld);
+          seen[ld] = true;
+        }
+      }
+
+      // Build perm: logDim d goes to position pos where orderedLogDims[pos] == d.
+      // perm[d] = pos means "logical dim d goes to output position pos".
+      if (orderedLogDims.size() == logRank) {
+        SmallVector<int64_t> perm(logRank);
+        for (unsigned pos = 0; pos < logRank; ++pos)
+          perm[orderedLogDims[pos]] = (int64_t)pos;
+        // Check if identity.
+        bool isIdentity = true;
+        for (unsigned d = 0; d < logRank; ++d)
+          if (perm[d] != (int64_t)d) { isIdentity = false; break; }
+        if (!isIdentity)
+          sinkPerm = std::move(perm);
       }
     }
+
+    // logDimToPos[d] = position of logical dim d in the (possibly transposed)
+    // input tile. Without transpose it is identity; with transpose it is sinkPerm.
+    auto logDimToPos = [&](int64_t d) -> unsigned {
+      return sinkPerm.empty() ? (unsigned)d : (unsigned)sinkPerm[d];
+    };
+
+    // Transpose helper — emit linalg.transpose with the given permutation.
+    // The pass stores perms in "input→output" form (perm[i] = output dim for
+    // input dim i), but linalg.transpose uses "output←input" form (perm[i] =
+    // input dim that feeds output dim i). Invert here so call sites stay simple.
+    auto emitTranspose = [&](Value src, ArrayRef<int64_t> perm) -> Value {
+      auto srcTy = cast<RankedTensorType>(src.getType());
+      auto mlirPerm = invertPerm(perm);
+      SmallVector<int64_t> outShape(mlirPerm.size());
+      for (unsigned i = 0; i < mlirPerm.size(); ++i)
+        outShape[i] = srcTy.getDimSize(mlirPerm[i]);
+      auto outTy = RankedTensorType::get(outShape, srcTy.getElementType());
+      Value empty = tensor::EmptyOp::create(b, loc, outTy.getShape(),
+                                            srcTy.getElementType());
+      return linalg::TransposeOp::create(b, loc, src, empty,
+          b.getDenseI64ArrayAttr(mlirPerm)).getResult()[0];
+    };
+
+    // If non-identity perm, transpose the input tile from canonical (ascending
+    // logical-dim) order to physical dim appearance order before slicing.
+    if (!sinkPerm.empty())
+      inputTile = emitTranspose(inputTile, sinkPerm);
 
     auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
 
@@ -1131,13 +1209,9 @@ struct RewriteDescriptorLayoutPass
 
     // Build extract/insert parameter base arrays from the physical plan.
     //
-    // inputTile is logical (rank = dPlan.coords.logicalRank). For each logical
-    // dim d, the base offset is 0 and the base size is:
-    //   - stickSize            if d is the logical src of a floor dim (will be
-    //                          overridden per-iteration inside the stick loop)
-    //   - physBlock[p]         for opTile dims (taken whole)
-    // We derive sizes by scanning dimRoles rather than reading logShape.
-    unsigned logRank = dPlan.coords.logicalRank;
+    // After the optional transpose, inputTile's dims are in physical appearance
+    // order. We index offsets/sizes by logDimToPos(logDim) — the position of
+    // each logical dim in the transposed tile.
     SmallVector<OpFoldResult> inputOffsetsBase(logRank, idx(0));
     SmallVector<OpFoldResult> inputSizesBase(logRank);
     SmallVector<OpFoldResult> inputStrides(logRank, idx(1));
@@ -1145,13 +1219,13 @@ struct RewriteDescriptorLayoutPass
     for (int p : dPlan.opTileDims) {
       int64_t logDim = dPlan.dimRoles[p];
       if (logDim >= 0 && (unsigned)logDim < logRank)
-        inputSizesBase[logDim] = idx(physBlock[p]);
+        inputSizesBase[logDimToPos(logDim)] = idx(physBlock[p]);
     }
     // Floor dims: size = stickSize on that logical dim (overridden in loop body).
     for (int p : dPlan.floorDims) {
       int64_t logDim = dPlan.dimRoles[p];
       if (logDim >= 0 && (unsigned)logDim < logRank)
-        inputSizesBase[logDim] = idx(stickSize);
+        inputSizesBase[logDimToPos(logDim)] = idx(stickSize);
     }
 
     // Sink insert: offset 0 / full physBlock size for non-floor dims.
@@ -1170,24 +1244,25 @@ struct RewriteDescriptorLayoutPass
       int64_t logDim = dPlan.dimRoles[p];
       if (logDim < 0 || (unsigned)logDim >= logRank) continue;
 
+      unsigned tileDim = logDimToPos(logDim); // position in transposed tile
       int64_t tripCount = physBlock[p]; // sticks per tile along dim p
       Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
 
-      // Extract-result type: stickSize on the floor's logical dim, physBlock
-      // for every opTile logical dim.
+      // Extract-result type: dimensions match the transposed tile layout.
       SmallVector<int64_t> slShape(logRank);
       for (int p2 : dPlan.opTileDims) {
         int64_t ld = dPlan.dimRoles[p2];
-        if (ld >= 0 && (unsigned)ld < logRank) slShape[ld] = physBlock[p2];
+        if (ld >= 0 && (unsigned)ld < logRank)
+          slShape[logDimToPos(ld)] = physBlock[p2];
       }
-      slShape[logDim] = stickSize;
+      slShape[tileDim] = stickSize;
       auto slTy = RankedTensorType::get(slShape, elemTy);
 
       acc = emitStickLoop(b, loc, tripCount, acc,
           [&](OpBuilder &bb, Value s, Value sinkAccumulator) -> Value {
-            // Input-extract: s-th stick-slice of inputTile on the floor's logDim.
+            // Input-extract: s-th stick-slice of inputTile on the floor's dim.
             SmallVector<OpFoldResult> inOff = inputOffsetsBase;
-            inOff[logDim] =
+            inOff[tileDim] =
                 arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
             Value inputSlice = tensor::ExtractSliceOp::create(
                 bb, loc, slTy, inputTile, inOff, inputSizesBase, inputStrides);
