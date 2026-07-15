@@ -78,6 +78,8 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <algorithm>
+#include <numeric>
 #include <optional>
 
 namespace mlir::triton::ktdp {
@@ -293,6 +295,9 @@ struct RewriteDescriptorLayoutPass
     if (auto mm = dyn_cast<linalg::MatmulOp>(op))
       return sourceNeedsDispatch(mm, 2) ? (changed = true, dispatchMatmul(mm)) : success();
 
+    if (auto bmm = dyn_cast<linalg::BatchMatmulOp>(op))
+      return sourceNeedsDispatch(bmm, 3) ? (changed = true, dispatchBatchMatmul(bmm)) : success();
+
     if (auto rd = dyn_cast<linalg::ReduceOp>(op))
       return sourceNeedsDispatch(rd, 2) ? (changed = true, dispatchReduce(rd)) : success();
 
@@ -322,7 +327,7 @@ struct RewriteDescriptorLayoutPass
       changed = false;
       SmallVector<Operation *> candidates;
       module.walk([&](Operation *op) {
-        if (isa<linalg::MatmulOp, linalg::ReduceOp, mlir::ktdp::StoreOp>(op))
+        if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, linalg::ReduceOp, mlir::ktdp::StoreOp>(op))
           candidates.push_back(op);
       });
       for (auto *op : candidates)
@@ -396,28 +401,25 @@ struct RewriteDescriptorLayoutPass
   };
 
   // Assign a role to each physical dim of an operand:
-  //   >= 0  : parallel dim, maps to C dim [value]
+  //   >= 0  : parallel dim, maps to output axis [value] (0=M, 1=N, etc.)
   //   -1    : reduction dim — consumed by Op (inner) or looped (outer)
   //
-  // All physical dims whose logical source is in `consumedLogicalDims` get
-  // role -1. classify() then splits them right-to-left: the rightmost is
+  // All physical dims whose logical source has canonicalAxes[logDim] == -1
+  // get role -1. classify() then splits them right-to-left: the rightmost is
   // opInnerDim (consumed by Op); the rest are loopDims (scf.for reduction loops).
-  //
-  // `parallelRole` is the role assigned to non-consumed dims — typically the
-  // logical C dim index they contribute to (0=M, 1=N, etc.).
-  // Build per-physical-dim roles from a per-logical-dim reduction predicate.
-  // reductionMask[logDim] = true → any physical dim whose src is that logical dim
-  // gets role -1 (reduction); others get `parallelRole`.
+  // Build per-physical-dim roles from canonicalAxes.
+  // canonicalAxes[logDim] gives the output axis index (>= 0) or -1 (reduction).
+  // Each physical dim p whose src is logDim gets roles[p] = canonicalAxes[logDim].
   static void buildDimRoles(const OperandCoords &coords,
-                             ArrayRef<bool> reductionMask,
-                             int64_t parallelRole,
+                             ArrayRef<int64_t> canonicalAxes,
                              SmallVectorImpl<int64_t> &roles) {
     int n = (int)coords.src.size();
     roles.resize(n);
     for (int p = 0; p < n; ++p) {
       int64_t logDim = coords.src[p];
-      bool isReduction = logDim < (int64_t)reductionMask.size() && reductionMask[logDim];
-      roles[p] = isReduction ? -1 : parallelRole;
+      roles[p] = (logDim < (int64_t)canonicalAxes.size())
+                     ? canonicalAxes[logDim]
+                     : -1;
     }
   }
 
@@ -469,10 +471,8 @@ struct RewriteDescriptorLayoutPass
 
     // Resolved fields — filled by resolveAndReconcile() after classify().
     // emitSourceStage reads these only; it does not re-derive from spec/dimRoles.
-    bool                needsTranspose;    // true iff the op-tile must be transposed before the op
+    SmallVector<int64_t> transposePerm;    // permutation from physical to canonical axis order; empty = identity (no transpose)
     SmallVector<int64_t> opExtents;        // extent of each opTileDim after slicing (pre-transpose)
-    int64_t             parallelOutputAxis; // output axis this operand contributes to (its parallelRole)
-    int64_t             parallelExtent;     // post-transpose extent along that output axis
 
   };
 
@@ -590,32 +590,12 @@ struct RewriteDescriptorLayoutPass
     SmallVector<int64_t> canonicalAxes; // one entry per logical dim of this operand
   };
 
-  // Per-logical-dim reduction predicate: isReduction[i] = true iff dim i is reduction.
-  static SmallVector<bool> isReduction(const SourceOperandSpec &spec) {
-    SmallVector<bool> result;
-    for (int64_t ax : spec.canonicalAxes)
-      result.push_back(ax == -1);
-    return result;
-  }
 
-  // The unique parallel output-axis carried by this operand.
-  static int64_t parallelRole(const SourceOperandSpec &spec) {
-    for (int64_t v : spec.canonicalAxes)
-      if (v != -1) return v;
-    llvm_unreachable("SourceOperandSpec: no parallel axis");
-  }
-
-  // Transpose needed iff canonical low dim is reduction XOR physical low dim is.
-  static bool needsTranspose(const SourceOperandSpec &spec, int64_t dimLoRole) {
-    bool canonicalLowIsReduction = isReduction(spec)[0];
-    bool physicalLowIsReduction  = (dimLoRole == -1);
-    return canonicalLowIsReduction != physicalLowIsReduction;
-  }
 
   // Descriptor for one source contraction op (e.g. linalg.matmul).
   // `emitOp` receives all (possibly transposed) input slices + accumulator
   // and returns the updated accumulator. Acc shape is derived from each
-  // operand's resolved opExtents + needsTranspose fields by emitSourceStage.
+  // operand's resolved opExtents + transposePerm fields by emitSourceStage.
   struct SourceOpSpec {
     SmallVector<SourceOperandSpec> operands;  // one per input
     unsigned logicalRank;
@@ -655,7 +635,7 @@ struct RewriteDescriptorLayoutPass
     plan.stickSize  = tensorTy.getDimSize(rank - 1);
     plan.opInnerDim = -1;
     // All dims are opTileDims (dims 0 … rank-1, ascending), all WholeBlock.
-    // dimRoles mirrors canonicalAxes so needsTranspose derives correctly:
+    // dimRoles mirrors canonicalAxes so transposePerm derives correctly:
     //   canonical reduction dim → role -1, canonical parallel dim → its axis index.
     for (int p = 0; p < rank; ++p) {
       plan.opTileDims.push_back(p);
@@ -663,12 +643,10 @@ struct RewriteDescriptorLayoutPass
     }
     plan.sliceKind.assign(rank, SliceKind::WholeBlock);
 
-    // Resolved fields: no transpose; extents straight from shape.
-    plan.needsTranspose     = false;
+    // Resolved fields: no transpose (identity perm = empty); extents straight from shape.
+    plan.transposePerm      = {};
     for (int p : plan.opTileDims)
       plan.opExtents.push_back(tensorTy.getDimSize(p));
-    plan.parallelOutputAxis = parallelRole(opSpec);
-    plan.parallelExtent     = tensorTy.getDimSize(rank - 1);
     return plan;
   }
 
@@ -696,8 +674,7 @@ struct RewriteDescriptorLayoutPass
         OperandCoords coords = OperandCoords::fromMarker(marker, spec.logicalRank,
                                                          physShape);
         SmallVector<int64_t> dimRoles;
-        buildDimRoles(coords, isReduction(spec.operands[i]),
-                      parallelRole(spec.operands[i]), dimRoles);
+        buildDimRoles(coords, spec.operands[i].canonicalAxes, dimRoles);
         plans[i] = classify(operand, coords, dimRoles);
       } else {
         // No load found → scratchpad: a logical value flowing in from elsewhere
@@ -720,6 +697,21 @@ struct RewriteDescriptorLayoutPass
     }
 
     resolveAndReconcile(plans, spec);
+
+    // D3 guard: reject parallel floor dims with physBlock > 1.
+    // extractOpSlice uses stickIV (the reduction stick loop IV) as the offset
+    // for StickIndex dims, which is only correct for reduction floors.  Parallel
+    // floor dims with physBlock > 1 would need their own loop; until that is
+    // implemented, fail early with a clear diagnostic.
+    for (unsigned i = 0; i < nOps; ++i) {
+      for (int p : plans[i].floorDims) {
+        if (plans[i].dimRoles[p] >= 0 && plans[i].coords.physBlock[p] > 1)
+          return op.emitError(
+              "spyre_tensor_layout: source stage does not yet support "
+              "multi-stick parallel floor dims (physBlock > 1 on a parallel "
+              "axis)");
+      }
+    }
 
     return emitSourceStage(op, spec.emitOp, plans);
   }
@@ -800,19 +792,55 @@ struct RewriteDescriptorLayoutPass
     for (unsigned i = 0; i < plans.size(); ++i) {
       OperandPlan &plan = plans[i];
       const SourceOperandSpec &opSpec = spec.operands[i];
-      int dimLo = plan.opTileDims[0];
-      plan.needsTranspose = needsTranspose(opSpec, plan.dimRoles[dimLo]);
+
+      // Derive transposePerm: permutation from physical opTileDim order to
+      // canonical axis order (matching the operand's canonicalAxes layout).
+      //
+      // canonicalAxes defines the expected role at each logical position.
+      // opTileDims are in physical order; each has role dimRoles[p].
+      // We need to reorder the physical dims so their roles match canonicalAxes.
+      //
+      // Algorithm: for each canonical position c, find which physical opTileDim
+      // index j has the matching role. perm[j] = c (physical j goes to output c).
+      // For reduction dims (role == -1), match left-to-right among unmatched.
+      {
+        unsigned nTile = plan.opTileDims.size();
+        SmallVector<int64_t> perm(nTile, -1);
+        SmallVector<bool> used(nTile, false);
+
+        // First pass: match parallel dims (role >= 0) — unique role values.
+        for (unsigned c = 0; c < nTile; ++c) {
+          int64_t canonRole = opSpec.canonicalAxes[c];
+          if (canonRole == -1) continue;
+          for (unsigned j = 0; j < nTile; ++j) {
+            if (!used[j] && plan.dimRoles[plan.opTileDims[j]] == canonRole) {
+              perm[j] = (int64_t)c;
+              used[j] = true;
+              break;
+            }
+          }
+        }
+        // Second pass: match reduction dims (role == -1) left-to-right.
+        for (unsigned c = 0; c < nTile; ++c) {
+          if (opSpec.canonicalAxes[c] != -1) continue;
+          for (unsigned j = 0; j < nTile; ++j) {
+            if (!used[j] && plan.dimRoles[plan.opTileDims[j]] == -1) {
+              perm[j] = (int64_t)c;
+              used[j] = true;
+              break;
+            }
+          }
+        }
+        // Check if identity.
+        bool isIdentity = true;
+        for (unsigned j = 0; j < nTile; ++j)
+          if (perm[j] != (int64_t)j) { isIdentity = false; break; }
+        plan.transposePerm = isIdentity ? SmallVector<int64_t>{} : perm;
+      }
+
       plan.opExtents.clear();
       for (int p : plan.opTileDims)
         plan.opExtents.push_back(opSliceExtent(plan, p));
-      plan.parallelOutputAxis = parallelRole(opSpec);
-      // parallelExtent: extent of the unique non-reduction opTileDim after transpose.
-      SmallVector<bool> redMask = isReduction(opSpec);
-      int64_t extLo = plan.opExtents[0];
-      int64_t extHi = plan.opExtents.size() > 1 ? plan.opExtents[1] : extLo;
-      plan.parallelExtent = !redMask[0]
-                                ? (plan.needsTranspose ? extHi : extLo)
-                                : (plan.needsTranspose ? extLo : extHi);
     }
 
     // Step 2 — StickifiedBlock demotion.
@@ -824,19 +852,12 @@ struct RewriteDescriptorLayoutPass
         for (auto &sk : plan.sliceKind)
           if (sk == SliceKind::StickifiedBlock)
             sk = SliceKind::WholeBlock;
-      // Re-derive extents and parallelExtent now that sliceKind has changed.
+      // Re-derive extents now that sliceKind has changed.
       for (unsigned i = 0; i < plans.size(); ++i) {
         OperandPlan &plan = plans[i];
-        const SourceOperandSpec &opSpec = spec.operands[i];
         plan.opExtents.clear();
         for (int p : plan.opTileDims)
           plan.opExtents.push_back(opSliceExtent(plan, p));
-        SmallVector<bool> redMask = isReduction(opSpec);
-        int64_t extLo = plan.opExtents[0];
-        int64_t extHi = plan.opExtents.size() > 1 ? plan.opExtents[1] : extLo;
-        plan.parallelExtent = !redMask[0]
-                                  ? (plan.needsTranspose ? extHi : extLo)
-                                  : (plan.needsTranspose ? extLo : extHi);
       }
     }
   }
@@ -856,6 +877,23 @@ struct RewriteDescriptorLayoutPass
           ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
     };
     return dispatchSource(mm, spec);
+  }
+
+  // linalg.batch_matmul instantiation:
+  //   A=(b,m,k): dim0=B (output 0), dim1=M (output 1), dim2=K (reduction).
+  //   B=(b,k,n): dim0=B (output 0), dim1=K (reduction), dim2=N (output 2).
+  LogicalResult dispatchBatchMatmul(linalg::BatchMatmulOp bmm) {
+    SourceOpSpec spec;
+    spec.operands = {SourceOperandSpec{{0, 1, -1}},   // A=(b,m,k)
+                     SourceOperandSpec{{0, -1, 2}}};  // B=(b,k,n)
+    spec.logicalRank = 3;
+    spec.emitOp = [](OpBuilder &b, Location loc,
+                     ArrayRef<Value> slices, Value acc,
+                     RankedTensorType accTy) -> Value {
+      return linalg::BatchMatmulOp::create(b, loc, accTy,
+          ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
+    };
+    return dispatchSource(bmm, spec);
   }
 
   // linalg.reduce instantiation:
@@ -909,26 +947,38 @@ struct RewriteDescriptorLayoutPass
       sliceTys.push_back(RankedTensorType::get(plan.opExtents, elemTy));
     }
 
-    // Acc shape from resolved per-plan fields: each input plan contributes its
-    // parallelExtent to its parallelOutputAxis.
+    // Derive acc shape from the union of all (outputAxis, extent) pairs.
+    // For each plan, iterate opTileDims: dimRoles[p] >= 0 means parallel,
+    // and its value is the output axis index. opSliceExtent gives the extent.
     int64_t maxAxis = -1;
     for (auto &plan : plans)
-      if (plan.parallelOutputAxis > maxAxis) maxAxis = plan.parallelOutputAxis;
+      for (unsigned j = 0; j < plan.opTileDims.size(); ++j) {
+        int p = plan.opTileDims[j];
+        int64_t role = plan.dimRoles[p];
+        if (role >= 0 && role > maxAxis)
+          maxAxis = role;
+      }
     SmallVector<int64_t> accDims(maxAxis + 1, 0);
     for (auto &plan : plans)
-      accDims[plan.parallelOutputAxis] = plan.parallelExtent;
+      for (unsigned j = 0; j < plan.opTileDims.size(); ++j) {
+        int p = plan.opTileDims[j];
+        int64_t role = plan.dimRoles[p];
+        if (role >= 0)
+          accDims[role] = plan.opExtents[j];
+      }
     auto accTy = RankedTensorType::get(accDims, accElemTy);
 
-    // Transpose helper — currently only 2D (matmul). N-D generalisation deferred.
-    auto emitTranspose2D = [&](Value src, Type elemT) -> Value {
-      assert(cast<RankedTensorType>(src.getType()).getRank() == 2 &&
-             "transpose of non-2D op-tile not yet supported");
+    // Transpose helper — emit linalg.transpose with the given permutation.
+    auto emitTranspose = [&](Value src, ArrayRef<int64_t> perm) -> Value {
       auto srcTy = cast<RankedTensorType>(src.getType());
-      auto outTy = RankedTensorType::get(
-          {srcTy.getDimSize(1), srcTy.getDimSize(0)}, elemT);
-      Value empty = tensor::EmptyOp::create(b, loc, outTy.getShape(), elemT);
+      SmallVector<int64_t> outShape(perm.size());
+      for (unsigned i = 0; i < perm.size(); ++i)
+        outShape[perm[i]] = srcTy.getDimSize(i);
+      auto outTy = RankedTensorType::get(outShape, srcTy.getElementType());
+      Value empty = tensor::EmptyOp::create(b, loc, outTy.getShape(),
+                                            srcTy.getElementType());
       return linalg::TransposeOp::create(b, loc, src, empty,
-          b.getDenseI64ArrayAttr({1, 0})).getResult()[0];
+          b.getDenseI64ArrayAttr(perm)).getResult()[0];
     };
 
     // Determine the stick loop trip count (stickFactor).
@@ -984,8 +1034,8 @@ struct RewriteDescriptorLayoutPass
         auto elemTy =
             cast<RankedTensorType>(plans[i].value.getType()).getElementType();
         Value slicePhys = extractOpSlice(b, loc, plans[i], sliceTys[i], stickIV);
-        slices.push_back(plans[i].needsTranspose
-                             ? emitTranspose2D(slicePhys, elemTy)
+        slices.push_back(!plans[i].transposePerm.empty()
+                             ? emitTranspose(slicePhys, plans[i].transposePerm)
                              : slicePhys);
       }
       Value r = emitOp(b, loc, slices, acc, accTy);

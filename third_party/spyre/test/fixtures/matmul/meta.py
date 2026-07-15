@@ -107,18 +107,39 @@ SIGNATURE = {
 }
 
 _SIG_BMM = {
-    "a_ptr":   "*fp32",
-    "b_ptr":   "*fp32",
-    "c_ptr":   "*fp32",
-    "B":       "i32",
-    "M":       "i32",
-    "K":       "i32",
-    "N":       "i32",
-    "BLOCK_B": "i32",
-    "BLOCK_M": "i32",
-    "BLOCK_K": "i32",
-    "BLOCK_N": "i32",
+    "a_ptr":    "*fp32",
+    "b_ptr":    "*fp32",
+    "c_ptr":    "*fp32",
+    "B":        "i32",
+    "M":        "i32",
+    "K":        "i32",
+    "N":        "i32",
+    "BLOCK_B":  "i32",
+    "BLOCK_M":  "i32",
+    "BLOCK_K":  "i32",
+    "BLOCK_N":  "i32",
+    "A_LAYOUT": "constexpr",
+    "B_LAYOUT": "constexpr",
+    "C_LAYOUT": "constexpr",
 }
+
+_SIG_BMM_SPYRE = {
+    "a_ptr":    "*fp16",
+    "b_ptr":    "*fp16",
+    "c_ptr":    "*fp16",
+    "B":        "i32",
+    "M":        "i32",
+    "K":        "i32",
+    "N":        "i32",
+    "BLOCK_B":  "i32",
+    "BLOCK_M":  "i32",
+    "BLOCK_K":  "i32",
+    "BLOCK_N":  "i32",
+    "A_LAYOUT": "constexpr",
+    "B_LAYOUT": "constexpr",
+    "C_LAYOUT": "constexpr",
+}
+_SB = functools.partial(_sticksize, _SIG_BMM_SPYRE)
 
 # Spyre physical-layout variants: same arg list as matmul_kernel plus the
 # three optional layout constexprs (A/B/C_LAYOUT) carrying the stick-tiling.
@@ -280,10 +301,12 @@ VARIANTS = {
         "tags": ["descriptor-load-static", "descriptor-store-static", "dot", "program-id-1d", "num-programs-fold"],
         "kernel_fn":    kernel.bmm_matmul_kernel,
         "SIGNATURE":    _SIG_BMM,
-        "constexpr":    ["B", "M", "K", "N", "BLOCK_B", "BLOCK_M", "BLOCK_K", "BLOCK_N"],
+        "constexpr":    ["B", "M", "K", "N", "BLOCK_B", "BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
         "params":       {
             "B": [4], "M": [128], "K": [32], "N": [64],
             "BLOCK_B": [1], "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+            "A_LAYOUT": [0], "B_LAYOUT": [0], "C_LAYOUT": [0],
         },
         "reference":    run_bmm,
         "inputs":       make_inputs_bmm,
@@ -299,10 +322,12 @@ VARIANTS = {
         "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot", "program-id-1d", "num-programs-fold"],
         "kernel_fn":    kernel.bmm_matmul_kernel,
         "SIGNATURE":    _SIG_BMM,
-        "constexpr":    ["BLOCK_B", "BLOCK_M", "BLOCK_K", "BLOCK_N"],
+        "constexpr":    ["BLOCK_B", "BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
         "params":       {
             "B": [4], "M": [128], "K": [32], "N": [64],
             "BLOCK_B": [1], "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+            "A_LAYOUT": [0], "B_LAYOUT": [0], "C_LAYOUT": [0],
         },
         "reference":    run_bmm,
         "inputs":       make_inputs_bmm,
@@ -555,6 +580,50 @@ VARIANTS = {
             t.assert_present("linalg.matmul"),
             t.assert_present("scf.for"),
             t.assert_present("tensor.insert_slice"),
+        ),
+    },
+    # --- BMM Spyre physical-layout variant ---
+    # Batch matmul with stick-tiling: A[B,M,K] stick-on-K, B[B,K,N] stick-on-N,
+    # C[B,M,N] stick-on-N. Exercises dispatchBatchMatmul with physical layouts.
+    # N=64 (=stick size) so B_operand's parallel floor dim has physBlock=1 (D3).
+    "bmm_spyre_stick": {
+        "tags": ["descriptor-load-static", "descriptor-store-static", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "Batch matmul with Spyre stick-tiling: A stick-on-K (reduction "
+            "loop), B/C stick-on-N. Exercises dispatchBatchMatmul with "
+            "physical layouts and the D3 parallel-floor constraint."
+        ),
+        "kernel_fn":    kernel.bmm_matmul_kernel,
+        "SIGNATURE":    _SIG_BMM_SPYRE,
+        "constexpr":    ["B", "M", "K", "N", "BLOCK_B", "BLOCK_M", "BLOCK_K",
+                         "BLOCK_N", "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            # B=4, M=64, K=128, N=64; fp16 stick=64. BLOCK_B=4 so the batch
+            # identity dim has extent >1 in the physical block, avoiding an
+            # ambiguous unit-dim rank-reduction in tensor.extract_slice (the
+            # stick-index floor dim already has size 1 during extraction).
+            # K=128 / 64 = 2 K-sticks → reduction loop trip count 2.
+            # N=64 / 64 = 1 → single parallel N-stick (D3 satisfied).
+            "B": [4], "M": [64], "K": [128], "N": [64],
+            "BLOCK_B": [4], "BLOCK_M": [64], "BLOCK_K": [128], "BLOCK_N": [64],
+            # A[B,M,K] stick-on-K (dim 2): phys [K/S, B, M, K%S]
+            "A_LAYOUT": [[(2, "floordiv", _SB("a_ptr")), 0, 1, (2, "mod", _SB("a_ptr"))]],
+            # B_operand[B,K,N] stick-on-N (dim 2): phys [N/S, B, K, N%S]
+            "B_LAYOUT": [[(2, "floordiv", _SB("b_ptr")), 0, 1, (2, "mod", _SB("b_ptr"))]],
+            # C[B,M,N] stick-on-N (dim 2): phys [N/S, B, M, N%S]
+            "C_LAYOUT": [[(2, "floordiv", _SB("c_ptr")), 0, 1, (2, "mod", _SB("c_ptr"))]],
+        },
+        "grid":         [1],
+        "reference":    run_bmm,
+        "inputs":       functools.partial(make_inputs_bmm, dtype=np.float16),
+        "output_key":   "c_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.batch_matmul"),
+            t.assert_absent("tt.dot"),
         ),
     },
     # --- BMM 3D grid variants ---

@@ -102,11 +102,19 @@ def bmm_matmul_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    A_LAYOUT: tl.constexpr = 0,
+    B_LAYOUT: tl.constexpr = 0,
+    C_LAYOUT: tl.constexpr = 0,
 ):
     """Batched matmul (BMM): C[B,M,N] = A[B,M,K] @ B[B,K,N].
 
-    To be filled up
+    Flattens batch * M-blocks into a single work dimension and distributes
+    it across the SpyreOptions.grid cores. Each iteration recovers the batch
+    index and M-block index via divmod.
 
+    ``A_LAYOUT`` / ``B_LAYOUT`` / ``C_LAYOUT`` are optional Spyre physical
+    stick-tiling layouts (same mechanism as ``matmul_kernel``). When non-zero
+    they annotate the matching descriptor via ``tl.spyre_tensor_layout``.
     """
     pid = tl.program_id(0)
     num_cores = tl.num_programs(0)
@@ -132,6 +140,13 @@ def bmm_matmul_kernel(
         c_ptr,
         shape=[B, M, N], strides=[M*N, N, 1], block_shape=[BLOCK_B, BLOCK_M, BLOCK_N],
     )
+
+    if A_LAYOUT is not None and A_LAYOUT != 0:
+        tl.spyre_tensor_layout(a_desc, A_LAYOUT)
+    if B_LAYOUT is not None and B_LAYOUT != 0:
+        tl.spyre_tensor_layout(b_desc, B_LAYOUT)
+    if C_LAYOUT is not None and C_LAYOUT != 0:
+        tl.spyre_tensor_layout(c_desc, C_LAYOUT)
 
     for bm in range(bm_start, bm_end):
         b = bm // m_blocks
