@@ -298,8 +298,15 @@ struct RewriteDescriptorLayoutPass
     if (auto bmm = dyn_cast<linalg::BatchMatmulOp>(op))
       return sourceNeedsDispatch(bmm, 3) ? (changed = true, dispatchBatchMatmul(bmm)) : success();
 
-    if (auto rd = dyn_cast<linalg::ReduceOp>(op))
-      return sourceNeedsDispatch(rd, 2) ? (changed = true, dispatchReduce(rd)) : success();
+    if (auto rd = dyn_cast<linalg::ReduceOp>(op)) {
+      // Reduce logical input rank = output rank + num reduction dims.
+      // Only dispatch if input rank exceeds that (Phase 1 added a stick dim).
+      auto initTy = cast<RankedTensorType>(rd.getDpsInits()[0].getType());
+      unsigned logicalInputRank = initTy.getRank() + rd.getDimensions().size();
+      return sourceNeedsDispatch(rd, logicalInputRank)
+                 ? (changed = true, dispatchReduce(rd))
+                 : success();
+    }
 
     if (auto st = dyn_cast<mlir::ktdp::StoreOp>(op)) {
       auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
