@@ -6,19 +6,21 @@ include "mlir/Pass/PassBase.td"
 // ============================================================================
 // Pass pipeline: TTIR → KTIR
 //
-//   LowerDescriptorMemory
-//           ↓
-//    LowerScalarLoad   [LowerPointerChainMemory]
+
+//
+//   LowerDescriptorMemory       [LowerPointerChainMemory]
 //           └───────────┬───────────┘
+//
+//                LowerScalarLoad
 //                       ↓
 //                 LowerComputeOps
-//                       |
-//                ConvertFunctions
-//                       |
-//                 DistributeWork
-//                       |
-//                canonicalize + CSE
-//                       |
+//                       ↓
+//               ConvertFunctions
+//                       ↓
+//               DistributeWork
+//                       ↓
+//              canonicalize + CSE
+//                       ↓
 //                     KTIR
 //
 // Each pass declares its contract below:

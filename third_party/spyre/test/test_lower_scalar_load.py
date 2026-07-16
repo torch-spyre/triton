@@ -54,7 +54,7 @@ class TestScalarLoad(LowerScalarLoadTester):
     def test_bare_pointer(self):
         """Load a scalar through a bare pointer (no addptr chain, no mask).
 
-        The pointer is cast straight to `index` (via `ptrToIndex`, an
+        The pointer is cast straight to `index` (via `getBasePtrAsIndex`, an
         `unrealized_conversion_cast` that survives until `ConvertFunctions`)
         and used directly as the rank-0 memory view's offset — no
         `arith.addi` folding is needed since there's no `tt.addptr` chain.

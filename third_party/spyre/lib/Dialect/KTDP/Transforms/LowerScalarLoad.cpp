@@ -81,26 +81,12 @@ static bool isScalarPtr(Value ptr) {
 /// `arith.constant`. Returns std::nullopt if the value is not a
 /// materialized constant — in particular, a comparison of two constants
 /// (`arith.cmpi`) is deliberately *not* folded here; only a value that is
-/// itself `arith.constant` counts, mirroring `LowerDescriptorMemory.cpp`'s
-/// `getConstantInt`.
+/// itself `arith.constant` counts. Thin bool-projecting wrapper around the
+/// shared `getConstantInt`.
 static std::optional<bool> getConstantMask(Value v) {
-  if (auto cst = v.getDefiningOp<arith::ConstantOp>())
-    if (auto attr = dyn_cast<IntegerAttr>(cst.getValue()))
-      return attr.getInt() != 0;
+  if (auto c = mlir::triton::ktdp::getConstantInt(v))
+    return *c != 0;
   return std::nullopt;
-}
-
-/// Cast a `!tt.ptr` value to `index` via an `unrealized_conversion_cast`.
-/// Mirrors `LowerDescriptorMemory.cpp`'s `getBasePtrAsIndex`: the cast
-/// survives this pass and is consumed by the later `ConvertFunctions`
-/// pass, which rewrites `!tt.ptr` function arguments to `index` and
-/// erases the matching casts.
-static Value ptrToIndex(OpBuilder &builder, Location loc, Value ptr) {
-  if (ptr.getType().isIndex())
-    return ptr;
-  return UnrealizedConversionCastOp::create(builder, loc,
-                                             builder.getIndexType(), ptr)
-      .getResult(0);
 }
 
 /// Walk a chain of scalar `tt.addptr` ops back to its root pointer,
@@ -122,7 +108,7 @@ static Value resolveScalarAddress(OpBuilder &builder, Location loc,
     ptr = addPtr.getPtr();
   }
 
-  Value baseIndex = ptrToIndex(builder, loc, ptr);
+  Value baseIndex = mlir::triton::ktdp::getBasePtrAsIndex(builder, loc, ptr);
   for (Value offset : llvm::reverse(offsets))
     baseIndex =
         arith::AddIOp::create(builder, loc, baseIndex, offset).getResult();
@@ -286,11 +272,9 @@ struct LowerScalarLoadPass
     //   arith (index casts, adds, zero constants), tensor (extract)
     target.addLegalDialect<mlir::ktdp::KtdpDialect, arith::ArithDialect,
                            tensor::TensorDialect>();
-    // `UnrealizedConversionCastOp` is used by `ptrToIndex` to convert a
-    // `!tt.ptr` base pointer to `index`; the cast survives this pass and
-    // is consumed by the later `ConvertFunctions` pass, exactly as the
-    // descriptor path's `getBasePtrAsIndex` relies on (see
-    // `LowerDescriptorMemory.cpp`).
+    // `UnrealizedConversionCastOp` is used by `getBasePtrAsIndex` to convert
+    // a `!tt.ptr` base pointer to `index`; the cast survives this pass and
+    // is consumed by the later `ConvertFunctions` pass.
     target.addLegalOp<ModuleOp, UnrealizedConversionCastOp>();
 
     RewritePatternSet patterns(ctx);
