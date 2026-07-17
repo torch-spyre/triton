@@ -24,6 +24,24 @@
 // legal/untouched; see `[LowerPointerChainMemory]` (not yet implemented,
 // Passes.td pipeline diagram) for that path.
 //
+// Pass-ordering note: when a scalar `tt.load` result feeds a dynamic shape
+// operand of `tt.make_tensor_descriptor`, `LowerDescriptorMemory` reaches
+// `kDynamic` for that dimension regardless of which pass runs first:
+//   Flow A (`LowerScalarLoad` first) — the `tt.load` is already rewritten
+//     to the read chain above; `LowerDescriptorMemory` sees the shape
+//     operand's producer is `tensor.extract`, not `arith.constant`, and
+//     emits `kDynamic`.
+//   Flow B (`LowerDescriptorMemory` first — this repo's actual pipeline
+//     order) — `LowerDescriptorMemory` sees the producer is the raw,
+//     unconverted `tt.load`, also not `arith.constant`, and emits
+//     `kDynamic` directly; this pass then lowers the `tt.load` as normal.
+// Both flows agree today only because `getConstantInt` folds nothing but a
+// materialized `arith.constant` — it never traces through either the read
+// chain above or a raw `tt.load`. `test_dynamic_shape_from_scalar_load`
+// (`test_lower_desc_memory.py`) pins Flow B; if `getConstantInt` is later
+// extended to trace through one of these chains but not the other, that
+// test will catch the resulting order dependency between the two passes.
+//
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/KTDP/Transforms/Passes.h"
