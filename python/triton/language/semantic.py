@@ -1937,6 +1937,26 @@ class TritonSemantic(Generic[TensorTy]):
         work_slices = tl._unwrap_if_constexpr(work_slices)
         dep_work_slices = tl._unwrap_if_constexpr(dep_work_slices)
 
+        # Validate constexpr arguments.
+        _VALID_MODES = {"all_reduce", "reduce_to_one", "reduce_scatter", "broadcast"}
+        _VALID_SHORTHAND_COMBINERS = {"add", "max", "mul"}
+        if not isinstance(axis, str) or not axis:
+            raise ValueError(f"tl.inter_tile: axis must be a non-empty string, got {axis!r}")
+        if mode not in _VALID_MODES:
+            raise ValueError(
+                f"tl.inter_tile: mode must be one of {sorted(_VALID_MODES)}, got {mode!r}")
+        if combiner and combiner not in _VALID_SHORTHAND_COMBINERS:
+            raise ValueError(
+                f"tl.inter_tile: combiner must be one of "
+                f"{sorted(_VALID_SHORTHAND_COMBINERS)} or '' (region), got {combiner!r}")
+        if scatter_dimension is not None and mode != "reduce_scatter":
+            raise ValueError(
+                f"tl.inter_tile: scatter_dimension is only valid with "
+                f"mode='reduce_scatter', got mode={mode!r}")
+        if mode == "reduce_scatter" and scatter_dimension is None:
+            raise ValueError(
+                "tl.inter_tile: mode='reduce_scatter' requires scatter_dimension")
+
         # Normalize work_slices: accepts a list (indexed by tile id) or a dict
         # (keyed by tile id).  Canonical form: C[int_tile_id] = {str_dim: int}.
         if isinstance(work_slices, (list, tuple)):

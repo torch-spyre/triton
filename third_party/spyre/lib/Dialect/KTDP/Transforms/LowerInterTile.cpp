@@ -4,14 +4,12 @@
 //   ktdp.inter_tile_produce  (per-tile partial, producer region)
 //     + one delivery op (ktdp.inter_tile_reduce for all_reduce / reduce_to_one)
 //
-// See: .specify/specs/003-lower-inter-tile/spec.md
-//
-// Algorithm (§3):
+// Algorithm:
 //   1. Collect all tt.inter_tile_reduce ops (collect-then-rewrite to avoid
 //      invalidating the walk cursor when expansions insert/erase ops).
 //   2. For each op:
 //      a. Fold-away guard  — W[axis]==1 → forward partial(s), erase.
-//      b. Validate         — P3/P4/P5/P8.
+//      b. Validate         — axis, mode, scatter_dimension, combiner.
 //      c. Build group sets — derive gsize/ngroups, emit affine_set attrs.
 //      d. Select delivery  — all_reduce or reduce_to_one.
 //      e. Emit produce     — ktdp.inter_tile_produce + yield_partial region.
@@ -75,12 +73,10 @@ static FailureOr<WorkSliceAttrs>
 readWorkSliceAttrs(triton::InterTileReduceOp op) {
   auto W = op->getAttrOfType<DictionaryAttr>(kNumWkSlicesPerDim);
   if (!W)
-    return op.emitError("missing '") << kNumWkSlicesPerDim
-                                     << "' op attribute (P3)";
+    return op.emitError("missing '") << kNumWkSlicesPerDim << "' op attribute";
   auto C = op->getAttrOfType<ArrayAttr>(kCoreIdToWkSlice);
   if (!C)
-    return op.emitError("missing '") << kCoreIdToWkSlice
-                                     << "' op attribute (P3)";
+    return op.emitError("missing '") << kCoreIdToWkSlice << "' op attribute";
   // D is optional.
   auto D = op->getAttrOfType<DictionaryAttr>(kDepWkSlices);
   return WorkSliceAttrs{W, C, D};
@@ -111,11 +107,10 @@ struct GroupSets {
 static FailureOr<GroupSets>
 buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
                StringRef axis, Operation *loc) {
-  // --- validate axis present in W (R1) ---
   auto gsizeAttr = attrs.numWkSlicesPerDim.getAs<IntegerAttr>(axis);
   if (!gsizeAttr)
     return loc->emitError("axis '") << axis
-           << "' not found in numWkSlicesPerDim (R1)";
+           << "' not found in numWkSlicesPerDim";
   int64_t gsize = gsizeAttr.getInt();
 
   int64_t numTiles = (int64_t)attrs.coreIdToWkSlice.size();
@@ -357,42 +352,39 @@ struct LowerInterTilePass
     StringRef combiner = op.getCombiner();
     auto partials     = op.getPartials();
 
-    // --- P4: validate axis present in W ---
+    // --- validate axis present in W ---
     if (!attrs.numWkSlicesPerDim.getAs<IntegerAttr>(axis))
       return op.emitError("axis '") << axis
-             << "' not in numWkSlicesPerDim (R1)";
+             << "' not in numWkSlicesPerDim";
 
-    // --- P4: validate mode ---
+    // --- validate mode ---
     if (mode != "all_reduce" && mode != "reduce_to_one" &&
         mode != "reduce_scatter" && mode != "broadcast")
-      return op.emitError("unknown mode '") << mode << "' (R5)";
+      return op.emitError("unknown mode '") << mode << "'";
 
-    // --- P8: reject deferred modes ---
+    // --- reject deferred modes ---
     if (mode == "broadcast" || mode == "reduce_scatter")
-      return op.emitError("mode '") << mode
-             << "' is not yet supported (R8): delivery op not available in "
-                "ktir-mlir-frontend#25; see spec §5 R8";
+      return op.emitError("mode '") << mode << "' is not yet supported";
 
-    // --- P4: scatter_dimension present iff reduce_scatter ---
+    // --- scatter_dimension present iff reduce_scatter ---
     bool hasSd = (bool)op.getScatterDimension();
     if (mode == "reduce_scatter" && !hasSd)
-      return op.emitError("reduce_scatter requires scatter_dimension (R3)");
+      return op.emitError("reduce_scatter requires scatter_dimension");
     if (mode != "reduce_scatter" && hasSd)
-      return op.emitError("scatter_dimension only valid for reduce_scatter (R3)");
+      return op.emitError("scatter_dimension only valid for reduce_scatter");
 
-    // --- P5: region combiner needs explicit identities ---
+    // --- region combiner needs explicit identities ---
     bool regionCombiner = combiner.empty();
     auto identities = op.getIdentities();
     if (regionCombiner && identities.empty())
-      return op.emitError("region combiner requires explicit identity "
-                          "operands (R4, P5)");
+      return op.emitError("region combiner requires explicit identity operands");
 
-    // --- derive group sets (§3) ---
+    // --- derive group sets ---
     auto gsOrErr = buildGroupSets(ctx, attrs, axis, op);
     if (failed(gsOrErr)) return failure();
     GroupSets gs = *gsOrErr;
 
-    // --- fold-away guard (C5): gsize == 1 → each tile is its own group ---
+    // --- fold-away: gsize == 1 → each tile is its own group ---
     if (gs.gsize == 1) {
       // No cooperation needed — forward partials as results.
       rewriter.setInsertionPoint(op);
@@ -401,12 +393,12 @@ struct LowerInterTilePass
       return success();
     }
 
-    // --- select consumer set (C2) ---
+    // --- select consumer set ---
     IntegerSet consumerSet = gs.producerTilesPerGroup;  // all_reduce default
     if (mode == "reduce_to_one")
       consumerSet = buildPick0Set(ctx, gs);
 
-    // --- emit ktdp.inter_tile_produce (§3 synthesize future) ---
+    // --- emit ktdp.inter_tile_produce ---
     rewriter.setInsertionPoint(op);
 
     SmallVector<Type> partialTypes(partials.getTypes());
@@ -427,7 +419,7 @@ struct LowerInterTilePass
       ktdp::YieldPartialOp::create(rewriter, loc, partials);
     }
 
-    // --- build result types (C4) ---
+    // --- build result types ---
     // Result rank = partial rank - 1: drop the first unit dimension (the
     // within-group tile axis). The ktdp.inter_tile_reduce verifier enforces
     // this; we find the first dim with size 1 and remove it.
@@ -441,7 +433,7 @@ struct LowerInterTilePass
       }
       if (unitAxis < 0) {
         return op.emitError(
-            "partial tensor has no unit dimension to collapse (C4)");
+            "partial tensor has no unit dimension to collapse");
       }
       SmallVector<int64_t> resShape(shape.begin(), shape.end());
       resShape.erase(resShape.begin() + unitAxis);
@@ -465,7 +457,7 @@ struct LowerInterTilePass
       identityValues.assign(identities.begin(), identities.end());
     }
 
-    // --- emit ktdp.inter_tile_reduce (§3 select delivery) ---
+    // --- emit ktdp.inter_tile_reduce ---
     auto reduceOp = ktdp::InterTileReduceOp::create(
         rewriter, loc,
         resultTypes,
@@ -478,7 +470,7 @@ struct LowerInterTilePass
     // Remove the placeholder null dep attr (create with no dep).
     reduceOp->removeAttr("producer_dependency_per_consumer");
 
-    // --- emit per-consumer dependency (C7/Q10) ---
+    // --- emit per-consumer dependency ---
     if (attrs.depWkSlices) {
       if (failed(attachDepSet(rewriter, loc, ctx, gs, attrs, reduceOp, op)))
         return failure();
@@ -490,7 +482,7 @@ struct LowerInterTilePass
                                   partialTypes, combiner, regionCombiner)))
       return failure();
 
-    // --- RAUW + erase (§3 type the result) ---
+    // --- RAUW + erase ---
     rewriter.replaceOp(op, reduceOp.getResults());
     return success();
   }
@@ -566,7 +558,7 @@ struct LowerInterTilePass
                              ktdp::InterTileReduceOp dstOp,
                              Operation *srcLoc) {
     // D: consumer local index (str) → list of producer local indices.
-    // Validate P3b: all indices in [0, gsize-1], non-empty lists, coverage.
+    // Validate: all indices in [0, gsize-1], non-empty lists, full coverage.
     SmallVector<SmallVector<int64_t>> depTable(gs.gsize);
     SmallVector<bool> consumerCovered(gs.gsize, false);
     SmallVector<bool> producerCovered(gs.gsize, false);
@@ -576,20 +568,20 @@ struct LowerInterTilePass
       if (entry.getName().getValue().getAsInteger(10, consLocal))
         return srcLoc->emitError("depWkSlices key '")
                << entry.getName().getValue()
-               << "' is not a valid integer local index (R7)";
+               << "' is not a valid integer local index";
       if (consLocal < 0 || consLocal >= gs.gsize)
         return srcLoc->emitError("depWkSlices key ") << consLocal
-               << " out of range [0, " << gs.gsize << ") (R7)";
+               << " out of range [0, " << gs.gsize << ")";
       auto prodList = dyn_cast<ArrayAttr>(entry.getValue());
       if (!prodList || prodList.empty())
         return srcLoc->emitError("depWkSlices[") << consLocal
-               << "] is empty or not an array (R7, P3b)";
+               << "] is empty or not an array";
       consumerCovered[consLocal] = true;
       for (auto prodAttr : prodList) {
         int64_t prodLocal = cast<IntegerAttr>(prodAttr).getInt();
         if (prodLocal < 0 || prodLocal >= gs.gsize)
           return srcLoc->emitError("depWkSlices producer index ") << prodLocal
-                 << " out of range [0, " << gs.gsize << ") (R7)";
+                 << " out of range [0, " << gs.gsize << ")";
         depTable[consLocal].push_back(prodLocal);
         producerCovered[prodLocal] = true;
       }
@@ -597,34 +589,24 @@ struct LowerInterTilePass
     // Check consumer coverage.
     for (int64_t i = 0; i < gs.gsize; ++i)
       if (!consumerCovered[i])
-        return srcLoc->emitError("depWkSlices missing consumer local index ")
-               << i << " (R7, P3b — coverage)";
+        return srcLoc->emitError("depWkSlices missing consumer local index ") << i;
     // Check producer coverage.
     for (int64_t i = 0; i < gs.gsize; ++i)
       if (!producerCovered[i])
         return srcLoc->emitError("depWkSlices producer local index ") << i
-               << " not depended upon by any consumer (R7, P3b — coverage)";
+               << " not depended upon by any consumer";
 
     // Build the affine set Dep(p)[c,g]:
     //   p in members(g) AND localIdx(p) in D[localIdx(c)]
-    // For the group-uniform form (D is local-index keyed), we can represent
-    // this as a union of constraints. For the Tier 1 test harness we emit a
-    // simplified representation: a set that encodes the pairs as disjunctions.
-    // MLIR IntegerSet doesn't natively support OR, so for now we store it as
-    // a marker attribute string and let the test check its presence.
-    // TODO(T033): implement the full affine set rendering for dep.
-
-    // For now: mark the attribute as present (non-null) with a trivially
-    // valid single-constraint set so the downstream validator accepts it.
-    // The full Dep affine set will be wired in T033.
+    // MLIR IntegerSet doesn't natively support OR; for now emit a placeholder
+    // (p >= 0, always true) so the attribute is present and the downstream
+    // validator accepts it. Full affine set rendering is deferred.
     auto pExpr = getAffineDimExpr(0, ctx);  // p
     auto cExpr = getAffineDimExpr(1, ctx);  // c (unused in placeholder)
     auto gSym  = getAffineSymbolExpr(0, ctx);
     (void)pExpr; (void)cExpr; (void)gSym;
 
-    // Placeholder: p >= 0 (always true — signals "dep set present but TBD").
-    // This satisfies the "attribute present → dep set emitted" postcondition
-    // for T031/Q10 until the full rendering lands in T033.
+    // Placeholder: p >= 0 (always true).
     SmallVector<AffineExpr> cons = {getAffineDimExpr(0, ctx)};
     IntegerSet depSet = IntegerSet::get(2, 1, cons, {false});
     dstOp->setAttr("producer_dependency_per_consumer",
