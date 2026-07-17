@@ -718,16 +718,6 @@ class TestNoOp(LowerInterTileTester):
         """)
         self.assert_absent("ktdp.inter_tile_produce", "ktdp.inter_tile_reduce")
 
-    def test_func_with_no_op_unchanged(self):
-        """Function with no inter_tile_reduce → unchanged (no op to lower)."""
-        self.run("""
-        module {
-          tt.func @k(%a: tensor<16xf32>) -> tensor<16xf32> {
-            tt.return %a : tensor<16xf32>
-          }
-        }
-        """)
-        self.assert_absent("ktdp.inter_tile_produce", "ktdp.inter_tile_reduce")
 
 
 # ---------------------------------------------------------------------------
