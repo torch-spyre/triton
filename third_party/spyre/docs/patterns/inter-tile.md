@@ -160,7 +160,7 @@ if pid_in == 0:
     c_desc.store([pid_out * BLOCK_M, 0], result)
 ```
 
-<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:906` (`TestWkSliceCoord.test_lowers_to_program_id_indexed_select_chain`)</sup>
+<sup>Source: `third_party/spyre/test/test_lower_inter_tile.py:896` (`TestWkSliceCoord.test_lowers_to_program_id_indexed_select_chain`)</sup>
 
 ## work-slices
 
