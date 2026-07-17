@@ -16,6 +16,7 @@ namespace mlir::triton::ktdp {
 
 std::unique_ptr<OperationPass<ModuleOp>> createConvertFunctionsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerDescriptorMemoryPass();
+std::unique_ptr<OperationPass<ModuleOp>> createLowerScalarLoadPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerComputeOpsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createDistributeWorkPass(
     llvm::ArrayRef<int64_t> grid = {});
