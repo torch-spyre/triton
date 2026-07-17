@@ -246,13 +246,13 @@ static IntegerSet buildPick0Set(MLIRContext *ctx, const GroupSets &gs) {
 }
 
 //===----------------------------------------------------------------------===//
-// Identity materialization for shorthand combiners
+// CombinerSpec — dispatch helpers for shorthand combiners
 //===----------------------------------------------------------------------===//
 
-static Value materializeIdentity(OpBuilder &b, Location loc,
-                                  RankedTensorType type, StringRef combiner) {
-  MLIRContext *ctx = b.getContext();
-  Type elemType = type.getElementType();
+// Returns the identity TypedAttr for (combiner, elemType), or failure() if
+// unsupported.
+static FailureOr<TypedAttr> combinerIdentity(OpBuilder &b, StringRef combiner,
+                                              Type elemType) {
   TypedAttr initVal;
   if (combiner == "add") {
     if (isa<FloatType>(elemType))
@@ -260,21 +260,60 @@ static Value materializeIdentity(OpBuilder &b, Location loc,
     else
       initVal = b.getIntegerAttr(elemType, 0);
   } else if (combiner == "max") {
-    auto ftype = cast<FloatType>(elemType);
-    initVal = b.getFloatAttr(ftype,
-        APFloat::getInf(ftype.getFloatSemantics(), /*neg=*/true));
+    if (isa<FloatType>(elemType)) {
+      auto ftype = cast<FloatType>(elemType);
+      initVal = b.getFloatAttr(ftype,
+          APFloat::getInf(ftype.getFloatSemantics(), /*neg=*/true));
+    } else {
+      auto itype = cast<IntegerType>(elemType);
+      APInt minVal = itype.isSigned()
+          ? APInt::getSignedMinValue(itype.getWidth())
+          : APInt::getMinValue(itype.getWidth());
+      initVal = b.getIntegerAttr(elemType, minVal);
+    }
   } else if (combiner == "mul") {
     if (isa<FloatType>(elemType))
       initVal = b.getFloatAttr(elemType, 1.0);
     else
       initVal = b.getIntegerAttr(elemType, 1);
   } else {
-    llvm_unreachable("unknown shorthand combiner");
+    return failure();
   }
-  Value scalar = arith::ConstantOp::create(b, loc, initVal);
-  Value empty = tensor::EmptyOp::create(b, loc, type.getShape(), elemType);
+  return initVal;
+}
+
+// Emits the reduction op for one (lhs, rhs, out) triple.
+// Returns the scalar/tensor result Value, or failure() if unsupported.
+static FailureOr<Value> combinerEmitOp(OpBuilder &b, Location loc,
+                                        StringRef combiner,
+                                        Value lhs, Value rhs, Value out) {
+  if (combiner == "add")
+    return linalg::AddOp::create(b, loc, ValueRange{lhs, rhs}, ValueRange{out})
+               .getResult(0);
+  if (combiner == "max")
+    return linalg::MaxOp::create(b, loc, ValueRange{lhs, rhs}, ValueRange{out})
+               .getResult(0);
+  if (combiner == "mul")
+    return linalg::MulOp::create(b, loc, ValueRange{lhs, rhs}, ValueRange{out})
+               .getResult(0);
+  return failure();  // caller emits error
+}
+
+//===----------------------------------------------------------------------===//
+// Identity materialization for shorthand combiners
+//===----------------------------------------------------------------------===//
+
+static FailureOr<Value> materializeIdentity(OpBuilder &b, Location loc,
+                                             RankedTensorType type,
+                                             StringRef combiner) {
+  auto identAttr = combinerIdentity(b, combiner, type.getElementType());
+  if (failed(identAttr))
+    return failure();  // caller must emit error
+  Value scalar = arith::ConstantOp::create(b, loc, *identAttr);
+  Value empty = tensor::EmptyOp::create(b, loc, type.getShape(),
+                                         type.getElementType());
   return linalg::FillOp::create(b, loc, ValueRange{scalar}, ValueRange{empty})
-      .getResult(0);
+             .getResult(0);
 }
 
 //===----------------------------------------------------------------------===//
@@ -416,8 +455,10 @@ struct LowerInterTilePass
       // Shorthand: materialize identity for each partial.
       for (auto p : partials) {
         auto tensorType = cast<RankedTensorType>(p.getType());
-        identityValues.push_back(
-            materializeIdentity(rewriter, loc, tensorType, combiner));
+        auto identOrErr = materializeIdentity(rewriter, loc, tensorType, combiner);
+        if (failed(identOrErr))
+          return op.emitError("unknown shorthand combiner '") << combiner << "'";
+        identityValues.push_back(*identOrErr);
       }
     } else {
       // Region form: use the explicit identity operands from the tt op.
@@ -481,23 +522,10 @@ struct LowerInterTilePass
         Value out = tensor::EmptyOp::create(rewriter, loc,
                                             tensorType.getShape(),
                                             tensorType.getElementType());
-        Value result;
-        if (combiner == "add") {
-          result = linalg::AddOp::create(rewriter, loc,
-                                          ValueRange{l, r}, ValueRange{out})
-                       .getResult(0);
-        } else if (combiner == "max") {
-          result = linalg::MaxOp::create(rewriter, loc,
-                                          ValueRange{l, r}, ValueRange{out})
-                       .getResult(0);
-        } else if (combiner == "mul") {
-          result = linalg::MulOp::create(rewriter, loc,
-                                          ValueRange{l, r}, ValueRange{out})
-                       .getResult(0);
-        } else {
+        auto result = combinerEmitOp(rewriter, loc, combiner, l, r, out);
+        if (failed(result))
           return dstOp.emitError("unknown shorthand combiner '") << combiner << "'";
-        }
-        reduced.push_back(result);
+        reduced.push_back(*result);
       }
     } else {
       // Region form: clone the tt combiner body, remapping values.
