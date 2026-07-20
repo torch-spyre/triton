@@ -260,11 +260,13 @@ static FailureOr<TypedAttr> combinerIdentity(OpBuilder &b, StringRef combiner,
       initVal = b.getFloatAttr(ftype,
           APFloat::getInf(ftype.getFloatSemantics(), /*neg=*/true));
     } else {
+      // linalg.MaxOp is unconditionally signed-max (arith.maxsi), regardless
+      // of the IntegerType signedness attribute. Triton also produces signless
+      // integer types only (isSigned/isUnsigned are always false), so always
+      // use the signed minimum as the identity.
       auto itype = cast<IntegerType>(elemType);
-      APInt minVal = itype.isSigned()
-          ? APInt::getSignedMinValue(itype.getWidth())
-          : APInt::getMinValue(itype.getWidth());
-      initVal = b.getIntegerAttr(elemType, minVal);
+      initVal = b.getIntegerAttr(elemType,
+                                  APInt::getSignedMinValue(itype.getWidth()));
     }
   } else if (combiner == "mul") {
     if (isa<FloatType>(elemType))

@@ -952,3 +952,55 @@ class TestWkSliceCoord:
             cur = getattr(cur, "__cause__", None)
         joined = " ".join(msgs)
         assert "wk_slice_coord" in joined and "missing" in joined and "'in'" in joined
+
+
+# ---------------------------------------------------------------------------
+# Semantic validation — combiner/dtype compatibility
+# ---------------------------------------------------------------------------
+
+class TestCombinerDtypeValidation:
+    """combiner='max' on unsigned integer types is rejected at compile time."""
+
+    # Minimal work_slices for a 2-tile reduction.
+    _WS = [{"x": 0, "n": 0}, {"x": 0, "n": 1}]
+
+    def _make_kernel(self, dtype_str):
+        """Return a @triton.jit kernel that calls inter_tile with combiner='max'
+        on a tensor of the given dtype (e.g. 'uint32', 'int32')."""
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _kernel(x_ptr, BLOCK: tl.constexpr, WORK_SLICES: tl.constexpr):
+            pid = tl.program_id(0)
+            offs = pid * BLOCK + tl.arange(0, BLOCK)
+            x = tl.load(x_ptr + offs)
+            partial = tl.reshape(x, [1, BLOCK])
+            tl.inter_tile(partial, axis="n", combiner="max",
+                          mode="all_reduce", work_slices=WORK_SLICES)
+
+        return _kernel
+
+    def test_max_uint32_rejected(self):
+        """combiner='max' with tl.uint32 is rejected with a clear error."""
+        import triton
+        kernel = self._make_kernel("uint32")
+        sig = {"x_ptr": "*u32"}
+        cx = {"BLOCK": 8, "WORK_SLICES": self._WS}
+        with pytest.raises(Exception) as ei:
+            compile_to_ttir(kernel, sig, cx)
+        msgs = []
+        cur = ei.value
+        while cur is not None:
+            msgs.append(str(cur))
+            cur = getattr(cur, "__cause__", None)
+        joined = " ".join(msgs)
+        assert "max" in joined and "unsigned" in joined
+
+    def test_max_int32_accepted(self):
+        """combiner='max' with tl.int32 is accepted (signed max is supported)."""
+        kernel = self._make_kernel("int32")
+        sig = {"x_ptr": "*i32"}
+        cx = {"BLOCK": 8, "WORK_SLICES": self._WS}
+        # Should not raise.
+        compile_to_ttir(kernel, sig, cx)

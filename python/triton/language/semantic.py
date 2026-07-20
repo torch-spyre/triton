@@ -1957,6 +1957,18 @@ class TritonSemantic(Generic[TensorTy]):
             raise ValueError(
                 "tl.inter_tile: mode='reduce_scatter' requires scatter_dimension")
 
+        # Validate combiner/dtype compatibility before type info is erased at the IR level.
+        # linalg.MaxOp lowers to arith.maxsi (signed); unsigned integer max is not
+        # yet supported.
+        if combiner == "max":
+            partials_check = [x] if not isinstance(x, (list, tuple)) else list(x)
+            for p in partials_check:
+                scalar = p.type.scalar
+                if scalar.is_int_unsigned():
+                    raise ValueError(
+                        f"tl.inter_tile: combiner='max' is not supported for unsigned "
+                        f"integer type {scalar}")
+
         # Normalize work_slices: accepts a list (indexed by tile id) or a dict
         # (keyed by tile id).  Canonical form: C[int_tile_id] = {str_dim: int}.
         if isinstance(work_slices, (list, tuple)):
