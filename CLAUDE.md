@@ -33,11 +33,11 @@ venv without activating it.
 
 ### Documented but may not be immediately obvious
 
-- **First build needs `GIT_PAT`.** A Spyre-only build resolves LLVM from the
-  `ktir-mlir-frontend` artifact store via `setup_mlir.py`, which currently
-  needs a GitHub token: `export GIT_PAT=<token>`. The failure message when it's
-  missing is *not* obvious (it surfaces during LLVM fetch). Tracked in
-  ktir-mlir-frontend#24.
+- **No `GIT_PAT` needed.** A Spyre-only build resolves LLVM from the
+  `ktir-mlir-frontend` artifact store via `setup_mlir.py`, which downloads the
+  pinned LLVM build from a public GitHub Releases asset (no auth required).
+  `GIT_PAT`/`GITHUB_TOKEN` is only consulted as a fallback for the
+  token-gated Actions-artifact path, which should not be needed in normal use.
 - **LLVM is NOT the upstream Triton blob.** `setup.py` runs
   `third_party/spyre/ktir-mlir-frontend/scripts/setup_mlir.py`, reading the pin
   from `cmake/llvm-hash-spyre.txt` (not `cmake/llvm-hash.txt`). It only runs

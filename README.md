@@ -56,14 +56,11 @@ The Spyre backend is the default build target, so a plain `pip install`
 produces a Spyre-only Triton out of the box — no environment variables and no
 GPU toolchains required. Python 3.12 or newer is recommended.
 
-> **Heads-up: the first build downloads LLVM and may need `GIT_PAT`.** A
-> Spyre-only build resolves LLVM from the `ktir-mlir-frontend` artifact store on
-> first use, which currently requires a GitHub token in the `GIT_PAT`
-> environment variable. If your install fails while fetching LLVM — the error
-> may not say so clearly — `export GIT_PAT=<token>` and retry. See
-> [LLVM Build Dependency](#llvm-build-dependency) for details. Removal of this
-> requirement is tracked in
-> [ktir-mlir-frontend#24](https://github.com/torch-spyre/ktir-mlir-frontend/issues/24).
+> **First build downloads LLVM (~900 MB).** A Spyre-only build resolves LLVM
+> from a public GitHub Releases asset in `ktir-mlir-frontend` on first use — no
+> token required. The download is cached in `~/.cache/ktir-mlir/` so subsequent
+> builds are instant. See [LLVM Build Dependency](#llvm-build-dependency) for
+> details.
 
 ### Install directly from Git
 
@@ -192,11 +189,6 @@ running `third_party/spyre/ktir-mlir-frontend/scripts/setup_mlir.py`, which
 reads the pinned hash from `cmake/llvm-hash-spyre.txt` and fetches the matching
 build from `torch-spyre/ktir-mlir-frontend`. The resolved path is passed to
 CMake as `LLVM_SYSPATH`.
-
-> **First download requires a token.** Fetching the LLVM artifact for the first
-> time currently needs a GitHub token in `GIT_PAT`. Removing this requirement is
-> considered in
-> [ktir-mlir-frontend#24](https://github.com/torch-spyre/ktir-mlir-frontend/issues/24).
 
 To point the build at a prebuilt LLVM and skip this step entirely, set
 `LLVM_SYSPATH` yourself — `setup.py` only runs `setup_mlir.py` when
