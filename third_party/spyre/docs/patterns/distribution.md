@@ -56,7 +56,7 @@ Expected diagnostics:
 - `gather::2d_large_table` — M=4096, N=256, K_INDICES=64, BLOCK_ROWS=8, BLOCK_COLS=32 (also demonstrates: descriptor-gather, program-id-2d)
 - `matmul::default` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-load-static, descriptor-store-static, dot, program-id-2d)
 - `matmul::dynamic` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, program-id-2d)
-- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, descriptor-store-static, dot, program-id-1d)
+- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-load-static, descriptor-store-static, dot, program-id-1d)
 
 _+ 15 more variants_
 
@@ -83,13 +83,13 @@ offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
 **Round-trip evidence**
 
-- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, descriptor-store-static, dot, num-programs-fold)
-- `matmul::bmm_dynamic` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, num-programs-fold)
+- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-load-static, descriptor-store-static, dot, num-programs-fold)
+- `matmul::bmm_dynamic` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, num-programs-fold)
 - `matmul::spyre_stick_parallel` — M=64, K=64, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, descriptor-store-static, dot, spyre-tensor-layout)
 - `matmul::spyre_stick_parallel_dynamic` — M=64, K=64, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, spyre-tensor-layout)
 - `matmul::spyre_stick_k` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, descriptor-store-static, dot, spyre-tensor-layout)
 
-_+ 14 more variants_
+_+ 15 more variants_
 
 ## program-id-2d
 
