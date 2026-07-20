@@ -1,6 +1,7 @@
 //===- Utility.cpp - Shared transform utilities for KTDP passes -----------===//
 
 #include "Dialect/KTDP/Transforms/Utility.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
@@ -15,6 +16,21 @@ void cleanupDeadOps(ModuleOp module,
         op.erase();
     }
   });
+}
+
+Value getBasePtrAsIndex(OpBuilder &builder, Location loc, Value basePtr) {
+  if (basePtr.getType().isIndex())
+    return basePtr;
+  return UnrealizedConversionCastOp::create(builder, loc,
+                                            builder.getIndexType(), basePtr)
+      .getResult(0);
+}
+
+std::optional<int64_t> getConstantInt(Value v) {
+  if (auto cst = v.getDefiningOp<arith::ConstantOp>())
+    if (auto attr = dyn_cast<IntegerAttr>(cst.getValue()))
+      return attr.getInt();
+  return std::nullopt;
 }
 
 } // namespace mlir::triton::ktdp
