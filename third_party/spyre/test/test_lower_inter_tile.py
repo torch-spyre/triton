@@ -13,6 +13,7 @@ Organization: one test class per rewrite rule / spec clause.
   TestNoOp              — C6/Q8:  no op → IR unchanged
   TestBroadcastDeferred — R8:     broadcast/reduce_scatter → diagnostic
   TestValidation        — R1–R5:  precondition rejections
+  TestWorkSlicesSemanticValidation — Python-level work_slices type/structure checks
 
 Partial shape convention: the partial tensor carries a leading unit dimension
 (size 1) that is the within-group tile axis to be collapsed by the reduce.
@@ -1004,3 +1005,114 @@ class TestCombinerDtypeValidation:
         cx = {"BLOCK": 8, "WORK_SLICES": self._WS}
         # Should not raise.
         compile_to_ttir(kernel, sig, cx)
+
+
+class TestWorkSlicesSemanticValidation:
+    """Python-level semantic validation of work_slices before the MLIR builder call.
+
+    These tests verify that tl.inter_tile raises clear ValueError messages
+    when work_slices is not a list, is empty, contains non-dict entries, has
+    inconsistent keys across tiles, or omits the reduction axis.
+    """
+
+    def _make_kernel(self):
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _kernel(x_ptr, BLOCK: tl.constexpr, WORK_SLICES: tl.constexpr):
+            x = tl.load(x_ptr + tl.arange(0, BLOCK))
+            partial = tl.reshape(x, [1, BLOCK])
+            tl.inter_tile(partial, axis="n", combiner="add",
+                          mode="all_reduce", work_slices=WORK_SLICES)
+
+        return _kernel
+
+    def _get_error(self, ei):
+        msgs, cur = [], ei.value
+        while cur is not None:
+            msgs.append(str(cur))
+            cur = getattr(cur, "__cause__", None)
+        return " ".join(msgs)
+
+    def _sig(self):
+        return {"x_ptr": "*fp32"}
+
+    def test_dict_rejected(self):
+        """A plain dict (tile_id -> entry) is rejected; only list is accepted."""
+        kernel = self._make_kernel()
+        cx = {"BLOCK": 8, "WORK_SLICES": {0: {"n": 0}, 1: {"n": 1}}}
+        with pytest.raises(Exception) as ei:
+            compile_to_ttir(kernel, self._sig(), cx)
+        assert "must be a list" in self._get_error(ei)
+
+    def test_sparse_dict_rejected(self):
+        """Sparse dict (e.g. {0: ..., 2: ...}) is also rejected — reviewer's example."""
+        kernel = self._make_kernel()
+        cx = {"BLOCK": 8, "WORK_SLICES": {0: {"n": 0}, 2: {"n": 1}}}
+        with pytest.raises(Exception) as ei:
+            compile_to_ttir(kernel, self._sig(), cx)
+        assert "must be a list" in self._get_error(ei)
+
+    def test_tuple_rejected(self):
+        """A tuple of dicts is rejected; only list is accepted."""
+        kernel = self._make_kernel()
+        cx = {"BLOCK": 8, "WORK_SLICES": ({"n": 0}, {"n": 1})}
+        with pytest.raises(Exception) as ei:
+            compile_to_ttir(kernel, self._sig(), cx)
+        assert "must be a list" in self._get_error(ei)
+
+    def test_non_sequence_rejected(self):
+        """A scalar (42) is rejected."""
+        kernel = self._make_kernel()
+        cx = {"BLOCK": 8, "WORK_SLICES": 42}
+        with pytest.raises(Exception) as ei:
+            compile_to_ttir(kernel, self._sig(), cx)
+        assert "must be a list" in self._get_error(ei)
+
+    def test_empty_list_rejected(self):
+        """An empty list is rejected."""
+        kernel = self._make_kernel()
+        cx = {"BLOCK": 8, "WORK_SLICES": []}
+        with pytest.raises(Exception) as ei:
+            compile_to_ttir(kernel, self._sig(), cx)
+        assert "must not be empty" in self._get_error(ei)
+
+    def test_entry_not_dict_rejected(self):
+        """List entries that are not dicts (e.g. tuples) are rejected."""
+        kernel = self._make_kernel()
+        cx = {"BLOCK": 8, "WORK_SLICES": [("n", 0), ("n", 1)]}
+        with pytest.raises(Exception) as ei:
+            compile_to_ttir(kernel, self._sig(), cx)
+        assert "must be a dict" in self._get_error(ei)
+
+    def test_inconsistent_keys_rejected(self):
+        """Entries with different keys across tiles are rejected."""
+        kernel = self._make_kernel()
+        cx = {"BLOCK": 8, "WORK_SLICES": [{"n": 0}, {"n": 1, "m": 0}]}
+        with pytest.raises(Exception) as ei:
+            compile_to_ttir(kernel, self._sig(), cx)
+        assert "keys must be identical" in self._get_error(ei)
+
+    def test_missing_key_at_tail_rejected(self):
+        """Second entry with empty keys is rejected."""
+        kernel = self._make_kernel()
+        cx = {"BLOCK": 8, "WORK_SLICES": [{"n": 0}, {}]}
+        with pytest.raises(Exception) as ei:
+            compile_to_ttir(kernel, self._sig(), cx)
+        assert "keys must be identical" in self._get_error(ei)
+
+    def test_axis_missing_rejected(self):
+        """Entries that do not contain the reduction axis are rejected."""
+        kernel = self._make_kernel()
+        cx = {"BLOCK": 8, "WORK_SLICES": [{"m": 0}, {"m": 1}]}
+        with pytest.raises(Exception) as ei:
+            compile_to_ttir(kernel, self._sig(), cx)
+        assert "axis 'n' is not a key" in self._get_error(ei)
+
+    def test_valid_list_accepted(self):
+        """A well-formed list of dicts with consistent keys is accepted."""
+        kernel = self._make_kernel()
+        cx = {"BLOCK": 8, "WORK_SLICES": [{"n": 0}, {"n": 1}]}
+        # Should not raise.
+        compile_to_ttir(kernel, self._sig(), cx)

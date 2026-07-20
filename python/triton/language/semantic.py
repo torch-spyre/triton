@@ -1969,14 +1969,31 @@ class TritonSemantic(Generic[TensorTy]):
                         f"tl.inter_tile: combiner='max' is not supported for unsigned "
                         f"integer type {scalar}")
 
-        # Normalize work_slices: accepts a list (indexed by tile id) or a dict
-        # (keyed by tile id).  Canonical form: C[int_tile_id] = {str_dim: int}.
-        if isinstance(work_slices, (list, tuple)):
-            items = enumerate(work_slices)
-        else:
-            items = work_slices.items()
-        C = {int(k): {str(ak): int(av) for ak, av in v.items()}
-             for k, v in items}
+        # Validate and normalize work_slices.
+        if not isinstance(work_slices, list):
+            raise ValueError(
+                f"tl.inter_tile: work_slices must be a list, got {type(work_slices).__name__!r}")
+        if len(work_slices) == 0:
+            raise ValueError("tl.inter_tile: work_slices must not be empty")
+        for i, entry in enumerate(work_slices):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"tl.inter_tile: work_slices[{i}] must be a dict, "
+                    f"got {type(entry).__name__!r}")
+        ref_keys = set(work_slices[0].keys())
+        for i, entry in enumerate(work_slices[1:], start=1):
+            if set(entry.keys()) != ref_keys:
+                raise ValueError(
+                    f"tl.inter_tile: work_slices[{i}] has keys "
+                    f"{sorted(entry.keys())}, expected {sorted(ref_keys)} "
+                    f"(keys must be identical across all tiles)")
+        for i, entry in enumerate(work_slices):
+            if axis not in entry:
+                raise ValueError(
+                    f"tl.inter_tile: axis {axis!r} is not a key in "
+                    f"work_slices[{i}] = {dict(entry)!r}")
+        C = {i: {str(ak): int(av) for ak, av in entry.items()}
+             for i, entry in enumerate(work_slices)}
 
         # Derive W (numWkSlicesPerDim) from C.
         all_dims = list(next(iter(C.values())).keys()) if C else []
@@ -1986,10 +2003,10 @@ class TritonSemantic(Generic[TensorTy]):
         w_keys = list(W.keys())
         w_vals = [W[k] for k in w_keys]
 
-        num_tiles = max(C.keys()) + 1 if C else 0
-        # Per-tile slice indices in tile-id order; missing tiles get zeros.
+        num_tiles = len(work_slices)
+        # Per-tile slice indices in tile-id order.
         c_keys = all_dims
-        c_vals = [[C[t].get(dim, 0) for dim in c_keys]
+        c_vals = [[C[t][dim] for dim in c_keys]
                   for t in range(num_tiles)]
 
         dep_keys: list = []
