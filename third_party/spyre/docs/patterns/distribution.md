@@ -89,7 +89,7 @@ offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 - `matmul::spyre_stick_parallel_dynamic` — M=64, K=64, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, spyre-tensor-layout)
 - `matmul::spyre_stick_k` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, descriptor-store-static, dot, spyre-tensor-layout)
 
-_+ 15 more variants_
+_+ 16 more variants_
 
 ## program-id-2d
 

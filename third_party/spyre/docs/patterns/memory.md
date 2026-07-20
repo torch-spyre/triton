@@ -587,7 +587,7 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>
 - `matmul::spyre_stick_parallel` — M=64, K=64, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-store-static, dot, program-id-1d, spyre-tensor-layout)
 - `matmul::spyre_stick_k` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-store-static, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 14 more variants_
+_+ 15 more variants_
 
 ## descriptor-offset-base
 
@@ -831,7 +831,7 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
 - `matmul::spyre_stick_parallel` — M=64, K=64, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, dot, program-id-1d, spyre-tensor-layout)
 - `matmul::spyre_stick_k` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=64, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 14 more variants_
+_+ 15 more variants_
 
 ## physical-layout-double-rescale-guard
 
