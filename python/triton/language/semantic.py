@@ -1919,3 +1919,180 @@ class TritonSemantic(Generic[TensorTy]):
                                                             [s.handle for s in strides], block_shape, is_signed_int,
                                                             padding)
         return tl.tensor_descriptor(handle, shape, strides, type)
+
+    # --- START --- added for spyre
+    def inter_tile(self, x, axis, combiner, mode, *, work_slices,
+                   dep_work_slices=None, scatter_dimension=None):
+        """Emit tt.inter_tile_reduce with work-slice op attributes."""
+        target = driver.active.get_current_target()
+        if target.backend != "spyre":
+            raise ValueError(
+                "tl.inter_tile is only supported on the 'spyre' "
+                f"backend, not '{target.backend}'")
+
+        axis = tl._unwrap_if_constexpr(axis)
+        combiner = tl._unwrap_if_constexpr(combiner)
+        mode = tl._unwrap_if_constexpr(mode)
+        scatter_dimension = tl._unwrap_if_constexpr(scatter_dimension)
+        work_slices = tl._unwrap_if_constexpr(work_slices)
+        dep_work_slices = tl._unwrap_if_constexpr(dep_work_slices)
+
+        # Validate constexpr arguments.
+        _VALID_MODES = {"all_reduce", "reduce_to_one", "reduce_scatter", "broadcast"}
+        _VALID_SHORTHAND_COMBINERS = {"add", "max", "mul"}
+        if not isinstance(axis, str) or not axis:
+            raise ValueError(f"tl.inter_tile: axis must be a non-empty string, got {axis!r}")
+        if mode not in _VALID_MODES:
+            raise ValueError(
+                f"tl.inter_tile: mode must be one of {sorted(_VALID_MODES)}, got {mode!r}")
+        if combiner and combiner not in _VALID_SHORTHAND_COMBINERS:
+            raise ValueError(
+                f"tl.inter_tile: combiner must be one of "
+                f"{sorted(_VALID_SHORTHAND_COMBINERS)} or '' (region), got {combiner!r}")
+        if scatter_dimension is not None and mode != "reduce_scatter":
+            raise ValueError(
+                f"tl.inter_tile: scatter_dimension is only valid with "
+                f"mode='reduce_scatter', got mode={mode!r}")
+        if mode == "reduce_scatter" and scatter_dimension is None:
+            raise ValueError(
+                "tl.inter_tile: mode='reduce_scatter' requires scatter_dimension")
+
+        # Validate combiner/dtype compatibility before type info is erased at the IR level.
+        # linalg.MaxOp lowers to arith.maxsi (signed); unsigned integer max is not
+        # yet supported.
+        if combiner == "max":
+            partials_check = [x] if not isinstance(x, (list, tuple)) else list(x)
+            for p in partials_check:
+                scalar = p.type.scalar
+                if scalar.is_int_unsigned():
+                    raise ValueError(
+                        f"tl.inter_tile: combiner='max' is not supported for unsigned "
+                        f"integer type {scalar}")
+
+        # Validate and normalize work_slices.
+        if not isinstance(work_slices, list):
+            raise ValueError(
+                f"tl.inter_tile: work_slices must be a list, got {type(work_slices).__name__!r}")
+        if len(work_slices) == 0:
+            raise ValueError("tl.inter_tile: work_slices must not be empty")
+        for i, entry in enumerate(work_slices):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"tl.inter_tile: work_slices[{i}] must be a dict, "
+                    f"got {type(entry).__name__!r}")
+        ref_keys = set(work_slices[0].keys())
+        for i, entry in enumerate(work_slices[1:], start=1):
+            if set(entry.keys()) != ref_keys:
+                raise ValueError(
+                    f"tl.inter_tile: work_slices[{i}] has keys "
+                    f"{sorted(entry.keys())}, expected {sorted(ref_keys)} "
+                    f"(keys must be identical across all tiles)")
+        for i, entry in enumerate(work_slices):
+            if axis not in entry:
+                raise ValueError(
+                    f"tl.inter_tile: axis {axis!r} is not a key in "
+                    f"work_slices[{i}] = {dict(entry)!r}")
+        C = {i: {str(ak): int(av) for ak, av in entry.items()}
+             for i, entry in enumerate(work_slices)}
+
+        # Derive W (numWkSlicesPerDim) from C.
+        all_dims = list(next(iter(C.values())).keys()) if C else []
+        W = {dim: max(C[t][dim] for t in C) + 1 for dim in all_dims}
+
+        # Serialize W, C, D for the builder.
+        w_keys = list(W.keys())
+        w_vals = [W[k] for k in w_keys]
+
+        num_tiles = len(work_slices)
+        # Per-tile slice indices in tile-id order.
+        c_keys = all_dims
+        c_vals = [[C[t][dim] for dim in c_keys]
+                  for t in range(num_tiles)]
+
+        dep_keys: list = []
+        dep_vals: list = []
+        if dep_work_slices is not None:
+            D = {str(k): [int(v) for v in vs]
+                 for k, vs in dep_work_slices.items()}
+            dep_keys = list(D.keys())
+            dep_vals = [D[k] for k in dep_keys]
+
+        scatter_dim_val = -1 if scatter_dimension is None else int(scatter_dimension)
+
+        partials = [x] if not isinstance(x, (list, tuple)) else list(x)
+
+        handles = self.builder.create_inter_tile_reduce(
+            [p.handle for p in partials],
+            axis, combiner, mode, scatter_dim_val,
+            w_keys, w_vals, c_keys, c_vals,
+            dep_keys, dep_vals,
+        )
+
+        if not handles:
+            return tl.tensor(None, tl.void)
+
+        # Result type: partial type with the first (unit) axis dropped.
+        def _result_type(partial):
+            shape = partial.type.shape  # e.g. [1, BLOCK_M, BLOCK_N]
+            return tl.block_type(partial.type.scalar, shape[1:])
+
+        if len(handles) == 1:
+            return tl.tensor(handles[0], _result_type(partials[0]))
+        return [tl.tensor(h, _result_type(p))
+                for h, p in zip(handles, partials)]
+
+    def wk_slice_coord(self, work_slices, axis):
+        """Return work_slices[program_id(0)][axis] as a runtime i32 scalar.
+
+        ``work_slices`` and ``axis`` are constexpr, so the per-tile coordinate
+        column ``coords = [ws[axis] for ws in work_slices]`` is known at compile
+        time.  The runtime ``program_id(0)`` selects which entry the executing
+        tile reads.  Since the frontend has no dense-constant-array builder, the
+        lookup is composed as a chain of scalar selects on the scalar pid::
+
+            coord = 0
+            for i, c in enumerate(coords):
+                coord = (pid == i) ? c : coord
+
+        All operands are i32 scalars, so the result is a runtime i32 scalar — no
+        tensors, no reduction (spec E4).
+        """
+        target = driver.active.get_current_target()
+        if target.backend != "spyre":
+            raise ValueError(
+                "tl.wk_slice_coord is only supported on the 'spyre' "
+                f"backend, not '{target.backend}'")
+
+        axis = tl._unwrap_if_constexpr(axis)
+        work_slices = tl._unwrap_if_constexpr(work_slices)
+
+        # Normalize to a tile-id-ordered list of slice-index dicts (accepts a
+        # list indexed by tile id, or a dict keyed by tile id) — same surface
+        # as tl.inter_tile's work_slices.
+        if isinstance(work_slices, (list, tuple)):
+            entries = list(work_slices)
+        else:
+            num = max(int(k) for k in work_slices) + 1 if work_slices else 0
+            entries = [work_slices[t] for t in range(num)]
+
+        if not entries:
+            raise ValueError("tl.wk_slice_coord: work_slices is empty")
+
+        # Extract the per-axis column; every tile must declare the axis.
+        coords = []
+        for t, ws in enumerate(entries):
+            if axis not in ws:
+                raise ValueError(
+                    f"tl.wk_slice_coord: axis {axis!r} missing from "
+                    f"work_slices[{t}] = {dict(ws)!r}")
+            coords.append(int(ws[axis]))
+
+        pid = self.program_id(0)  # runtime i32 scalar
+
+        # Fold the constant column into a scalar select chain indexed by pid.
+        coord = self.scalar_constant(0, tl.int32)
+        for i, c in enumerate(coords):
+            is_i = self.equal(pid, self.scalar_constant(i, tl.int32))
+            coord = self.where(is_i, self.scalar_constant(c, tl.int32), coord)
+        return coord
+    # --- END --- added for spyre

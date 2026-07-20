@@ -15,6 +15,8 @@ include "mlir/Pass/PassBase.td"
 //                       ↓
 //                 LowerComputeOps
 //                       ↓
+//               LowerInterTile    ← added for spyre (inter-tile collectives)
+//                       ↓
 //               ConvertFunctions
 //                       ↓
 //               DistributeWork
@@ -118,6 +120,44 @@ def LowerComputeOps : Pass<"lower-compute-ops", "mlir::ModuleOp"> {
         "mlir::tensor::TensorDialect",
         "mlir::arith::ArithDialect",
         "mlir::math::MathDialect"
+    ];
+}
+
+def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
+    let summary = "Lower tt.inter_tile_reduce to ktdp inter-tile produce/reduce pairs.";
+    let description = [{
+        Input: TTIR after LowerComputeOps — tt.inter_tile_reduce ops whose
+        partial operands are already linalg/tensor values; enclosing func.func
+        carries numWkSlicesPerDim and coreIdToWkSlice function attributes.
+
+        Lowering:
+        - tt.inter_tile_reduce (mode=all_reduce) →
+            ktdp.inter_tile_produce (producer region + ktdp.yield_partial) +
+            ktdp.inter_tile_reduce (full consumer set + ktdp.yield_reduced)
+        - tt.inter_tile_reduce (mode=reduce_to_one) →
+            ktdp.inter_tile_produce +
+            ktdp.inter_tile_reduce (consumer = pick₀(g))
+        - tt.inter_tile_reduce (mode=broadcast, reduce_scatter) →
+            rejected with "not yet supported" diagnostic (P8/R8); delivery ops
+            not yet available in ktir-mlir-frontend#25.
+        - Axis with numWkSlicesPerDim[axis] == 1 → fold-away (erase op,
+            forward partial unchanged).
+        - depWkSlices present → producer_dependency_per_consumer affine set;
+            absent → full-barrier (attribute omitted).
+
+        Must run after LowerComputeOps (partials must be linalg/tensor) and
+        before ConvertFunctions (reads function attributes ConvertFunctions
+        would rewrite).
+
+        Output: no tt.inter_tile_reduce ops remain; ktdp.inter_tile_produce /
+        inter_tile_reduce pairs are introduced; the tile_future is single-use.
+    }];
+
+    let dependentDialects = [
+        "mlir::ktdp::KtdpDialect",
+        "mlir::arith::ArithDialect",
+        "mlir::linalg::LinalgDialect",
+        "mlir::tensor::TensorDialect"
     ];
 }
 

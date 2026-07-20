@@ -833,7 +833,168 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
 
 _+ 7 more variants_
 
+## scalar-load-addptr-chain
+
+### Supported
+
+#### ✅ `test_addptr_chain_folded`
+
+_A scalar `tt.addptr` chain feeding the load is folded into a single `index` offset with plain `arith.addi` — no element-size scaling (striding is the kernel author's responsibility)_
+
+The `tt.addptr` op itself becomes dead once the fold consumes it
+and the `tt.load` is replaced; `cleanupDeadOps` sweeps it at the
+end of the pass, so it must be absent from the result.
+
+```python
+p = ptr + idx        # tt.addptr, offset in elements — no scaling
+x = tl.load(p)        # scalar load through the shifted pointer
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_scalar_load.py:96` (`TestScalarLoad.test_addptr_chain_folded`)</sup>
+
+## scalar-load-addptr-chain-multi
+
+### Supported
+
+#### ✅ `test_addptr_chain_multi_hop`
+
+_`resolveScalarAddress` loops over an arbitrary-length `tt.addptr` chain, not just a single hop: two chained `tt.addptr` ops must fold into one `arith.addi` chain (two adds), with both `tt.addptr` ops swept as dead by `cleanupDeadOps`_
+
+```python
+p = ptr + a         # tt.addptr, offset in elements
+p = p + b            # a second tt.addptr on the shifted pointer
+x = tl.load(p)        # scalar load through the twice-shifted pointer
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_scalar_load.py:128` (`TestScalarLoad.test_addptr_chain_multi_hop`)</sup>
+
+## scalar-load-bare
+
+### Supported
+
+#### ✅ `test_bare_pointer`
+
+_Load a scalar through a bare pointer (no addptr chain, no mask)_
+
+The pointer is cast straight to `index` (via `getBasePtrAsIndex`, an
+`unrealized_conversion_cast` that survives until `ConvertFunctions`)
+and used directly as the rank-0 memory view's offset — no
+`arith.addi` folding is needed since there's no `tt.addptr` chain.
+
+The loaded value is stored back out via `tt.store` (left untouched
+by this pass — raw scalar stores are out of scope), matching how a
+scalar load is typically consumed in a real kernel.
+
+```python
+x = tl.load(ptr)  # ptr: tl.pointer_type(tl.float16), scalar load
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_scalar_load.py:51` (`TestScalarLoad.test_bare_pointer`)</sup>
+
+## scalar-load-masked-constant-false-no-other
+
+### Supported
+
+#### ✅ `test_masked_constant_false_without_other`
+
+_A masked scalar load whose mask is a materialized `arith.constant false`, with no `other`, performs no read and yields a materialized zero of the element type instead_
+
+```python
+x = tl.load(ptr, mask=False)  # compile-time-false guard, implicit zero fallback
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_scalar_load.py:225` (`TestScalarLoad.test_masked_constant_false_without_other`)</sup>
+
+## scalar-load-masked-constant-false-other
+
+### Supported
+
+#### ✅ `test_masked_constant_false_with_other`
+
+_A masked scalar load whose mask is a materialized `arith.constant false`, with an explicit `other`, performs no read at all — the op is replaced directly by `other`_
+
+```python
+x = tl.load(ptr, mask=False, other=0.0)  # compile-time-false guard, explicit fallback
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_scalar_load.py:200` (`TestScalarLoad.test_masked_constant_false_with_other`)</sup>
+
+## scalar-load-masked-constant-true
+
+### Supported
+
+#### ✅ `test_masked_constant_true`
+
+_A masked scalar load whose mask is a materialized `arith.constant true` drops straight through to the unconditional read — no runtime branch is ever emitted, since Spyre has no runtime control-flow divergence to lower one to_
+
+```python
+x = tl.load(ptr, mask=True)  # compile-time-true guard, unconditional read
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_scalar_load.py:178` (`TestScalarLoad.test_masked_constant_true`)</sup>
+
+## scalar-load-masked-runtime
+
+### Rejected
+
+#### ❌ `test_masked_cmpi_rejected`
+
+_A mask built from `arith.cmpi` of two constants is *not* folded by `getConstantMask` — only a literal `arith.constant` counts_
+
+This pins the "we don't fold comparisons, only literal constants" behavior documented on `getConstantMask`, distinct from the function-argument case covered by `test_masked_runtime_rejected`.
+
+```python
+# NOT supported: a comparison of two constants is not folded —
+# only a literal materialized arith.constant counts as a
+# compile-time-constant mask.
+mask = 3 < 5  # REJECTED even though both operands are constants
+x = tl.load(ptr, mask=mask, other=0.0)
+```
+
+Expected diagnostics:
+
+- `mask must be a compile-time constant`
+
+<sup>Source: `third_party/spyre/test/test_lower_scalar_load.py:275` (`TestScalarLoad.test_masked_cmpi_rejected`)</sup>
+
+#### ❌ `test_masked_runtime_rejected`
+
+_A mask that isn't a materialized `arith.constant` — here a function argument, but the same refusal applies to e.g_
+
+a `cmpi` of two constants, which this pass deliberately does not fold — cannot be lowered: Spyre has no user-programmable control-flow divergence, so there is no way to guard the read on a runtime-dependent value. The pass refuses to lower it and fails with a diagnostic, mirroring the descriptor path's `test_descriptor_from_arg_fails`.
+
+```python
+# NOT supported: mask depends on a runtime value.
+# Spyre has no runtime control-flow divergence, so a masked
+# scalar load's mask must be a compile-time constant.
+mask = idx < n_elements  # REJECTED — not a materialized constant
+x = tl.load(ptr, mask=mask, other=0.0)
+```
+
+Expected diagnostics:
+
+- `mask must be a compile-time constant`
+
+<sup>Source: `third_party/spyre/test/test_lower_scalar_load.py:247` (`TestScalarLoad.test_masked_runtime_rejected`)</sup>
+
+## scalar-load-tensor-of-ptrs
+
+### Rejected
+
+#### ❌ `test_tensor_of_pointers_untouched`
+
+_A tensor-of-pointers `tt.load` (pointer operand shaped as a tensor of `!tt.ptr<ElemT>`, not a bare scalar pointer) is out of scope for this pass and must remain legal/untouched — the dynamic legality predicate must not fire for it_
+
+```python
+# NOT handled by this pass: pointer operand is a tensor of
+# pointers, not a bare scalar !tt.ptr — that path belongs to
+# the separate, still-unimplemented [LowerPointerChainMemory].
+x = tl.load(ptr + tl.arange(0, BLOCK))  # tensor-of-pointers load
+```
+
+<sup>Source: `third_party/spyre/test/test_lower_scalar_load.py:304` (`TestScalarLoad.test_tensor_of_pointers_untouched`)</sup>
+
 
 ---
 
-_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-load-dynamic-from-scalar-load`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-load-dynamic-from-scalar-load`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`, `scalar-load-addptr-chain`, `scalar-load-addptr-chain-multi`, `scalar-load-bare`, `scalar-load-masked-constant-false-no-other`, `scalar-load-masked-constant-false-other`, `scalar-load-masked-constant-true`. Add a tagged fixture variant to verify end-to-end._

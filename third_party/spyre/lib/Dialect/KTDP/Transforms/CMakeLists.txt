@@ -3,6 +3,7 @@ add_triton_library(KTDPTransforms
   LowerDescriptorMemory.cpp
   LowerScalarLoad.cpp
   LowerComputeOps.cpp
+  LowerInterTile.cpp
   DistributeWork.cpp
   Utility.cpp
 
