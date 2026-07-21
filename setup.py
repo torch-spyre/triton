@@ -423,8 +423,10 @@ class CMakeBuild(build_ext):
         # Resolve LLVM from the ktir-mlir-frontend artifact store so Triton and
         # mlir_ktdp are built against the same LLVM. Must run before the
         # passthrough_args evaluation below so LLVM_SYSPATH is in os.environ.
-        # setup_mlir.py caches the artifact in ~/.cache/ktir-mlir/; GIT_PAT /
-        # GITHUB_TOKEN is required for the first download only.
+        # setup_mlir.py caches the artifact in ~/.cache/ktir-mlir/; the first
+        # download comes from a public GitHub Releases asset, no token needed.
+        # GIT_PAT / GITHUB_TOKEN are only used by the token-gated Actions-artifact
+        # fallback, which should not be needed in normal use.
         if not _has_gpu_backend and "spyre" in _active_backends and "LLVM_SYSPATH" not in os.environ:
             _frontend_dir = os.path.join(get_base_dir(), "third_party", "spyre", "ktir-mlir-frontend")
             _setup_mlir = os.path.join(_frontend_dir, "scripts", "setup_mlir.py")
