@@ -8,18 +8,20 @@ Each input module must export:
 
 Usage::
 
-    python gen_ttir.py ../examples/triton/vector_add.py
-    python gen_ttir.py ../examples/triton/softmax.py
-    python gen_ttir.py ../examples/triton/*.py             # regenerate all
+    python scripts/gen_ttir.py test/fixtures/vector_add/kernel.py
+    python scripts/gen_ttir.py test/fixtures/*/kernel.py   # regenerate all
+
+Output ``.mlir`` files are written next to each input file.
 """
 
 import importlib.util
 import sys
 from pathlib import Path
 
-_triton_root = Path(__file__).resolve().parents[3]
+_spyre_dir = Path(__file__).resolve().parents[1]
+_triton_root = _spyre_dir.parents[1]
 sys.path.insert(0, str(_triton_root / "python"))
-sys.path.insert(0, str(_triton_root / "third_party" / "spyre"))
+sys.path.insert(0, str(_spyre_dir / "test"))
 
 from utils import compile_to_ttir
 import triton
@@ -48,8 +50,6 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    ttir_dir = Path(__file__).parent.parent / "examples" / "ttir"
-
     for kernel_path in sys.argv[1:]:
         module = load_module(kernel_path)
         kernel_fn = find_kernel(module)
@@ -59,7 +59,7 @@ def main():
         ttir_text = compile_to_ttir(kernel_fn, signature, constexprs)
 
         out_name = Path(kernel_path).stem + ".mlir"
-        out_path = ttir_dir / out_name
+        out_path = Path(kernel_path).parent / out_name
         out_path.write_text(ttir_text)
         print(f"Wrote {out_path}")
 
