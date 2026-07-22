@@ -241,16 +241,33 @@ buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
 // exactly the tile(s) with C[t]_axis == 0 within the group.  For the
 // affine form, that tile is `off(g)` (the member with j=0 in the members
 // formula).  So consumer = { i : i == g*groupStep }  →  a 1-point set.
-static IntegerSet buildPick0Set(MLIRContext *ctx, const GroupSets &gs) {
-  // pick₀ is the first (lowest tile id) member of each group.
-  // For contiguous groups: off(g) = g * gsize.
-  // consumer = { (i)[g] : i == g * gsize }
+// Build the pick₀ consumer set from gs.pick0TileIds.
+// pick0TileIds[g] is the tile-id with axis_value==0 in group g.
+// Requires those ids to form an arithmetic sequence base + g*stride so
+// the predicate can be expressed as a single affine equality i == base + g*stride.
+static FailureOr<IntegerSet> buildPick0Set(MLIRContext *ctx,
+                                            const GroupSets &gs,
+                                            Operation *loc) {
+  int64_t ngroups = (int64_t)gs.pick0TileIds.size();
+  if (ngroups == 0)
+    return IntegerSet::getEmptySet(1, 1, ctx);
+
+  int64_t base   = gs.pick0TileIds[0];
+  int64_t stride = (ngroups > 1) ? (gs.pick0TileIds[1] - base) : 0;
+
+  for (int64_t g = 0; g < ngroups; ++g) {
+    if (gs.pick0TileIds[g] != base + g * stride)
+      return loc->emitError(
+          "reduce_to_one: pick0 tile-ids are not an arithmetic sequence "
+          "(non-uniform pick0 layouts are not yet supported)");
+  }
+
+  // Emit i == base + g*stride.
   auto iExpr = getAffineDimExpr(0, ctx);
   auto gSym  = getAffineSymbolExpr(0, ctx);
-  // Equality: i - g*gsize == 0
-  SmallVector<AffineExpr> cons = {
-      iExpr - gSym * getAffineConstantExpr(gs.gsize, ctx)
-  };
+  AffineExpr rhs = getAffineConstantExpr(base, ctx)
+                   + gSym * getAffineConstantExpr(stride, ctx);
+  SmallVector<AffineExpr> cons = {iExpr - rhs};
   return IntegerSet::get(1, 1, cons, {true});
 }
 
@@ -411,8 +428,11 @@ struct LowerInterTilePass
 
     // --- select consumer set ---
     IntegerSet consumerSet = gs.producerTilesPerGroup;  // all_reduce default
-    if (mode == "reduce_to_one")
-      consumerSet = buildPick0Set(ctx, gs);
+    if (mode == "reduce_to_one") {
+      auto pick0OrErr = buildPick0Set(ctx, gs, op);
+      if (failed(pick0OrErr)) return failure();
+      consumerSet = *pick0OrErr;
+    }
 
     // --- emit ktdp.inter_tile_produce ---
     rewriter.setInsertionPoint(op);
