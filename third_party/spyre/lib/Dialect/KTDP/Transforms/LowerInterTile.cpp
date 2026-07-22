@@ -56,7 +56,7 @@ static constexpr StringRef kCoreIdToWkSlice   = "coreIdToWkSlice";
 static constexpr StringRef kDepWkSlices        = "depWkSlices";
 
 //===----------------------------------------------------------------------===//
-// readWorkSliceAttrs — read W, C, D from the enclosing func.func
+// readWorkSliceAttrs — read W, C, D from the op's own attributes
 //===----------------------------------------------------------------------===//
 
 struct WorkSliceAttrs {
