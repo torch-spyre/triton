@@ -90,8 +90,8 @@ struct GroupSets {
   IntegerSet producerTilesPerGroup;  // (i)[g] : membership predicate
   IntegerSet groups;                  // (g) : range [0, ngroups)
   int64_t gsize;
-  int64_t ngroups;
   int64_t stride;  // groupStep (= gsize for contiguous groups)
+  SmallVector<int64_t> pick0TileIds;  // pick0TileIds[g] = tile-id with axis_value==0 in group g
 };
 
 // Build the GroupSets for the given reduction axis.
@@ -186,6 +186,20 @@ buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
     }
   }
 
+  // Find pick0 tile per group: the tile with axis_value==0 in each group.
+  SmallVector<int64_t> pick0TileIds(ngroups, -1);
+  for (int64_t g = 0; g < ngroups; ++g) {
+    auto &members = tupleToTiles[tupleOrder[g]];
+    for (int64_t j = 0; j < gsize; ++j) {
+      auto tileMap = dyn_cast<DictionaryAttr>(attrs.coreIdToWkSlice[members[j]]);
+      int64_t axVal = tileMap.getAs<IntegerAttr>(axis).getInt();
+      if (axVal == 0) { pick0TileIds[g] = members[j]; break; }
+    }
+    if (pick0TileIds[g] == -1)
+      return loc->emitError("group ") << g
+             << " has no tile with " << axis << "=0";
+  }
+
   // --- emit affine sets ---
   // groups = { (g) : g >= 0, ngroups-1-g >= 0 }
   // g must be a DIM (not a symbol) — ktdp.inter_tile_produce verifier
@@ -209,7 +223,7 @@ buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
   };
   IntegerSet producerSet = IntegerSet::get(1, 1, cons, {false, false});
 
-  return GroupSets{producerSet, groupsSet, gsize, ngroups, /*stride=*/gsize};
+  return GroupSets{producerSet, groupsSet, gsize, /*stride=*/gsize, pick0TileIds};
 }
 
 //===----------------------------------------------------------------------===//
