@@ -488,7 +488,7 @@ struct LowerInterTilePass
 
     // --- emit per-consumer dependency ---
     if (attrs.depWkSlices) {
-      if (failed(attachDepSet(rewriter, loc, ctx, gs, attrs, reduceOp, op)))
+      if (failed(attachDepSet(rewriter, loc, ctx, gs, attrs, reduceOp, op, mode)))
         return failure();
     }
     // Absent D → full-barrier (attribute omitted — already done above).
@@ -572,7 +572,12 @@ struct LowerInterTilePass
                              const GroupSets &gs,
                              const WorkSliceAttrs &attrs,
                              ktdp::InterTileReduceOp dstOp,
-                             Operation *srcLoc) {
+                             Operation *srcLoc,
+                             StringRef mode) {
+    // reduce_to_one: only pick0 (local index 0) is a consumer.
+    // all_reduce: every member of the group is a consumer.
+    int64_t numConsumers = (mode == "reduce_to_one") ? 1 : gs.gsize;
+
     // D: consumer local index (str) → list of producer local indices.
     // Validate: all indices in [0, gsize-1], non-empty lists, full coverage.
     SmallVector<SmallVector<int64_t>> depTable(gs.gsize);
@@ -602,8 +607,8 @@ struct LowerInterTilePass
         producerCovered[prodLocal] = true;
       }
     }
-    // Check consumer coverage.
-    for (int64_t i = 0; i < gs.gsize; ++i)
+    // Check consumer coverage (only consumers valid for this mode).
+    for (int64_t i = 0; i < numConsumers; ++i)
       if (!consumerCovered[i])
         return srcLoc->emitError("depWkSlices missing consumer local index ") << i;
     // Check producer coverage.
