@@ -3834,9 +3834,8 @@ def wk_slice_coord(work_slices, axis, _semantic=None):
     ``work_slices`` by convention.  See spec E4.
 
     Args:
-        work_slices: ``tl.constexpr`` list (or dict keyed by tile id) of per-tile
-                     slice-index dicts — the same value passed to
-                     :func:`inter_tile`.
+        work_slices: ``tl.constexpr`` list of per-tile slice-index dicts —
+                     the same value passed to :func:`inter_tile`.
         axis:        ``tl.constexpr`` work-slice dim name to look up (e.g.
                      ``"in"``).  Must be a key in every ``work_slices`` entry.
 
