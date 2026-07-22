@@ -404,6 +404,49 @@ VARIANTS = {
     # the element dtype via _sticksize (fp16 → 64 = 128 bytes / 2).
     #   stick-on-X layout: phys [X//stick, other, X%stick]
     #     = [(X_logical, "floordiv", stick), other_logical, (X_logical, "mod", stick)]
+    "spyre_stick_k_reduction": {
+        # A stick-on-K, B stick-on-N, C stick-on-N. Matches the worked example
+        # in docs/rewriting-descriptor-layout.md §Example 1.
+        # A[M,K] stick-on-K → phys [K//S, M, S] = [2, 64, 64]
+        # B[K,N] stick-on-N → phys [N//S, K, S] = [4, 128, 64]
+        # C[M,N] stick-on-N → phys [N//S, M, S] = [4, 64, 64]
+        # The K-stick loop is compiler-synthesized: A loads as [2,64,64],
+        # the scf.for over 2 K-sticks slices A and offsets into B's flat K dim.
+        "tags": ["descriptor-load-static", "descriptor-store-static", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "Matmul with A stick-on-K, B/C stick-on-N. "
+            "The K-stick loop is synthesized: A is loaded as a rank-3 "
+            "[K_sticks, M, lane] tile and iterated with extract_slice."
+        ),
+        "kernel_fn":    kernel.matmul_kernel,
+        "SIGNATURE":    _SIG_SPYRE,
+        "constexpr":    ["M", "K", "N", "BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            # M=64, K=128 (2 K-sticks), N=256 (4 N-sticks)
+            "M": [64], "K": [128], "N": [256],
+            "BLOCK_M": [64], "BLOCK_K": [128], "BLOCK_N": [64],
+            # A[M,K] stick-on-K: phys [K//_S, M, K%_S]
+            "A_LAYOUT": [[(1, "floordiv", _SS("a_ptr")), 0, (1, "mod", _SS("a_ptr"))]],
+            # B[K,N] stick-on-N: phys [N//_S, K, N%_S]
+            "B_LAYOUT": [[(1, "floordiv", _SS("b_ptr")), 0, (1, "mod", _SS("b_ptr"))]],
+            # C[M,N] stick-on-N: phys [N//_S, M, N%_S]
+            "C_LAYOUT": [[(1, "floordiv", _SS("c_ptr")), 0, (1, "mod", _SS("c_ptr"))]],
+        },
+        "grid":         [1],
+        "reference":    run,
+        "inputs":       _make_inputs_fp16,
+        "output_key":   "c_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.matmul"),
+            t.assert_present("scf.for"),
+            t.assert_present("tensor.insert_slice"),
+        ),
+    },
     "spyre_stick_parallel": {
         # Case 1: parallel sticks. A stick-on-M, B & C stick-on-N. No K
         # reduction loop — one inner linalg.matmul per output stick.
@@ -526,7 +569,33 @@ VARIANTS = {
                          "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
         "params":       {
             "M": [64], "K": [128], "N": [256],
-            "BLOCK_M": [64], "BLOCK_K": [128], "BLOCK_N": [64],
+            "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
+            "A_LAYOUT": [[(0, "floordiv", _SS("a_ptr")), 1, (0, "mod", _SS("a_ptr"))]],
+            "B_LAYOUT": [[(1, "floordiv", _SS("b_ptr")), 0, (1, "mod", _SS("b_ptr"))]],
+            "C_LAYOUT": [[(1, "floordiv", _SS("c_ptr")), 0, (1, "mod", _SS("c_ptr"))]],
+        },
+        "grid":         [1],
+        "reference":    run,
+        "inputs":       _make_inputs_fp16,
+        "output_key":   "c_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,  # fp16 ULP noise
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.matmul"),
+            t.assert_present("scf.for"),
+        ),
+    },
+    "spyre_stick_k2": {
+        "tags": ["descriptor-load-static", "descriptor-store-static", "dot",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "kernel_fn":    kernel.matmul_kernel,
+        "SIGNATURE":    _SIG_SPYRE,
+        "constexpr":    ["M", "K", "N", "BLOCK_M", "BLOCK_K", "BLOCK_N",
+                         "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        "params":       {
+            "M": [128], "K": [128], "N": [128],
+            "BLOCK_M": [64], "BLOCK_K": [64], "BLOCK_N": [64],
             "A_LAYOUT": [[(0, "floordiv", _SS("a_ptr")), 1, (0, "mod", _SS("a_ptr"))]],
             "B_LAYOUT": [[(1, "floordiv", _SS("b_ptr")), 0, (1, "mod", _SS("b_ptr"))]],
             "C_LAYOUT": [[(1, "floordiv", _SS("c_ptr")), 0, (1, "mod", _SS("c_ptr"))]],
