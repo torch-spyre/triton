@@ -193,7 +193,12 @@ buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
     for (int64_t j = 0; j < gsize; ++j) {
       auto tileMap = dyn_cast<DictionaryAttr>(attrs.coreIdToWkSlice[members[j]]);
       int64_t axVal = tileMap.getAs<IntegerAttr>(axis).getInt();
-      if (axVal == 0) { pick0TileIds[g] = members[j]; break; }
+      if (axVal == 0) {
+        if (pick0TileIds[g] != -1)
+          return loc->emitError("group ") << g
+                 << " has more than one tile with " << axis << "=0";
+        pick0TileIds[g] = members[j];
+      }
     }
     if (pick0TileIds[g] == -1)
       return loc->emitError("group ") << g
@@ -230,21 +235,11 @@ buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
 // buildPick0 — find the reduced-axis slice-0 tile in group g
 //===----------------------------------------------------------------------===//
 
-// Returns the tile_id with C[t]_axis == 0 that also has the non-axis coords
-// matching group g. Falls back to the tile with the smallest id among those
-// in the group. For simplicity in the current scope we return the lowest tile
-// id in the group (min fallback always works; the A/B pick₀ disambiguation
-// only matters when slice-0 != min, which requires inspecting C at compile
-// time). The structural-test T5 will drive the full pick₀ path.
-//
-// Here we emit the affine set for the single-tile consumer: the set contains
-// exactly the tile(s) with C[t]_axis == 0 within the group.  For the
-// affine form, that tile is `off(g)` (the member with j=0 in the members
-// formula).  So consumer = { i : i == g*groupStep }  →  a 1-point set.
 // Build the pick₀ consumer set from gs.pick0TileIds.
-// pick0TileIds[g] is the tile-id with axis_value==0 in group g.
-// Requires those ids to form an arithmetic sequence base + g*stride so
-// the predicate can be expressed as a single affine equality i == base + g*stride.
+// pick0TileIds[g] is the tile-id with axis_value==0 in group g, scanned from
+// coreIdToWkSlice in buildGroupSets. The ids must form an arithmetic sequence
+// base + g*stride so the predicate can be expressed as the single affine
+// equality i == base + g*stride.
 static FailureOr<IntegerSet> buildPick0Set(MLIRContext *ctx,
                                             const GroupSets &gs,
                                             Operation *loc) {
@@ -613,6 +608,10 @@ struct LowerInterTilePass
       if (consLocal < 0 || consLocal >= gs.gsize)
         return srcLoc->emitError("depWkSlices key ") << consLocal
                << " out of range [0, " << gs.gsize << ")";
+      if (consLocal >= numConsumers)
+        return srcLoc->emitError("depWkSlices key ") << consLocal
+               << " is not a valid consumer for mode '" << mode
+               << "' (only indices [0, " << numConsumers << ") are consumers)";
       auto prodList = dyn_cast<ArrayAttr>(entry.getValue());
       if (!prodList || prodList.empty())
         return srcLoc->emitError("depWkSlices[") << consLocal

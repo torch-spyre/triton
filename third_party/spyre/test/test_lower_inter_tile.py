@@ -415,6 +415,72 @@ class TestReduceToOne(LowerInterTileTester):
         self.assert_present("ktdp.inter_tile_produce", "ktdp.inter_tile_reduce")
         self.assert_absent("tt.inter_tile_reduce")
 
+    def test_pick0_not_at_lowest_tile_id(self):
+        """pick0 tile is the one with axis_value==0, not necessarily the lowest tile-id.
+
+        core_map=[{"x":1},{"x":0}]: tile 0 has x=1, tile 1 has x=0.
+        pick0 must be tile 1 — consumer_tiles_per_group should encode i==1, not i==0.
+        """
+        attrs = _op_attrs({"x": 2},
+                          core_map=[{"x": 1}, {"x": 0}])
+        ttir = self.run(f"""
+        module {{
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          {{
+            %0 = tt.inter_tile_reduce
+                   partials(%p : tensor<1x16xf32>)
+                   axis = "x" mode = "reduce_to_one" combiner = "add"
+                   {attrs}
+                   -> (tensor<16xf32>)
+            tt.return %0 : tensor<16xf32>
+          }}
+        }}
+        """)
+        # consumer_tiles_per_group must select tile 1 (d0 == 1), not tile 0.
+        self.assert_present("ktdp.inter_tile_reduce")
+        ktir = str(self.mod)
+        assert "d0 == 1" in ktir or "d0 - 1 == 0" in ktir, \
+            f"Expected consumer set to select tile 1, got:\n{ktir}"
+
+    def test_reduce_to_one_dep_valid_consumer_accepted(self):
+        """reduce_to_one with depWkSlices key '0' (pick0) is accepted."""
+        # gsize=2, numConsumers=1 — only key "0" is a valid consumer.
+        attrs = _op_attrs({"x": 2}, dep={"0": [0, 1]})
+        self.run(f"""
+        module {{
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          {{
+            %0 = tt.inter_tile_reduce
+                   partials(%p : tensor<1x16xf32>)
+                   axis = "x" mode = "reduce_to_one" combiner = "add"
+                   {attrs}
+                   -> (tensor<16xf32>)
+            tt.return %0 : tensor<16xf32>
+          }}
+        }}
+        """)
+        self.assert_present("ktdp.inter_tile_reduce")
+
+    def test_reduce_to_one_dep_invalid_consumer_rejected(self, capfd):
+        """reduce_to_one with depWkSlices key '1' (non-consumer) is rejected."""
+        # gsize=2, numConsumers=1 — key "1" is not a valid consumer for reduce_to_one.
+        attrs = _op_attrs({"x": 2}, dep={"1": [0, 1]})
+        with pytest.raises(RuntimeError):
+            self.run(f"""
+            module {{
+              tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+              {{
+                %0 = tt.inter_tile_reduce
+                       partials(%p : tensor<1x16xf32>)
+                       axis = "x" mode = "reduce_to_one" combiner = "add"
+                       {attrs}
+                       -> (tensor<16xf32>)
+                tt.return %0 : tensor<16xf32>
+              }}
+            }}
+            """)
+        self.assert_stderr(capfd, "not a valid consumer")
+
 
 # ---------------------------------------------------------------------------
 # C3 / Q4 — Shorthand combiner identity materialization

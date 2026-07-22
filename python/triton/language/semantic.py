@@ -2066,9 +2066,7 @@ class TritonSemantic(Generic[TensorTy]):
         axis = tl._unwrap_if_constexpr(axis)
         work_slices = tl._unwrap_if_constexpr(work_slices)
 
-        # Normalize to a tile-id-ordered list of slice-index dicts (accepts a
-        # list indexed by tile id, or a dict keyed by tile id) — same surface
-        # as tl.inter_tile's work_slices.
+        # Normalize to a tile-id-ordered list of slice-index dicts.
         if isinstance(work_slices, (list, tuple)):
             entries = list(work_slices)
         else:
