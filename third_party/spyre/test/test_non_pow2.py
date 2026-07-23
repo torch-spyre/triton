@@ -129,13 +129,13 @@ class TestVerifyTensorSizeNonPow2:
         mod = _parse_mlir(
             """
         module {
-          tt.func @k(%arg0: tensor<4x192x64xf32>) -> tensor<4x64xf32> {
-            %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+          tt.func @k(%arg0: tensor<4x192x64xf32>) -> tensor<4x192xf32> {
+            %0 = "tt.reduce"(%arg0) <{axis = 2 : i32}> ({
             ^bb0(%a: f32, %b: f32):
               %1 = arith.addf %a, %b : f32
               "tt.reduce.return"(%1) : (f32) -> ()
-            }) : (tensor<4x192x64xf32>) -> tensor<4x64xf32>
-            tt.return %0 : tensor<4x64xf32>
+            }) : (tensor<4x192x64xf32>) -> tensor<4x192xf32>
+            tt.return %0 : tensor<4x192xf32>
           }
         }
         """
