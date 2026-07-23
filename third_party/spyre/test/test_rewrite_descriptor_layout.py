@@ -1340,10 +1340,10 @@ class TestBatchMatmul(RewriteLayoutTester):
       phys_op  = [1, 0, 0, 2]
       phys_arg = [64, 0, 0, 64]
 
-    B_stick_K[B,K,N] stick-on-K (dim 1): physical [K, B, N//64, K%64] = [128, 4, 1, 64]
+    B_stick_K[B,K,N] stick-on-K (dim 1): physical [K/S, B, N, K%S] = [2, 4, 64, 64]
       phys_src = [1, 0, 2, 1]
-      phys_op  = [0, 0, 1, 2]  (identity, identity, floordiv, mod)
-      phys_arg = [0, 0, 64, 64]
+      phys_op  = [1, 0, 0, 2]  (floordiv, identity, identity, mod)
+      phys_arg = [64, 0, 0, 64]
     """
 
     # A[B,M,K] stick-on-K: phys [K/S, B, M, K%S]
@@ -1361,8 +1361,8 @@ class TestBatchMatmul(RewriteLayoutTester):
     # B[B,K,N] stick-on-K: phys [K, B, N//64, K%64]
     _B_LAYOUT_STICK_K = (
         "{phys_src = array<i64: 1, 0, 2, 1>, "
-        "phys_op = array<i64: 0, 0, 1, 2>, "
-        "phys_arg = array<i64: 0, 0, 64, 64>}"
+        "phys_op = array<i64: 1, 0, 0, 2>, "
+        "phys_arg = array<i64: 64, 0, 0, 64>}"
     )
 
     def _kernel_t15(self):
@@ -1490,13 +1490,6 @@ class TestBatchMatmul(RewriteLayoutTester):
 
     # --- T16 tests ---
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "T16 known gap: dispatchBatchMatmul misidentifies the reduction axis "
-        "when B[B,K,N] is stick-on-K (phys_src=[1,0,2,1], phys_op=[0,0,1,2]). "
-        "The pass reconstructs linalg.batch_matmul with result type tensor<4x64xf32> "
-        "instead of tensor<4x64x64xf32>, causing a verifier failure. "
-        "Fix: dispatchBatchMatmul must handle the B-operand stick-on-K path."
-    ))
     def test_batch_matmul_both_stick_k_lowers(self):
         # T16: both A and B stick-on-K — shared reduction axis.
         # Expected once fixed: linalg.batch_matmul present, marker erased,
@@ -1507,9 +1500,10 @@ class TestBatchMatmul(RewriteLayoutTester):
         self.assert_present("scf.for")
 
     @pytest.mark.xfail(strict=True, reason=(
-        "T16 known gap: same root cause as test_batch_matmul_both_stick_k_lowers. "
-        "The pass fails before producing output, so the single-loop invariant "
-        "cannot be checked yet."
+        "T16: correct layout now produces 2 scf.for loops instead of 1. "
+        "Both A and B have K-floor loopDims; the fixpoint dispatches them "
+        "separately, each synthesizing its own K-stick loop. A single shared "
+        "loop requires deduplication of the stickFactor across plans."
     ))
     def test_batch_matmul_both_stick_k_single_loop(self):
         # T16: both operands share the same K-stick reduction loop.
