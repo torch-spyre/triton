@@ -54,6 +54,9 @@ _STICK_ON_M_1D = (
     "phys_arg = array<i64: 64, 64>}"
 )
 
+# Same encoding for a 1-D [N] stick layout (logically identical — the only dim is dim 0).
+_STICK_ON_N_1D = _STICK_ON_M_1D
+
 
 class RewriteLayoutTester(SinglePassTester):
     """Shared base: run the full TTIR→KTDP pipeline up to and including
@@ -1757,16 +1760,6 @@ class TestTransposeThenReduce(RewriteLayoutTester):
         }}
         """
 
-    @pytest.mark.xfail(
-        reason=(
-            "S4 incomplete: retypeChain stops at linalg.TransposeOp but does "
-            "not update the transpose's init/outs tensor, leaving a rank "
-            "mismatch (input rank-3, init rank-2) that the MLIR verifier "
-            "catches.  Fix: retypeChain must also update the transpose's init "
-            "shape, or Phase 2 must erase dead transposes after dispatch."
-        ),
-        strict=True,
-    )
     def test_retype_chain_stops_at_transpose(self):
         # S4/retypeChain: the pass must succeed end-to-end and linalg.reduce
         # must still be present in the output (dispatched by Phase 2).  With
@@ -1776,16 +1769,6 @@ class TestTransposeThenReduce(RewriteLayoutTester):
         self.assert_absent("tt.spyre_tensor_layout")
         self.assert_present("linalg.reduce")
 
-    @pytest.mark.xfail(
-        reason=(
-            "S4 incomplete: retypeChain stops at linalg.TransposeOp but does "
-            "not update the transpose's init/outs tensor, leaving a rank "
-            "mismatch (input rank-3, init rank-2) that the MLIR verifier "
-            "catches.  Fix: retypeChain must also update the transpose's init "
-            "shape, or Phase 2 must erase dead transposes after dispatch."
-        ),
-        strict=True,
-    )
     def test_transpose_erased(self):
         # S4: after the full pass the physical load is rank-3 [1x64x64xf16].
         # retypeChain stops at the transpose so the transpose result's type is
