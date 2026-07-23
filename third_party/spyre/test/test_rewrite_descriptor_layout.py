@@ -1499,7 +1499,7 @@ class TestBatchMatmul(RewriteLayoutTester):
         self.assert_present("linalg.batch_matmul")
         self.assert_present("scf.for")
 
-    def test_batch_matmul_both_stick_k_single_loop(self):
+    def test_batch_matmul_both_stick_k_two_loops(self):
         # T16: both A and B stick-on-K with 2 K-sticks each.
         # Phase 1 rescales the outer K-tile loop; Phase 2 emits an inner
         # K-stick loop (stickFactor=2).  Total: 2 nested scf.for loops —
