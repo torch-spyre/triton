@@ -116,14 +116,15 @@ def _extra_checks_default(tester) -> None:
 
     Asserts the exact op pattern that ``tl.inter_tile(..., combiner="add",
     mode="all_reduce")`` lowers to, given:
-      - partial shape  1 × BLOCK_M × BLOCK_N  (unit leading dim)
+      - partial shape  BLOCK_M × BLOCK_N
       - 4 groups of 2 tiles  (ngroups=4, gsize=2)
       - reduce-then-fold with linalg.add combiner
 
-    These are structural invariants.  If the lowering changes (e.g. the
-    pass emits a different combiner, collapses the unit dim differently,
-    or uses a different affine-set shape), this check will fail and prompt
-    a review of both the pass and this oracle.
+    The delivery op preserves shape: ``result_type == partial_type``;
+    grouping lives in the affine sets, not in a tensor axis.  If the
+    lowering changes (different combiner, different affine-set shape, or
+    rank drift), this check will fail and prompt a review of both the
+    pass and this oracle.
     """
     # Both produce and reduce ops must be present.
     tester.assert_present("ktdp.inter_tile_produce")
@@ -142,10 +143,11 @@ def _extra_checks_default(tester) -> None:
         num_dims=1, num_symbols=0, num_constraints=2,
     )
 
-    # Produce result type: tile_future carrying the 1×16×16 partial. PR-25 wraps
-    # the partial types in parens: !ktdp.tile_future<(tensor<...>), groups=...>.
+    # Produce result type: tile_future carrying the 16×16 partial. The
+    # tile_future syntax wraps the partial types in parens:
+    # !ktdp.tile_future<(tensor<...>), groups=...>.
     tester.assert_result_type(
-        "ktdp.inter_tile_produce", "ktdp.tile_future<(tensor<1x16x16x",
+        "ktdp.inter_tile_produce", "ktdp.tile_future<(tensor<16x16x",
     )
 
     # Reduce op: still carries consumer_tiles_per_group; groups is inferred
@@ -159,7 +161,7 @@ def _extra_checks_default(tester) -> None:
         num_dims=1, num_symbols=0, num_constraints=2,
     )
 
-    # Reduce result type: unit dim collapsed → 16×16 (not 1×16×16).
+    # Reduce result type equals the partial type (16×16), no rank reduction.
     tester.assert_result_type("ktdp.inter_tile_reduce", "tensor<16x16x")
     tester.assert_result(
         "ktdp.inter_tile_reduce", shape=[16, 16],
@@ -208,10 +210,11 @@ VARIANTS = {
             "all_reduce along the x-axis.  Tiles are grouped into 4 row-groups "
             "of 2; ``LowerInterTile`` lowers the ``tl.inter_tile`` op to a "
             "``ktdp.inter_tile_produce`` + ``ktdp.inter_tile_reduce`` pair with "
-            "a ``linalg.add`` combiner over the ``1×BLOCK_M×BLOCK_N`` partials.\n\n"
+            "a ``linalg.add`` combiner over the ``BLOCK_M×BLOCK_N`` partials.\n\n"
             "The result for each tile is the element-wise sum of the two "
-            "column-blocks in its group (unit leading dim collapsed by the reduce "
-            "result type).  ``WORK_SLICES`` is a compile-time list; "
+            "column-blocks in its group; the delivery op preserves the "
+            "partial shape (no rank reduction).  ``WORK_SLICES`` is a "
+            "compile-time list; "
             "``LowerInterTile`` derives groups by equality of the slice dict."
         ),
         "kernel_fn":    kernel.inter_tile_add_kernel,
@@ -318,7 +321,7 @@ def _extra_checks_splitk(tester) -> None:
         num_dims=1, num_symbols=0, num_constraints=2,
     )
     tester.assert_result_type(
-        "ktdp.inter_tile_produce", "ktdp.tile_future<(tensor<1x16x16x",
+        "ktdp.inter_tile_produce", "ktdp.tile_future<(tensor<16x16x",
     )
     # reduce_to_one: single equality constraint — only pick₀ consumes
     tester.assert_integer_set(

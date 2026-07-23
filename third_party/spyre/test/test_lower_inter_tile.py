@@ -9,15 +9,17 @@ Organization: one test class per rewrite rule / spec clause.
   TestAllReduce         — C2/Q2:  all_reduce consumer == producer set
   TestReduceToOne       — C2/Q2:  reduce_to_one consumer == pick₀ (1-point set)
   TestShorthandIdentity — C3/Q4:  add/max/mul → linalg.fill identity
-  TestResultTypes       — C4/Q5:  result rank = partial rank - 1 (unit axis collapsed)
+  TestResultTypes       — C4/Q5:  result type == partial type (no rank reduction)
   TestNoOp              — C6/Q8:  no op → IR unchanged
   TestBroadcastDeferred — R8:     broadcast/reduce_scatter → diagnostic
   TestValidation        — R1–R5:  precondition rejections
   TestWorkSlicesSemanticValidation — Python-level work_slices type/structure checks
 
-Partial shape convention: the partial tensor carries a leading unit dimension
-(size 1) that is the within-group tile axis to be collapsed by the reduce.
-For example, partial ``tensor<1x16xf32>`` collapses to result ``tensor<16xf32>``.
+The inter_tile_reduce op preserves shape: ``result_type == partial_type``
+(grouping is expressed by the affine sets, not by a tensor axis). Tests
+here use ``tensor<1xNxf32>`` partials as regression fixtures for a
+historical rank-reducing layout — the ``1`` leading dim is an ordinary
+tensor dim carried through the op unchanged.
 
 Negative tests use ``pytest.raises`` + ``assert_stderr(capfd, ...)`` to verify
 both the RuntimeError and the MLIR diagnostic on stderr.
@@ -222,14 +224,14 @@ class TestGroupSets(LowerInterTileTester):
         attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<1x16xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<16xf32>)
-            tt.return %0 : tensor<16xf32>
+                   -> (tensor<1x16xf32>)
+            tt.return %0 : tensor<1x16xf32>
           }}
         }}
         """)
@@ -241,14 +243,14 @@ class TestGroupSets(LowerInterTileTester):
         attrs = _op_attrs({"y": 2, "x": 2})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<8xf32>)
-            tt.return %0 : tensor<8xf32>
+                   -> (tensor<1x8xf32>)
+            tt.return %0 : tensor<1x8xf32>
           }}
         }}
         """)
@@ -266,14 +268,14 @@ class TestGroupSets(LowerInterTileTester):
         attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<1x16xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<16xf32>)
-            tt.return %0 : tensor<16xf32>
+                   -> (tensor<1x16xf32>)
+            tt.return %0 : tensor<1x16xf32>
           }}
         }}
         """)
@@ -296,14 +298,14 @@ class TestGroupSets(LowerInterTileTester):
         attrs = _op_attrs({"y": 2, "x": 2})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<8xf32>)
-            tt.return %0 : tensor<8xf32>
+                   -> (tensor<1x8xf32>)
+            tt.return %0 : tensor<1x8xf32>
           }}
         }}
         """)
@@ -335,14 +337,14 @@ class TestAllReduce(LowerInterTileTester):
         attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<1x16xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<16xf32>)
-            tt.return %0 : tensor<16xf32>
+                   -> (tensor<1x16xf32>)
+            tt.return %0 : tensor<1x16xf32>
           }}
         }}
         """)
@@ -359,14 +361,14 @@ class TestAllReduce(LowerInterTileTester):
         attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<8xf32>)
-            tt.return %0 : tensor<8xf32>
+                   -> (tensor<1x8xf32>)
+            tt.return %0 : tensor<1x8xf32>
           }}
         }}
         """)
@@ -378,14 +380,14 @@ class TestAllReduce(LowerInterTileTester):
         attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<8xf32>)
-            tt.return %0 : tensor<8xf32>
+                   -> (tensor<1x8xf32>)
+            tt.return %0 : tensor<1x8xf32>
           }}
         }}
         """)
@@ -405,14 +407,14 @@ class TestReduceToOne(LowerInterTileTester):
         attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<1x16xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "reduce_to_one" combiner = "add"
                    {attrs}
-                   -> (tensor<16xf32>)
-            tt.return %0 : tensor<16xf32>
+                   -> (tensor<1x16xf32>)
+            tt.return %0 : tensor<1x16xf32>
           }}
         }}
         """)
@@ -429,14 +431,14 @@ class TestReduceToOne(LowerInterTileTester):
                           core_map=[{"x": 1}, {"x": 0}])
         ttir = self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<1x16xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "reduce_to_one" combiner = "add"
                    {attrs}
-                   -> (tensor<16xf32>)
-            tt.return %0 : tensor<16xf32>
+                   -> (tensor<1x16xf32>)
+            tt.return %0 : tensor<1x16xf32>
           }}
         }}
         """)
@@ -452,14 +454,14 @@ class TestReduceToOne(LowerInterTileTester):
         attrs = _op_attrs({"x": 2}, dep={"0": [0, 1]})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<1x16xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "reduce_to_one" combiner = "add"
                    {attrs}
-                   -> (tensor<16xf32>)
-            tt.return %0 : tensor<16xf32>
+                   -> (tensor<1x16xf32>)
+            tt.return %0 : tensor<1x16xf32>
           }}
         }}
         """)
@@ -472,14 +474,14 @@ class TestReduceToOne(LowerInterTileTester):
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
-              tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+              tt.func @k(%p: tensor<1x16xf32>) -> tensor<1x16xf32>
               {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x16xf32>)
                        axis = "x" mode = "reduce_to_one" combiner = "add"
                        {attrs}
-                       -> (tensor<16xf32>)
-                tt.return %0 : tensor<16xf32>
+                       -> (tensor<1x16xf32>)
+                tt.return %0 : tensor<1x16xf32>
               }}
             }}
             """)
@@ -497,14 +499,14 @@ class TestShorthandIdentity(LowerInterTileTester):
         attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "x" mode = "all_reduce" combiner = "{combiner}"
                    {attrs}
-                   -> (tensor<8xf32>)
-            tt.return %0 : tensor<8xf32>
+                   -> (tensor<1x8xf32>)
+            tt.return %0 : tensor<1x8xf32>
           }}
         }}
         """)
@@ -539,52 +541,52 @@ class TestShorthandIdentity(LowerInterTileTester):
 
 
 # ---------------------------------------------------------------------------
-# C4 / Q5 — Result types: rank = partial rank - 1 (unit axis collapsed)
+# C4 / Q5 — Result types: result type == partial type (no rank reduction)
 # ---------------------------------------------------------------------------
 
 class TestResultTypes(LowerInterTileTester):
-    """Delivery op result type has rank one less than the partial."""
+    """Delivery op result type equals the partial type (ktdp op contract)."""
 
     @pattern("result-types", category="inter-tile", example=[
-        "partial: tensor<1xNxf32>  # leading unit axis = within-group tile axis",
+        "partial: tensor<1xNxf32>",
         "result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')",
-        "# result: tensor<Nxf32>  — unit axis collapsed, rank decremented by 1",
+        "# result: tensor<1xNxf32>  — same shape as the partial",
     ])
     def test_f32_result_type(self):
-        """tensor<1x16xf32> partial → tensor<16xf32> result."""
+        """tensor<1x16xf32> partial → tensor<1x16xf32> result."""
         attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<1x16xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<16xf32>)
-            tt.return %0 : tensor<16xf32>
+                   -> (tensor<1x16xf32>)
+            tt.return %0 : tensor<1x16xf32>
           }}
         }}
         """)
-        self.assert_result_type("ktdp.inter_tile_reduce", "tensor<16xf32>")
+        self.assert_result_type("ktdp.inter_tile_reduce", "tensor<1x16xf32>")
 
     def test_f16_result_type(self):
         """f16 partial → f16 result (spec P6)."""
         attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x8xf16>) -> tensor<8xf16>
+          tt.func @k(%p: tensor<1x8xf16>) -> tensor<1x8xf16>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf16>)
                    axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<8xf16>)
-            tt.return %0 : tensor<8xf16>
+                   -> (tensor<1x8xf16>)
+            tt.return %0 : tensor<1x8xf16>
           }}
         }}
         """)
-        self.assert_result_type("ktdp.inter_tile_reduce", "tensor<8xf16>")
+        self.assert_result_type("ktdp.inter_tile_reduce", "tensor<1x8xf16>")
 
     def test_multi_arity_result_types(self):
         """A=2 partials → A=2 results (multi-arity path, spec P7)."""
@@ -592,42 +594,43 @@ class TestResultTypes(LowerInterTileTester):
         self.run(f"""
         module {{
           tt.func @k(%p0: tensor<1x8xf32>, %p1: tensor<1x8xf32>)
-              -> (tensor<8xf32>, tensor<8xf32>)
+              -> (tensor<1x8xf32>, tensor<1x8xf32>)
           {{
             %0, %1 = tt.inter_tile_reduce
                        partials(%p0 : tensor<1x8xf32>, %p1 : tensor<1x8xf32>)
                        axis = "x" mode = "all_reduce" combiner = "add"
                        {attrs}
-                       -> (tensor<8xf32>, tensor<8xf32>)
-            tt.return %0, %1 : tensor<8xf32>, tensor<8xf32>
+                       -> (tensor<1x8xf32>, tensor<1x8xf32>)
+            tt.return %0, %1 : tensor<1x8xf32>, tensor<1x8xf32>
           }}
         }}
         """)
         self.assert_present("ktdp.inter_tile_reduce")
         self.assert_absent("tt.inter_tile_reduce")
 
-    def test_result_rank_one_less_than_partial(self):
-        """Result rank = partial rank - 1: the unit axis is always collapsed (C4/Q5).
+    def test_result_type_equals_partial_type(self):
+        """Result type equals the partial type (C4/Q5; ktdp op contract).
 
-        Tests the invariant directly: rank(partial)=2, rank(result)=1.
-        For T1: tensor<1x16xf32> → tensor<16xf32>.
+        Regression pin for a rank-reducing lowering variant: the delivery
+        op must not drop dims. A `tensor<1xNxf32>` partial produces a
+        `tensor<1xNxf32>` result; the ktdp verifier rejects any rank
+        change, and the pass forwards the partial shape verbatim.
         """
         attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x16xf32>) -> tensor<16xf32>
+          tt.func @k(%p: tensor<1x16xf32>) -> tensor<1x16xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x16xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<16xf32>)
-            tt.return %0 : tensor<16xf32>
+                   -> (tensor<1x16xf32>)
+            tt.return %0 : tensor<1x16xf32>
           }}
         }}
         """)
-        # The collapsed result must NOT contain "1x" (the unit axis is gone).
-        self.assert_result_type("ktdp.inter_tile_reduce", "tensor<16xf32>")
+        self.assert_result_type("ktdp.inter_tile_reduce", "tensor<1x16xf32>")
         self.assert_absent("tt.inter_tile_reduce")
 
 
@@ -662,14 +665,14 @@ class TestWorkSlices(LowerInterTileTester):
         attrs = _op_attrs({"mb": 2, "out": 2})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "out" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<8xf32>)
-            tt.return %0 : tensor<8xf32>
+                   -> (tensor<1x8xf32>)
+            tt.return %0 : tensor<1x8xf32>
           }}
         }}
         """)
@@ -685,14 +688,14 @@ class TestWorkSlices(LowerInterTileTester):
         attrs = _op_attrs({"x": 4})
         self.run(f"""
         module {{
-          tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+          tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
           {{
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<1x8xf32>)
                    axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
-                   -> (tensor<8xf32>)
-            tt.return %0 : tensor<8xf32>
+                   -> (tensor<1x8xf32>)
+            tt.return %0 : tensor<1x8xf32>
           }}
         }}
         """)
@@ -723,19 +726,19 @@ class TestDoubleAllReduce(LowerInterTileTester):
         self.run(f"""
         module {{
           tt.func @k(%pmax: tensor<1x8xf32>, %psum: tensor<1x8xf32>)
-              -> (tensor<8xf32>, tensor<8xf32>)
+              -> (tensor<1x8xf32>, tensor<1x8xf32>)
           {{
             %rowmax = tt.inter_tile_reduce
                         partials(%pmax : tensor<1x8xf32>)
                         axis = "out" mode = "all_reduce" combiner = "max"
                         {attrs}
-                        -> (tensor<8xf32>)
+                        -> (tensor<1x8xf32>)
             %rowsum = tt.inter_tile_reduce
                         partials(%psum : tensor<1x8xf32>)
                         axis = "out" mode = "all_reduce" combiner = "add"
                         {attrs}
-                        -> (tensor<8xf32>)
-            tt.return %rowmax, %rowsum : tensor<8xf32>, tensor<8xf32>
+                        -> (tensor<1x8xf32>)
+            tt.return %rowmax, %rowsum : tensor<1x8xf32>, tensor<1x8xf32>
           }}
         }}
         """)
@@ -750,19 +753,19 @@ class TestDoubleAllReduce(LowerInterTileTester):
         self.run(f"""
         module {{
           tt.func @k(%pmax: tensor<1x8xf32>, %psum: tensor<1x8xf32>)
-              -> (tensor<8xf32>, tensor<8xf32>)
+              -> (tensor<1x8xf32>, tensor<1x8xf32>)
           {{
             %rowmax = tt.inter_tile_reduce
                         partials(%pmax : tensor<1x8xf32>)
                         axis = "out" mode = "all_reduce" combiner = "max"
                         {attrs}
-                        -> (tensor<8xf32>)
+                        -> (tensor<1x8xf32>)
             %rowsum = tt.inter_tile_reduce
                         partials(%psum : tensor<1x8xf32>)
                         axis = "out" mode = "all_reduce" combiner = "add"
                         {attrs}
-                        -> (tensor<8xf32>)
-            tt.return %rowmax, %rowsum : tensor<8xf32>, tensor<8xf32>
+                        -> (tensor<1x8xf32>)
+            tt.return %rowmax, %rowsum : tensor<1x8xf32>, tensor<1x8xf32>
           }}
         }}
         """)
@@ -805,14 +808,14 @@ class TestBroadcastDeferred(LowerInterTileTester):
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
-              tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+              tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
               {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "broadcast" combiner = ""
                        {attrs}
-                       -> (tensor<8xf32>)
-                tt.return %0 : tensor<8xf32>
+                       -> (tensor<1x8xf32>)
+                tt.return %0 : tensor<1x8xf32>
               }}
             }}
             """)
@@ -823,15 +826,15 @@ class TestBroadcastDeferred(LowerInterTileTester):
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
-              tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+              tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
               {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "reduce_scatter" combiner = "add"
                        scatter_dimension = 0
                        {attrs}
-                       -> (tensor<8xf32>)
-                tt.return %0 : tensor<8xf32>
+                       -> (tensor<1x8xf32>)
+                tt.return %0 : tensor<1x8xf32>
               }}
             }}
             """)
@@ -850,12 +853,12 @@ class TestValidation(LowerInterTileTester):
         with pytest.raises(RuntimeError):
             self.run("""
             module {
-              tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32> {
+              tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32> {
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "all_reduce" combiner = "add"
-                       -> (tensor<8xf32>)
-                tt.return %0 : tensor<8xf32>
+                       -> (tensor<1x8xf32>)
+                tt.return %0 : tensor<1x8xf32>
               }
             }
             """)
@@ -867,14 +870,14 @@ class TestValidation(LowerInterTileTester):
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
-              tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+              tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
               {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "all_reduce" combiner = "add"
                        {attrs}
-                       -> (tensor<8xf32>)
-                tt.return %0 : tensor<8xf32>
+                       -> (tensor<1x8xf32>)
+                tt.return %0 : tensor<1x8xf32>
               }}
             }}
             """)
@@ -886,14 +889,14 @@ class TestValidation(LowerInterTileTester):
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
-              tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+              tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
               {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "bad_mode" combiner = "add"
                        {attrs}
-                       -> (tensor<8xf32>)
-                tt.return %0 : tensor<8xf32>
+                       -> (tensor<1x8xf32>)
+                tt.return %0 : tensor<1x8xf32>
               }}
             }}
             """)
@@ -905,14 +908,14 @@ class TestValidation(LowerInterTileTester):
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
-              tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+              tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
               {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "all_reduce" combiner = ""
                        {attrs}
-                       -> (tensor<8xf32>)
-                tt.return %0 : tensor<8xf32>
+                       -> (tensor<1x8xf32>)
+                tt.return %0 : tensor<1x8xf32>
               }}
             }}
             """)
@@ -924,15 +927,15 @@ class TestValidation(LowerInterTileTester):
         with pytest.raises(RuntimeError):
             self.run(f"""
             module {{
-              tt.func @k(%p: tensor<1x8xf32>) -> tensor<8xf32>
+              tt.func @k(%p: tensor<1x8xf32>) -> tensor<1x8xf32>
               {{
                 %0 = tt.inter_tile_reduce
                        partials(%p : tensor<1x8xf32>)
                        axis = "x" mode = "all_reduce" combiner = "add"
                        scatter_dimension = 0
                        {attrs}
-                       -> (tensor<8xf32>)
-                tt.return %0 : tensor<8xf32>
+                       -> (tensor<1x8xf32>)
+                tt.return %0 : tensor<1x8xf32>
               }}
             }}
             """)

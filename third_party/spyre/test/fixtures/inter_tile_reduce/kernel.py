@@ -57,20 +57,19 @@ def inter_tile_add_kernel(
     offset_m = pid_m * BLOCK_M
     offset_n = pid_n * BLOCK_N
     # Each tile loads its column-block; shape = tensor<BLOCK_M x BLOCK_N x f32>.
-    # The partial must have a unit leading dimension for the inter_tile_reduce
-    # verifier (result rank = partial rank - 1).
-    partial_2d = x_desc.load([offset_m, offset_n])  # tensor<BLOCK_M x BLOCK_N x f32>
-    partial = tl.reshape(partial_2d, [1, BLOCK_M, BLOCK_N])  # unit leading dim
+    partial = x_desc.load([offset_m, offset_n])
 
     # Cross-tile reduction: all tiles in the same row group (same pid_m)
     # cooperate.  WORK_SLICES carries the W/C metadata for the pass.
+    # Result shape == partial shape (grouping is via affine sets, not a
+    # tensor axis).
     result = tl.inter_tile(
         partial,
         axis="n",
         combiner="add",
         mode="all_reduce",
         work_slices=WORK_SLICES,
-    )  # tensor<BLOCK_M x BLOCK_N x f32> (unit dim collapsed by the pass)
+    )
 
     out_desc.store([offset_m, offset_n], result)
 
@@ -99,8 +98,7 @@ def inter_tile_add_kernel_f16(
 
     offset_m = pid_m * BLOCK_M
     offset_n = pid_n * BLOCK_N
-    partial_2d = x_desc.load([offset_m, offset_n])  # tensor<BLOCK_M x BLOCK_N x f16>
-    partial = tl.reshape(partial_2d, [1, BLOCK_M, BLOCK_N])
+    partial = x_desc.load([offset_m, offset_n])  # tensor<BLOCK_M x BLOCK_N x f16>
 
     result = tl.inter_tile(
         partial,
@@ -171,10 +169,9 @@ def matmul_splitk_kernel(
         b_tile = b_desc.load([k * BLOCK_K, 0])
         acc = tl.dot(a_tile, b_tile, acc)
 
-    partial = tl.reshape(acc, [1, BLOCK_M, BLOCK_N])
-
+    # Result shape == partial shape (BLOCK_M x BLOCK_N).
     result = tl.inter_tile(
-        partial,
+        acc,
         axis="in",
         combiner="add",
         mode="reduce_to_one",
@@ -204,8 +201,8 @@ def softmax_inter_tile(
       pid_mb  — selects the BLOCK_COLS column-block within the row-group
 
     axis="mb": tiles that differ only on "mb" (column-blocks) but share the same "out"
-    row-group cooperate (16-core mb-cohort). The partial passed to tl.inter_tile has
-    a unit leading dim [1, BLOCK_ROWS] which LowerInterTile collapses to [BLOCK_ROWS].
+    row-group cooperate (16-core mb-cohort). The partial passed to tl.inter_tile is
+    a rank-1 tensor [BLOCK_ROWS]; the reduction preserves that shape.
 
     Coordinates are recovered from WORK_SLICES via tl.wk_slice_coord rather than
     the manual pid // / pid % radix (spec E4).
@@ -232,10 +229,9 @@ def softmax_inter_tile(
     x = in_desc.load([row0, col0])
     x_f32 = x.to(tl.float32)
 
-    local_max = tl.max(x_f32, axis=1)
-    partial_max = tl.reshape(local_max, [1, BLOCK_ROWS])
+    local_max = tl.max(x_f32, axis=1)  # tensor<BLOCK_ROWSxf32>
     rowmax = tl.inter_tile(
-        partial_max,
+        local_max,
         axis="mb",
         combiner="max",
         mode="all_reduce",
@@ -245,10 +241,9 @@ def softmax_inter_tile(
     x_shifted = x_f32 - tl.reshape(rowmax, [BLOCK_ROWS, 1])
     exp_x = tl.exp(x_shifted)
 
-    local_sum = tl.sum(exp_x, axis=1)
-    partial_sum = tl.reshape(local_sum, [1, BLOCK_ROWS])
+    local_sum = tl.sum(exp_x, axis=1)  # tensor<BLOCK_ROWSxf32>
     rowsum = tl.inter_tile(
-        partial_sum,
+        local_sum,
         axis="mb",
         combiner="add",
         mode="all_reduce",

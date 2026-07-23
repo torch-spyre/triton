@@ -2031,15 +2031,12 @@ class TritonSemantic(Generic[TensorTy]):
         if not handles:
             return tl.tensor(None, tl.void)
 
-        # Result type: partial type with the first (unit) axis dropped.
-        def _result_type(partial):
-            shape = partial.type.shape  # e.g. [1, BLOCK_M, BLOCK_N]
-            return tl.block_type(partial.type.scalar, shape[1:])
-
+        # Result type == partial type. Grouping is expressed by the affine
+        # sets on the ktdp op, not by a tensor axis, so the tt op preserves
+        # every dim of the partial.
         if len(handles) == 1:
-            return tl.tensor(handles[0], _result_type(partials[0]))
-        return [tl.tensor(h, _result_type(p))
-                for h, p in zip(handles, partials)]
+            return tl.tensor(handles[0], partials[0].type)
+        return [tl.tensor(h, p.type) for h, p in zip(handles, partials)]
 
     def wk_slice_coord(self, work_slices, axis):
         """Return work_slices[program_id(0)][axis] as a runtime i32 scalar.

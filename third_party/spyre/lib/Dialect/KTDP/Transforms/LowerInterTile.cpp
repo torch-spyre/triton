@@ -414,7 +414,10 @@ struct LowerInterTilePass
 
     // --- fold-away: gsize == 1 → each tile is its own group ---
     if (gs.gsize == 1) {
-      // No cooperation needed — forward partials as results.
+      // No cooperation needed — forward partials as results. The tt op's
+      // result type equals its partial type (no rank reduction), so
+      // rewriting each downstream use of a tt result to the matching
+      // partial value is type-safe by construction.
       rewriter.setInsertionPoint(op);
       op.replaceAllUsesWith(partials);
       rewriter.eraseOp(op);
@@ -453,27 +456,10 @@ struct LowerInterTilePass
       ktdp::YieldPartialOp::create(rewriter, loc, partials);
     }
 
-    // --- build result types ---
-    // Result rank = partial rank - 1: drop the first unit dimension (the
-    // within-group tile axis). The ktdp.inter_tile_reduce verifier enforces
-    // this; we find the first dim with size 1 and remove it.
-    SmallVector<Type> resultTypes;
-    for (auto pTy : partialTypes) {
-      auto ranked = cast<RankedTensorType>(pTy);
-      ArrayRef<int64_t> shape = ranked.getShape();
-      int unitAxis = -1;
-      for (int i = 0; i < (int)shape.size(); ++i) {
-        if (shape[i] == 1) { unitAxis = i; break; }
-      }
-      if (unitAxis < 0) {
-        return op.emitError(
-            "partial tensor has no unit dimension to collapse");
-      }
-      SmallVector<int64_t> resShape(shape.begin(), shape.end());
-      resShape.erase(resShape.begin() + unitAxis);
-      resultTypes.push_back(
-          RankedTensorType::get(resShape, ranked.getElementType()));
-    }
+    // Result types == partial types. The ktdp.inter_tile_reduce verifier
+    // enforces this equality; grouping is expressed by the affine sets,
+    // not by a tensor axis, so no dim is collapsed here.
+    SmallVector<Type> resultTypes(partialTypes.begin(), partialTypes.end());
 
     // --- build identity values ---
     SmallVector<Value> identityValues;

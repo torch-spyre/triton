@@ -1931,16 +1931,13 @@ void init_triton_ir(py::module &&m) {
           depWkSlices = DictionaryAttr::get(ctx, depAttrs);
         }
 
-        // --- result types: inferred from partials (same type, rank collapsed by pass) ---
+        // Result types == partial types. The ktdp.inter_tile_reduce op
+        // requires result_type == partial_type; the tt op mirrors that
+        // so the lowering can replace each use of a tt result with the
+        // corresponding partial value directly (no reshape needed).
         SmallVector<Type> resultTypes;
-        for (auto &p : partials) {
-          auto rTy = cast<RankedTensorType>(p.getType());
-          // Drop the leading unit dimension (the within-group tile axis).
-          SmallVector<int64_t> shape(rTy.getShape().begin() + 1,
-                                     rTy.getShape().end());
-          resultTypes.push_back(
-              RankedTensorType::get(shape, rTy.getElementType()));
-        }
+        for (auto &p : partials)
+          resultTypes.push_back(p.getType());
 
         // --- optional scatter_dimension ---
         IntegerAttr scatterDimAttr;
