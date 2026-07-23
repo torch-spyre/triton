@@ -323,6 +323,87 @@ class StructuralAssertions:
             type_substr in t for o in matches for t in o.result_types
         ), f"Op '{op_name}' has no result type containing '{type_substr}'"
 
+    def assert_tile_future_groups(self, op_name: str, *,
+                                  num_symbols: int = None, num_dims: int = None,
+                                  num_constraints: int = None, parent: str = None):
+        """Assert properties of the `groups` integer set carried by an inter-tile op's
+        associated `!ktdp.tile_future` type.
+
+        In PR-25 of ktir-mlir-frontend, the `groups` integer set moved off
+        `ktdp.inter_tile_produce` / `ktdp.inter_tile_reduce` as an op attribute
+        and became a type parameter of `!ktdp.tile_future<(...), groups = #set>`.
+        The set now lives on the produce op's result type (single tile_future
+        result) or the reduce op's operand 0 type (its future input). This
+        helper looks in the correct place based on *op_name*.
+
+        Parameters
+        ----------
+        op_name          : `"ktdp.inter_tile_produce"` or `"ktdp.inter_tile_reduce"`
+        num_symbols, num_dims, num_constraints
+                         : same semantics as :meth:`assert_integer_set` —
+                           parsed from the affine_set text.
+        parent           : optional parent op filter (see :meth:`_find`).
+        """
+        matches = self._find(op_name, parent)
+        assert matches, f"Op '{op_name}' not found in KTIR"
+
+        if op_name == "ktdp.inter_tile_produce":
+            # groups lives in the op's single result type (a tile_future).
+            def _type_str(op):
+                if op._op.get_num_results() == 0:
+                    return None
+                return str(op._op.get_result(0).get_type())
+        elif op_name == "ktdp.inter_tile_reduce":
+            # groups lives in the type of operand 0 (the future).
+            def _type_str(op):
+                if op._op.get_num_operands() == 0:
+                    return None
+                return str(op._op.get_operand(0).get_type())
+        else:
+            raise ValueError(
+                f"assert_tile_future_groups: expected 'ktdp.inter_tile_produce' "
+                f"or 'ktdp.inter_tile_reduce', got '{op_name}'"
+            )
+
+        def _parse(op):
+            ty = _type_str(op)
+            if ty is None or "tile_future" not in ty:
+                return None
+            # Match: groups = affine_set<(d1, d2)[s1, s2] : (c1, c2, c3)>
+            m = re.search(
+                r"groups\s*=\s*affine_set<\s*\(([^)]*)\)\s*(?:\[([^\]]*)\])?\s*:\s*\(([^)]*)\)\s*>",
+                ty,
+            )
+            if not m:
+                return None
+            dims_txt, syms_txt, cons_txt = m.group(1), m.group(2) or "", m.group(3)
+            dims = len(dims_txt.split(",")) if dims_txt.strip() else 0
+            syms = len(syms_txt.split(",")) if syms_txt.strip() else 0
+            cons = len(cons_txt.split(",")) if cons_txt.strip() else 0
+            return {"dims": dims, "syms": syms, "cons": cons}
+
+        parsed = [p for p in (_parse(o) for o in matches) if p is not None]
+        assert parsed, (
+            f"Op '{op_name}' has no !ktdp.tile_future<..., groups = ...> "
+            f"in its associated type (looked at "
+            f"{'result 0' if op_name == 'ktdp.inter_tile_produce' else 'operand 0'})"
+        )
+
+        def _matches(p):
+            if num_symbols is not None and p["syms"] != num_symbols:
+                return False
+            if num_dims is not None and p["dims"] != num_dims:
+                return False
+            if num_constraints is not None and p["cons"] != num_constraints:
+                return False
+            return True
+
+        assert any(_matches(p) for p in parsed), (
+            f"Op '{op_name}' tile_future groups: no match for "
+            f"num_symbols={num_symbols}, num_dims={num_dims}, "
+            f"num_constraints={num_constraints}; got {parsed}"
+        )
+
     def assert_has_region(self, op_name: str, parent: str = None):
         """Assert at least one matching op owns at least one region."""
         matches = self._find(op_name, parent)

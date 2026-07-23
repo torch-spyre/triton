@@ -280,9 +280,10 @@ class TestGroupSets(LowerInterTileTester):
         # producer_tiles_per_group: 1 dim (i), 1 symbol (g), 2 constraints (≥/≤)
         self.assert_integer_set("ktdp.inter_tile_produce", "producer_tiles_per_group",
                                 num_dims=1, num_symbols=1, num_constraints=2)
-        # groups: 1 dim (g), 0 symbols, 2 constraints (g >= 0, ngroups-1-g >= 0)
-        self.assert_integer_set("ktdp.inter_tile_produce", "groups",
-                                num_dims=1, num_symbols=0, num_constraints=2)
+        # groups: 1 dim (g), 0 symbols, 2 constraints (g >= 0, ngroups-1-g >= 0).
+        # Post PR-25, `groups` lives on the !ktdp.tile_future type, not on the op.
+        self.assert_tile_future_groups("ktdp.inter_tile_produce",
+                                       num_dims=1, num_symbols=0, num_constraints=2)
 
     def test_multi_group_partition(self):
         """Multi-group case: 2 groups × 2 tiles; verify affine set shapes.
@@ -308,11 +309,14 @@ class TestGroupSets(LowerInterTileTester):
         """)
         self.assert_integer_set("ktdp.inter_tile_produce", "producer_tiles_per_group",
                                 num_dims=1, num_symbols=1, num_constraints=2)
-        self.assert_integer_set("ktdp.inter_tile_produce", "groups",
-                                num_dims=1, num_symbols=0, num_constraints=2)
-        # The reduce op also carries consumer_tiles_per_group and groups.
+        # Post PR-25: groups lives on the tile_future type, not on the op.
+        self.assert_tile_future_groups("ktdp.inter_tile_produce",
+                                       num_dims=1, num_symbols=0, num_constraints=2)
+        # The reduce op still carries consumer_tiles_per_group; groups is
+        # inferred from its !tile_future operand type.
         self.assert_affine_attr("ktdp.inter_tile_reduce", "consumer_tiles_per_group")
-        self.assert_affine_attr("ktdp.inter_tile_reduce", "groups")
+        self.assert_tile_future_groups("ktdp.inter_tile_reduce",
+                                       num_dims=1, num_symbols=0, num_constraints=2)
 
 
 # ---------------------------------------------------------------------------
@@ -672,8 +676,9 @@ class TestWorkSlices(LowerInterTileTester):
         self.assert_present("ktdp.inter_tile_produce", "ktdp.inter_tile_reduce")
         self.assert_integer_set("ktdp.inter_tile_produce", "producer_tiles_per_group",
                                 num_dims=1, num_symbols=1, num_constraints=2)
-        self.assert_integer_set("ktdp.inter_tile_produce", "groups",
-                                num_dims=1, num_symbols=0, num_constraints=2)
+        # Post PR-25: groups is a type parameter of !ktdp.tile_future.
+        self.assert_tile_future_groups("ktdp.inter_tile_produce",
+                                       num_dims=1, num_symbols=0, num_constraints=2)
 
     def test_single_axis_work_slices(self):
         """Single-axis work_slices: all tiles share value 0 → one group (gsize = W[axis])."""
@@ -692,8 +697,9 @@ class TestWorkSlices(LowerInterTileTester):
         }}
         """)
         self.assert_present("ktdp.inter_tile_produce")
-        self.assert_integer_set("ktdp.inter_tile_produce", "groups",
-                                num_dims=1, num_symbols=0, num_constraints=2)
+        # Post PR-25: groups is a type parameter of !ktdp.tile_future.
+        self.assert_tile_future_groups("ktdp.inter_tile_produce",
+                                       num_dims=1, num_symbols=0, num_constraints=2)
 
 
 # ---------------------------------------------------------------------------

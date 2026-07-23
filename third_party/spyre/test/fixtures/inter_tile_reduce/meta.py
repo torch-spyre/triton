@@ -135,24 +135,27 @@ def _extra_checks_default(tester) -> None:
         "ktdp.inter_tile_produce", "producer_tiles_per_group",
         num_dims=1, num_symbols=1, num_constraints=2,
     )
-    # groups set: (g) with 0 dims, 0 symbols, 2 constraints (0<=g<=ngroups-1).
-    tester.assert_integer_set(
-        "ktdp.inter_tile_produce", "groups",
+    # groups set: (g) with 1 dim, 0 symbols, 2 constraints (0<=g<=ngroups-1).
+    # Post PR-25: groups lives on the !ktdp.tile_future type, not on the op.
+    tester.assert_tile_future_groups(
+        "ktdp.inter_tile_produce",
         num_dims=1, num_symbols=0, num_constraints=2,
     )
 
-    # Produce result type: tile_future carrying the 1×16×16 partial.
+    # Produce result type: tile_future carrying the 1×16×16 partial. PR-25 wraps
+    # the partial types in parens: !ktdp.tile_future<(tensor<...>), groups=...>.
     tester.assert_result_type(
-        "ktdp.inter_tile_produce", "ktdp.tile_future<tensor<1x16x16x",
+        "ktdp.inter_tile_produce", "ktdp.tile_future<(tensor<1x16x16x",
     )
 
-    # Reduce op: same affine-set shape for consumer_tiles_per_group / groups.
+    # Reduce op: still carries consumer_tiles_per_group; groups is inferred
+    # from its !tile_future operand type.
     tester.assert_integer_set(
         "ktdp.inter_tile_reduce", "consumer_tiles_per_group",
         num_dims=1, num_symbols=1, num_constraints=2,
     )
-    tester.assert_integer_set(
-        "ktdp.inter_tile_reduce", "groups",
+    tester.assert_tile_future_groups(
+        "ktdp.inter_tile_reduce",
         num_dims=1, num_symbols=0, num_constraints=2,
     )
 
@@ -309,20 +312,21 @@ def _extra_checks_splitk(tester) -> None:
         "ktdp.inter_tile_produce", "producer_tiles_per_group",
         num_dims=1, num_symbols=1, num_constraints=2,
     )
-    tester.assert_integer_set(
-        "ktdp.inter_tile_produce", "groups",
+    # Post PR-25: groups lives on the !ktdp.tile_future type.
+    tester.assert_tile_future_groups(
+        "ktdp.inter_tile_produce",
         num_dims=1, num_symbols=0, num_constraints=2,
     )
     tester.assert_result_type(
-        "ktdp.inter_tile_produce", "ktdp.tile_future<tensor<1x16x16x",
+        "ktdp.inter_tile_produce", "ktdp.tile_future<(tensor<1x16x16x",
     )
     # reduce_to_one: single equality constraint — only pick₀ consumes
     tester.assert_integer_set(
         "ktdp.inter_tile_reduce", "consumer_tiles_per_group",
         num_dims=1, num_symbols=1, num_constraints=1,
     )
-    tester.assert_integer_set(
-        "ktdp.inter_tile_reduce", "groups",
+    tester.assert_tile_future_groups(
+        "ktdp.inter_tile_reduce",
         num_dims=1, num_symbols=0, num_constraints=2,
     )
     tester.assert_result_type("ktdp.inter_tile_reduce", "tensor<16x16x")
@@ -372,8 +376,9 @@ def _extra_checks_softmax(tester) -> None:
         "ktdp.inter_tile_reduce", "consumer_tiles_per_group",
         num_dims=1, num_symbols=1, num_constraints=2,
     )
-    tester.assert_integer_set(
-        "ktdp.inter_tile_reduce", "groups",
+    # Post PR-25: groups lives on the !ktdp.tile_future operand type.
+    tester.assert_tile_future_groups(
+        "ktdp.inter_tile_reduce",
         num_dims=1, num_symbols=0, num_constraints=2,
     )
     tester.assert_result_type("ktdp.inter_tile_reduce", "tensor<256x")

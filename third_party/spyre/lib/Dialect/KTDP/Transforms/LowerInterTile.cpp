@@ -433,13 +433,16 @@ struct LowerInterTilePass
     rewriter.setInsertionPoint(op);
 
     SmallVector<Type> partialTypes(partials.getTypes());
-    auto futureType = ktdp::TileFutureType::get(ctx, partialTypes);
+    SmallVector<RankedTensorType> rankedPartials;
+    rankedPartials.reserve(partialTypes.size());
+    for (Type pTy : partialTypes)
+      rankedPartials.push_back(cast<RankedTensorType>(pTy));
+    auto futureType = ktdp::TileFutureType::get(rankedPartials, gs.groups);
 
     auto produceOp = ktdp::InterTileProduceOp::create(
         rewriter, loc,
         futureType,
-        IntegerSetAttr::get(gs.producerTilesPerGroup),
-        IntegerSetAttr::get(gs.groups));
+        IntegerSetAttr::get(gs.producerTilesPerGroup));
 
     // Producer region: single block with %gid: index arg, yield_partial.
     Block *produceBlock = &produceOp.getBody().emplaceBlock();
@@ -495,7 +498,6 @@ struct LowerInterTilePass
         produceOp.getFuture(),
         identityValues,
         IntegerSetAttr::get(consumerSet),
-        IntegerSetAttr::get(gs.groups),
         /*producer_dependency_per_consumer=*/IntegerSetAttr{});
 
     // Remove the placeholder null dep attr (create with no dep).
