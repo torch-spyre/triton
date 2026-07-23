@@ -1499,21 +1499,17 @@ class TestBatchMatmul(RewriteLayoutTester):
         self.assert_present("linalg.batch_matmul")
         self.assert_present("scf.for")
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "T16: correct layout now produces 2 scf.for loops instead of 1. "
-        "Both A and B have K-floor loopDims; the fixpoint dispatches them "
-        "separately, each synthesizing its own K-stick loop. A single shared "
-        "loop requires deduplication of the stickFactor across plans."
-    ))
     def test_batch_matmul_both_stick_k_single_loop(self):
-        # T16: both operands share the same K-stick reduction loop.
-        # There must be exactly one scf.for (not two separate loops).
+        # T16: both A and B stick-on-K with 2 K-sticks each.
+        # Phase 1 rescales the outer K-tile loop; Phase 2 emits an inner
+        # K-stick loop (stickFactor=2).  Total: 2 nested scf.for loops —
+        # the same pattern as T7 (matmul) and T15 (batch_matmul A-stick-K).
         self.run(self._kernel_t16())
         from utils import walk_module
         scf_fors = [o for o in walk_module(self.mod) if o.name == "scf.for"]
-        assert len(scf_fors) == 1, (
-            f"Expected exactly 1 scf.for (shared K-stick loop), "
-            f"got {len(scf_fors)}"
+        assert len(scf_fors) == 2, (
+            f"Expected 2 scf.for loops (Phase-1 rescaled outer + Phase-2 "
+            f"stick inner), got {len(scf_fors)}"
         )
 
 
