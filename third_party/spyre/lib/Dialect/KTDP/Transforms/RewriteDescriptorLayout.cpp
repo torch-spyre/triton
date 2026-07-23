@@ -283,12 +283,17 @@ struct RewriteDescriptorLayoutPass
   // Sink ops (store): data/tile rank mismatch with a marker → redirect data_tile.
   // Add new op types here; synthesizeContractions drives the loop generically.
   LogicalResult dispatchOne(Operation *op, bool &changed) {
-    // Shared predicate for all linalg source ops: true if any input rank
-    // exceeds logicalRank, meaning Phase 1 has physicalized at least one input.
-    auto sourceNeedsDispatch = [](linalg::LinalgOp op, unsigned logicalRank) {
-      return llvm::any_of(op.getDpsInputOperands(), [logicalRank](OpOperand *operand) {
+    // Shared predicate for all linalg source ops: true if any input operand
+    // is rank-increased (Phase 1 added a stick dim) AND traces back to a
+    // physicalized memory view with a layout marker.  The rank pre-check
+    // avoids re-dispatching canonical (already-lowered) ops whose inputs
+    // happen to trace back through the same physical load.
+    auto sourceNeedsDispatch = [&](linalg::LinalgOp op, unsigned logicalRank) {
+      return llvm::any_of(op.getDpsInputOperands(), [&](OpOperand *operand) {
         auto t = dyn_cast<RankedTensorType>(operand->get().getType());
-        return t && t.getRank() > (int)logicalRank;
+        if (!t || t.getRank() <= (int)logicalRank)
+          return false;
+        return static_cast<bool>(findMarkerForOperand(operand->get()));
       });
     };
 
@@ -299,10 +304,16 @@ struct RewriteDescriptorLayoutPass
       return sourceNeedsDispatch(bmm, 3) ? (changed = true, dispatchBatchMatmul(bmm)) : success();
 
     if (auto rd = dyn_cast<linalg::ReduceOp>(op)) {
-      // Reduce logical input rank = output rank + num reduction dims.
-      // Only dispatch if input rank exceeds that (Phase 1 added a stick dim).
-      auto initTy = cast<RankedTensorType>(rd.getDpsInits()[0].getType());
-      unsigned logicalInputRank = initTy.getRank() + rd.getDimensions().size();
+      // Derive the logical input rank from the marker (phys_src max+1) so the
+      // rank pre-check in sourceNeedsDispatch is correct even when the init has
+      // already been physicalized by Phase 1.
+      auto rdMarker = findMarkerForOperand(rd.getInputs()[0]);
+      unsigned logicalInputRank = 2; // fallback: minimum plausible rank
+      if (rdMarker) {
+        for (int64_t src : rdMarker.getPhysSrc())
+          if ((unsigned)(src + 1) > logicalInputRank)
+            logicalInputRank = (unsigned)(src + 1);
+      }
       return sourceNeedsDispatch(rd, logicalInputRank)
                  ? (changed = true, dispatchReduce(rd))
                  : success();
@@ -356,18 +367,38 @@ struct RewriteDescriptorLayoutPass
     return tensorOps == 1;
   }
 
-  // Walk backward from `val` through single-tensor elementwise ops to the
-  // ktdp.load that produced it. Returns the load, or null if not found.
-  static mlir::ktdp::LoadOp walkToLoad(Value val) {
+  // Walk backward from `val` through single-tensor elementwise ops and
+  // linalg.transpose ops to the ktdp.load that produced it.
+  // Returns {load, accumulatedPermutation}. The permutation is nullopt if no
+  // transpose was encountered (identity), or the composed logical permutation
+  // of all traversed transposes. Returns {null, nullopt} if not found.
+  static std::pair<mlir::ktdp::LoadOp, std::optional<SmallVector<int64_t>>>
+  walkToLoad(Value val) {
     Value v = val;
+    std::optional<SmallVector<int64_t>> accumPerm;
     while (true) {
       auto *defOp = v.getDefiningOp();
       if (!defOp)
-        return {};
+        return {mlir::ktdp::LoadOp{}, std::nullopt};
       if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(defOp))
-        return ld;
+        return {ld, accumPerm};
+      // Step through linalg.transpose: follow data operand(0), accumulate perm.
+      if (auto tr = dyn_cast<linalg::TransposeOp>(defOp)) {
+        auto perm = SmallVector<int64_t>(tr.getPermutation());
+        if (!accumPerm.has_value()) {
+          accumPerm = perm;
+        } else {
+          // Compose: new[i] = old[perm[i]]
+          SmallVector<int64_t> composed(perm.size());
+          for (unsigned i = 0; i < perm.size(); ++i)
+            composed[i] = (*accumPerm)[perm[i]];
+          accumPerm = composed;
+        }
+        v = defOp->getOperand(0); // data input of transpose
+        continue;
+      }
       if (!isSingleTensorElementwiseOp(defOp))
-        return {};
+        return {mlir::ktdp::LoadOp{}, std::nullopt};
       for (auto operand : defOp->getOperands())
         if (isa<RankedTensorType>(operand.getType())) { v = operand; break; }
     }
@@ -377,7 +408,7 @@ struct RewriteDescriptorLayoutPass
   // ktdp.load, then look up the physical memView -> marker map populated
   // during Phase 1.
   triton::SpyreTensorLayoutOp findMarkerForOperand(Value operand) {
-    auto ld = walkToLoad(operand);
+    auto [ld, perm] = walkToLoad(operand);
     if (!ld)
       return {};
     auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
@@ -669,7 +700,7 @@ struct RewriteDescriptorLayoutPass
 
     for (unsigned i = 0; i < nOps; ++i) {
       Value operand = op.getInputs()[i];
-      auto ld = walkToLoad(operand);
+      auto [ld, transposePerm] = walkToLoad(operand);
 
       if (ld) {
         // Physical operand: load found — must have a marker.
@@ -680,8 +711,22 @@ struct RewriteDescriptorLayoutPass
         auto physShape = cast<RankedTensorType>(operand.getType()).getShape();
         OperandCoords coords = OperandCoords::fromMarker(marker, spec.logicalRank,
                                                          physShape);
+        // If a linalg.transpose sits between the load and this op, its perm τ
+        // reorders the logical axes.  Compose τ into canonicalAxes so that
+        // buildDimRoles sees the correct role for each physical opTileDim:
+        //   newCanonicalAxes[i] = originalCanonicalAxes[τ[i]]
+        SmallVector<int64_t> effectiveCanonicalAxes = spec.operands[i].canonicalAxes;
+        if (transposePerm.has_value()) {
+          const auto &tau = *transposePerm;
+          assert(tau.size() == effectiveCanonicalAxes.size() &&
+                 "transpose perm size must match canonicalAxes size");
+          SmallVector<int64_t> reordered(effectiveCanonicalAxes.size());
+          for (unsigned j = 0; j < tau.size(); ++j)
+            reordered[j] = effectiveCanonicalAxes[tau[j]];
+          effectiveCanonicalAxes = std::move(reordered);
+        }
         SmallVector<int64_t> dimRoles;
-        buildDimRoles(coords, spec.operands[i].canonicalAxes, dimRoles);
+        buildDimRoles(coords, effectiveCanonicalAxes, dimRoles);
         plans[i] = classify(operand, coords, dimRoles);
       } else {
         // No load found → scratchpad: a logical value flowing in from elsewhere
@@ -917,18 +962,44 @@ struct RewriteDescriptorLayoutPass
     return dispatchSource(bmm, spec);
   }
 
-  // linalg.reduce instantiation:
-  //   input=(m,n): dim0=M (parallel, output axis 0), dim1=N (reduction).
-  //   Reduction axis = 1 in the logical 2D input tile.
+  // linalg.reduce instantiation: generalized to any rank and any combiner.
+  //   canonicalAxes maps each logical input dim to an output axis (or -1 for
+  //   reduction dims).  After computeTransposePerm the slice has parallel dims
+  //   first (0..outputRank-1) and reduction dims last (outputRank..sliceRank-1).
   LogicalResult dispatchReduce(linalg::ReduceOp rd) {
+    // Derive logicalRank from the input operand's marker (phys_src encodes
+    // which logical dim each physical dim derives from; logical rank =
+    // max(phys_src) + 1).  The DPS init may already be physicalized by Phase 1
+    // so its rank is the physical output rank, not the logical output rank.
+    auto marker = findMarkerForOperand(rd.getInputs()[0]);
+    if (!marker)
+      return rd.emitError(
+          "spyre_tensor_layout: dispatchReduce called but no marker on input");
+    unsigned logicalRank = 0;
+    for (int64_t src : marker.getPhysSrc())
+      if ((unsigned)(src + 1) > logicalRank)
+        logicalRank = (unsigned)(src + 1);
+    auto reductionDims = rd.getDimensions();
+    unsigned outputRank = logicalRank - (unsigned)reductionDims.size();
+
+    // canonicalAxes: non-reduction dims get consecutive output axes; reduction → -1
+    SmallVector<int64_t> canonicalAxes(logicalRank, -1);
+    unsigned outAxis = 0;
+    for (unsigned d = 0; d < logicalRank; ++d)
+      if (!llvm::is_contained(reductionDims, (int64_t)d))
+        canonicalAxes[d] = outAxis++;
+
     SourceOpSpec spec;
-    spec.operands = {SourceOperandSpec{{0, -1}}};  // input=(m,n): M parallel, N reduction
-    spec.logicalRank = 2;
-    spec.emitOp = [](OpBuilder &b, Location loc,
-                     ArrayRef<Value> slices, Value acc,
-                     RankedTensorType accTy) -> Value {
-      // slices[0] is a 2D [M, stickSize] tile; reduce over dim 1 → [M].
-      SmallVector<int64_t> dims = {1};
+    spec.operands = {SourceOperandSpec{canonicalAxes}};
+    spec.logicalRank = logicalRank;
+    spec.emitOp = [outputRank](OpBuilder &b, Location loc,
+                               ArrayRef<Value> slices, Value acc,
+                               RankedTensorType accTy) -> Value {
+      auto sliceTy = cast<RankedTensorType>(slices[0].getType());
+      SmallVector<int64_t> dims;
+      for (unsigned d = outputRank; d < (unsigned)sliceTy.getRank(); ++d)
+        dims.push_back((int64_t)d);
+      // TODO(S2): clone combiner region from original op — hardcoded addf for now
       return linalg::ReduceOp::create(
           b, loc, ValueRange{slices[0]}, ValueRange{acc}, dims,
           [&](OpBuilder &inner, Location iloc, ValueRange args) {
@@ -1142,41 +1213,23 @@ struct RewriteDescriptorLayoutPass
     // ascending physical order and recording the logical dim they map to. The
     // order of first appearance of each logical dim gives the target position.
     unsigned logRank = dPlan.coords.logicalRank;
-    SmallVector<int64_t> sinkPerm; // logDim → position in transposed tile
+    // Compute sinkPerm as invertPerm(computeTransposePerm(opTileDims, dimRoles, iota(logRank))).
+    // computeTransposePerm maps physical opTileDim order → canonical (ascending logical-dim)
+    // order. Its inverse maps canonical → physical appearance order, which is what the sink
+    // needs: source applies π (physical→canonical), sink applies π^-1 (canonical→physical).
+    SmallVector<int64_t> sinkPerm;
     {
-      // Collect (physDimIdx, logDim) for opTile dims ONLY, sorted by physIdx.
-      // Floor dims are excluded because their logical dim is already represented
-      // by the lane dim (which is in opTileDims). The transpose must align the
-      // logical tile so that after stick-extraction along the floor's logical dim,
-      // the resulting slice matches the physical non-floor layout (the lane
-      // position, not the floor position, determines where that logical dim sits).
-      SmallVector<std::pair<int, int64_t>> physOrder;
-      for (int p : dPlan.opTileDims)
-        physOrder.push_back({p, dPlan.dimRoles[p]});
-      llvm::sort(physOrder, [](auto &a, auto &b) { return a.first < b.first; });
-
-      // Deduplicate logical dims (keep first appearance = physical order).
-      SmallVector<int64_t> orderedLogDims;
-      SmallVector<bool> seen(logRank, false);
-      for (auto &[_, ld] : physOrder) {
-        if (ld >= 0 && (unsigned)ld < logRank && !seen[ld]) {
-          orderedLogDims.push_back(ld);
-          seen[ld] = true;
-        }
-      }
-
-      // Build perm: logDim d goes to position pos where orderedLogDims[pos] == d.
-      // perm[d] = pos means "logical dim d goes to output position pos".
-      if (orderedLogDims.size() == logRank) {
-        SmallVector<int64_t> perm(logRank);
-        for (unsigned pos = 0; pos < logRank; ++pos)
-          perm[orderedLogDims[pos]] = (int64_t)pos;
-        // Check if identity.
+      SmallVector<int64_t> canonicalAxesD(logRank);
+      std::iota(canonicalAxesD.begin(), canonicalAxesD.end(), 0);
+      auto fwdPerm = computeTransposePerm(dPlan.opTileDims, dPlan.dimRoles,
+                                          canonicalAxesD);
+      if (!fwdPerm.empty()) {
+        auto inv = invertPerm(fwdPerm);
         bool isIdentity = true;
         for (unsigned d = 0; d < logRank; ++d)
-          if (perm[d] != (int64_t)d) { isIdentity = false; break; }
+          if (inv[d] != (int64_t)d) { isIdentity = false; break; }
         if (!isIdentity)
-          sinkPerm = std::move(perm);
+          sinkPerm = std::move(inv);
       }
     }
 
@@ -1984,6 +2037,8 @@ struct RewriteDescriptorLayoutPass
       if (op->getNumResults() != 1)
         continue;
       if (isContractionOp(op))
+        continue;
+      if (isa<linalg::TransposeOp>(op))
         continue;
       auto resTy  = dyn_cast<RankedTensorType>(op->getResult(0).getType());
       auto opndTy = op->getNumOperands() > 0
