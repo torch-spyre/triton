@@ -1870,18 +1870,6 @@ class TestTransposeThenMatmul(RewriteLayoutTester):
         }}
         """
 
-    @pytest.mark.xfail(
-        reason=(
-            "S4 incomplete: dispatchSource uses operand.getType() for physShape "
-            "when a linalg.transpose sits between the load and the matmul.  "
-            "Because retypeChain stops at the transpose, operand.getType() is "
-            "the logical (rank-2) type, but phys_src has size 3, causing an "
-            "ArrayRef OOB assert in buildDimRoles.  Fix: use ld.getResult() "
-            "type (the physical load type) for physShape when transposePerm "
-            "is set, not operand.getType()."
-        ),
-        strict=True,
-    )
     def test_transpose_then_matmul_dispatches(self):
         # S4/T18: the pass composes tau into canonicalAxes and dispatches the
         # matmul successfully.  No marker remains; linalg.matmul is present;

@@ -228,6 +228,12 @@ struct RewriteDescriptorLayoutPass
   // muli multipliers; subsequent descriptors on the same loop must skip.
   DenseSet<scf::ForOp> rescaledLoops;
 
+  // Maps a physical ktdp.load result → the logical permutation τ of a
+  // linalg.transpose that was erased in Phase 1.  Populated by retypeChain
+  // when it short-circuits a transpose.  Read by dispatchSource to compose
+  // τ into canonicalAxes before buildDimRoles.
+  llvm::DenseMap<mlir::Value, SmallVector<int64_t>> physicalLoadToTransposePerm;
+
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -367,38 +373,20 @@ struct RewriteDescriptorLayoutPass
     return tensorOps == 1;
   }
 
-  // Walk backward from `val` through single-tensor elementwise ops and
-  // linalg.transpose ops to the ktdp.load that produced it.
-  // Returns {load, accumulatedPermutation}. The permutation is nullopt if no
-  // transpose was encountered (identity), or the composed logical permutation
-  // of all traversed transposes. Returns {null, nullopt} if not found.
-  static std::pair<mlir::ktdp::LoadOp, std::optional<SmallVector<int64_t>>>
-  walkToLoad(Value val) {
+  // Walk backward from `val` through single-tensor elementwise ops to the
+  // ktdp.load that produced it.  Returns null if not found.
+  // Note: linalg.transpose ops are erased by retypeChain in Phase 1, so they
+  // will not appear in the chain during Phase 2.
+  static mlir::ktdp::LoadOp walkToLoad(Value val) {
     Value v = val;
-    std::optional<SmallVector<int64_t>> accumPerm;
     while (true) {
       auto *defOp = v.getDefiningOp();
       if (!defOp)
-        return {mlir::ktdp::LoadOp{}, std::nullopt};
+        return mlir::ktdp::LoadOp{};
       if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(defOp))
-        return {ld, accumPerm};
-      // Step through linalg.transpose: follow data operand(0), accumulate perm.
-      if (auto tr = dyn_cast<linalg::TransposeOp>(defOp)) {
-        auto perm = SmallVector<int64_t>(tr.getPermutation());
-        if (!accumPerm.has_value()) {
-          accumPerm = perm;
-        } else {
-          // Compose: new[i] = old[perm[i]]
-          SmallVector<int64_t> composed(perm.size());
-          for (unsigned i = 0; i < perm.size(); ++i)
-            composed[i] = (*accumPerm)[perm[i]];
-          accumPerm = composed;
-        }
-        v = defOp->getOperand(0); // data input of transpose
-        continue;
-      }
+        return ld;
       if (!isSingleTensorElementwiseOp(defOp))
-        return {mlir::ktdp::LoadOp{}, std::nullopt};
+        return mlir::ktdp::LoadOp{};
       for (auto operand : defOp->getOperands())
         if (isa<RankedTensorType>(operand.getType())) { v = operand; break; }
     }
@@ -408,7 +396,7 @@ struct RewriteDescriptorLayoutPass
   // ktdp.load, then look up the physical memView -> marker map populated
   // during Phase 1.
   triton::SpyreTensorLayoutOp findMarkerForOperand(Value operand) {
-    auto [ld, perm] = walkToLoad(operand);
+    auto ld = walkToLoad(operand);
     if (!ld)
       return {};
     auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
@@ -700,7 +688,7 @@ struct RewriteDescriptorLayoutPass
 
     for (unsigned i = 0; i < nOps; ++i) {
       Value operand = op.getInputs()[i];
-      auto [ld, transposePerm] = walkToLoad(operand);
+      auto ld = walkToLoad(operand);
 
       if (ld) {
         // Physical operand: load found — must have a marker.
@@ -708,28 +696,29 @@ struct RewriteDescriptorLayoutPass
         if (!marker)
           return op.emitError(
               "spyre_tensor_layout: physical operand load has no layout marker");
-        // When a linalg.transpose sits between the load and this op, retypeChain
-        // leaves the transpose result at logical rank — use the physical load's
-        // type to get the correct physical shape for OperandCoords.
-        auto physShape = cast<RankedTensorType>(
-            transposePerm.has_value() ? ld.getResult().getType()
-                                      : operand.getType())
-            .getShape();
+        // Since the linalg.transpose was erased by retypeChain in Phase 1 and
+        // its result RAUW'd with the physical load, operand.getType() is already
+        // the physical type here.
+        auto physShape = cast<RankedTensorType>(operand.getType()).getShape();
         OperandCoords coords = OperandCoords::fromMarker(marker, spec.logicalRank,
                                                          physShape);
-        // If a linalg.transpose sits between the load and this op, its perm τ
-        // reorders the logical axes.  Compose τ into canonicalAxes so that
-        // buildDimRoles sees the correct role for each physical opTileDim:
+        // If a linalg.transpose was erased in Phase 1 for this physical load,
+        // its permutation τ was recorded in physicalLoadToTransposePerm.
+        // Compose τ into canonicalAxes so that buildDimRoles sees the correct
+        // role for each physical opTileDim:
         //   newCanonicalAxes[i] = originalCanonicalAxes[τ[i]]
         SmallVector<int64_t> effectiveCanonicalAxes = spec.operands[i].canonicalAxes;
-        if (transposePerm.has_value()) {
-          const auto &tau = *transposePerm;
-          assert(tau.size() == effectiveCanonicalAxes.size() &&
-                 "transpose perm size must match canonicalAxes size");
-          SmallVector<int64_t> reordered(effectiveCanonicalAxes.size());
-          for (unsigned j = 0; j < tau.size(); ++j)
-            reordered[j] = effectiveCanonicalAxes[tau[j]];
-          effectiveCanonicalAxes = std::move(reordered);
+        {
+          auto it = physicalLoadToTransposePerm.find(ld.getResult());
+          if (it != physicalLoadToTransposePerm.end()) {
+            const auto &tau = it->second;
+            assert(tau.size() == effectiveCanonicalAxes.size() &&
+                   "transpose perm size must match canonicalAxes size");
+            SmallVector<int64_t> reordered(effectiveCanonicalAxes.size());
+            for (unsigned j = 0; j < tau.size(); ++j)
+              reordered[j] = effectiveCanonicalAxes[tau[j]];
+            effectiveCanonicalAxes = std::move(reordered);
+          }
         }
         SmallVector<int64_t> dimRoles;
         buildDimRoles(coords, effectiveCanonicalAxes, dimRoles);
@@ -2065,16 +2054,14 @@ struct RewriteDescriptorLayoutPass
   // Forward-retype the elementwise op chain: replace oldVal with newVal
   // everywhere and update result types of single-result ops that still carry
   // the old (logical-rank) type. Stops at contraction ops.
+  // When a linalg.transpose is encountered: record its permutation in
+  // physicalLoadToTransposePerm (keyed by newVal, the physical load result),
+  // RAUW the transpose result with its input (short-circuit), erase the
+  // transpose, and continue into its former consumers.
   void retypeChain(Value oldVal, Value newVal) {
-    // Replace uses selectively: skip linalg.TransposeOp operands so the
-    // transpose stays entirely at logical rank.  Phase 2 (walkToLoad) traces
-    // through transposes to find the physical load — the transpose does not
-    // need to be updated here.  Unconditional replaceAllUsesWith would leave
-    // the transpose with a physical input but logical init/result, which the
-    // MLIR verifier rejects.
-    for (OpOperand &use : llvm::make_early_inc_range(oldVal.getUses()))
-      if (!isa<linalg::TransposeOp>(use.getOwner()))
-        use.set(newVal);
+    // newVal is always the physical load result (constant throughout this call).
+    Value physLoadResult = newVal;
+    oldVal.replaceAllUsesWith(newVal);
     SmallVector<Operation *> worklist(newVal.getUsers().begin(),
                                       newVal.getUsers().end());
     while (!worklist.empty()) {
@@ -2083,8 +2070,20 @@ struct RewriteDescriptorLayoutPass
         continue;
       if (isContractionOp(op))
         continue;
-      if (isa<linalg::TransposeOp>(op))
+      if (auto tr = dyn_cast<linalg::TransposeOp>(op)) {
+        auto perm = SmallVector<int64_t>(tr.getPermutation());
+        // Record against the physical load result so dispatchSource can look
+        // up by ld.getResult().
+        physicalLoadToTransposePerm[physLoadResult] = perm;
+        // Short-circuit: replace transpose result with its input operand.
+        Value physInput = tr.getInput(); // operand(0), now equals newVal (or an
+                                         // intermediate after elementwise chain)
+        tr.getResult()[0].replaceAllUsesWith(physInput);
+        // Add former consumers to worklist before erasing.
+        worklist.append(physInput.getUsers().begin(), physInput.getUsers().end());
+        tr.erase();
         continue;
+      }
       auto resTy  = dyn_cast<RankedTensorType>(op->getResult(0).getType());
       auto opndTy = op->getNumOperands() > 0
                         ? dyn_cast<RankedTensorType>(op->getOperand(0).getType())
