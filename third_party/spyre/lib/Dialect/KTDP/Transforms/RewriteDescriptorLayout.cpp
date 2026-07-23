@@ -708,7 +708,13 @@ struct RewriteDescriptorLayoutPass
         if (!marker)
           return op.emitError(
               "spyre_tensor_layout: physical operand load has no layout marker");
-        auto physShape = cast<RankedTensorType>(operand.getType()).getShape();
+        // When a linalg.transpose sits between the load and this op, retypeChain
+        // leaves the transpose result at logical rank — use the physical load's
+        // type to get the correct physical shape for OperandCoords.
+        auto physShape = cast<RankedTensorType>(
+            transposePerm.has_value() ? ld.getResult().getType()
+                                      : operand.getType())
+            .getShape();
         OperandCoords coords = OperandCoords::fromMarker(marker, spec.logicalRank,
                                                          physShape);
         // If a linalg.transpose sits between the load and this op, its perm τ
@@ -989,21 +995,42 @@ struct RewriteDescriptorLayoutPass
       if (!llvm::is_contained(reductionDims, (int64_t)d))
         canonicalAxes[d] = outAxis++;
 
-    // Named lambda so it outlives the dispatchSource call — function_ref is
-    // non-owning and would dangle if assigned from a temporary.
-    auto emitReduceOp = [outputRank](OpBuilder &b, Location loc,
-                                     ArrayRef<Value> slices, Value acc,
-                                     RankedTensorType accTy) -> Value {
+    // Snapshot combiner block contents before building the lambda — same
+    // pattern as LowerComputeOps lines 424-448.  The lambda is named so it
+    // outlives the dispatchSource call (function_ref is non-owning).
+    Block &combinerBlock = rd.getOperation()->getRegion(0).front();
+    SmallVector<Operation *> combinerOps;
+    for (Operation &op : combinerBlock.without_terminator())
+      combinerOps.push_back(&op);
+    auto combinerYield = cast<linalg::YieldOp>(combinerBlock.getTerminator());
+    SmallVector<Value> yieldVals(combinerYield.getValues().begin(),
+                                 combinerYield.getValues().end());
+    SmallVector<Value> origBlockArgs(combinerBlock.getArguments().begin(),
+                                     combinerBlock.getArguments().end());
+
+    auto emitReduceOp = [outputRank,
+                         combinerOps = std::move(combinerOps),
+                         yieldVals = std::move(yieldVals),
+                         origBlockArgs = std::move(origBlockArgs)](
+                            OpBuilder &b, Location loc,
+                            ArrayRef<Value> slices, Value acc,
+                            RankedTensorType accTy) -> Value {
       auto sliceTy = cast<RankedTensorType>(slices[0].getType());
       SmallVector<int64_t> dims;
       for (unsigned d = outputRank; d < (unsigned)sliceTy.getRank(); ++d)
         dims.push_back((int64_t)d);
-      // TODO(S2): clone combiner region from original op — hardcoded addf for now
       return linalg::ReduceOp::create(
           b, loc, ValueRange{slices[0]}, ValueRange{acc}, dims,
           [&](OpBuilder &inner, Location iloc, ValueRange args) {
-            Value sum = arith::AddFOp::create(inner, iloc, args[0], args[1]);
-            linalg::YieldOp::create(inner, iloc, sum);
+            IRMapping mapping;
+            for (unsigned i = 0; i < origBlockArgs.size(); ++i)
+              mapping.map(origBlockArgs[i], args[i]);
+            for (Operation *op : combinerOps)
+              inner.clone(*op, mapping);
+            SmallVector<Value> mapped;
+            for (Value v : yieldVals)
+              mapped.push_back(mapping.lookupOrDefault(v));
+            linalg::YieldOp::create(inner, iloc, mapped);
           }).getResult(0);
     };
     SourceOpSpec spec;
@@ -2039,7 +2066,15 @@ struct RewriteDescriptorLayoutPass
   // everywhere and update result types of single-result ops that still carry
   // the old (logical-rank) type. Stops at contraction ops.
   void retypeChain(Value oldVal, Value newVal) {
-    oldVal.replaceAllUsesWith(newVal);
+    // Replace uses selectively: skip linalg.TransposeOp operands so the
+    // transpose stays entirely at logical rank.  Phase 2 (walkToLoad) traces
+    // through transposes to find the physical load — the transpose does not
+    // need to be updated here.  Unconditional replaceAllUsesWith would leave
+    // the transpose with a physical input but logical init/result, which the
+    // MLIR verifier rejects.
+    for (OpOperand &use : llvm::make_early_inc_range(oldVal.getUses()))
+      if (!isa<linalg::TransposeOp>(use.getOwner()))
+        use.set(newVal);
     SmallVector<Operation *> worklist(newVal.getUsers().begin(),
                                       newVal.getUsers().end());
     while (!worklist.empty()) {

@@ -1605,8 +1605,6 @@ class TestReduceGeneralized(RewriteLayoutTester):
 
     A stick loop over N//64 = 4 N-sticks is synthesized by Phase 2.
 
-    Note: T19's "non-addf combiner" sub-test is xfail because combiner
-    cloning is not yet implemented (marked TODO(S2) in dispatchReduce).
     """
 
     # Rank-3 [B, M, N] stick-on-N with B=identity:
@@ -1686,15 +1684,9 @@ class TestReduceGeneralized(RewriteLayoutTester):
         # The block_shape <1x64x256xf16> spans all 4 N-sticks (256/64=4 per block).
         self.assert_result_type("ktdp.load", "1x4x64x64xf16")
 
-    @pytest.mark.xfail(strict=True,
-                       reason="combiner cloning not yet implemented — S2 TODO"
-                               " in dispatchReduce; hardcoded addf used instead")
     def test_reduce_3d_non_addf_combiner(self):
-        # T19/C8/Q13: a non-addf combiner (maxnumf) should be cloned from the
-        # original op into the synthesized inner linalg.reduce.  This is marked
-        # TODO(S2) in dispatchReduce — currently dispatchReduce hardcodes arith.addf
-        # regardless of the original combiner.  Once combiner cloning is implemented,
-        # delete this xfail and replace with a positive assertion.
+        # T19/C8/Q13: a non-addf combiner (maxnumf) is cloned from the original
+        # op into the synthesized inner linalg.reduce (combiner cloning, S2).
         self.run(self._kernel(combiner="maxnumf"))
         self.assert_present("arith.maxnumf")
 
