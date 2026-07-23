@@ -989,12 +989,11 @@ struct RewriteDescriptorLayoutPass
       if (!llvm::is_contained(reductionDims, (int64_t)d))
         canonicalAxes[d] = outAxis++;
 
-    SourceOpSpec spec;
-    spec.operands = {SourceOperandSpec{canonicalAxes}};
-    spec.logicalRank = logicalRank;
-    spec.emitOp = [outputRank](OpBuilder &b, Location loc,
-                               ArrayRef<Value> slices, Value acc,
-                               RankedTensorType accTy) -> Value {
+    // Named lambda so it outlives the dispatchSource call — function_ref is
+    // non-owning and would dangle if assigned from a temporary.
+    auto emitReduceOp = [outputRank](OpBuilder &b, Location loc,
+                                     ArrayRef<Value> slices, Value acc,
+                                     RankedTensorType accTy) -> Value {
       auto sliceTy = cast<RankedTensorType>(slices[0].getType());
       SmallVector<int64_t> dims;
       for (unsigned d = outputRank; d < (unsigned)sliceTy.getRank(); ++d)
@@ -1007,6 +1006,10 @@ struct RewriteDescriptorLayoutPass
             linalg::YieldOp::create(inner, iloc, sum);
           }).getResult(0);
     };
+    SourceOpSpec spec;
+    spec.operands = {SourceOperandSpec{canonicalAxes}};
+    spec.logicalRank = logicalRank;
+    spec.emitOp = emitReduceOp;
     return dispatchSource(rd, spec);
   }
 
@@ -2017,10 +2020,17 @@ struct RewriteDescriptorLayoutPass
     st.getAccessTileMutable().set(newTile);
   }
 
-  // True if the op is a contraction whose result shape is determined by its own
-  // semantics rather than being inherited from a single physical input.
-  // retypeChain stops here and does not propagate through.
+  // True if the op is a shape-constraining op whose result shape is NOT
+  // inherited from a single physical input — retypeChain must stop here so
+  // Phase 2 can handle the operands via dispatchSource.
+  //
+  // Note: isaContractionOpInterface covers linalg.matmul / linalg.batch_matmul
+  // but NOT linalg.reduce (reduce is not a contraction in the MLIR sense).
+  // linalg.reduce must be listed explicitly here; over-relying on
+  // isaContractionOpInterface is the root cause of the TestReduceStick bug.
   static bool isContractionOp(Operation *op) {
+    if (isa<linalg::ReduceOp>(op))
+      return true;
     auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
     return linalgOp && linalg::isaContractionOpInterface(linalgOp);
   }
