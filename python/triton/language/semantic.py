@@ -2031,9 +2031,7 @@ class TritonSemantic(Generic[TensorTy]):
         if not handles:
             return tl.tensor(None, tl.void)
 
-        # Result type == partial type. Grouping is expressed by the affine
-        # sets on the ktdp op, not by a tensor axis, so the tt op preserves
-        # every dim of the partial.
+        # Wrap each result handle as a tl.tensor with its partial's type.
         if len(handles) == 1:
             return tl.tensor(handles[0], partials[0].type)
         return [tl.tensor(h, p.type) for h, p in zip(handles, partials)]
