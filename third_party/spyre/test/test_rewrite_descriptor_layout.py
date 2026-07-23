@@ -31,31 +31,40 @@ from conftest import SinglePassTester
 from utils_pattern import pattern
 
 
+def layout_attr(dims):
+    """Translate a meta.py-style layout spec into a tt.spyre_tensor_layout attribute string.
+
+    Each entry in `dims` is either:
+      - int  : identity dim (logical dim index, phys_op=0, phys_arg=0)
+      - (int, "floordiv", S): floor-div dim (phys_op=1, phys_arg=S)
+      - (int, "mod",      S): mod dim       (phys_op=2, phys_arg=S)
+    """
+    _OP = {"identity": 0, "floordiv": 1, "mod": 2}
+    src, op, arg = [], [], []
+    for d in dims:
+        if isinstance(d, int):
+            src.append(d); op.append(0); arg.append(0)
+        else:
+            logical, kind, s = d
+            src.append(logical); op.append(_OP[kind]); arg.append(s)
+    def arr(vals): return "array<i64: " + ", ".join(map(str, vals)) + ">"
+    return "{phys_src = " + arr(src) + ", phys_op = " + arr(op) + ", phys_arg = " + arr(arg) + "}"
+
+
 # Marker attr for the [M,N] stick-on-N layout, reused across tests.
-_STICK_ON_N = (
-    "{phys_src = array<i64: 1, 0, 1>, "
-    "phys_op = array<i64: 1, 0, 2>, "
-    "phys_arg = array<i64: 64, 0, 64>}"
-)
+# phys = [N//64, M, N%64]
+_STICK_ON_N = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
 
 # Marker attr for the [M,N] stick-on-N layout used by the reduce test.
 # Same encoding as _STICK_ON_N (S=64): phys = [N//64, M, N%64].
-_STICK_ON_N_REDUCE = (
-    "{phys_src = array<i64: 1, 0, 1>, "
-    "phys_op = array<i64: 1, 0, 2>, "
-    "phys_arg = array<i64: 64, 0, 64>}"
-)
+_STICK_ON_N_REDUCE = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
 
 # Marker attr for a 1-D [M] stick layout used by the reduce output descriptor.
 # phys = [M//64, M%64] (stick-on-M, S=64).
-_STICK_ON_M_1D = (
-    "{phys_src = array<i64: 0, 0>, "
-    "phys_op = array<i64: 1, 2>, "
-    "phys_arg = array<i64: 64, 64>}"
-)
+_STICK_ON_M_1D = layout_attr([(0, "floordiv", 64), (0, "mod", 64)])
 
 # Same encoding for a 1-D [N] stick layout (logically identical — the only dim is dim 0).
-_STICK_ON_N_1D = _STICK_ON_M_1D
+_STICK_ON_N_1D = layout_attr([(0, "floordiv", 64), (0, "mod", 64)])
 
 
 class RewriteLayoutTester(SinglePassTester):
@@ -291,11 +300,7 @@ class TestGather(RewriteLayoutTester):
     def test_gather_marker_erased(self):
         # The physical memory view is built; the marker is erased; the pipeline
         # succeeds because the indirect tile's result is dead (DCE removes it).
-        gather_layout = (
-            "{phys_src = array<i64: 1, 0, 1>, "
-            "phys_op = array<i64: 1, 0, 2>, "
-            "phys_arg = array<i64: 64, 0, 64>}"
-        )
+        gather_layout = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
         self.run(f"""
         module {{
           tt.func @k(%ptr: !tt.ptr<f16>, %idx_ptr: !tt.ptr<i32>, %y: i32) {{
@@ -328,11 +333,7 @@ class TestGather(RewriteLayoutTester):
         # non-multiple of S=64 (constant 50).  ColMap substitution inserts
         # floordiv/mod arithmetic; the pass must still complete successfully
         # and erase the marker.
-        gather_layout = (
-            "{phys_src = array<i64: 1, 0, 1>, "
-            "phys_op = array<i64: 1, 0, 2>, "
-            "phys_arg = array<i64: 64, 0, 64>}"
-        )
+        gather_layout = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
         self.run(f"""
         module {{
           tt.func @k(%ptr: !tt.ptr<f16>, %idx_ptr: !tt.ptr<i32>) {{
@@ -385,11 +386,9 @@ class TestMatmulSingleStick(RewriteLayoutTester):
     """
 
     # A[M,K] stick-on-M: phys_src=[0,1,0] => dim0=M//64, dim1=K, dim2=M%64
-    _A_LAYOUT = ("{phys_src = array<i64: 0, 1, 0>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _A_LAYOUT = layout_attr([(0, "floordiv", 64), 1, (0, "mod", 64)])
     # B[K,N] stick-on-N: phys_src=[1,0,1] => dim0=N//64, dim1=K, dim2=N%64
-    _B_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _B_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
 
     _KERNEL = """
         module {{
@@ -460,11 +459,9 @@ class TestMatmulKSplit(RewriteLayoutTester):
     """
 
     # A[M,K] stick-on-K: phys_src=[1,0,1] => dim0=K//64, dim1=M, dim2=K%64
-    _A_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _A_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
     # B[K,N] stick-on-N: phys_src=[1,0,1] => dim0=N//64, dim1=K, dim2=N%64
-    _B_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _B_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
 
     _KERNEL = """
         module {{
@@ -602,14 +599,11 @@ class TestMatmulAnnotatedOutput(RewriteLayoutTester):
     """
 
     # A[M,K] stick-on-M: phys_src=[0,1,0] => [M//64, K, M%64]
-    _A_LAYOUT = ("{phys_src = array<i64: 0, 1, 0>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _A_LAYOUT = layout_attr([(0, "floordiv", 64), 1, (0, "mod", 64)])
     # B[K,N] stick-on-N: phys_src=[1,0,1] => [N//64, K, N%64]
-    _B_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _B_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
     # C[M,N] stick-on-N: phys_src=[1,0,1] => [N//64, M, N%64]
-    _C_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _C_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
 
     _KERNEL = """
         module {{
@@ -733,17 +727,13 @@ class TestMatmulChainedScratchpad(RewriteLayoutTester):
     """
 
     # A[M,K1] stick-on-M: phys_src=[0,1,0] => [M//64, K1, M%64]
-    _A_LAYOUT = ("{phys_src = array<i64: 0, 1, 0>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _A_LAYOUT = layout_attr([(0, "floordiv", 64), 1, (0, "mod", 64)])
     # B[K1,K2] stick-on-K2: phys_src=[1,0,1] => [K2//32, K1, K2%32]
-    _B_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>}")
+    _B_LAYOUT = layout_attr([(1, "floordiv", 32), 0, (1, "mod", 32)])
     # C[K2,N] stick-on-N: phys_src=[1,0,1] => [N//64, K2, N%64]
-    _C_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _C_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
     # D[M,N] stick-on-N: phys_src=[1,0,1] => [N//64, M, N%64]
-    _D_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _D_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
 
     _KERNEL = """
         module {{
@@ -919,11 +909,9 @@ class TestLoopRescale(RewriteLayoutTester):
     """
 
     # A[M,K] stick-on-K: phys_src=[1,0,1] => dim0=K//64, dim1=M, dim2=K%64
-    _A_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _A_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
     # B[K,N] stick-on-N: phys_src=[1,0,1] => dim0=N//64, dim1=K, dim2=N%64
-    _B_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _B_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
 
     def _kernel_f2(self):
         # A block spans 2 sticks (BLOCK_K=128, S=64, f=2).
@@ -1068,11 +1056,9 @@ class TestDoubleRescaleGuard(RewriteLayoutTester):
     """
 
     # A[M,K] stick-on-K: phys_src=[1,0,1] => dim0=K//64, dim1=M, dim2=K%64
-    _A_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _A_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
     # B[K,N] stick-on-K: phys_src=[0,1,0] => dim0=K//64, dim1=N, dim2=K%64
-    _B_LAYOUT = ("{phys_src = array<i64: 0, 1, 0>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _B_LAYOUT = layout_attr([(0, "floordiv", 64), 1, (0, "mod", 64)])
 
     def _kernel(self):
         # Two descriptors, both stick-on-K with f=2 (BLOCK_K=128, S=64).
@@ -1199,8 +1185,7 @@ class TestRejectedInputs(RewriteLayoutTester):
         # the loop induction variable; it should fail when it can't match the
         # pattern.
         # A[M,K] stick-on-K: phys_src=[1,0,1] => dim0=K//64, dim1=M, dim2=K%64
-        a_layout = ("{phys_src = array<i64: 1, 0, 1>, "
-                    "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+        a_layout = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
         with pytest.raises(Exception):
             self.run(f"""
             module {{
@@ -1269,11 +1254,7 @@ class TestHigherRank(RewriteLayoutTester):
     #   phys_src = [0, 2, 1, 2] : B, N//64, M, N%64
     #   phys_op  = [0, 1, 0, 2] : identity, floordiv, identity, mod
     #   phys_arg = [0, 64, 0, 64]
-    _LAYOUT_3D = (
-        "{phys_src = array<i64: 0, 2, 1, 2>, "
-        "phys_op = array<i64: 0, 1, 0, 2>, "
-        "phys_arg = array<i64: 0, 64, 0, 64>}"
-    )
+    _LAYOUT_3D = layout_attr([0, (2, "floordiv", 64), 1, (2, "mod", 64)])
 
     def _kernel(self):
         # [B=2, M=64, N=128] stick-on-N: phys = [2, 2, 64, 64]
@@ -1347,23 +1328,11 @@ class TestBatchMatmul(RewriteLayoutTester):
     """
 
     # A[B,M,K] stick-on-K: phys [K/S, B, M, K%S]
-    _A_LAYOUT = (
-        "{phys_src = array<i64: 2, 0, 1, 2>, "
-        "phys_op = array<i64: 1, 0, 0, 2>, "
-        "phys_arg = array<i64: 64, 0, 0, 64>}"
-    )
+    _A_LAYOUT = layout_attr([(2, "floordiv", 64), 0, 1, (2, "mod", 64)])
     # B[B,K,N] stick-on-N: phys [N/S, B, K, N%S]
-    _B_LAYOUT_STICK_N = (
-        "{phys_src = array<i64: 2, 0, 1, 2>, "
-        "phys_op = array<i64: 1, 0, 0, 2>, "
-        "phys_arg = array<i64: 64, 0, 0, 64>}"
-    )
-    # B[B,K,N] stick-on-K: phys [K, B, N//64, K%64]
-    _B_LAYOUT_STICK_K = (
-        "{phys_src = array<i64: 1, 0, 2, 1>, "
-        "phys_op = array<i64: 1, 0, 0, 2>, "
-        "phys_arg = array<i64: 64, 0, 0, 64>}"
-    )
+    _B_LAYOUT_STICK_N = layout_attr([(2, "floordiv", 64), 0, 1, (2, "mod", 64)])
+    # B[B,K,N] stick-on-K: phys [K/S, B, N, K%S]
+    _B_LAYOUT_STICK_K = layout_attr([(1, "floordiv", 64), 0, 2, (1, "mod", 64)])
 
     def _kernel_t15(self):
         # T15: A stick-on-K (2 K-sticks -> K-stick reduction loop),
@@ -1604,11 +1573,7 @@ class TestReduceGeneralized(RewriteLayoutTester):
     #   phys_src = [0, 2, 1, 2] : B, N//64, M, N%64
     #   phys_op  = [0, 1, 0, 2] : identity, floordiv, identity, mod
     #   phys_arg = [0, 64, 0, 64]
-    _LAYOUT_3D = (
-        "{phys_src = array<i64: 0, 2, 1, 2>, "
-        "phys_op = array<i64: 0, 1, 0, 2>, "
-        "phys_arg = array<i64: 0, 64, 0, 64>}"
-    )
+    _LAYOUT_3D = layout_attr([0, (2, "floordiv", 64), 1, (2, "mod", 64)])
 
     def _kernel(self, combiner="addf"):
         # [B=1, M=64, N=256] input, reduce over axis 2 (N).
@@ -1798,11 +1763,9 @@ class TestTransposeThenMatmul(RewriteLayoutTester):
     """
 
     # A[K,M] stick-on-M: phys_src=[1,0,1] => [M//64, K, M%64]
-    _A_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _A_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
     # B[K,N] stick-on-N: phys_src=[1,0,1] => [N//64, K, N%64]
-    _B_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
-                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    _B_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
 
     def _kernel(self):
         # A described as [K=64, M=64] (K-first), stick-on-M.
