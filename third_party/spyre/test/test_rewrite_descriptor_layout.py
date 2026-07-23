@@ -185,6 +185,49 @@ class TestDynamicLayout(RewriteLayoutTester):
 
 class TestPassThrough(RewriteLayoutTester):
 
+    def test_rank_match_no_dispatch(self):
+        # S1 negative: sourceNeedsDispatch requires BOTH (a) rank > logicalRank
+        # AND (b) the operand traces back to a physMemViewToMarker entry (i.e. a
+        # ktdp.load from an annotated descriptor).  A linalg.reduce whose rank-3
+        # input comes from linalg.transpose -> linalg.fill (no descriptor, no
+        # tt.spyre_tensor_layout marker) satisfies (a) — rank 3 > logicalRank
+        # fallback 2 — but fails (b): walkToLoad finds no ktdp.load, so
+        # findMarkerForOperand returns null and sourceNeedsDispatch returns false.
+        # Phase 2 therefore leaves the reduce untouched: no stick loop is
+        # synthesized, no dispatch.
+        self.run("""
+        module {
+          tt.func @k(%val: f16, %out_ptr: !tt.ptr<f16>) {
+            %M = arith.constant 2 : i32
+            %N = arith.constant 16 : i32
+            %sN = arith.constant 16 : i64
+            %s1 = arith.constant 1 : i64
+            %c0 = arith.constant 0 : i32
+            %a = tt.splat %val : f16 -> tensor<16x2x64xf16>
+            %t = tt.trans %a {order = array<i32: 1, 0, 2>}
+                : tensor<16x2x64xf16> -> tensor<2x16x64xf16>
+            %sum = "tt.reduce"(%t) ({
+            ^bb0(%x: f16, %y: f16):
+              %add = arith.addf %x, %y : f16
+              tt.reduce.return %add : f16
+            }) {axis = 2 : i32} : (tensor<2x16x64xf16>) -> tensor<2x16xf16>
+            %out_desc = tt.make_tensor_descriptor %out_ptr, [%M, %N], [%sN, %s1]
+                : <f16>, <2x16xf16>
+            tt.descriptor_store %out_desc[%c0, %c0], %sum
+                : !tt.tensordesc<2x16xf16>, tensor<2x16xf16>
+            tt.return
+          }
+        }
+        """)
+        # No marker present or injected — the pass has nothing to erase.
+        self.assert_absent("tt.spyre_tensor_layout")
+        # No stick loop synthesized — S1 guard correctly blocked dispatch.
+        self.assert_absent("scf.for")
+        # The reduce op is still present with its original rank-3 input.
+        self.assert_present("linalg.reduce")
+        # The transpose is still present (unchanged by the pass).
+        self.assert_present("linalg.transpose")
+
     def test_unannotated_descriptor_untouched(self):
         # A descriptor with no tt.spyre_tensor_layout marker is left exactly as
         # is — still logical 2D. The pass only fires on annotated descriptors.
@@ -1273,6 +1316,211 @@ class TestHigherRank(RewriteLayoutTester):
 
 
 # =========================================================================
+# T15/T16: Batch matmul — dispatchBatchMatmul with stick-tiled operands
+# =========================================================================
+
+class TestBatchMatmul(RewriteLayoutTester):
+    """Structural tests for dispatchBatchMatmul with physical (stick-tiled) layouts.
+
+    T15 — A stick-on-K, B stick-on-N (different stickified axes per operand).
+    T16 — A stick-on-K, B stick-on-K (both operands share the reduction axis).
+
+    Shapes used: B=4, M=64, K=128, N=64, S=64.
+
+    A[B,M,K] stick-on-K (dim 2): physical [K/S, B, M, K%S] = [2, 4, 64, 64]
+      phys_src = [2, 0, 1, 2]  (K//64, B, M, K%64)
+      phys_op  = [1, 0, 0, 2]  (floordiv, identity, identity, mod)
+      phys_arg = [64, 0, 0, 64]
+
+    B_stick_N[B,K,N] stick-on-N (dim 2): physical [N/S, B, K, N%S] = [1, 4, 128, 64]
+      phys_src = [2, 0, 1, 2]  (N//64, B, K, N%64)
+      phys_op  = [1, 0, 0, 2]
+      phys_arg = [64, 0, 0, 64]
+
+    B_stick_K[B,K,N] stick-on-K (dim 1): physical [K, B, N//64, K%64] = [128, 4, 1, 64]
+      phys_src = [1, 0, 2, 1]
+      phys_op  = [0, 0, 1, 2]  (identity, identity, floordiv, mod)
+      phys_arg = [0, 0, 64, 64]
+    """
+
+    # A[B,M,K] stick-on-K: phys [K/S, B, M, K%S]
+    _A_LAYOUT = (
+        "{phys_src = array<i64: 2, 0, 1, 2>, "
+        "phys_op = array<i64: 1, 0, 0, 2>, "
+        "phys_arg = array<i64: 64, 0, 0, 64>}"
+    )
+    # B[B,K,N] stick-on-N: phys [N/S, B, K, N%S]
+    _B_LAYOUT_STICK_N = (
+        "{phys_src = array<i64: 2, 0, 1, 2>, "
+        "phys_op = array<i64: 1, 0, 0, 2>, "
+        "phys_arg = array<i64: 64, 0, 0, 64>}"
+    )
+    # B[B,K,N] stick-on-K: phys [K, B, N//64, K%64]
+    _B_LAYOUT_STICK_K = (
+        "{phys_src = array<i64: 1, 0, 2, 1>, "
+        "phys_op = array<i64: 0, 0, 1, 2>, "
+        "phys_arg = array<i64: 0, 0, 64, 64>}"
+    )
+
+    def _kernel_t15(self):
+        # T15: A stick-on-K (2 K-sticks -> K-stick reduction loop),
+        #      B stick-on-N (1 N-stick -> no extra loop from B's parallel dim).
+        # B=4, M=64, K=128, N=64, S=64.
+        return f"""
+        module {{
+          tt.func @bmm(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f16>,
+                       %bm: i32, %n: i32) {{
+            %B  = arith.constant 4   : i32
+            %M  = arith.constant 64  : i32
+            %K  = arith.constant 128 : i32
+            %N  = arith.constant 64  : i32
+            %num_k = arith.constant 2 : i32
+            %c0 = arith.constant 0   : i32
+            %c1 = arith.constant 1   : i32
+            %c128 = arith.constant 128 : i32
+            %sAM = arith.constant 128  : i64
+            %sAK = arith.constant 1    : i64
+            %sBK = arith.constant 64   : i64
+            %sBN = arith.constant 1    : i64
+            %sCM = arith.constant 64   : i64
+            %sCN = arith.constant 1    : i64
+            %sB  = arith.constant 8192 : i64
+            %adesc = tt.make_tensor_descriptor %a, [%B, %M, %K], [%sB, %sAM, %sAK]
+                : <f16>, <4x64x128xf16>
+            %bdesc = tt.make_tensor_descriptor %b, [%B, %K, %N], [%sB, %sBK, %sBN]
+                : <f16>, <4x128x64xf16>
+            %cdesc = tt.make_tensor_descriptor %c, [%B, %M, %N], [%sB, %sCM, %sCN]
+                : <f16>, <4x64x64xf16>
+            tt.spyre_tensor_layout %adesc {self._A_LAYOUT} : <4x64x128xf16>
+            tt.spyre_tensor_layout %bdesc {self._B_LAYOUT_STICK_N} : <4x128x64xf16>
+            %acc_init = arith.constant dense<0.0> : tensor<4x64x64xf32>
+            %result = scf.for %k = %c0 to %num_k step %c1
+                iter_args(%acc = %acc_init) -> (tensor<4x64x64xf32>) : i32 {{
+              %k128 = arith.muli %k, %c128 : i32
+              %at = tt.descriptor_load %adesc[%c0, %bm, %k128]
+                  : !tt.tensordesc<4x64x128xf16> -> tensor<4x64x128xf16>
+              %bt = tt.descriptor_load %bdesc[%c0, %k128, %n]
+                  : !tt.tensordesc<4x128x64xf16> -> tensor<4x128x64xf16>
+              %d = tt.dot %at, %bt, %acc
+                  : tensor<4x64x128xf16> * tensor<4x128x64xf16> -> tensor<4x64x64xf32>
+              scf.yield %d : tensor<4x64x64xf32>
+            }}
+            %dh = arith.truncf %result : tensor<4x64x64xf32> to tensor<4x64x64xf16>
+            tt.descriptor_store %cdesc[%c0, %bm, %n], %dh
+                : !tt.tensordesc<4x64x64xf16>, tensor<4x64x64xf16>
+            tt.return
+          }}
+        }}
+        """
+
+    def _kernel_t16(self):
+        # T16: both A and B stick-on-K (shared K reduction axis).
+        # A: stick-on-K (dim 2), same as T15.
+        # B[B,K,N] stick-on-K (dim 1): phys [K, B, N//64, K%64].
+        # Both descriptors contribute to the same stickFactor on K.
+        return f"""
+        module {{
+          tt.func @bmm_kk(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f16>,
+                          %bm: i32, %n: i32) {{
+            %B  = arith.constant 4   : i32
+            %M  = arith.constant 64  : i32
+            %K  = arith.constant 128 : i32
+            %N  = arith.constant 64  : i32
+            %num_k = arith.constant 2 : i32
+            %c0 = arith.constant 0   : i32
+            %c1 = arith.constant 1   : i32
+            %c128 = arith.constant 128 : i32
+            %sAM = arith.constant 128  : i64
+            %sAK = arith.constant 1    : i64
+            %sBK = arith.constant 64   : i64
+            %sBN = arith.constant 1    : i64
+            %sCM = arith.constant 64   : i64
+            %sCN = arith.constant 1    : i64
+            %sB  = arith.constant 8192 : i64
+            %adesc = tt.make_tensor_descriptor %a, [%B, %M, %K], [%sB, %sAM, %sAK]
+                : <f16>, <4x64x128xf16>
+            %bdesc = tt.make_tensor_descriptor %b, [%B, %K, %N], [%sB, %sBK, %sBN]
+                : <f16>, <4x128x64xf16>
+            %cdesc = tt.make_tensor_descriptor %c, [%B, %M, %N], [%sB, %sCM, %sCN]
+                : <f16>, <4x64x64xf16>
+            tt.spyre_tensor_layout %adesc {self._A_LAYOUT} : <4x64x128xf16>
+            tt.spyre_tensor_layout %bdesc {self._B_LAYOUT_STICK_K} : <4x128x64xf16>
+            %acc_init = arith.constant dense<0.0> : tensor<4x64x64xf32>
+            %result = scf.for %k = %c0 to %num_k step %c1
+                iter_args(%acc = %acc_init) -> (tensor<4x64x64xf32>) : i32 {{
+              %k128 = arith.muli %k, %c128 : i32
+              %at = tt.descriptor_load %adesc[%c0, %bm, %k128]
+                  : !tt.tensordesc<4x64x128xf16> -> tensor<4x64x128xf16>
+              %bt = tt.descriptor_load %bdesc[%c0, %k128, %n]
+                  : !tt.tensordesc<4x128x64xf16> -> tensor<4x128x64xf16>
+              %d = tt.dot %at, %bt, %acc
+                  : tensor<4x64x128xf16> * tensor<4x128x64xf16> -> tensor<4x64x64xf32>
+              scf.yield %d : tensor<4x64x64xf32>
+            }}
+            %dh = arith.truncf %result : tensor<4x64x64xf32> to tensor<4x64x64xf16>
+            tt.descriptor_store %cdesc[%c0, %bm, %n], %dh
+                : !tt.tensordesc<4x64x64xf16>, tensor<4x64x64xf16>
+            tt.return
+          }}
+        }}
+        """
+
+    # --- T15 tests ---
+
+    @pattern("batch-matmul-stick", category="compute", example=
+        "C[B,M,N] = A[B,M,K] @ B[B,K,N]; A stick-on-K (K-stick reduction loop), "
+        "B stick-on-N (parallel N-stick). dispatchBatchMatmul lowers tt.dot to "
+        "linalg.batch_matmul and wraps the K-stick iteration in scf.for.")
+    def test_batch_matmul_dispatches(self):
+        # T15/Q1: dispatchBatchMatmul fires; linalg.batch_matmul is present;
+        # marker is erased; K-stick reduction loop and extract_slice are present.
+        self.run(self._kernel_t15())
+        self.assert_absent("tt.spyre_tensor_layout")
+        self.assert_present("linalg.batch_matmul")
+        self.assert_present("scf.for")
+        self.assert_present("tensor.extract_slice")
+
+    def test_batch_matmul_marker_erased(self):
+        # T15/Q1: every tt.spyre_tensor_layout marker must be erased.
+        self.run(self._kernel_t15())
+        self.assert_absent("tt.spyre_tensor_layout")
+
+    # --- T16 tests ---
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "T16 known gap: dispatchBatchMatmul misidentifies the reduction axis "
+        "when B[B,K,N] is stick-on-K (phys_src=[1,0,2,1], phys_op=[0,0,1,2]). "
+        "The pass reconstructs linalg.batch_matmul with result type tensor<4x64xf32> "
+        "instead of tensor<4x64x64xf32>, causing a verifier failure. "
+        "Fix: dispatchBatchMatmul must handle the B-operand stick-on-K path."
+    ))
+    def test_batch_matmul_both_stick_k_lowers(self):
+        # T16: both A and B stick-on-K — shared reduction axis.
+        # Expected once fixed: linalg.batch_matmul present, marker erased,
+        # single scf.for for the shared K-stick reduction loop.
+        self.run(self._kernel_t16())
+        self.assert_absent("tt.spyre_tensor_layout")
+        self.assert_present("linalg.batch_matmul")
+        self.assert_present("scf.for")
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "T16 known gap: same root cause as test_batch_matmul_both_stick_k_lowers. "
+        "The pass fails before producing output, so the single-loop invariant "
+        "cannot be checked yet."
+    ))
+    def test_batch_matmul_both_stick_k_single_loop(self):
+        # T16: both operands share the same K-stick reduction loop.
+        # There must be exactly one scf.for (not two separate loops).
+        self.run(self._kernel_t16())
+        from utils import walk_module
+        scf_fors = [o for o in walk_module(self.mod) if o.name == "scf.for"]
+        assert len(scf_fors) == 1, (
+            f"Expected exactly 1 scf.for (shared K-stick loop), "
+            f"got {len(scf_fors)}"
+        )
+
+
+# =========================================================================
 # Negative (frontend): the layout list must be passed inline, not via a local
 # =========================================================================
 
@@ -1332,3 +1580,322 @@ class TestInlineOnly:
         txt = compile_to_ttir(kernel, self.SIGNATURE,
                               {"M": 512, "N": 256, "BLOCK_M": 16, "BLOCK_N": 64})
         assert "tt.spyre_tensor_layout" in txt
+
+
+# =========================================================================
+# T19: Generalized reduce — arbitrary-rank input with stick-on-last-dim
+# =========================================================================
+
+class TestReduceGeneralized(RewriteLayoutTester):
+    """T19: Rank-3 [B=1, M=64, N=256] input reduced over N (dim 2).
+
+    The input descriptor is annotated stick-on-N with S=64:
+      phys_src = [0, 2, 1, 2] -> [B, N//64, M, N%64] = [1, 4, 64, 64]
+      phys_op  = [0, 1, 0, 2] : identity, floordiv, identity, mod
+      phys_arg = [0, 64, 0, 64]
+
+    logicalRank = max(phys_src)+1 = 3
+    outputRank  = 3 - 1 = 2  (reducing one dim: axis 2 = N)
+    Output: [B=1, M=64].
+
+    dispatchReduce builds opTileDims = {0, 2, 3} (B, M, lane) for each
+    N-stick iteration, yielding a [1, 64, 64] slice.  The inner
+    linalg.reduce reduces dims {outputRank, ..., sliceRank-1} = {2}
+    (the lane dim) and accumulates into [B=1, M=64].
+
+    A stick loop over N//64 = 4 N-sticks is synthesized by Phase 2.
+
+    Note: T19's "non-addf combiner" sub-test is xfail because combiner
+    cloning is not yet implemented (marked TODO(S2) in dispatchReduce).
+    """
+
+    # Rank-3 [B, M, N] stick-on-N with B=identity:
+    #   phys_src = [0, 2, 1, 2] : B, N//64, M, N%64
+    #   phys_op  = [0, 1, 0, 2] : identity, floordiv, identity, mod
+    #   phys_arg = [0, 64, 0, 64]
+    _LAYOUT_3D = (
+        "{phys_src = array<i64: 0, 2, 1, 2>, "
+        "phys_op = array<i64: 0, 1, 0, 2>, "
+        "phys_arg = array<i64: 0, 64, 0, 64>}"
+    )
+
+    def _kernel(self, combiner="addf"):
+        # [B=1, M=64, N=256] input, reduce over axis 2 (N).
+        # Output [B=1, M=64] stored without a physical layout annotation so
+        # the test focuses purely on the source dispatch (scf.for synthesis).
+        if combiner == "addf":
+            combiner_body = """
+              %add = arith.addf %x, %y : f16
+              tt.reduce.return %add : f16"""
+        else:
+            # maxnumf — combiner cloning is TODO in dispatchReduce
+            combiner_body = """
+              %mx = arith.maxnumf %x, %y : f16
+              tt.reduce.return %mx : f16"""
+        return f"""
+        module {{
+          tt.func @k(%in_ptr: !tt.ptr<f16>, %out_ptr: !tt.ptr<f16>) {{
+            %B  = arith.constant 1   : i32
+            %M  = arith.constant 64  : i32
+            %N  = arith.constant 256 : i32
+            %sB = arith.constant 16384 : i64
+            %sM = arith.constant 256   : i64
+            %sN = arith.constant 1     : i64
+            %s1 = arith.constant 1     : i64
+            %c0 = arith.constant 0     : i32
+            %in_desc = tt.make_tensor_descriptor %in_ptr, [%B, %M, %N], [%sB, %sM, %sN]
+                : <f16>, <1x64x256xf16>
+            tt.spyre_tensor_layout %in_desc {self._LAYOUT_3D} : <1x64x256xf16>
+            %out_desc = tt.make_tensor_descriptor %out_ptr, [%B, %M], [%sM, %s1]
+                : <f16>, <1x64xf16>
+            %tile = tt.descriptor_load %in_desc[%c0, %c0, %c0]
+                : !tt.tensordesc<1x64x256xf16> -> tensor<1x64x256xf16>
+            %sum = "tt.reduce"(%tile) ({{
+            ^bb0(%x: f16, %y: f16):{combiner_body}
+            }}) {{axis = 2 : i32}} : (tensor<1x64x256xf16>) -> tensor<1x64xf16>
+            tt.descriptor_store %out_desc[%c0, %c0], %sum
+                : !tt.tensordesc<1x64xf16>, tensor<1x64xf16>
+            tt.return
+          }}
+        }}
+        """
+
+    def test_reduce_3d_dispatches(self):
+        # T19/S2: dispatchReduce derives logicalRank=3 from the marker and
+        # synthesizes an scf.for over the 4 N-sticks (N//64 = 256//64 = 4).
+        # The inner linalg.reduce accumulates per-stick partial sums.
+        self.run(self._kernel())
+        # Marker consumed and erased by the pass.
+        self.assert_absent("tt.spyre_tensor_layout")
+        # Stick loop over N-sticks synthesized (f = N//S = 4 iterations).
+        self.assert_present("scf.for")
+        # Inner reduce present (partial sum over the lane dim).
+        self.assert_present("linalg.reduce")
+
+    def test_reduce_3d_dims(self):
+        # T19: the emitted linalg.reduce reduces dims {2} — the S lane dim (dim 2)
+        # of the [1, 64, 64] op-tile slice [B=1, M=64, S=64].
+        # Derivation: outputRank = logicalRank - |reductionDims| = 3 - 1 = 2;
+        # emitReduceOp emits dims {outputRank, ..., sliceRank-1} = {2, ..., 2} = {2}.
+        # The physical memory view covers the full [1, 4, 64, 64] tensor.
+        self.run(self._kernel())
+        self.assert_absent("tt.spyre_tensor_layout")
+        # Physical memory view: [B=1, N//64=4, M=64, S=64].
+        self.assert_result_type("ktdp.construct_memory_view", "1x4x64x64xf16")
+        # Physical load result: [B=1, N//64_per_block=4, M=64, S=64] block.
+        # The block_shape <1x64x256xf16> spans all 4 N-sticks (256/64=4 per block).
+        self.assert_result_type("ktdp.load", "1x4x64x64xf16")
+
+    @pytest.mark.xfail(strict=True,
+                       reason="combiner cloning not yet implemented — S2 TODO"
+                               " in dispatchReduce; hardcoded addf used instead")
+    def test_reduce_3d_non_addf_combiner(self):
+        # T19/C8/Q13: a non-addf combiner (maxnumf) should be cloned from the
+        # original op into the synthesized inner linalg.reduce.  This is marked
+        # TODO(S2) in dispatchReduce — currently dispatchReduce hardcodes arith.addf
+        # regardless of the original combiner.  Once combiner cloning is implemented,
+        # delete this xfail and replace with a positive assertion.
+        self.run(self._kernel(combiner="maxnumf"))
+        self.assert_present("arith.maxnumf")
+
+
+# =========================================================================
+# T17: linalg.transpose between load and linalg.reduce
+# =========================================================================
+
+class TestTransposeThenReduce(RewriteLayoutTester):
+    """T17: load [M=64, N=64] stick-on-N → tt.trans [1,0] → linalg.reduce axis=1.
+
+    After LowerComputeOps, tt.trans lowers to linalg.transpose and tt.reduce
+    lowers to linalg.reduce.  RewriteDescriptorLayout must:
+
+    1. Phase 1 (retypeLoad): physicalize the ktdp.load to tensor<1x64x64xf16>.
+       retypeChain propagates the physical type forward but STOPS at the
+       linalg.TransposeOp — the transpose result stays at its original logical
+       shape so linalg.reduce sees the expected type.
+
+    2. Phase 2 (dispatchReduce): walkToLoad traces THROUGH linalg.transpose,
+       accumulates perm=[1,0], and composes tau into canonicalAxes so the
+       correct physical dim roles are assigned.
+
+    Shapes:
+      in_ptr:  [M=64, N=64] stick-on-N -> phys block [N//64=1, M=64, lane=64]
+      tt.trans {order=[1,0]}: tensor<64x64xf16> -> tensor<64x64xf16> (M,N -> N,M)
+      tt.reduce axis=1 (reduces original M=64): result tensor<64xf16>
+      out_ptr: [N=64] stick-on-N (1D) -> phys [N//64=1, 64]
+
+    With N=64 (one N-stick), physBlock[0]=1 and the D3 parallel-floor guard
+    passes.  No loop is synthesised for the parallel N-stick dimension.
+    """
+
+    # in_ptr [M=64, N=64] stick-on-N: phys = [N//64, M, N%64]
+    # Same encoding as _STICK_ON_N_REDUCE.
+    _IN_LAYOUT = _STICK_ON_N_REDUCE
+
+    def _kernel(self):
+        # Input [M=64, N=64] stick-on-N; transpose swaps to [N=64, M=64];
+        # reduce over axis=1 (original M) gives [N=64]; store to 1D output.
+        return f"""
+        module {{
+          tt.func @k(%in_ptr: !tt.ptr<f16>, %out_ptr: !tt.ptr<f16>) {{
+            %M  = arith.constant 64 : i32
+            %N  = arith.constant 64 : i32
+            %sN = arith.constant 64 : i64
+            %s1 = arith.constant 1  : i64
+            %c0 = arith.constant 0  : i32
+            %in_desc = tt.make_tensor_descriptor %in_ptr, [%M, %N], [%sN, %s1]
+                : <f16>, <64x64xf16>
+            tt.spyre_tensor_layout %in_desc {self._IN_LAYOUT} : <64x64xf16>
+            %out_desc = tt.make_tensor_descriptor %out_ptr, [%N], [%s1]
+                : <f16>, <64xf16>
+            tt.spyre_tensor_layout %out_desc {_STICK_ON_N_1D} : <64xf16>
+            %tile = tt.descriptor_load %in_desc[%c0, %c0]
+                : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
+            %trans = tt.trans %tile {{order = array<i32: 1, 0>}}
+                : tensor<64x64xf16> -> tensor<64x64xf16>
+            %sum = "tt.reduce"(%trans) ({{
+            ^bb0(%a: f16, %b: f16):
+              %add = arith.addf %a, %b : f16
+              tt.reduce.return %add : f16
+            }}) {{axis = 1 : i32}} : (tensor<64x64xf16>) -> tensor<64xf16>
+            tt.descriptor_store %out_desc[%c0], %sum
+                : !tt.tensordesc<64xf16>, tensor<64xf16>
+            tt.return
+          }}
+        }}
+        """
+
+    @pytest.mark.xfail(
+        reason=(
+            "S4 incomplete: retypeChain stops at linalg.TransposeOp but does "
+            "not update the transpose's init/outs tensor, leaving a rank "
+            "mismatch (input rank-3, init rank-2) that the MLIR verifier "
+            "catches.  Fix: retypeChain must also update the transpose's init "
+            "shape, or Phase 2 must erase dead transposes after dispatch."
+        ),
+        strict=True,
+    )
+    def test_retype_chain_stops_at_transpose(self):
+        # S4/retypeChain: the pass must succeed end-to-end and linalg.reduce
+        # must still be present in the output (dispatched by Phase 2).  With
+        # N=64 there is one N-stick (f=1): no scf.for is synthesised for the
+        # parallel stick dimension.
+        self.run(self._kernel())
+        self.assert_absent("tt.spyre_tensor_layout")
+        self.assert_present("linalg.reduce")
+
+    @pytest.mark.xfail(
+        reason=(
+            "S4 incomplete: retypeChain stops at linalg.TransposeOp but does "
+            "not update the transpose's init/outs tensor, leaving a rank "
+            "mismatch (input rank-3, init rank-2) that the MLIR verifier "
+            "catches.  Fix: retypeChain must also update the transpose's init "
+            "shape, or Phase 2 must erase dead transposes after dispatch."
+        ),
+        strict=True,
+    )
+    def test_transpose_erased(self):
+        # S4: after the full pass the physical load is rank-3 [1x64x64xf16].
+        # retypeChain stops at the transpose so the transpose result's type is
+        # not overwritten; the source stage replaces the original linalg.reduce
+        # and its producer chain — the old transpose is dead and DCE removes it.
+        self.run(self._kernel())
+        self.assert_absent("tt.spyre_tensor_layout")
+        # Physical load result is rank-3.
+        self.assert_result_type("ktdp.load", "tensor<1x64x64xf16>")
+
+
+# =========================================================================
+# T18: transpose-then-matmul — dispatchSource composes tau into canonicalAxes
+# =========================================================================
+
+class TestTransposeThenMatmul(RewriteLayoutTester):
+    """T18: load [K=64, M=64] stick-on-M -> tt.trans [1,0] -> linalg.matmul.
+
+    The A descriptor is expressed in [K, M] order in memory (K is the logical
+    row dim, M the logical col dim) and annotated stick-on-M (the col dim).
+    After tt.trans {order=[1,0]}, the tensor looks like [M, K] and serves as
+    the first (LHS) operand of a matmul.
+
+    dispatchSource composes perm tau=[1,0] into the matmul's canonical axes
+    for the first operand (canonicalAxes=[0, -1], M=parallel, K=reduction):
+      effectiveCanonicalAxes = [canonicalAxes[tau[0]], canonicalAxes[tau[1]]]
+                             = [canonicalAxes[1], canonicalAxes[0]]
+                             = [-1, 0]
+    so that buildDimRoles assigns the K-derived phys dims as reduction and the
+    M-derived phys dims as parallel — identical roles to a direct stick-on-M A.
+
+    Shapes (singleton-stick case, same as TestMatmulSingleStick):
+      A: [K=64, M=64] stick-on-M -> phys [M//64=1, K=64, M%64=64] = [1,64,64]
+      tt.trans -> logical [M=64, K=64]
+      B: [K=64, N=64] stick-on-N -> phys [N//64=1, K=64, N%64=64] = [1,64,64]
+      C: [M=64, N=64] unannotated (logical store)
+    """
+
+    # A[K,M] stick-on-M: phys_src=[1,0,1] => [M//64, K, M%64]
+    _A_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
+                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+    # B[K,N] stick-on-N: phys_src=[1,0,1] => [N//64, K, N%64]
+    _B_LAYOUT = ("{phys_src = array<i64: 1, 0, 1>, "
+                 "phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}")
+
+    def _kernel(self):
+        # A described as [K=64, M=64] (K-first), stick-on-M.
+        # tt.trans {order=[1,0]} gives the [M=64, K=64] view fed to tt.dot.
+        # B is [K=64, N=64] stick-on-N; C is unannotated.
+        return f"""
+        module {{
+          tt.func @mm(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f16>,
+                      %m: i32, %k: i32, %n: i32) {{
+            %M  = arith.constant 64  : i32
+            %K  = arith.constant 64  : i32
+            %N  = arith.constant 64  : i32
+            %sM = arith.constant 64  : i64
+            %sN = arith.constant 64  : i64
+            %one = arith.constant 1  : i64
+            %adesc = tt.make_tensor_descriptor %a, [%K, %M], [%sM, %one]
+                : <f16>, <64x64xf16>
+            %bdesc = tt.make_tensor_descriptor %b, [%K, %N], [%sN, %one]
+                : <f16>, <64x64xf16>
+            %cdesc = tt.make_tensor_descriptor %c, [%M, %N], [%sM, %one]
+                : <f16>, <64x64xf16>
+            tt.spyre_tensor_layout %adesc {self._A_LAYOUT} : <64x64xf16>
+            tt.spyre_tensor_layout %bdesc {self._B_LAYOUT} : <64x64xf16>
+            %at = tt.descriptor_load %adesc[%k, %m]
+                : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
+            %at_t = tt.trans %at {{order = array<i32: 1, 0>}}
+                : tensor<64x64xf16> -> tensor<64x64xf16>
+            %bt = tt.descriptor_load %bdesc[%k, %n]
+                : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
+            %acc = arith.constant dense<0.0> : tensor<64x64xf32>
+            %d = tt.dot %at_t, %bt, %acc
+                : tensor<64x64xf16> * tensor<64x64xf16> -> tensor<64x64xf32>
+            %dh = arith.truncf %d : tensor<64x64xf32> to tensor<64x64xf16>
+            tt.descriptor_store %cdesc[%m, %n], %dh
+                : !tt.tensordesc<64x64xf16>, tensor<64x64xf16>
+            tt.return
+          }}
+        }}
+        """
+
+    @pytest.mark.xfail(
+        reason=(
+            "S4 incomplete: dispatchSource uses operand.getType() for physShape "
+            "when a linalg.transpose sits between the load and the matmul.  "
+            "Because retypeChain stops at the transpose, operand.getType() is "
+            "the logical (rank-2) type, but phys_src has size 3, causing an "
+            "ArrayRef OOB assert in buildDimRoles.  Fix: use ld.getResult() "
+            "type (the physical load type) for physShape when transposePerm "
+            "is set, not operand.getType()."
+        ),
+        strict=True,
+    )
+    def test_transpose_then_matmul_dispatches(self):
+        # S4/T18: the pass composes tau into canonicalAxes and dispatches the
+        # matmul successfully.  No marker remains; linalg.matmul is present;
+        # no linalg.generic is emitted.  With singleton sticks (f=1 for both
+        # operands) no scf.for is synthesised.
+        self.run(self._kernel())
+        self.assert_absent("tt.spyre_tensor_layout")
+        self.assert_absent("linalg.generic")
+        self.assert_present("linalg.matmul")
