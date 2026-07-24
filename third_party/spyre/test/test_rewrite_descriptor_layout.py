@@ -1181,13 +1181,13 @@ class TestRejectedInputs(RewriteLayoutTester):
 
     def test_r3_non_muli_floor_coord(self):
         # R3: A[M,K] stick-on-K inside an scf.for, but the K-offset is computed
-        # as addi(iv, C) instead of muli(iv, C). The pass expects muli to rescale
-        # the loop induction variable; it should fail when it can't match the
-        # pattern.
+        # as addi(iv, C) instead of muli(iv, C). The pass falls back to emitting
+        # divsi for the physical floor-div index (Phase 1, FloorDiv fallback path)
+        # and treats B (unannotated) as a logical scratchpad operand.
+        # The pass therefore succeeds — this documents the accepted behavior.
         # A[M,K] stick-on-K: phys_src=[1,0,1] => dim0=K//64, dim1=M, dim2=K%64
         a_layout = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
-        with pytest.raises(Exception):
-            self.run(f"""
+        self.run(f"""
             module {{
               tt.func @mm(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f16>,
                           %m: i32, %n: i32) {{
@@ -1228,6 +1228,9 @@ class TestRejectedInputs(RewriteLayoutTester):
               }}
             }}
             """)
+        # Pass succeeds: A uses divsi fallback for the addi-based floor coord,
+        # B (unannotated) is treated as a logical (scratchpad) operand.
+        self.assert_absent("tt.spyre_tensor_layout")
 
     # TODO R4 (test_r4_physical_operand_at_fixpoint): constructing a matmul
     # where an operand is physically typed but can't be reduced to canonical
@@ -1918,3 +1921,73 @@ class TestHbmDataLayoutLogical(RewriteLayoutTester):
             f"Unexpected row-major stride 4096 in logical (default) mode output.\n"
             f"Full module:\n{mod_text}"
         )
+
+
+# =========================================================================
+# U8: parallel floor dim with physBlock > 1 — parallel scatter loop
+# =========================================================================
+
+class TestParallelFloorMatmul(RewriteLayoutTester):
+    """U8: parallel floor dim with physBlock > 1 — the parallel scatter loop.
+
+    Kernel: P @ V matmul where V's head-dim axis is a parallel floor dim
+    with physBlock=2 (head_dim=128, seq=64).
+
+    P: [seq=64, seq=64] — no annotation (logical)
+    V: [seq=64, head_dim=128] stick-on-head_dim → phys [2, 64, 64]
+    C: [seq=64, head_dim=128] stick-on-head_dim → phys [2, 64, 64]
+
+    Phase 2 must synthesize a parallel scatter loop (parallelFactor=2)
+    that writes two [64, 64] result tiles into C_phys at positions [0,:,:]
+    and [1,:,:].
+    """
+
+    # V[seq, head_dim] stick-on-head_dim: phys_src=[1,0,1] => [head_dim//64, seq, head_dim%64]
+    _V_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
+    # C[seq, head_dim] stick-on-head_dim: same encoding
+    _C_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
+
+    def _kernel(self):
+        return f"""
+        module {{
+          tt.func @pv(%p_ptr: !tt.ptr<f32>, %v_ptr: !tt.ptr<f32>,
+                      %c_ptr: !tt.ptr<f32>,
+                      %m: i32, %n: i32, %k: i32) {{
+            %seq  = arith.constant 256 : i32
+            %hdim = arith.constant 256 : i32
+            %s64  = arith.constant 64  : i64
+            %s128 = arith.constant 128 : i64
+            %one  = arith.constant 1   : i64
+            %p_desc = tt.make_tensor_descriptor %p_ptr,
+                [%seq, %seq], [%s64, %one] : <f32>, <64x64xf32>
+            %v_desc = tt.make_tensor_descriptor %v_ptr,
+                [%seq, %hdim], [%s128, %one] : <f32>, <64x128xf32>
+            tt.spyre_tensor_layout %v_desc {self._V_LAYOUT} : <64x128xf32>
+            %c_desc = tt.make_tensor_descriptor %c_ptr,
+                [%seq, %hdim], [%s128, %one] : <f32>, <64x128xf32>
+            tt.spyre_tensor_layout %c_desc {self._C_LAYOUT} : <64x128xf32>
+            %p_tile = tt.descriptor_load %p_desc[%m, %k]
+                : !tt.tensordesc<64x64xf32> -> tensor<64x64xf32>
+            %v_tile = tt.descriptor_load %v_desc[%k, %n]
+                : !tt.tensordesc<64x128xf32> -> tensor<64x128xf32>
+            %acc = arith.constant dense<0.0> : tensor<64x128xf32>
+            %result = tt.dot %p_tile, %v_tile, %acc
+                : tensor<64x64xf32> * tensor<64x128xf32> -> tensor<64x128xf32>
+            tt.descriptor_store %c_desc[%m, %n], %result
+                : !tt.tensordesc<64x128xf32>, tensor<64x128xf32>
+            tt.return
+          }}
+        }}
+        """
+
+    def test_parallel_floor_dispatches(self):
+        # U8: parallel scatter loop synthesized for V's parallel floor dim.
+        self.run(self._kernel())
+        self.assert_absent("tt.spyre_tensor_layout")
+        self.assert_present("linalg.matmul")
+        self.assert_present("scf.for")   # the scatter loop
+
+    def test_parallel_floor_no_d3_rejection(self):
+        # D3 guard removed — pass must succeed with physBlock=2 parallel floor.
+        self.run(self._kernel())  # if D3 still active this would raise
+        self.assert_absent("tt.spyre_tensor_layout")

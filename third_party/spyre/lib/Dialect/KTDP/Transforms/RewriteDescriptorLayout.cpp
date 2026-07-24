@@ -286,6 +286,29 @@ struct RewriteDescriptorLayoutPass
     return forOp.getResult(0);
   }
 
+  // Outer parallel-scatter loop: iterates parallelIV = 0..tripCount filling
+  // disjoint positions in `container`. body(builder, parallelIV, container)
+  // returns the updated container after tensor.insert_slice. Inlines for
+  // tripCount <= 1 (passes const-0 IV, returns body result directly).
+  Value emitParallelScatterLoop(OpBuilder &b, Location loc, int64_t tripCount,
+                                 Value container,
+                                 function_ref<Value(OpBuilder &, Value, Value)> body) {
+    if (tripCount <= 1) {
+      Value s0 = arith::ConstantIndexOp::create(b, loc, 0);
+      return body(b, s0, container);
+    }
+    Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
+    Value c1 = arith::ConstantIndexOp::create(b, loc, 1);
+    Value ub = arith::ConstantIndexOp::create(b, loc, tripCount);
+    auto forOp = scf::ForOp::create(b, loc, c0, ub, c1, ValueRange{container});
+    OpBuilder ib = OpBuilder::atBlockBegin(forOp.getBody());
+    Value updated =
+        body(ib, forOp.getInductionVar(), forOp.getRegionIterArgs()[0]);
+    scf::YieldOp::create(ib, loc, ValueRange{updated});
+    b.setInsertionPointAfter(forOp);
+    return forOp.getResult(0);
+  }
+
   // Return true and dispatch if `op` needs Phase 2 processing, false if not.
   // Source ops (matmul, …): rank-mismatched inputs → dispatch, erase, RAUW.
   // Sink ops (store): data/tile rank mismatch with a marker → redirect data_tile.
@@ -693,11 +716,19 @@ struct RewriteDescriptorLayoutPass
       auto ld = walkToLoad(operand);
 
       if (ld) {
-        // Physical operand: load found — must have a marker.
+        // Physical operand: load found — check for a marker.
+        // An unannotated load (no marker in physMemViewToMarker) produces a
+        // tensor already in logical shape; treat it as a scratchpad (pass whole).
         auto marker = findMarkerForOperand(operand);
-        if (!marker)
-          return op.emitError(
-              "spyre_tensor_layout: physical operand load has no layout marker");
+        if (!marker) {
+          auto tensorTy = dyn_cast<RankedTensorType>(operand.getType());
+          if (!tensorTy ||
+              tensorTy.getRank() != (int64_t)spec.operands[i].canonicalAxes.size())
+            return op.emitError(
+                "spyre_tensor_layout: physical operand load has no layout marker");
+          plans[i] = classifyScratchpad(operand, spec.operands[i]);
+          continue;
+        }
         // Since the linalg.transpose was erased by retypeChain in Phase 1 and
         // its result RAUW'd with the physical load, operand.getType() is already
         // the physical type here.
@@ -747,21 +778,6 @@ struct RewriteDescriptorLayoutPass
 
     resolveAndReconcile(plans, spec);
 
-    // D3 guard: reject parallel floor dims with physBlock > 1.
-    // extractOpSlice uses stickIV (the reduction stick loop IV) as the offset
-    // for StickIndex dims, which is only correct for reduction floors.  Parallel
-    // floor dims with physBlock > 1 would need their own loop; until that is
-    // implemented, fail early with a clear diagnostic.
-    for (unsigned i = 0; i < nOps; ++i) {
-      for (int p : plans[i].floorDims) {
-        if (plans[i].dimRoles[p] >= 0 && plans[i].coords.physBlock[p] > 1)
-          return op.emitError(
-              "spyre_tensor_layout: source stage does not yet support "
-              "multi-stick parallel floor dims (physBlock > 1 on a parallel "
-              "axis)");
-      }
-    }
-
     return emitSourceStage(op, spec.emitOp, plans);
   }
 
@@ -782,7 +798,8 @@ struct RewriteDescriptorLayoutPass
   // the trivial stickFactor=1 case where emitStickLoop passes a const-0).
   static Value extractOpSlice(OpBuilder &b, Location loc,
                                const OperandPlan &plan,
-                               RankedTensorType resultTy, Value stickIV) {
+                               RankedTensorType resultTy, Value stickIV,
+                               Value parallelIV = nullptr) {
     auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
     ArrayRef<int64_t> physBlock = plan.coords.physBlock;
     int rank = (int)physBlock.size();
@@ -790,7 +807,10 @@ struct RewriteDescriptorLayoutPass
     for (int p = 0; p < rank; ++p) {
       switch (plan.sliceKind[p]) {
       case SliceKind::StickIndex: {
-        Value iv = (physBlock[p] > 1) ? stickIV : Value{};
+        // Parallel floor dim (role >= 0) → use parallelIV
+        // Reduction floor dim (role == -1) → use stickIV
+        Value selectedIV = (plan.dimRoles[p] >= 0 && parallelIV) ? parallelIV : stickIV;
+        Value iv = (physBlock[p] > 1) ? selectedIV : Value{};
         if (!iv) {
           offsets[p] = idx(0);
         } else if (iv.getType().isIndex()) {
@@ -1138,27 +1158,94 @@ struct RewriteDescriptorLayoutPass
       }
     }
 
+    // Detect parallel floor dims with physBlock > 1 (U8 parallel scatter path).
+    int64_t parallelFactor = 1;
+    for (auto &plan : plans) {
+      for (int p : plan.floorDims) {
+        int64_t role = plan.dimRoles[p];
+        if (role >= 0 && plan.coords.physBlock[p] > 1) {
+          int64_t f = plan.coords.physBlock[p];
+          if (parallelFactor != 1 && parallelFactor != f)
+            llvm_unreachable("emitSourceStage: plans disagree on parallelFactor");
+          parallelFactor = f;
+        }
+      }
+    }
+
     // stickIV: within-tile stick index used by StickIndex / StickifiedBlock.
     Value stickIV;
 
-    Value result = emitStickLoop(b, loc, stickFactor, cVal,
-        [&](OpBuilder &bb, Value s, Value acc) {
-      stickIV = s;
-      OpBuilder saved = b;
-      b = bb;
-      SmallVector<Value> slices;
-      for (unsigned i = 0; i < plans.size(); ++i) {
-        auto elemTy =
-            cast<RankedTensorType>(plans[i].value.getType()).getElementType();
-        Value slicePhys = extractOpSlice(b, loc, plans[i], sliceTys[i], stickIV);
-        slices.push_back(!plans[i].transposePerm.empty()
-                             ? emitTranspose(slicePhys, plans[i].transposePerm)
-                             : slicePhys);
-      }
-      Value r = emitOp(b, loc, slices, acc, accTy);
-      b = saved;
-      return r;
-    });
+    Value result;
+    if (parallelFactor > 1) {
+      // Parallel scatter path: outer loop over parallel sticks, inner over reduction.
+      // Build a physical output container sized by the full parallel output shape.
+      // accTy has the canonical logical shape; the physical shape adds the parallelFactor
+      // floor dim. For now build it as tensor.empty of (parallelFactor, ...accDims).
+      SmallVector<int64_t> physOutShape;
+      physOutShape.push_back(parallelFactor);
+      for (int64_t d : accDims)
+        physOutShape.push_back(d);
+      auto physOutTy = RankedTensorType::get(physOutShape, accElemTy);
+      Value container = tensor::EmptyOp::create(b, loc, physOutTy.getShape(), accElemTy);
+
+      result = emitParallelScatterLoop(b, loc, parallelFactor, container,
+          [&](OpBuilder &bb, Value pIV, Value cont) -> Value {
+            Value innerResult = emitStickLoop(bb, loc, stickFactor,
+                arith::ConstantOp::create(bb, loc, accTy,
+                    mlir::cast<mlir::DenseElementsAttr>(
+                        mlir::DenseElementsAttr::get(accTy,
+                            llvm::APFloat::getZero(
+                                mlir::cast<mlir::FloatType>(accElemTy)
+                                    .getFloatSemantics())))).getResult(),
+                [&](OpBuilder &bbb, Value s, Value acc) {
+                  stickIV = s;
+                  OpBuilder saved = b;
+                  b = bbb;
+                  SmallVector<Value> slices;
+                  for (unsigned i = 0; i < plans.size(); ++i) {
+                    Value slicePhys = extractOpSlice(bbb, loc, plans[i],
+                                                     sliceTys[i], stickIV, pIV);
+                    slices.push_back(!plans[i].transposePerm.empty()
+                        ? emitTranspose(slicePhys, plans[i].transposePerm)
+                        : slicePhys);
+                  }
+                  Value r = emitOp(b, loc, slices, acc, accTy);
+                  b = saved;
+                  return r;
+                });
+            // Insert innerResult at pIV position in the container.
+            // innerResult shape = accTy shape (e.g. [64, 64]).
+            // container shape = physOutShape (e.g. [2, 64, 64]).
+            // Insert at offsets [pIV, 0, 0...], sizes [1, accDims...].
+            SmallVector<OpFoldResult> offsets(physOutShape.size(), bb.getIndexAttr(0));
+            offsets[0] = pIV;
+            SmallVector<OpFoldResult> sizes;
+            sizes.push_back(bb.getIndexAttr(1));
+            for (int64_t d : accDims)
+              sizes.push_back(bb.getIndexAttr(d));
+            SmallVector<OpFoldResult> strides(physOutShape.size(), bb.getIndexAttr(1));
+            return tensor::InsertSliceOp::create(bb, loc, innerResult, cont,
+                                                  offsets, sizes, strides);
+          });
+    } else {
+      // Existing reduction-only path — unchanged.
+      result = emitStickLoop(b, loc, stickFactor, cVal,
+          [&](OpBuilder &bb, Value s, Value acc) {
+        stickIV = s;
+        OpBuilder saved = b;
+        b = bb;
+        SmallVector<Value> slices;
+        for (unsigned i = 0; i < plans.size(); ++i) {
+          Value slicePhys = extractOpSlice(b, loc, plans[i], sliceTys[i], stickIV);
+          slices.push_back(!plans[i].transposePerm.empty()
+                               ? emitTranspose(slicePhys, plans[i].transposePerm)
+                               : slicePhys);
+        }
+        Value r = emitOp(b, loc, slices, acc, accTy);
+        b = saved;
+        return r;
+      });
+    }
 
     op.getResult(0).replaceAllUsesWith(result);
     op.erase();
