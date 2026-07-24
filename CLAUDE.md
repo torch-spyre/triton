@@ -138,3 +138,15 @@ uv run pytest third_party/spyre/test -k "not numerical" # structural only
 
 Numerical coverage is a work in progress; known gaps are strict-xfail'd and
 missing oracles skip, so the suite stays green while catching regressions.
+
+## Documentation conventions
+
+- **Use GitHub-compatible LaTeX math.** GitHub renders `$...$` (inline) and
+  `$$...$$` (display block) via KaTeX. Stick to the KaTeX subset it supports:
+  - **Use**: `\lfloor`, `\rfloor`, `\lceil`, `\rceil`, `\cdot`, `\times`,
+    `\mod`, `\div`, `^`, `_`, `\frac`, `\sum`, `\prod`, `\in`, `\to`,
+    `\mathbb`, `\mathbf`, `\text{short label}`, `\begin{aligned}...\end{aligned}`.
+  - **Avoid** (renders as raw text or breaks layout on GitHub): `\;` `\,` `\!`
+    spacing hacks, `\quad` / `\qquad`, `\bmod` (use `\mod` instead),
+    `\operatorname{}`, `\DeclareMathOperator`, `\newcommand`, multi-line `align`
+    without `aligned`, and bare `\\` outside an environment.

@@ -133,6 +133,28 @@ def make_inputs_large_k(M, N, K_INDICES, BLOCK_COLS, y_offset,
                         seed=1006, allow_duplicates=True)
 
 
+def make_inputs_spyre(M, N, K_INDICES, BLOCK_COLS, y_offset,
+                      **_unused) -> dict:
+    """fp16 inputs for the Spyre physical-layout variant."""
+    rng = np.random.default_rng(seed=42)
+    in_data = rng.standard_normal((M, N)).astype(np.float16)
+    idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
+    out_data = np.zeros((K_INDICES, N), dtype=np.float16)
+    return {
+        "in_ptr":   in_data,
+        "out_ptr":  out_data,
+        "idx_ptr":  idx_data,
+        "y_offset": y_offset,
+    }
+
+
+def run_spyre(inputs: dict) -> np.ndarray:
+    """NumPy oracle for the Spyre variant: gather full rows, fp16."""
+    in_data = inputs["in_ptr"]
+    idx = inputs["idx_ptr"]
+    return in_data[idx, :]
+
+
 def run(inputs: dict) -> np.ndarray:
     """NumPy oracle: gather rows from ``in_ptr`` at ``idx_ptr`` positions.
 
@@ -673,6 +695,29 @@ SIGNATURE = {
     "K_INDICES":  "i32",
     "BLOCK_COLS": "i32",
 }
+
+_DTYPE_MAP = {"fp32": np.float32, "fp16": np.float16}
+
+def _np_dtype(sig, key):
+    return _DTYPE_MAP[sig[key].lstrip("*")]
+
+def _sticksize(sig, key):
+    return 128 // np.dtype(_np_dtype(sig, key)).itemsize
+
+_SIG_SPYRE = {
+    "in_ptr":      "*fp16",
+    "out_ptr":     "*fp16",
+    "idx_ptr":     "*i32",
+    "y_offset":    "i32",
+    "M":           "i32",
+    "N":           "i32",
+    "K_INDICES":   "i32",
+    "BLOCK_ROWS":  "constexpr",
+    "BLOCK_COLS":  "constexpr",
+    "IN_LAYOUT":   "constexpr",
+    "OUT_LAYOUT":  "constexpr",
+}
+_SS = functools.partial(_sticksize, _SIG_SPYRE)
 
 # 2D kernel has no ``y_offset`` argument and adds ``BLOCK_ROWS``.
 _SIG_2D = {
@@ -1472,5 +1517,57 @@ VARIANTS = {
         "inputs":       make_inputs_2d_index_3d_block_large,
         "output_key":   "out_ptr",
         "extra_checks": _EXTRA_CHECKS,
+    },
+    # ------------------------------------------------------------------
+    # Spyre physical-layout variant.
+    # in_desc [M, N] annotated stick-on-N; out_desc [K_INDICES, BLOCK_COLS]
+    # annotated stick-on-N. idx_desc is not annotated.
+    # Loops over all N columns in BLOCK_COLS-wide sticks so the full row
+    # is gathered into out_ptr[K_INDICES, N].
+    # ------------------------------------------------------------------
+    "spyre_stick": {
+        "kernel_fn":  kernel.gather_kernel_spyre,
+        "SIGNATURE":  _SIG_SPYRE,
+        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_ROWS", "BLOCK_COLS",
+                       "IN_LAYOUT", "OUT_LAYOUT"],
+        "params": {
+            "M":          [256],
+            # N spans multiple source N-sticks (256/64 = 4) so the physical
+            # in_desc first dim is > 1 and the gather's floordiv/mod actually
+            # selects a source stick rather than collapsing to stick 0.
+            "N":          [256],
+            "K_INDICES":  [32],
+            "BLOCK_ROWS": [32],
+            # BLOCK_COLS == STICK_SIZE (64): one stick per gather call;
+            # the col_stick loop runs N//BLOCK_COLS = 4 times.
+            "BLOCK_COLS": [128],
+            # y_offset unused by the kernel (full-row gather), but kept in
+            # the signature as a runtime scalar to satisfy run_cpu plumbing.
+            "y_offset":   [0],
+            # in_ptr [M, N]: stick-on-N → [N//_S, M, _S]
+            "IN_LAYOUT":  [[(1, "floordiv", _SS("in_ptr")), 0, (1, "mod", _SS("in_ptr"))]],
+            # out_ptr [K_INDICES, N]: stick-on-N → [N//_S, K_INDICES, _S]
+            "OUT_LAYOUT": [[(1, "floordiv", _SS("out_ptr")), 0, (1, "mod", _SS("out_ptr"))]],
+        },
+        "tags":       ["descriptor-gather", "spyre-tensor-layout"],
+        "grid":       [1],
+        "parallel":   False,
+        "reference":  run_spyre,
+        "inputs":     make_inputs_spyre,
+        "output_key": "out_ptr",
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            # in_desc is physicalized stick-on-N → rank-3 [N//stick, M, stick]
+            # view = [4, 256, 64] (4 source N-sticks).
+            t.assert_result_type(
+                "ktdp.construct_memory_view", "4x256x64xf16"),
+            # Each gather reads BLOCK_COLS=128 (2 sticks) for K_INDICES=32
+            # rows, so the indirect access tile is rank-3 [2, 32, 64].
+            t.assert_result(
+                "ktdp.construct_indirect_access_tile", shape=[2, 32, 64]),
+            # The rank-3 load result flows straight into the rank-3 store sink,
+            # so no insert_slice is synthesized (ranks already match).
+            t.assert_absent("tensor.insert_slice"),
+        ),
     },
 }

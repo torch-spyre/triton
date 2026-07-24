@@ -26,16 +26,35 @@ namespace py = pybind11;
 
 void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // Pipeline: LowerDescriptorMemory → LowerScalarLoad → LowerComputeOps →
-  // ConvertFunctions. ConvertFunctions runs last because it replaces
-  // !tt.ptr args with index; memory passes must consume !tt.ptr via
-  // getBasePtrAsIndex/ptrToIndex first.
-  m.def("add_convert_ttir_to_ktdp", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
-    pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
-    pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
-    pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
-  });
+  // RewriteDescriptorLayout → ConvertFunctions.
+  //
+  // RewriteDescriptorLayout runs after LowerComputeOps so that tt.dot is
+  // already linalg.matmul before operands are physicalized — tt.dot requires
+  // 2-D operands and would mis-lower a rank-3 physical operand.
+  // The marker (tt.spyre_tensor_layout) persists through the intervening
+  // passes: its desc operand auto-re-points at the UnrealizedConversionCast
+  // bridge left by LowerDescriptorMemory Walk 1, and both passes mark the
+  // marker legal so it is never flagged as unconverted.
+  //
+  // ConvertFunctions runs last because it replaces !tt.ptr args with index;
+  // memory passes must consume !tt.ptr via getBasePtrAsIndex first.
+  m.def("add_convert_ttir_to_ktdp",
+        [](mlir::PassManager &pm, bool hw_layout) {
+          pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
+          pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
+          pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
+          pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
+              mlir::triton::ktdp::RewriteDescriptorLayoutOptions{hw_layout}));
+          pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
+        },
+        py::arg("pm"), py::arg("hw_layout") = false);
   // Individual pass bindings for debugging and testing.
+  m.def("add_rewrite_descriptor_layout",
+        [](mlir::PassManager &pm, bool hw_layout) {
+          pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
+              mlir::triton::ktdp::RewriteDescriptorLayoutOptions{hw_layout}));
+        },
+        py::arg("pm"), py::arg("hw_layout") = false);
   m.def("add_lower_descriptor_memory", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
   });

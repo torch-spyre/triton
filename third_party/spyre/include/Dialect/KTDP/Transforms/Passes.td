@@ -6,16 +6,16 @@ include "mlir/Pass/PassBase.td"
 // ============================================================================
 // Pass pipeline: TTIR → KTIR
 //
-
-//
-//   LowerDescriptorMemory       [LowerPointerChainMemory]
+//   LowerDescriptorMemory   [LowerPointerChainMemory]
 //           └───────────┬───────────┘
-//
+//                       ↓
 //                LowerScalarLoad
 //                       ↓
-//                 LowerComputeOps
+//                LowerComputeOps
 //                       ↓
-//               ConvertFunctions
+//          RewriteDescriptorLayout   (spyre_tensor_layout-annotated
+//                       ↓             descriptors only; otherwise a no-op)
+//                ConvertFunctions
 //                       ↓
 //               DistributeWork
 //                       ↓
@@ -23,11 +23,81 @@ include "mlir/Pass/PassBase.td"
 //                       ↓
 //                     KTIR
 //
+// RewriteDescriptorLayout runs LAST (before ConvertFunctions) so that tt.dot
+// is already linalg.matmul before operands are physicalized. The marker
+// (tt.spyre_tensor_layout) persists through LowerDescriptorMemory +
+// LowerComputeOps via the UnrealizedConversionCast bridge left by Walk 1; both
+// passes mark the marker legal so it is never flagged as unconverted.
+//
 // Each pass declares its contract below:
 //   Input    — dialects/ops it expects to see
 //   Lowering — ops it converts and what they become
 //   Output   — what the IR looks like after this pass
 // ============================================================================
+
+def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"> {
+    let summary = "Rewrite logical tensor descriptors to physical (stick-tiled) "
+                  "layout from tt.spyre_tensor_layout annotations.";
+    let description = [{
+        Input: lowered KTDP IR (after LowerDescriptorMemory + LowerComputeOps).
+        Each annotated descriptor has been lowered to:
+          ktdp.construct_memory_view (logical shape/strides, wrapped in an
+          UnrealizedConversionCast bridging back to !tt.tensordesc so the
+          tt.spyre_tensor_layout marker's desc operand stays valid) →
+          ktdp.construct_access_tile (logical block shape) →
+          ktdp.load/store.
+        The marker holds the physical layout as the OpSpec device_coordinates form
+        (phys_src / phys_op / phys_arg i64 arrays, one entry per physical dim;
+        op 0=identity, 1=floordiv, 2=mod).
+
+        Runs in three phases (staged model):
+
+        Phase 1 — physicalize each annotated descriptor:
+        - rebuild ktdp.construct_memory_view with physical shape/strides/memref
+          type: floordiv dims get extent ceil(N/div) (covering partial boundary
+          sticks), mod dims get extent = modulus, identity dims are unchanged
+          (e.g. [M,N] -> [ceil(N/64), M, 64]);
+        - rebuild each ktdp.construct_access_tile with physical block shape +
+          remapped index operands (identity / divsi / remsi);
+        - retype ktdp.load result tensors and forward-retype the elementwise
+          compute chain to the physical rank (stops at multi-tensor ops);
+        - redirect ktdp.store's access tile operand to the physical tile.
+
+        Phase 2 — synthesize loop nests for ops whose physical dims need their
+        own iteration:
+        - source (matmul): physicalize INPUTS, emit an scf.for nest extracting
+          2-D slices + linalg.matmul (K-stick dims drive a reduction loop);
+          the matmul OUTPUT stays logical;
+        - sink (store, only when the output descriptor is annotated): consume the
+          logical value, emit an scf.for nest scattering it into the physical
+          output buffer via tensor.insert_slice.
+
+        Phase 3 — erase the tt.spyre_tensor_layout markers and the now-dead
+        UnrealizedConversionCast bridges.
+
+        Output: physical ktdp.construct_memory_view + access_tile + load/store,
+        with scf.for / linalg.matmul / tensor.insert_slice loop nests where
+        required; no tt.spyre_tensor_layout ops remain. Descriptors without an
+        annotation are left untouched. A pure pointwise kernel exercises only
+        Phase 1.
+    }];
+
+    let options = [
+        Option<"hwDataLayout", "hw-data-layout", "bool", "false",
+               "When true, compute physical strides as row-major over the "
+               "physical shape (hardware layout mode). When false (default), "
+               "derive strides from logical strides via the coord map "
+               "(logical layout mode).">
+    ];
+
+    let dependentDialects = [
+        "mlir::arith::ArithDialect",
+        "mlir::ktdp::KtdpDialect",
+        "mlir::linalg::LinalgDialect",
+        "mlir::scf::SCFDialect",
+        "mlir::tensor::TensorDialect"
+    ];
+}
 
 def LowerDescriptorMemory : Pass<"lower-descriptor-memory", "mlir::ModuleOp"> {
     let summary = "Lower tt.descriptor_* ops to ktdp memory ops.";
