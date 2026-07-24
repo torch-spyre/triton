@@ -1374,6 +1374,122 @@ struct RewriteDescriptorLayoutPass
       castOp.erase();
   }
 
+  // Compute physical strides as row-major of the physical shape.
+  // physStrides[M-1] = 1; physStrides[i] = physStrides[i+1] * physShape[i+1].
+  // Handles both fully-static and mixed-dynamic cases.
+  // Returns (physStaticStrides, physDynStrides).
+  static std::pair<SmallVector<int64_t>, SmallVector<Value>>
+  buildPhysicalStrides(unsigned physRank,
+                       ArrayRef<int64_t> physStaticSizes,
+                       ArrayRef<Value>   physDynSizes,
+                       OpBuilder &b,
+                       Location loc) {
+    SmallVector<int64_t> physStaticStrides(physRank);
+    SmallVector<Value>   physDynStrides;
+
+    bool hasAnyDynStride = false;
+    for (unsigned k = 0; k < physRank; ++k) {
+      if (physStaticSizes[k] == ShapedType::kDynamic) {
+        physStaticStrides[k] = ShapedType::kDynamic;
+        hasAnyDynStride = true;
+      }
+    }
+    if (!hasAnyDynStride) {
+      // All sizes are static: compute row-major strides.
+      physStaticStrides[physRank - 1] = 1;
+      for (int k = (int)physRank - 2; k >= 0; --k)
+        physStaticStrides[k] = physStaticStrides[k + 1] * physStaticSizes[k + 1];
+    } else {
+      // At least one dynamic size: all strides are dynamic SSA values.
+      // Build SSA values for each stride by accumulating a product of sizes.
+      // Innermost stride is 1; each outer stride = inner stride * inner size.
+      SmallVector<Value> strideSsaVals(physRank);
+      Value one = arith::ConstantOp::create(b, loc, b.getIndexAttr(1)).getResult();
+      strideSsaVals[physRank - 1] = one;
+      auto getSizeVal = [&](unsigned dim) -> Value {
+        if (physStaticSizes[dim] != ShapedType::kDynamic)
+          return arith::ConstantOp::create(b, loc, b.getIndexAttr(physStaticSizes[dim])).getResult();
+        // Find which physDynSizes entry this is.
+        int pos = 0;
+        for (unsigned d = 0; d < dim; ++d)
+          if (physStaticSizes[d] == ShapedType::kDynamic) ++pos;
+        return physDynSizes[pos];
+      };
+      for (int k = (int)physRank - 2; k >= 0; --k) {
+        Value innerSize = getSizeVal(k + 1);
+        strideSsaVals[k] = arith::MulIOp::create(
+            b, loc, strideSsaVals[k + 1], innerSize).getResult();
+      }
+      for (unsigned k = 0; k < physRank; ++k) {
+        physStaticStrides[k] = ShapedType::kDynamic;
+        physDynStrides.push_back(strideSsaVals[k]);
+      }
+    }
+    return {std::move(physStaticStrides), std::move(physDynStrides)};
+  }
+
+  // Compute physical strides from logical strides via the coordinate map.
+  // For each physical dim p with phys_src[p]=s and op:
+  //   Identity      → physStride[p] = logStride[s]
+  //   FloorDiv(arg) → physStride[p] = logStride[s] * arg
+  //   Mod(arg)      → physStride[p] = logStride[s]
+  // Returns (physStaticStrides, physDynStrides) following the same
+  // static/dynamic encoding as buildPhysicalMemoryView.
+  // emitError is called (and failure returned) if a dynamic stride is missing.
+  static FailureOr<std::pair<SmallVector<int64_t>, SmallVector<Value>>>
+  buildLogicalStrides(unsigned physRank,
+                      ArrayRef<int64_t> physSrc,
+                      ArrayRef<int64_t> physOp,
+                      ArrayRef<int64_t> physArg,
+                      ArrayRef<int64_t> logStaticStrides,
+                      ArrayRef<Value>   logDynStrides,
+                      ArrayRef<int>     logDynStrideIdx,
+                      OpBuilder &b,
+                      Location loc,
+                      llvm::function_ref<InFlightDiagnostic()> emitError) {
+    SmallVector<int64_t> physStaticStrides(physRank);
+    SmallVector<Value>   physDynStrides;
+
+    bool hasAnyDynStride = false;
+    for (unsigned k = 0; k < physRank; ++k) {
+      int64_t s = physSrc[k];
+      auto op = static_cast<CoordOp>(physOp[k]);
+      int64_t arg = physArg[k];
+      int64_t logSt = logStaticStrides[s];
+
+      if (logSt == ShapedType::kDynamic) {
+        physStaticStrides[k] = ShapedType::kDynamic;
+        hasAnyDynStride = true;
+      } else if (op == CoordOp::FloorDiv) {
+        physStaticStrides[k] = logSt * arg;
+      } else {
+        // Identity or Mod: stride equals the logical stride of the source dim.
+        physStaticStrides[k] = logSt;
+      }
+    }
+    if (hasAnyDynStride) {
+      // Build SSA stride values for dynamic dims.
+      for (unsigned k = 0; k < physRank; ++k) {
+        if (physStaticStrides[k] != ShapedType::kDynamic)
+          continue;
+        int64_t s = physSrc[k];
+        auto op = static_cast<CoordOp>(physOp[k]);
+        int64_t arg = physArg[k];
+        if (logDynStrideIdx[s] < 0)
+          return emitError() << "spyre_tensor_layout: expected dynamic stride for dim";
+        Value logDynSt = logDynStrides[logDynStrideIdx[s]];
+        if (op == CoordOp::FloorDiv) {
+          Value argVal = arith::ConstantOp::create(b, loc, b.getIndexAttr(arg));
+          physDynStrides.push_back(
+              arith::MulIOp::create(b, loc, logDynSt, argVal).getResult());
+        } else {
+          physDynStrides.push_back(logDynSt);
+        }
+      }
+    }
+    return std::make_pair(std::move(physStaticStrides), std::move(physDynStrides));
+  }
+
   // Phase 1: physicalize one annotated descriptor (memView + access tiles +
   // loads). Does NOT erase the marker — Phase 2 still needs its coord map.
   //
@@ -1459,8 +1575,6 @@ struct RewriteDescriptorLayoutPass
 
       SmallVector<int64_t> physStaticSizes;
       SmallVector<Value>   physDynSizes;
-      SmallVector<int64_t> physStaticStrides;
-      SmallVector<Value>   physDynStrides;
 
       for (unsigned k = 0; k < physRank; ++k) {
         int64_t src = physSrc[k];
@@ -1497,113 +1611,23 @@ struct RewriteDescriptorLayoutPass
           }
         }
 
-        // Physical strides: row-major over the physical shape.
-        // We derive them symbolically below after computing all sizes;
-        // push placeholder for now.
-        (void)logStaticStrides; (void)logDynStrides;
-        (void)logDynStrideIdx;
       }
 
       // Compute physical strides.
-      //
-      // hwDataLayout=true  ("physical" mode): row-major over the physical shape.
-      //   physStrides[M-1] = 1
-      //   physStrides[i]   = physStrides[i+1] * physShape[i+1]  for i = M-2..0
-      //   Dynamic physical sizes make the whole stride array dynamic.
-      //
-      // hwDataLayout=false ("logical" mode, default): derive from logical strides.
-      //   For each physical dim p with phys_src[p]=s and op:
-      //     Identity      → physStride[p] = logStride[s]
-      //     FloorDiv(arg) → physStride[p] = logStride[s] * arg
-      //     Mod(arg)      → physStride[p] = logStride[s]
-      //
-      physStaticStrides.resize(physRank);
-      physDynStrides.clear();
+      SmallVector<int64_t> physStaticStrides;
+      SmallVector<Value> physDynStrides;
       if (hwDataLayout) {
-        // Physical / row-major mode: strides are fully determined by physStaticSizes.
-        bool hasAnyDynStride = false;
-        for (unsigned k = 0; k < physRank; ++k) {
-          if (physStaticSizes[k] == ShapedType::kDynamic) {
-            physStaticStrides[k] = ShapedType::kDynamic;
-            hasAnyDynStride = true;
-          }
-        }
-        if (!hasAnyDynStride) {
-          // All sizes are static: compute row-major strides.
-          physStaticStrides[physRank - 1] = 1;
-          for (int k = (int)physRank - 2; k >= 0; --k)
-            physStaticStrides[k] = physStaticStrides[k + 1] * physStaticSizes[k + 1];
-        } else {
-          // At least one dynamic size: all strides are dynamic SSA values.
-          // Build SSA values for each stride by accumulating a product of sizes.
-          // Innermost stride is 1; each outer stride = inner stride * inner size.
-          // We build from the innermost outward.
-          SmallVector<Value> strideSsaVals(physRank);
-          Value one = arith::ConstantOp::create(b, loc, b.getIndexAttr(1)).getResult();
-          strideSsaVals[physRank - 1] = one;
-          // We also need an SSA value for each physStaticSize to multiply with.
-          auto getSizeVal = [&](unsigned dim) -> Value {
-            if (physStaticSizes[dim] != ShapedType::kDynamic)
-              return arith::ConstantOp::create(b, loc, b.getIndexAttr(physStaticSizes[dim])).getResult();
-            // Find which physDynSizes entry this is.
-            int pos = 0;
-            for (unsigned d = 0; d < dim; ++d)
-              if (physStaticSizes[d] == ShapedType::kDynamic) ++pos;
-            return physDynSizes[pos];
-          };
-          for (int k = (int)physRank - 2; k >= 0; --k) {
-            Value innerSize = getSizeVal(k + 1);
-            strideSsaVals[k] = arith::MulIOp::create(
-                b, loc, strideSsaVals[k + 1], innerSize).getResult();
-          }
-          for (unsigned k = 0; k < physRank; ++k) {
-            physStaticStrides[k] = ShapedType::kDynamic;
-            physDynStrides.push_back(strideSsaVals[k]);
-          }
-        }
+        std::tie(physStaticStrides, physDynStrides) =
+            buildPhysicalStrides(physRank, physStaticSizes, physDynSizes, b, loc);
       } else {
-        // Logical mode (default): derive strides from logical strides via coord map.
-        bool hasAnyDynStride = false;
-        for (unsigned k = 0; k < physRank; ++k) {
-          int64_t s = physSrc[k];
-          auto op = static_cast<CoordOp>(physOp[k]);
-          int64_t arg = physArg[k];
-          int64_t logSt = logStaticStrides[s];
-
-          if (logSt == ShapedType::kDynamic) {
-            physStaticStrides[k] = ShapedType::kDynamic;
-            hasAnyDynStride = true;
-          } else if (op == CoordOp::FloorDiv) {
-            physStaticStrides[k] = logSt * arg;
-          } else {
-            // Identity or Mod: stride equals the logical stride of the source dim.
-            physStaticStrides[k] = logSt;
-          }
-        }
-        if (hasAnyDynStride) {
-          // Build SSA stride values for dynamic dims.
-          int dynPos = 0;
-          for (unsigned k = 0; k < physRank; ++k) {
-            if (physStaticStrides[k] != ShapedType::kDynamic)
-              continue;
-            int64_t s = physSrc[k];
-            auto op = static_cast<CoordOp>(physOp[k]);
-            int64_t arg = physArg[k];
-            if (logDynStrideIdx[s] < 0)
-              return marker.emitError(
-                  "spyre_tensor_layout: expected dynamic stride for dim");
-            Value logDynSt = logDynStrides[logDynStrideIdx[s]];
-            if (op == CoordOp::FloorDiv) {
-              Value argVal = arith::ConstantOp::create(
-                  b, loc, b.getIndexAttr(arg));
-              physDynStrides.push_back(
-                  arith::MulIOp::create(b, loc, logDynSt, argVal).getResult());
-            } else {
-              physDynStrides.push_back(logDynSt);
-            }
-            (void)dynPos++;
-          }
-        }
+        auto result =
+            buildLogicalStrides(physRank, physSrc, physOp, physArg,
+                                logStaticStrides, logDynStrides, logDynStrideIdx,
+                                b, loc,
+                                [&]() { return marker.emitError(); });
+        if (failed(result))
+          return failure();
+        std::tie(physStaticStrides, physDynStrides) = std::move(*result);
       }
 
       // Physical memref type.
