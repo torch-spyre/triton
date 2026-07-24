@@ -141,12 +141,17 @@ def walk_module(mod) -> list:
 # make_ktir_mod — full TTIR → KTIR pipeline, returns live ir.module
 # ---------------------------------------------------------------------------
 
-def make_ktir_mod(ttir_path, *, grid=None):
+def make_ktir_mod(ttir_path, *, grid=None, hbm_data_layout="logical"):
     """Parse *ttir_path*, run TTIR and KTIR passes, return the live module.
 
     ``grid`` is an optional per-axis hardware partition forwarded to the
     DistributeWork pass via SpyreOptions. Defaults to the backend's
     default grid (currently ``(32,)``) when omitted.
+
+    ``hbm_data_layout`` controls the HBM layout used by the lowering passes.
+    Defaults to ``"logical"`` (identity layout). Only forwarded to
+    ``parse_options`` when non-default so that callers unaware of the option
+    (e.g. older ``SpyreOptions``) are unaffected.
     """
     from triton._C.libtriton import ir
     from triton.backends.compiler import GPUTarget
@@ -154,7 +159,11 @@ def make_ktir_mod(ttir_path, *, grid=None):
 
     target = GPUTarget(backend="spyre", arch=1, warp_size=1)
     backend = SpyreBackend(target)
-    opts = {"grid": tuple(grid)} if grid is not None else {}
+    opts = {}
+    if grid is not None:
+        opts["grid"] = tuple(grid)
+    if hbm_data_layout != "logical":
+        opts["hbm_data_layout"] = hbm_data_layout
     options = backend.parse_options(opts)
 
     ctx = ir.context()
@@ -403,3 +412,77 @@ class StructuralAssertions:
             assert s in stderr, (
                 f"Expected '{s}' in stderr, got:\n{stderr}"
             )
+
+
+# ---------------------------------------------------------------------------
+# stickify — reorder a logical numpy array into physical stick-tiled layout
+# ---------------------------------------------------------------------------
+
+def stickify(arr: "np.ndarray", layout: list) -> "np.ndarray":
+    """Reorder a logical numpy array into physical (stick-tiled) row-major order.
+
+    Each entry in ``layout`` is either:
+
+    - ``int``: identity dim (logical axis index, no split)
+    - ``(int, "floordiv", S)``: floor-div dim (produces N//S axis)
+    - ``(int, "mod", S)``: mod dim (produces S-wide lane axis)
+
+    The physical dim order matches the order of entries in ``layout``.
+    Returns a C-contiguous numpy array in physical layout.
+
+    Example::
+
+        # arr_MK has shape [64, 128]
+        # layout: K-major stickification with stick size 64
+        out = stickify(arr_MK, [(1, "floordiv", 64), 0, (1, "mod", 64)])
+        # out.shape == (2, 64, 64)  — (K/S, M, lane)
+        # a[0, 64] == out[1, 0, 0]  — k_stick=1, m=0, lane=0
+    """
+    import numpy as np
+
+    # Step 1: Find all stickified axes and their stick sizes.
+    # For each logical axis that appears as a floordiv entry, record S.
+    splits = {}  # logical_axis -> S
+    for d in layout:
+        if isinstance(d, tuple) and d[1] == "floordiv":
+            splits[d[0]] = d[2]
+
+    # Step 2: Reshape — split each stickified axis into (N//S, S).
+    # Build the reshape target shape and track how each original axis maps
+    # into the reshaped array.
+    arr_reshaped = arr
+    axis_map = {}  # original logical axis index -> int (unsplit) or (floor, lane) pair
+    offset = 0
+    for orig_ax in range(arr.ndim):
+        if orig_ax in splits:
+            S = splits[orig_ax]
+            n = arr_reshaped.shape[offset]
+            assert n % S == 0, (
+                f"dim {orig_ax} size {n} not divisible by stick size {S}"
+            )
+            new_shape = (
+                arr_reshaped.shape[:offset]
+                + (n // S, S)
+                + arr_reshaped.shape[offset + 1:]
+            )
+            arr_reshaped = arr_reshaped.reshape(new_shape)
+            axis_map[orig_ax] = (offset, offset + 1)
+            offset += 2
+        else:
+            axis_map[orig_ax] = offset
+            offset += 1
+
+    # Step 3: Build the transpose permutation from the layout order.
+    perm = []
+    for d in layout:
+        if isinstance(d, int):
+            perm.append(axis_map[d])
+        elif d[1] == "floordiv":
+            floor_ax, _ = axis_map[d[0]]
+            perm.append(floor_ax)
+        elif d[1] == "mod":
+            _, lane_ax = axis_map[d[0]]
+            perm.append(lane_ax)
+
+    arr_transposed = arr_reshaped.transpose(perm)
+    return np.ascontiguousarray(arr_transposed)

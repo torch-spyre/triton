@@ -218,6 +218,8 @@ struct RewriteDescriptorLayoutPass
     : public mlir::triton::ktdp::impl::RewriteDescriptorLayoutBase<
           RewriteDescriptorLayoutPass> {
 
+  using RewriteDescriptorLayoutBase::RewriteDescriptorLayoutBase;
+
   // Maps each physical ConstructMemoryViewOp result -> its source marker.
   // Populated during Phase 1; read during Phase 2 (markers still live).
   DenseMap<Value, triton::SpyreTensorLayoutOp> physMemViewToMarker;
@@ -1502,20 +1504,65 @@ struct RewriteDescriptorLayoutPass
         (void)logDynStrideIdx;
       }
 
-      // Compute physical strides from the logical strides via the coord map.
+      // Compute physical strides.
       //
-      // For each physical dim p with phys_src[p]=s and op:
-      //   Identity  → physStride[p] = logStride[s]
-      //   FloorDiv(arg) → physStride[p] = logStride[s] * arg
-      //                   (one stick-step = arg consecutive logical rows)
-      //   Mod(arg)  → physStride[p] = logStride[s]
-      //                   (one lane-step = 1 logical row)
+      // hwDataLayout=true  ("physical" mode): row-major over the physical shape.
+      //   physStrides[M-1] = 1
+      //   physStrides[i]   = physStrides[i+1] * physShape[i+1]  for i = M-2..0
+      //   Dynamic physical sizes make the whole stride array dynamic.
       //
-      // This is correct for any physical dim ordering and avoids the
-      // row-major-over-physBlock assumption that breaks for stick-on-M.
+      // hwDataLayout=false ("logical" mode, default): derive from logical strides.
+      //   For each physical dim p with phys_src[p]=s and op:
+      //     Identity      → physStride[p] = logStride[s]
+      //     FloorDiv(arg) → physStride[p] = logStride[s] * arg
+      //     Mod(arg)      → physStride[p] = logStride[s]
+      //
       physStaticStrides.resize(physRank);
       physDynStrides.clear();
-      {
+      if (hwDataLayout) {
+        // Physical / row-major mode: strides are fully determined by physStaticSizes.
+        bool hasAnyDynStride = false;
+        for (unsigned k = 0; k < physRank; ++k) {
+          if (physStaticSizes[k] == ShapedType::kDynamic) {
+            physStaticStrides[k] = ShapedType::kDynamic;
+            hasAnyDynStride = true;
+          }
+        }
+        if (!hasAnyDynStride) {
+          // All sizes are static: compute row-major strides.
+          physStaticStrides[physRank - 1] = 1;
+          for (int k = (int)physRank - 2; k >= 0; --k)
+            physStaticStrides[k] = physStaticStrides[k + 1] * physStaticSizes[k + 1];
+        } else {
+          // At least one dynamic size: all strides are dynamic SSA values.
+          // Build SSA values for each stride by accumulating a product of sizes.
+          // Innermost stride is 1; each outer stride = inner stride * inner size.
+          // We build from the innermost outward.
+          SmallVector<Value> strideSsaVals(physRank);
+          Value one = arith::ConstantOp::create(b, loc, b.getIndexAttr(1)).getResult();
+          strideSsaVals[physRank - 1] = one;
+          // We also need an SSA value for each physStaticSize to multiply with.
+          auto getSizeVal = [&](unsigned dim) -> Value {
+            if (physStaticSizes[dim] != ShapedType::kDynamic)
+              return arith::ConstantOp::create(b, loc, b.getIndexAttr(physStaticSizes[dim])).getResult();
+            // Find which physDynSizes entry this is.
+            int pos = 0;
+            for (unsigned d = 0; d < dim; ++d)
+              if (physStaticSizes[d] == ShapedType::kDynamic) ++pos;
+            return physDynSizes[pos];
+          };
+          for (int k = (int)physRank - 2; k >= 0; --k) {
+            Value innerSize = getSizeVal(k + 1);
+            strideSsaVals[k] = arith::MulIOp::create(
+                b, loc, strideSsaVals[k + 1], innerSize).getResult();
+          }
+          for (unsigned k = 0; k < physRank; ++k) {
+            physStaticStrides[k] = ShapedType::kDynamic;
+            physDynStrides.push_back(strideSsaVals[k]);
+          }
+        }
+      } else {
+        // Logical mode (default): derive strides from logical strides via coord map.
         bool hasAnyDynStride = false;
         for (unsigned k = 0; k < physRank; ++k) {
           int64_t s = physSrc[k];

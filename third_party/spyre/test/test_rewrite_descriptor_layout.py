@@ -1815,3 +1815,106 @@ class TestTransposeThenMatmul(RewriteLayoutTester):
         self.assert_absent("tt.spyre_tensor_layout")
         self.assert_absent("linalg.generic")
         self.assert_present("linalg.matmul")
+
+
+# =========================================================================
+# T20: hbm_data_layout option controls stride convention in buildPhysicalMemoryView
+# =========================================================================
+
+class TestHbmDataLayout(RewriteLayoutTester):
+    """T20: hbm_data_layout="physical" emits row-major strides of the physical shape.
+
+    A[M=64, K=128] stick-on-K -> physical shape [K//64, M, lane] = [2, 64, 64].
+
+    Default "logical" mode: strides are derived from the logical strides via the
+    coordinate map -> [64, 128, 1] (the stride of the flat logical layout
+    projected through the physical permutation).
+
+    "physical" mode: strides are row-major of the physical shape
+    -> [2*64, 64, 1] = [4096, 64, 1].
+    """
+
+    # A[M,K] stick-on-K: phys_src=[1,0,1] => dim0=K//64, dim1=M, dim2=K%64
+    _A_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
+
+    def _kernel(self):
+        return f"""
+        module {{
+          tt.func @k(%a_ptr: !tt.ptr<f16>) {{
+            %M = arith.constant 64 : i32
+            %K = arith.constant 128 : i32
+            %sK = arith.constant 128 : i64
+            %s1 = arith.constant 1 : i64
+            %c0 = arith.constant 0 : i32
+            %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%sK, %s1]
+                : <f16>, <64x128xf16>
+            tt.spyre_tensor_layout %a_desc {self._A_LAYOUT} : <64x128xf16>
+            %tile = tt.descriptor_load %a_desc[%c0, %c0]
+                : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
+            tt.return
+          }}
+        }}
+        """
+
+    def _build_passes(self, pm):
+        from triton._C.libtriton import spyre
+        spyre.passes.ttir_to_ktdp.add_lower_descriptor_memory(pm)
+        spyre.passes.ttir_to_ktdp.add_lower_compute_ops(pm)
+        spyre.passes.ttir_to_ktdp.add_rewrite_descriptor_layout(pm, hw_layout=True)
+
+    def test_physical_strides_row_major(self):
+        # T20/Q14/E3: "physical" mode emits row-major strides of the physical shape.
+        # A[64,128] stick-on-K -> physical shape [2,64,64] -> strides [4096, 64, 1].
+        self.run(self._kernel())
+        self.assert_absent("tt.spyre_tensor_layout")
+        self.assert_present("ktdp.construct_memory_view")
+        mod_text = str(self.mod)
+        assert "4096" in mod_text, (
+            f"Expected row-major stride 4096 (= 64*64) in physical mode output.\n"
+            f"Full module:\n{mod_text}"
+        )
+
+
+class TestHbmDataLayoutLogical(RewriteLayoutTester):
+    """T20 complement: default "logical" mode uses coord-map-derived strides.
+
+    Same A[M=64, K=128] stick-on-K kernel; default _build_passes (no hw_layout).
+    Physical shape [2, 64, 64] -> logical-mode strides [64, 128, 1].
+    """
+
+    # A[M,K] stick-on-K: same layout as TestHbmDataLayout
+    _A_LAYOUT = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
+
+    def _kernel(self):
+        return f"""
+        module {{
+          tt.func @k(%a_ptr: !tt.ptr<f16>) {{
+            %M = arith.constant 64 : i32
+            %K = arith.constant 128 : i32
+            %sK = arith.constant 128 : i64
+            %s1 = arith.constant 1 : i64
+            %c0 = arith.constant 0 : i32
+            %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%sK, %s1]
+                : <f16>, <64x128xf16>
+            tt.spyre_tensor_layout %a_desc {self._A_LAYOUT} : <64x128xf16>
+            %tile = tt.descriptor_load %a_desc[%c0, %c0]
+                : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
+            tt.return
+          }}
+        }}
+        """
+
+    def test_logical_strides_coord_map(self):
+        # T20: default "logical" mode emits coord-map-derived strides, NOT
+        # row-major strides of the physical shape.
+        # A[64,128] stick-on-K -> physical shape [2,64,64].
+        # Logical strides [128, 1] projected through the coord map give [64, 128, 1].
+        # The distinguishing check: 4096 (row-major physical stride) must NOT appear.
+        self.run(self._kernel())
+        self.assert_absent("tt.spyre_tensor_layout")
+        self.assert_present("ktdp.construct_memory_view")
+        mod_text = str(self.mod)
+        assert "4096" not in mod_text, (
+            f"Unexpected row-major stride 4096 in logical (default) mode output.\n"
+            f"Full module:\n{mod_text}"
+        )

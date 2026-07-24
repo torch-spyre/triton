@@ -206,6 +206,8 @@ def load_driver(path: Path) -> tuple[str, dict]:
     }
     if hasattr(mod, "GRID") and mod.GRID is not None:
         entry["grid"] = tuple(mod.GRID)
+    if hasattr(mod, "HBM_DATA_LAYOUT") and mod.HBM_DATA_LAYOUT is not None:
+        entry["hbm_data_layout"] = mod.HBM_DATA_LAYOUT
     return path.stem, entry
 
 
@@ -246,6 +248,7 @@ def compile_variant(conftest_mod, entry: dict) -> tuple[str, str]:
     """Compile one variant to (ttir_text, ktir_text), both cleaned and
     post-inlining."""
     grid = entry.get("grid")  # None → backend default
+    hbm_data_layout = entry.get("hbm_data_layout", "logical")
 
     raw_ttir = conftest_mod.compile_to_ttir(
         entry["kernel_fn"],
@@ -261,7 +264,9 @@ def compile_variant(conftest_mod, entry: dict) -> tuple[str, str]:
             mode="w", suffix=".mlir", delete_on_close=False) as f:
         f.write(ttir_text)
         f.flush()
-        mod = conftest_mod.make_ktir_mod(f.name, grid=grid)
+        mod = conftest_mod.make_ktir_mod(
+            f.name, grid=grid, hbm_data_layout=hbm_data_layout
+        )
     ktir_text = str(mod)
 
     return clean_ir(ttir_text), clean_ir(ktir_text)

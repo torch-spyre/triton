@@ -82,6 +82,14 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
         Phase 1.
     }];
 
+    let options = [
+        Option<"hwDataLayout", "hw-data-layout", "bool", "false",
+               "When true, compute physical strides as row-major over the "
+               "physical shape (hardware layout mode). When false (default), "
+               "derive strides from logical strides via the coord map "
+               "(logical layout mode).">
+    ];
+
     let dependentDialects = [
         "mlir::arith::ArithDialect",
         "mlir::ktdp::KtdpDialect",

@@ -38,17 +38,23 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   //
   // ConvertFunctions runs last because it replaces !tt.ptr args with index;
   // memory passes must consume !tt.ptr via getBasePtrAsIndex first.
-  m.def("add_convert_ttir_to_ktdp", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
-    pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
-    pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
-    pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout());
-    pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
-  });
+  m.def("add_convert_ttir_to_ktdp",
+        [](mlir::PassManager &pm, bool hw_layout) {
+          pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
+          pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
+          pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
+          pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
+              mlir::triton::ktdp::RewriteDescriptorLayoutOptions{hw_layout}));
+          pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
+        },
+        py::arg("pm"), py::arg("hw_layout") = false);
   // Individual pass bindings for debugging and testing.
-  m.def("add_rewrite_descriptor_layout", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout());
-  });
+  m.def("add_rewrite_descriptor_layout",
+        [](mlir::PassManager &pm, bool hw_layout) {
+          pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
+              mlir::triton::ktdp::RewriteDescriptorLayoutOptions{hw_layout}));
+        },
+        py::arg("pm"), py::arg("hw_layout") = false);
   m.def("add_lower_descriptor_memory", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
   });
