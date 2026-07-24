@@ -1991,3 +1991,123 @@ class TestParallelFloorMatmul(RewriteLayoutTester):
         # D3 guard removed — pass must succeed with physBlock=2 parallel floor.
         self.run(self._kernel())  # if D3 still active this would raise
         self.assert_absent("tt.spyre_tensor_layout")
+
+
+# =========================================================================
+# U8 + scf.for: parallel scatter inside an accumulator loop (iter_arg bug)
+# =========================================================================
+
+class TestScatterIterArgMismatch(RewriteLayoutTester):
+    """iter_arg type mismatch when the U8 parallel scatter loop fires inside
+    an outer scf.for that carries the accumulator as an iter_arg.
+
+    The pattern is P @ V attention inner loop:
+
+      scf.for %k = 0 to SEQ step BLOCK_K
+          iter_args(%acc = zeros : tensor<1x64x128xf32>) {
+        %v = tt.descriptor_load %v_desc[...]     # V is stick-on-DMODEL
+        %new_acc = tt.dot %p, %v, %acc           # -> linalg.batch_matmul
+        scf.yield %new_acc
+      }
+
+    After Phase 2 dispatch, %new_acc becomes tensor<2x1x64x64xf32> (the
+    physical scatter container for parallelFactor=2).  But the outer
+    scf.for's iter_arg and its result are still tensor<1x64x128xf32>.
+    The verifier rejects the mismatch:
+
+      'scf.for' op 2-th region iter_arg and 2-th yielded value have
+      different type: 'tensor<1x64x128xf32>' != 'tensor<2x1x64x64xf32>'
+
+    Shapes:
+      P (scratchpad): tensor<1x64x64xf16>  — no annotation (logical)
+      V (physical):   logical [1, 64, 128], stick-on-dim2, S=64
+                      -> physical [2, 1, 64, 64]  (parallelFactor=2)
+      acc iter_arg:   tensor<1x64x128xf32> — initialised to zero
+      After dispatch: scatter result tensor<2x1x64x64xf32> — mismatch
+
+    BUG: emitSourceStage calls op.getResult(0).replaceAllUsesWith(result)
+    where result has the physical scatter type.  This updates the scf.yield
+    operand to point at result, but the enclosing scf.for's iter_arg type
+    (and the init value's type) are unchanged.  MLIR's scf.for verifier
+    requires iter_args[i].type == yield_operands[i].type == results[i].type.
+    """
+
+    # V[B,K,N] stick-on-N (dim 2): phys_src=[0,2,1,2], phys_op=[0,1,0,2]
+    # physical shape = [B, N//64, K, N%64] = [1, 2, 64, 64]
+    # For B=1,K=64,N=128 with block [1,64,128]:
+    #   physBlock = [B=1, N//64=2, K=64, N%64=64]
+    #   parallelFactor = physBlock[floor_of_N_dim] = 2
+    _V_LAYOUT = layout_attr([0, (2, "floordiv", 64), 1, (2, "mod", 64)])
+
+    def _kernel(self):
+        # Outer scf.for over sequence positions (SEQ=2, step=1) carries
+        # acc as tensor<1x64x128xf32>.  Inside: batch_matmul P @ V where
+        # V is stick-on-N with physBlock=2 -> triggers parallelFactor=2.
+        #
+        # P is unannotated (logical scratchpad).
+        # No output descriptor — we store the raw accumulator via an
+        # unannotated descriptor so the sink stage is irrelevant.
+        return f"""
+        module {{
+          tt.func @attn_pv(%p_ptr: !tt.ptr<f16>, %v_ptr: !tt.ptr<f16>,
+                           %out_ptr: !tt.ptr<f32>) {{
+            %B   = arith.constant 1   : i32
+            %SEQ = arith.constant 64  : i32
+            %DIM = arith.constant 128 : i32
+            %seq_steps = arith.constant 2 : i32
+            %c0  = arith.constant 0 : i32
+            %c1  = arith.constant 1 : i32
+            %c64 = arith.constant 64 : i32
+            %sB  = arith.constant 8192 : i64
+            %sS  = arith.constant 64   : i64
+            %sD  = arith.constant 128  : i64
+            %s1  = arith.constant 1    : i64
+            %p_desc = tt.make_tensor_descriptor %p_ptr,
+                [%B, %SEQ, %SEQ], [%sB, %sS, %s1]
+                : <f16>, <1x64x64xf16>
+            %v_desc = tt.make_tensor_descriptor %v_ptr,
+                [%B, %SEQ, %DIM], [%sB, %sD, %s1]
+                : <f16>, <1x64x128xf16>
+            tt.spyre_tensor_layout %v_desc {self._V_LAYOUT} : <1x64x128xf16>
+            %out_desc = tt.make_tensor_descriptor %out_ptr,
+                [%B, %SEQ, %DIM], [%sB, %sD, %s1]
+                : <f32>, <1x64x128xf32>
+            %acc_init = arith.constant dense<0.0> : tensor<1x64x128xf32>
+            %result = scf.for %k = %c0 to %seq_steps step %c1
+                iter_args(%acc = %acc_init) -> (tensor<1x64x128xf32>) : i32 {{
+              %k64 = arith.muli %k, %c64 : i32
+              %p_tile = tt.descriptor_load %p_desc[%c0, %c0, %k64]
+                  : !tt.tensordesc<1x64x64xf16> -> tensor<1x64x64xf16>
+              %v_tile = tt.descriptor_load %v_desc[%c0, %k64, %c0]
+                  : !tt.tensordesc<1x64x128xf16> -> tensor<1x64x128xf16>
+              %new_acc = tt.dot %p_tile, %v_tile, %acc
+                  : tensor<1x64x64xf16> * tensor<1x64x128xf16> -> tensor<1x64x128xf32>
+              scf.yield %new_acc : tensor<1x64x128xf32>
+            }}
+            tt.descriptor_store %out_desc[%c0, %c0, %c0], %result
+                : !tt.tensordesc<1x64x128xf32>, tensor<1x64x128xf32>
+            tt.return
+          }}
+        }}
+        """
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "BUG: emitSourceStage RAUWs the linalg.batch_matmul result with a "
+        "physical scatter container tensor<2x1x64x64xf32>, but the enclosing "
+        "scf.for's iter_arg and result type remain tensor<1x64x128xf32>. "
+        "The scf.for verifier rejects the mismatch. "
+        "Fix: update the scf.for iter_arg type, result type, and init value "
+        "to the physical shape after emitting the scatter result."
+    ))
+    def test_scatter_iter_arg_type_mismatch(self):
+        # This test documents the known failure: when the parallel scatter path
+        # (parallelFactor=2) fires inside an outer scf.for that carries the
+        # accumulator as an iter_arg, emitSourceStage leaves the iter_arg type
+        # inconsistent with the yielded scatter result type.
+        #
+        # Expected failure:
+        #   'scf.for' op 2-th region iter_arg and 2-th yielded value have
+        #   different type: 'tensor<1x64x128xf32>' != 'tensor<2x1x64x64xf32>'
+        self.run(self._kernel())
+        # If the pass were correct, the marker would be erased.
+        self.assert_absent("tt.spyre_tensor_layout")
