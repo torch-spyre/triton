@@ -106,7 +106,7 @@ Expected diagnostics:
 - `matmul::default` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-2d, num-programs-fold)
 - `matmul::dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, program-id-2d, num-programs-fold)
 - `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d, num-programs-fold)
-- `matmul::bmm_dynamic` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, program-id-1d, num-programs-fold)
+- `matmul::bmm_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, program-id-1d, num-programs-fold)
 - `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-2d)
 
 _+ 3 more variants_

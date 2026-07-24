@@ -157,6 +157,25 @@ VARIANTS = {
                             shape_not=[1024]),
         ),
     },
+    "single_block": {
+        # n_elements=1024=BLOCK_SIZE: only 1 block total.
+        # 31 cores produce a zero-trip scf.for range.
+        # extra_checks omitted: n_elements==BLOCK_SIZE so the full-tensor view
+        # and the tile have the same size; the inherited shape_not check would
+        # be vacuously false.
+        "base":         "default",
+        "params":       {"n_elements": [1024], "BLOCK_SIZE": [1024]},
+        "extra_checks": None,
+    },
+    "nonaligned": {
+        # n_elements=2097153: num_blocks=2049, not divisible by 32 cores.
+        # tl.minimum clamp fires on the last core's block range.
+        "base":   "default",
+        "params": {"n_elements": [2097153], "BLOCK_SIZE": [1024]},
+        "extra_checks": lambda t: (
+            t.assert_result("ktdp.construct_memory_view", shape_not=[1024]),
+        ),
+    },
     "dynamic": {
         # PR #86: flip n_elements from constexpr to runtime i32. Produces
         # memref<?xf32> in KTIR. Inherits ``params`` and everything else
@@ -183,6 +202,12 @@ VARIANTS = {
             # LowerDescriptorMemory.
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x"),
         ),
+    },
+    "dynamic_small": {
+        # Different shape: verifies the compiled dynamic kernel runs at a
+        # smaller n_elements than the static default.
+        "base":   "dynamic",
+        "params": {"n_elements": [4096], "BLOCK_SIZE": [1024]},
     },
     # --- 2D variants ---
     "2d": {
@@ -212,7 +237,8 @@ VARIANTS = {
         ),
     },
     "2d_dynamic": {
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
+        "base":      "2d",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
         "summary": (
             "2D elementwise add where both `M` and `N` are runtime "
             "arguments."
@@ -223,15 +249,26 @@ VARIANTS = {
             "lowers to `memref<?x?xf32>`, so the compiled kernel runs "
             "unchanged across a range of matrix shapes."
         ),
-        "kernel_fn":    kernel.add_kernel_2d,
-        "SIGNATURE":    _SIG_2D,
         "constexpr":    ["BLOCK_M", "BLOCK_N"],
-        "params":       {"M": [512], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16]},
-        "inputs":       make_inputs_2d,
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?xf32>"),
         ),
+    },
+    "2d_nonaligned": {
+        # M=520: m_blocks=33, not divisible by 32 cores → clamp fires.
+        "base":   "2d",
+        "params": {"M": [520], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16]},
+        "extra_checks": lambda t: (
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<520x32xf32>"),
+        ),
+    },
+    "2d_dynamic_alt": {
+        # Different N than the static 2d sibling: confirms the compiled
+        # dynamic kernel runs at a shape distinct from its static sibling.
+        "base":   "2d_dynamic",
+        "params": {"M": [256], "N": [64], "BLOCK_M": [16], "BLOCK_N": [16]},
     },
     # --- 3D variants ---
     "3d": {
@@ -262,7 +299,8 @@ VARIANTS = {
         ),
     },
     "3d_dynamic": {
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
+        "base":      "3d",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
         "summary": (
             "3D elementwise add where `M`, `N`, `P` are all runtime "
             "arguments."
@@ -272,17 +310,35 @@ VARIANTS = {
             "dimensions arrive as runtime `i32` arguments. The "
             "descriptor lowers to `memref<?x?x?xf32>`."
         ),
-        "kernel_fn":    kernel.add_kernel_3d,
-        "SIGNATURE":    _SIG_3D,
         "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P"],
-        "params":       {
-            "M": [64], "N": [32], "P": [16],
-            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
-        },
-        "inputs":       make_inputs_3d,
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?x?xf32>"),
+        ),
+    },
+    "3d_nonaligned": {
+        # M=65: m_blocks=9, not divisible by 32 cores → clamp fires.
+        "base":   "3d",
+        "params": {
+            "M": [65], "N": [32], "P": [16],
+            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
+        },
+        "extra_checks": lambda t: (
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<65x32x16xf32>"),
+        ),
+    },
+    "3d_active_cores": {
+        # M=256: m_blocks=32, all 32 cores get exactly 1 M-tile.
+        # The 3d default has M=64 (only 8 active cores).
+        "base":   "3d",
+        "params": {
+            "M": [256], "N": [32], "P": [16],
+            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
+        },
+        "extra_checks": lambda t: (
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<256x32x16xf32>"),
         ),
     },
     # --- 2D grid variants ---
@@ -310,7 +366,8 @@ VARIANTS = {
         ),
     },
     "2d_grid_dynamic": {
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-2d", "num-programs-fold"],
+        "base":      "2d_grid",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-2d", "num-programs-fold"],
         "summary": (
             "2D grid with runtime `M` and `N`: distribution loop structure, "
             "dynamic descriptor shapes."
@@ -319,12 +376,7 @@ VARIANTS = {
             "Same as `2d_grid` but `M` and `N` are runtime `i32` arguments. "
             "Descriptors lower to `memref<?x?xf32>`."
         ),
-        "kernel_fn":    kernel.add_kernel_2d_grid,
-        "SIGNATURE":    _SIG_2D,
         "constexpr":    ["BLOCK_M", "BLOCK_N"],
-        "params":       {"M": [256], "N": [128], "BLOCK_M": [16], "BLOCK_N": [16]},
-        "grid":         [4, 8],
-        "inputs":       make_inputs_2d,
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?xf32>"),
@@ -358,7 +410,8 @@ VARIANTS = {
         ),
     },
     "3d_grid_dynamic": {
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-3d", "num-programs-fold"],
+        "base":      "3d_grid",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-3d", "num-programs-fold"],
         "summary": (
             "3D grid with runtime `M`, `N`, `P`: distribution loop structure, "
             "dynamic descriptor shapes."
@@ -367,15 +420,7 @@ VARIANTS = {
             "Same as `3d_grid` but `M`, `N`, `P` are runtime `i32` arguments. "
             "Descriptors lower to `memref<?x?x?xf32>`."
         ),
-        "kernel_fn":    kernel.add_kernel_3d_grid,
-        "SIGNATURE":    _SIG_3D,
         "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P"],
-        "params":       {
-            "M": [64], "N": [32], "P": [16],
-            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
-        },
-        "grid":         [2, 4, 4],
-        "inputs":       make_inputs_3d,
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?x?xf32>"),

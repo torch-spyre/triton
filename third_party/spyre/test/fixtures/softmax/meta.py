@@ -109,6 +109,17 @@ VARIANTS = {
             t.assert_present("linalg.broadcast"),
         ),
     },
+    "few_rows": {
+        # M=16: only 16 rows across 32 cores → 16 cores are idle (zero-trip loop).
+        "base":   "default",
+        "params": {"M": [16], "N": [1024], "BLOCK_SIZE": [1024]},
+    },
+    "nonaligned": {
+        # M=1000: rows_per_core=ceil(1000/32)=32 for most cores, but the last
+        # core's range overshoots 1000 → tl.minimum clamp fires.
+        "base":   "default",
+        "params": {"M": [1000], "N": [1024], "BLOCK_SIZE": [1024]},
+    },
     "multi_tile": {
         # 3-pass over n_tiles = N / BLOCK_N. Redeclares SIGNATURE because
         # multi_tile's kernel has BLOCK_N in place of BLOCK_SIZE.
@@ -147,6 +158,18 @@ VARIANTS = {
             # three inner N-tile passes (max, denom, normalize).
             t.assert_count("scf.for", 4, cmp="ge"),
         ),
+    },
+    "multi_tile_nonaligned": {
+        # M=1000: rows_per_core clamp fires, same as nonaligned but on the
+        # multi-tile kernel where N-tile inner loops also run.
+        "base":   "multi_tile",
+        "params": {"M": [1000], "N": [1024], "BLOCK_N": [64]},
+    },
+    "multi_tile_small_block": {
+        # BLOCK_N=32: n_tiles=1024/32=32 inner iterations per pass (vs 16).
+        # Tests the N-tile inner loops at higher trip count.
+        "base":   "multi_tile",
+        "params": {"M": [1024], "N": [1024], "BLOCK_N": [32]},
     },
     "2pass": {
         # Online softmax: 2-pass, BLOCK_M × BLOCK_N tiled. Redeclares

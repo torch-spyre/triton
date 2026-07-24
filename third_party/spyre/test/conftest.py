@@ -170,11 +170,11 @@ def _resolve_variant(
       - ``module_sig`` — module-level ``SIGNATURE`` dict (maps arg name
         to dtype string). Used only if the variant doesn't declare its
         own ``SIGNATURE``.
-      - ``entry`` — the fully-merged variant dict. Must declare
-        ``constexpr`` (list[str]) and ``params`` (dict[str, list[Any]]).
-        May declare ``SIGNATURE`` to override the module-level default
-        wholesale (use when the variant's kernel has a different arg
-        list, e.g. softmax_multi_tile has BLOCK_N where
+      - ``entry`` — the fully-merged variant dict (after base resolution).
+        Must declare ``constexpr`` (list[str]) and ``params``
+        (dict[str, list[Any]]). May declare ``SIGNATURE`` to override the
+        module-level default wholesale (use when the variant's kernel has
+        a different arg list, e.g. softmax_multi_tile has BLOCK_N where
         softmax_single_tile has BLOCK_SIZE).
 
     Outputs:
@@ -205,6 +205,18 @@ def _resolve_variant(
 
     effective_sig = entry.get("SIGNATURE", module_sig)
     constexpr_names = set(entry["constexpr"])
+
+    # Validate: every constexpr name must be covered by params.  A missing
+    # name would otherwise surface as a cryptic KeyError or NoneType crash
+    # during Triton compilation rather than at collection time.
+    missing = constexpr_names - set(param_values)
+    if missing:
+        raise ValueError(
+            f"{kernel_name}: constexpr name(s) {sorted(missing)} not found in "
+            f"'params'. Add them to the variant's 'params' or its base variant's "
+            f"'params'."
+        )
+
     runtime_signature = {
         name: dtype for name, dtype in effective_sig.items()
         if name not in constexpr_names
@@ -223,12 +235,37 @@ def _load_examples():
         mod = _import_meta(meta_path)
         module_sig = getattr(mod, "SIGNATURE", {})
         variants = mod.VARIANTS
-        default = variants["default"]
-        for vname, delta in variants.items():
-            # Shallow merge: variant dict overrides default wholesale per key.
-            # Any key the variant omits (constexpr, params, etc.)
-            # inherits from default as-is.
-            merged = {**default, **delta}
+        # Build resolved bases before iterating so forward references are
+        # supported.  Resolution is lazy (depth-first) to catch cycles.
+        resolved: dict = {}
+
+        def _resolve_base(vname: str, chain: tuple = ()) -> dict:
+            if vname in resolved:
+                return resolved[vname]
+            if vname in chain:
+                raise ValueError(
+                    f"{name}: circular 'base' chain: {' -> '.join(chain)} -> {vname}"
+                )
+            delta = variants[vname]
+            base_name = delta.get("base", None if vname == "default" else "default")
+            if base_name is not None:
+                if base_name not in variants:
+                    raise ValueError(
+                        f"{name}::{vname}: 'base' refers to unknown variant {base_name!r}"
+                    )
+                base = _resolve_base(base_name, chain + (vname,))
+                merged = {**base, **delta}
+                merged.pop("base", None)
+            else:
+                merged = dict(delta)
+            resolved[vname] = merged
+            return merged
+
+        for vname in variants:
+            # Shallow-copy so that injected keys (signature, constexprs,
+            # param_values) don't leak into resolved[] and corrupt later
+            # base merges.
+            merged = dict(_resolve_base(vname))
             if module_sig:
                 runtime, constexprs, param_values = _resolve_variant(
                     module_sig, merged, kernel_name=f"{name}::{vname}"

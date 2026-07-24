@@ -172,6 +172,34 @@ VARIANTS = {
             t.assert_result_type("ktdp.construct_memory_view", "memref<512x64xf32>"),
         ),
     },
+    "single_tile": {
+        # M=16=BLOCK_M: only 1 M-tile total across 32 cores.
+        # 31 cores produce a zero-trip scf.for range.
+        "base":   "default",
+        "params": {
+            "M": [16], "K": [64], "N": [256],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+        "extra_checks": lambda t: (
+            t.assert_present("linalg.matmul"),
+            t.assert_absent("tt.dot"),
+            t.assert_result_type("ktdp.construct_memory_view", "memref<16x64xf32>"),
+        ),
+    },
+    "nonaligned": {
+        # M=520: m_blocks=33, not divisible by 32 cores.
+        # ceil(33/32)=2 for core 0; tl.minimum clamp fires on the last core.
+        "base":   "default",
+        "params": {
+            "M": [520], "K": [64], "N": [256],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+        "extra_checks": lambda t: (
+            t.assert_present("linalg.matmul"),
+            t.assert_absent("tt.dot"),
+            t.assert_result_type("ktdp.construct_memory_view", "memref<520x64xf32>"),
+        ),
+    },
     "dynamic": {
         # Dynamic: M, K, N are runtime i32 → memref<?x?xf32>.
         "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot", "program-id-2d", "num-programs-fold"],
@@ -192,6 +220,32 @@ VARIANTS = {
             t.assert_present("linalg.matmul"),
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
         ),
+    },
+    "dynamic_small": {
+        # Different shape than the static default: verifies the compiled
+        # dynamic kernel runs correctly at a smaller (M, K, N).
+        "base":   "dynamic",
+        "params": {
+            "M": [128], "K": [32], "N": [64],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+    },
+    "dynamic_large": {
+        # Larger shape: confirms the dynamic kernel scales beyond the
+        # static default's (512, 64, 256).
+        "base":   "dynamic",
+        "params": {
+            "M": [1024], "K": [128], "N": [512],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+    },
+    "dynamic_nonaligned": {
+        # M=500: non-divisible by 32 → clamp fires in the dynamic-bounds path.
+        "base":   "dynamic",
+        "params": {
+            "M": [500], "K": [64], "N": [256],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
     },
     # --- BMM (batched) variants ---
     "bmm": {
@@ -215,22 +269,27 @@ VARIANTS = {
     },
     "bmm_dynamic": {
         # BMM dynamic: B, M, K, N are runtime i32.
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot", "program-id-1d", "num-programs-fold"],
-        "kernel_fn":    kernel.bmm_matmul_kernel,
-        "SIGNATURE":    _SIG_BMM,
-        "constexpr":    ["BLOCK_B", "BLOCK_M", "BLOCK_K", "BLOCK_N"],
-        "params":       {
-            "B": [4], "M": [128], "K": [32], "N": [64],
+        "base":      "bmm",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot", "program-id-1d", "num-programs-fold"],
+        "constexpr": ["BLOCK_B", "BLOCK_M", "BLOCK_K", "BLOCK_N"],
+    },
+    "bmm_nonaligned": {
+        # B=5: b_blocks=5, bm_blocks=5*8=40, not divisible by 32 cores.
+        # tl.minimum clamp fires on the static bm distribution.
+        "base":   "bmm",
+        "params": {
+            "B": [5], "M": [128], "K": [32], "N": [64],
             "BLOCK_B": [1], "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
         },
-        "reference":    run_bmm,
-        "inputs":       make_inputs_bmm,
-        "output_key":   "c_ptr",
-        "rtol":         1e-2,
-        "extra_checks": lambda t: (
-            t.assert_present("linalg.batch_matmul"),
-            t.assert_absent("tt.dot"),
-        ),
+    },
+    "bmm_multi_bm": {
+        # B=8, M=256: bm_blocks=8*(256/16)=128, bm_per_core=4.
+        # The outer BM loop runs 4 iterations per core.
+        "base":   "bmm",
+        "params": {
+            "B": [8], "M": [256], "K": [32], "N": [64],
+            "BLOCK_B": [1], "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
     },
     # --- 2D grid variant ---
     "2d_grid": {
@@ -265,7 +324,8 @@ VARIANTS = {
         ),
     },
     "2d_grid_dynamic": {
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot", "program-id-2d"],
+        "base":      "2d_grid",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot", "program-id-2d"],
         "summary": (
             "2D grid matmul with runtime `M`, `K`, `N`: same distribution-loop "
             "structure, dynamic descriptor shapes."
@@ -274,21 +334,36 @@ VARIANTS = {
             "Same as `2d_grid` but `M`, `K`, `N` arrive as runtime `i32` "
             "arguments. Descriptors lower to `memref<?x?xf32>`."
         ),
-        "kernel_fn":    kernel.matmul_kernel_2d_grid,
-        "SIGNATURE":    _SIG_2D_GRID,
         "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N"],
-        "params":       {
-            "M": [256], "K": [64], "N": [128],
-            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
-        },
-        "grid":         [4, 8],
-        "reference":    run,
-        "inputs":       make_inputs,
-        "output_key":   "c_ptr",
-        "rtol":         1e-2,
         "extra_checks": lambda t: (
             t.assert_present("linalg.matmul"),
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
+        ),
+    },
+    "2d_grid_both_axes": {
+        # N=256 with grid=[4,4]: n_blocks=16, n_blocks_per_core=4.
+        # Both M and N distribution loops run multi-iteration simultaneously.
+        "base":   "2d_grid",
+        "params": {
+            "M": [256], "K": [64], "N": [256],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+        "grid":         [4, 4],
+        "extra_checks": lambda t: (
+            t.assert_present("linalg.matmul"),
+            t.assert_result_type("ktdp.construct_memory_view", "memref<256x64xf32>"),
+        ),
+    },
+    "2d_grid_nonaligned": {
+        # M=260: m_blocks=17, not divisible by 4 M-cores → clamp fires.
+        "base":   "2d_grid",
+        "params": {
+            "M": [260], "K": [64], "N": [128],
+            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
+        },
+        "extra_checks": lambda t: (
+            t.assert_present("linalg.matmul"),
+            t.assert_result_type("ktdp.construct_memory_view", "memref<260x64xf32>"),
         ),
     },
     # --- BMM 3D grid variants ---
@@ -324,7 +399,8 @@ VARIANTS = {
         ),
     },
     "bmm_3d_grid_dynamic": {
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot", "program-id-3d"],
+        "base":      "bmm_3d_grid",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot", "program-id-3d"],
         "summary": (
             "3D grid BMM with runtime `B`, `M`, `K`, `N`: same distribution loop "
             "structure, dynamic descriptor shapes."
@@ -333,23 +409,15 @@ VARIANTS = {
             "Same as `bmm_3d_grid` but `B`, `M`, `K`, `N` arrive as runtime "
             "`i32` arguments. Descriptors lower to `memref<?x?x?xf32>`."
         ),
-        "kernel_fn":    kernel.bmm_matmul_kernel_3d_grid,
-        "SIGNATURE":    _SIG_BMM_3D_GRID,
         "constexpr":    ["BLOCK_B", "BLOCK_M", "BLOCK_K", "BLOCK_N"],
-        "params":       {
-            "B": [4], "M": [64], "K": [32], "N": [64],
+    },
+    "bmm_3d_grid_nonaligned": {
+        # B=5: b_blocks=5, not divisible by 2 B-cores → clamp fires on B axis.
+        "base":   "bmm_3d_grid",
+        "params": {
+            "B": [5], "M": [64], "K": [32], "N": [64],
             "BLOCK_B": [1], "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
         },
-        "grid":         [2, 4, 4],
-        "reference":    run_bmm,
-        "inputs":       make_inputs_bmm,
-        "output_key":   "c_ptr",
-        "rtol":         1e-2,
-        "atol":         1e-4,
-        "extra_checks": lambda t: (
-            t.assert_present("linalg.batch_matmul"),
-            t.assert_absent("tt.dot"),
-        ),
     },
     # --- BMM addptr variants (disabled: tt.addptr-into-descriptor gap) ---
     # These exercise the per-batch pointer arithmetic pattern
@@ -374,21 +442,7 @@ VARIANTS = {
         },
     },
     "bmm_addptr_dynamic": {
-        "kernel_fn":    kernel.bmm_matmul_kernel_addptr,
-        "SIGNATURE":    _SIG_BMM_ADDPTR,
-        "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N"],
-        "params":       {
-            "B": [4], "M": [128], "K": [32], "N": [64],
-            "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
-        },
-        "reference":    run_bmm,
-        "inputs":       make_inputs_bmm,
-        "output_key":   "c_ptr",
-        "disabled": {
-            "reason":        "tt.addptr into tt.make_tensor_descriptor not "
-                             "yet lowered by LowerDescriptorMemory",
-            "tracking_test": "test_lower_desc_memory.py::"
-                             "TestAddptrIntoDescriptor",
-        },
+        "base":      "bmm_addptr",
+        "constexpr": ["BLOCK_M", "BLOCK_K", "BLOCK_N"],
     },
 }

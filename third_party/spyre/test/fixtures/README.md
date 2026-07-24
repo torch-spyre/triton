@@ -27,10 +27,14 @@ reference oracle and input generator. Different functions
 ## `VARIANTS` discovery rules
 
 - `"default"` is the full META dict.
-- Other keys are **shallow-merge deltas** over `"default"` — every key
-  the variant omits inherits wholesale from default. There is no
+- Other keys are **shallow-merge deltas** over a base variant — every
+  key the variant omits inherits wholesale from the base. There is no
   partial-override rule for nested fields; a variant that wants to
   change `constexpr` (or `params`) replaces the whole list / dict.
+- The base is `"default"` unless the variant declares `"base": "<name>"`,
+  which names another variant in the same `VARIANTS` dict. The `"base"`
+  key is consumed at load time and does not appear in the registry entry.
+  Circular chains are caught at collection time.
 - Registry keys: `<folder>` for the default variant and for
   single-variant kernels; `<folder>__<variant>` for every other entry.
   e.g. `vector_add`, `vector_add__dynamic`.
@@ -42,6 +46,7 @@ reference oracle and input generator. Different functions
 | `kernel_fn` | `@triton.jit` function | Compiled on demand via `compile_to_ttir` → `make_ktir_mod`. |
 | module-level `SIGNATURE` | `dict[str, str]` | Dtype per `@triton.jit` arg. Pure types — no values. Declared at module scope in `meta.py`, not inside `VARIANTS`. Used by every variant that doesn't redeclare it. |
 | variant `SIGNATURE` | `dict[str, str]` | Optional per-variant override. Replaces the module-level map wholesale — use when the variant's kernel has a different arg list (e.g. softmax's `multi_tile` has `BLOCK_N` where `single_tile` has `BLOCK_SIZE`). |
+| `base` | `str` | Optional. Name of another variant in the same `VARIANTS` dict to use as the merge base instead of `"default"`. Consumed at load time; not stored in the registry entry. |
 | `constexpr` | `list[str]` | Which arg names are Triton constexprs for this variant. Each variant declares the full list explicitly (no partial override over default's list). Values for constexprs come from `params`. |
 | `params` | `dict[str, list[Any]]` | Single source of truth for argument values. Lists today carry one element each; future Cartesian expansion (one registry entry per product) is deferred — when it lands, the `constexpr` vs runtime partition stays the same per expansion. |
 | `grid` | `list[int]` | Per-axis partition of the 32-core Spyre grid. One entry per `tl.program_id` axis the kernel reads; `prod(grid)` equals the hardware core count. Defaults to the backend's `(32,)` (1D on all cores) when omitted. |
