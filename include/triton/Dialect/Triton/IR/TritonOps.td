@@ -1063,7 +1063,14 @@ def TT_InterTileReduceOp : TT_Op<"inter_tile_reduce", [
   let results = (outs Variadic<AnyTensor>:$results);
   let regions = (region AnyRegion:$combiner_region);
 
-  let hasCustomAssemblyFormat = 1;
+  let assemblyFormat = [{
+    `partials` `(` $partials `:` type($partials) `)`
+    `identities` `(` $identities `:` type($identities) `)`
+    `axis` `=` $axis `mode` `=` $mode `combiner` `=` $combiner
+    (`scatter_dimension` `=` $scatter_dimension^)?
+    attr-dict `->` `(` type($results) `)`
+    ($combiner_region^)?
+  }];
 }
 // --- END --- added for spyre
 

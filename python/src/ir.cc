@@ -1887,6 +1887,7 @@ void init_triton_ir(py::module &&m) {
       "create_inter_tile_reduce",
       [](TritonOpBuilder &self,
          std::vector<Value> &partials,
+         std::vector<Value> &identities,
          std::string axis, std::string combiner, std::string mode,
          int64_t scatter_dimension,
          std::vector<std::string> &w_keys, std::vector<int64_t> &w_vals,
@@ -1947,7 +1948,7 @@ void init_triton_ir(py::module &&m) {
         auto op = self.create<triton::InterTileReduceOp>(
             resultTypes,
             /*partials=*/ValueRange(partials),
-            /*identities=*/ValueRange{},
+            /*identities=*/ValueRange(identities),
             axis, mode, combiner,
             scatterDimAttr,
             numWkSlicesPerDim,

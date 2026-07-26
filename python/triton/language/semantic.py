@@ -2021,8 +2021,27 @@ class TritonSemantic(Generic[TensorTy]):
 
         partials = [x] if not isinstance(x, (list, tuple)) else list(x)
 
+        # Build identity tensors for shorthand combiners so identities is
+        # always non-empty on the op.
+        def _max_identity(dtype):
+            return float('-inf') if dtype.is_floating() else dtype.get_int_min_value()
+
+        _COMBINER_IDENTITY = {
+            "add": lambda _: 0,
+            "mul": lambda _: 1,
+            "max": _max_identity,
+        }
+        identity_tensors = []
+        if combiner in _COMBINER_IDENTITY:
+            for p in partials:
+                scalar = p.type.scalar
+                identity_tensors.append(
+                    self.full(list(p.type.shape),
+                              _COMBINER_IDENTITY[combiner](scalar), scalar))
+
         handles = self.builder.create_inter_tile_reduce(
             [p.handle for p in partials],
+            [t.handle for t in identity_tensors],
             axis, combiner, mode, scatter_dim_val,
             w_keys, w_vals, c_keys, c_vals,
             dep_keys, dep_vals,
