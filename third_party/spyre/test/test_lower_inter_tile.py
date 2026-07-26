@@ -502,10 +502,10 @@ class TestReduceToOne(LowerInterTileTester):
 # C3 / Q4 — Shorthand combiner identity materialization
 # ---------------------------------------------------------------------------
 
-class TestShorthandIdentity(LowerInterTileTester):
-    """add/max/mul shorthand combiners materialize the correct identity."""
+class TestProduceReduceRegions(LowerInterTileTester):
+    """Producer region contains yield_partial; reducer region contains yield_reduced."""
 
-    def _run_shorthand(self, combiner: str):
+    def test_produce_reduce_regions(self):
         attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
@@ -514,40 +514,13 @@ class TestShorthandIdentity(LowerInterTileTester):
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<8xf32>)
                    identities(%id : tensor<8xf32>)
-                   axis = "x" mode = "all_reduce" combiner = "{combiner}"
+                   axis = "x" mode = "all_reduce" combiner = "add"
                    {attrs}
                    -> (tensor<8xf32>)
             tt.return %0 : tensor<8xf32>
           }}
         }}
         """)
-
-    @pattern("shorthand-identity", category="inter-tile", example=[
-        "result = tl.inter_tile(partial, axis='x', combiner='add', mode='all_reduce')",
-        "# Shorthand 'add' → identity 0.0 filled via linalg.fill + arith.constant",
-    ])
-    def test_add_identity(self):
-        """add combiner → scalar arith.constant fed into linalg.fill (C3/Q4)."""
-        self._run_shorthand("add")
-        self.assert_present("linalg.fill", "arith.constant")
-        # The fill input is the arith.constant scalar identity value.
-        self.assert_operand("linalg.fill", 0, defined_by="arith.constant")
-
-    def test_max_identity(self):
-        """max combiner → scalar arith.constant fed into linalg.fill (C3/Q4)."""
-        self._run_shorthand("max")
-        self.assert_present("linalg.fill", "arith.constant")
-        self.assert_operand("linalg.fill", 0, defined_by="arith.constant")
-
-    def test_mul_identity(self):
-        """mul combiner → scalar arith.constant fed into linalg.fill (C3/Q4)."""
-        self._run_shorthand("mul")
-        self.assert_present("linalg.fill", "arith.constant")
-        self.assert_operand("linalg.fill", 0, defined_by="arith.constant")
-
-    def test_produce_reduce_regions(self):
-        """Producer region contains yield_partial; reducer region contains yield_reduced."""
-        self._run_shorthand("add")
         self.assert_present("ktdp.yield_partial", "ktdp.yield_reduced")
 
 

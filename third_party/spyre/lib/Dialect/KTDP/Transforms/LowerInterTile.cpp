@@ -26,7 +26,6 @@
 #include "Ktdp/KtdpTypes.hpp"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineExpr.h"
@@ -272,41 +271,10 @@ static FailureOr<IntegerSet> buildPick0Set(MLIRContext *ctx,
 
 // Returns the identity TypedAttr for (combiner, elemType), or failure() if
 // unsupported.
-static FailureOr<TypedAttr> combinerIdentity(OpBuilder &b, StringRef combiner,
-                                              Type elemType) {
-  TypedAttr initVal;
-  if (combiner == "add") {
-    if (isa<FloatType>(elemType))
-      initVal = b.getFloatAttr(elemType, 0.0);
-    else
-      initVal = b.getIntegerAttr(elemType, 0);
-  } else if (combiner == "max") {
-    if (isa<FloatType>(elemType)) {
-      auto ftype = cast<FloatType>(elemType);
-      initVal = b.getFloatAttr(ftype,
-          APFloat::getInf(ftype.getFloatSemantics(), /*neg=*/true));
-    } else {
-      // linalg.MaxOp is unconditionally signed-max (arith.maxsi), regardless
-      // of the IntegerType signedness attribute. Triton also produces signless
-      // integer types only (isSigned/isUnsigned are always false), so always
-      // use the signed minimum as the identity.
-      auto itype = cast<IntegerType>(elemType);
-      initVal = b.getIntegerAttr(elemType,
-                                  APInt::getSignedMinValue(itype.getWidth()));
-    }
-  } else if (combiner == "mul") {
-    if (isa<FloatType>(elemType))
-      initVal = b.getFloatAttr(elemType, 1.0);
-    else
-      initVal = b.getIntegerAttr(elemType, 1);
-  } else {
-    return failure();
-  }
-  return initVal;
-}
 
 // Emits the reduction op for one (lhs, rhs, out) triple.
 // Returns the scalar/tensor result Value, or failure() if unsupported.
+// only used when the reducer region is not provided
 static FailureOr<Value> combinerEmitOp(OpBuilder &b, Location loc,
                                         StringRef combiner,
                                         Value lhs, Value rhs, Value out) {
@@ -322,22 +290,6 @@ static FailureOr<Value> combinerEmitOp(OpBuilder &b, Location loc,
   return failure();  // caller emits error
 }
 
-//===----------------------------------------------------------------------===//
-// Identity materialization for shorthand combiners
-//===----------------------------------------------------------------------===//
-
-static FailureOr<Value> materializeIdentity(OpBuilder &b, Location loc,
-                                             RankedTensorType type,
-                                             StringRef combiner) {
-  auto identAttr = combinerIdentity(b, combiner, type.getElementType());
-  if (failed(identAttr))
-    return failure();  // caller must emit error
-  Value scalar = arith::ConstantOp::create(b, loc, *identAttr);
-  Value empty = tensor::EmptyOp::create(b, loc, type.getShape(),
-                                         type.getElementType());
-  return linalg::FillOp::create(b, loc, ValueRange{scalar}, ValueRange{empty})
-             .getResult(0);
-}
 
 //===----------------------------------------------------------------------===//
 // The pass
@@ -401,11 +353,10 @@ struct LowerInterTilePass
     if (mode != "reduce_scatter" && hasSd)
       return op.emitError("scatter_dimension only valid for reduce_scatter");
 
-    // --- region combiner needs explicit identities ---
     bool regionCombiner = combiner.empty();
     auto identities = op.getIdentities();
-    if (regionCombiner && identities.empty())
-      return op.emitError("region combiner requires explicit identity operands");
+    if (identities.empty())
+      return op.emitError("identities operand group must not be empty");
 
     // --- derive group sets ---
     auto gsOrErr = buildGroupSets(ctx, attrs, axis, op);
@@ -461,21 +412,9 @@ struct LowerInterTilePass
     // not by a tensor axis, so no dim is collapsed here.
     SmallVector<Type> resultTypes(partialTypes.begin(), partialTypes.end());
 
-    // --- build identity values ---
-    SmallVector<Value> identityValues;
-    if (!regionCombiner) {
-      // Shorthand: materialize identity for each partial.
-      for (auto p : partials) {
-        auto tensorType = cast<RankedTensorType>(p.getType());
-        auto identOrErr = materializeIdentity(rewriter, loc, tensorType, combiner);
-        if (failed(identOrErr))
-          return op.emitError("unknown shorthand combiner '") << combiner << "'";
-        identityValues.push_back(*identOrErr);
-      }
-    } else {
-      // Region form: use the explicit identity operands from the tt op.
-      identityValues.assign(identities.begin(), identities.end());
-    }
+    // Identities are always provided on the tt op (semantic.py materializes
+    // them for shorthand combiners at TTIR construction time).
+    SmallVector<Value> identityValues(identities.begin(), identities.end());
 
     // --- emit ktdp.inter_tile_reduce ---
     auto reduceOp = ktdp::InterTileReduceOp::create(
