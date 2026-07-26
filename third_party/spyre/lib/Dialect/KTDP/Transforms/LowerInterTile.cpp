@@ -32,7 +32,6 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IntegerSet.h"
-#include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
 #include <map>
@@ -353,7 +352,8 @@ struct LowerInterTilePass
     if (mode != "reduce_scatter" && hasSd)
       return op.emitError("scatter_dimension only valid for reduce_scatter");
 
-    bool regionCombiner = combiner.empty();
+    if (combiner.empty())
+      return op.emitError("custom combiner regions are not yet supported (see issue #63)");
     auto identities = op.getIdentities();
     if (identities.empty())
       return op.emitError("identities operand group must not be empty");
@@ -436,8 +436,8 @@ struct LowerInterTilePass
     // Absent D → full-barrier (attribute omitted — already done above).
 
     // --- build reducer region ---
-    if (failed(buildReducerRegion(rewriter, loc, op, reduceOp,
-                                  partialTypes, combiner, regionCombiner)))
+    if (failed(buildReducerRegion(rewriter, loc, reduceOp,
+                                  partialTypes, combiner)))
       return failure();
 
     // --- RAUW + erase ---
@@ -447,61 +447,29 @@ struct LowerInterTilePass
 
   // Build the reducer region of the ktdp.inter_tile_reduce op.
   LogicalResult buildReducerRegion(IRRewriter &rewriter, Location loc,
-                                   triton::InterTileReduceOp srcOp,
                                    ktdp::InterTileReduceOp dstOp,
                                    ArrayRef<Type> partialTypes,
-                                   StringRef combiner, bool regionCombiner) {
+                                   StringRef combiner) {
     Block *block = &dstOp.getCombiner().emplaceBlock();
-    // 2A block args: lhs_1..lhs_A, rhs_1..rhs_A.
     SmallVector<Value> lhs, rhs;
-    for (auto t : partialTypes) {
+    for (auto t : partialTypes)
       lhs.push_back(block->addArgument(t, loc));
-    }
-    for (auto t : partialTypes) {
+    for (auto t : partialTypes)
       rhs.push_back(block->addArgument(t, loc));
-    }
 
     OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPointToStart(block);
 
     SmallVector<Value> reduced;
-    if (!regionCombiner) {
-      // Shorthand: emit linalg.add/max/mul into a fresh tensor.
-      for (auto [l, r] : llvm::zip(lhs, rhs)) {
-        auto tensorType = cast<RankedTensorType>(l.getType());
-        Value out = tensor::EmptyOp::create(rewriter, loc,
-                                            tensorType.getShape(),
-                                            tensorType.getElementType());
-        auto result = combinerEmitOp(rewriter, loc, combiner, l, r, out);
-        if (failed(result))
-          return dstOp.emitError("unknown shorthand combiner '") << combiner << "'";
-        reduced.push_back(*result);
-      }
-    } else {
-      // Region form: clone the tt combiner body, remapping values.
-      // The tt.inter_tile_reduce has a combiner_region with 2A args.
-      Region &srcRegion = srcOp.getCombinerRegion();
-      if (srcRegion.empty())
-        return srcOp.emitError("region combiner has no body");
-      Block &srcBlock = srcRegion.front();
-
-      // Build a value mapping: tt block args → ktdp block args.
-      IRMapping mapping;
-      auto srcArgs = srcBlock.getArguments();
-      // srcArgs layout: lhs_1..lhs_A, rhs_1..rhs_A
-      for (size_t i = 0; i < lhs.size(); ++i)
-        mapping.map(srcArgs[i], lhs[i]);
-      for (size_t i = 0; i < rhs.size(); ++i)
-        mapping.map(srcArgs[lhs.size() + i], rhs[i]);
-
-      // Clone all ops except the terminator (tt.reduce.return).
-      for (auto &innerOp : srcBlock.without_terminator())
-        rewriter.clone(innerOp, mapping);
-
-      // Map the tt.reduce.return operands to yield_reduced operands.
-      Operation *term = srcBlock.getTerminator();
-      for (auto operand : term->getOperands())
-        reduced.push_back(mapping.lookupOrDefault(operand));
+    for (auto [l, r] : llvm::zip(lhs, rhs)) {
+      auto tensorType = cast<RankedTensorType>(l.getType());
+      Value out = tensor::EmptyOp::create(rewriter, loc,
+                                          tensorType.getShape(),
+                                          tensorType.getElementType());
+      auto result = combinerEmitOp(rewriter, loc, combiner, l, r, out);
+      if (failed(result))
+        return dstOp.emitError("unknown shorthand combiner '") << combiner << "'";
+      reduced.push_back(*result);
     }
 
     ktdp::YieldReducedOp::create(rewriter, loc, reduced);

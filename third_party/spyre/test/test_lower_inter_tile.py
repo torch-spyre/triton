@@ -503,9 +503,9 @@ class TestReduceToOne(LowerInterTileTester):
 # ---------------------------------------------------------------------------
 
 class TestProduceReduceRegions(LowerInterTileTester):
-    """Producer region contains yield_partial; reducer region contains yield_reduced."""
+    """Producer/reducer regions have the expected structure."""
 
-    def test_produce_reduce_regions(self):
+    def _run(self, combiner: str):
         attrs = _op_attrs({"x": 2})
         self.run(f"""
         module {{
@@ -514,14 +514,38 @@ class TestProduceReduceRegions(LowerInterTileTester):
             %0 = tt.inter_tile_reduce
                    partials(%p : tensor<8xf32>)
                    identities(%id : tensor<8xf32>)
-                   axis = "x" mode = "all_reduce" combiner = "add"
+                   axis = "x" mode = "all_reduce" combiner = "{combiner}"
                    {attrs}
                    -> (tensor<8xf32>)
             tt.return %0 : tensor<8xf32>
           }}
         }}
         """)
-        self.assert_present("ktdp.yield_partial", "ktdp.yield_reduced")
+
+    def test_produce_region_yields_partial(self):
+        """Producer region terminates with ktdp.yield_partial."""
+        self._run("add")
+        self.assert_present("ktdp.yield_partial")
+
+    def test_reduce_region_yields_reduced(self):
+        """Reducer region terminates with ktdp.yield_reduced."""
+        self._run("add")
+        self.assert_present("ktdp.yield_reduced")
+
+    def test_add_combiner_emits_linalg_add(self):
+        """combiner='add' → linalg.add in the reducer region."""
+        self._run("add")
+        self.assert_present("linalg.add")
+
+    def test_max_combiner_emits_linalg_max(self):
+        """combiner='max' → linalg.max in the reducer region."""
+        self._run("max")
+        self.assert_present("linalg.max")
+
+    def test_mul_combiner_emits_linalg_mul(self):
+        """combiner='mul' → linalg.mul in the reducer region."""
+        self._run("mul")
+        self.assert_present("linalg.mul")
 
 
 # ---------------------------------------------------------------------------
@@ -919,7 +943,7 @@ class TestValidation(LowerInterTileTester):
               }}
             }}
             """)
-        self.assert_stderr(capfd, "region combiner has no body")
+        self.assert_stderr(capfd, "custom combiner regions are not yet supported")
 
     def test_scatter_dim_without_reduce_scatter_rejected(self, capfd):
         """R3: scatter_dimension on non-reduce_scatter mode → diagnostic."""
