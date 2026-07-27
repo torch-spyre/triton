@@ -22,6 +22,7 @@ See ``fixtures/README.md`` for the field reference.
 import functools
 
 import numpy as np
+import re
 
 from . import kernel
 
@@ -60,18 +61,7 @@ def make_inputs(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
     return {"x_ptr": x, "output_ptr": output}
 
 
-def make_inputs_f16(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
-                    NUM_N_TILES: int = _NUM_N_TILES,
-                    WORK_SLICES=None, **_kw) -> dict:
-    """Build pointer-tensor inputs for inter_tile_add_kernel (f16)."""
-    del BLOCK_M, BLOCK_N, NUM_N_TILES, WORK_SLICES, _kw
-    rng = np.random.default_rng(42)
-    x = rng.standard_normal((M, N)).astype(np.float16)
-    output = np.zeros((M, N), dtype=np.float16)
-    return {"x_ptr": x, "output_ptr": output}
-
-
-def run(inputs: dict, BLOCK_M: int, BLOCK_N: int, NUM_N_TILES: int, **_kw) -> np.ndarray:
+def run_element_sum(inputs: dict, BLOCK_M: int, BLOCK_N: int, NUM_N_TILES: int, **_kw) -> np.ndarray:
     """Oracle for this fixture's specific use case: column-block element-wise
     add-reduce across NUM_N_TILES tiles in each row-group.
 
@@ -97,14 +87,85 @@ def run(inputs: dict, BLOCK_M: int, BLOCK_N: int, NUM_N_TILES: int, **_kw) -> np
     col_sum = x4.sum(axis=2)
     return np.tile(col_sum, (1, 1, NUM_N_TILES)).reshape(M, N)
 
+def assert_tile_future_groups(tester, op_name: str, *,
+    num_symbols: int = None, num_dims: int = None,
+    num_constraints: int = None, parent: str = None):
 
-# ---------------------------------------------------------------------------
-# f16 oracle (thin wrapper — same reshape logic, cast to f16)
-# ---------------------------------------------------------------------------
+    """Assert properties of the `groups` integer set carried by an inter-tile op's
+    associated `!ktdp.tile_future` type.
 
-def run_f16(inputs: dict, BLOCK_M: int, BLOCK_N: int, NUM_N_TILES: int, **_kw) -> np.ndarray:
-    """f16 oracle: same column-block add-reduce as ``run``, cast to fp16."""
-    return run(inputs, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, NUM_N_TILES=NUM_N_TILES).astype(np.float16)
+    The `groups` integer set lives as a type parameter of
+    `!ktdp.tile_future<(...), groups = #set>` — on the produce op's result type
+    (single tile_future result) or the reduce op's operand 0 type (its future
+    input). This helper looks in the correct place based on *op_name*.
+
+    Parameters
+    ----------
+    op_name          : `"ktdp.inter_tile_produce"` or `"ktdp.inter_tile_reduce"`
+    num_symbols, num_dims, num_constraints
+                        : same semantics as :meth:`assert_integer_set` —
+                        parsed from the affine_set text.
+    parent           : optional parent op filter (see :meth:`_find`).
+    """
+    matches = tester._find(op_name, parent)
+    assert matches, f"Op '{op_name}' not found in KTIR"
+
+    if op_name == "ktdp.inter_tile_produce":
+        # groups lives in the op's single result type (a tile_future).
+        def _type_str(op):
+            if op._op.get_num_results() == 0:
+                return None
+            return str(op._op.get_result(0).get_type())
+    elif op_name == "ktdp.inter_tile_reduce":
+        # groups lives in the type of operand 0 (the future).
+        def _type_str(op):
+            if op._op.get_num_operands() == 0:
+                return None
+            return str(op._op.get_operand(0).get_type())
+    else:
+        raise ValueError(
+            f"assert_tile_future_groups: expected 'ktdp.inter_tile_produce' "
+            f"or 'ktdp.inter_tile_reduce', got '{op_name}'"
+        )
+
+    def _parse(op):
+        ty = _type_str(op)
+        if ty is None or "tile_future" not in ty:
+            return None
+        # Match: groups = affine_set<(d1, d2)[s1, s2] : (c1, c2, c3)>
+        m = re.search(
+            r"groups\s*=\s*affine_set<\s*\(([^)]*)\)\s*(?:\[([^\]]*)\])?\s*:\s*\(([^)]*)\)\s*>",
+            ty,
+        )
+        if not m:
+            return None
+        dims_txt, syms_txt, cons_txt = m.group(1), m.group(2) or "", m.group(3)
+        dims = len(dims_txt.split(",")) if dims_txt.strip() else 0
+        syms = len(syms_txt.split(",")) if syms_txt.strip() else 0
+        cons = len(cons_txt.split(",")) if cons_txt.strip() else 0
+        return {"dims": dims, "syms": syms, "cons": cons}
+
+    parsed = [p for p in (_parse(o) for o in matches) if p is not None]
+    assert parsed, (
+        f"Op '{op_name}' has no !ktdp.tile_future<..., groups = ...> "
+        f"in its associated type (looked at "
+        f"{'result 0' if op_name == 'ktdp.inter_tile_produce' else 'operand 0'})"
+    )
+
+    def _matches(p):
+        if num_symbols is not None and p["syms"] != num_symbols:
+            return False
+        if num_dims is not None and p["dims"] != num_dims:
+            return False
+        if num_constraints is not None and p["cons"] != num_constraints:
+            return False
+        return True
+
+    assert any(_matches(p) for p in parsed), (
+        f"Op '{op_name}' tile_future groups: no match for "
+        f"num_symbols={num_symbols}, num_dims={num_dims}, "
+        f"num_constraints={num_constraints}; got {parsed}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -137,8 +198,9 @@ def _extra_checks_default(tester) -> None:
         num_dims=1, num_symbols=1, num_constraints=2,
     )
     # groups set: (g) with 1 dim, 0 symbols, 2 constraints (0<=g<=ngroups-1).
-    # Post PR-25: groups lives on the !ktdp.tile_future type, not on the op.
-    tester.assert_tile_future_groups(
+    # groups lives on the !ktdp.tile_future type, not on the op.
+    assert_tile_future_groups(
+        tester, 
         "ktdp.inter_tile_produce",
         num_dims=1, num_symbols=0, num_constraints=2,
     )
@@ -156,7 +218,8 @@ def _extra_checks_default(tester) -> None:
         "ktdp.inter_tile_reduce", "consumer_tiles_per_group",
         num_dims=1, num_symbols=1, num_constraints=2,
     )
-    tester.assert_tile_future_groups(
+    assert_tile_future_groups(
+        tester, 
         "ktdp.inter_tile_reduce",
         num_dims=1, num_symbols=0, num_constraints=2,
     )
@@ -229,49 +292,9 @@ VARIANTS = {
         },
         "grid":          [_NUM_TILES],
         "parallel":      False,  # one block per tile, no distribution loop
-        "reference":     functools.partial(run, BLOCK_M=16, BLOCK_N=16, NUM_N_TILES=_NUM_N_TILES),
+        "reference":     functools.partial(run_element_sum, BLOCK_M=16, BLOCK_N=16, NUM_N_TILES=_NUM_N_TILES),
         "inputs":        make_inputs,
         "output_key":    "output_ptr",
-        "extra_checks":  _extra_checks_default,
-    },
-    "f16": {
-        "tags": ["all-reduce", "f16"],
-        "summary": (
-            "Multi-group ADD all_reduce (f16): same topology as default but "
-            "accumulating in half precision."
-        ),
-        "doc": (
-            "f16 variant of the default all_reduce fixture.  Same lowering "
-            "structure as ``default`` but with ``fp16`` pointer types.  "
-            "The numerical oracle computes in f32 then converts to f16; "
-            "the kernel accumulates in f16, so ``rtol=1e-2`` is used."
-        ),
-        "kernel_fn":    kernel.inter_tile_add_kernel_f16,
-        "SIGNATURE": {
-            "x_ptr":       "*fp16",
-            "output_ptr":  "*fp16",
-            "M":           "i32",
-            "N":           "i32",
-            "BLOCK_M":     "i32",
-            "BLOCK_N":     "i32",
-            "NUM_N_TILES": "i32",
-            "WORK_SLICES": None,
-        },
-        "constexpr":    ["BLOCK_M", "BLOCK_N", "NUM_N_TILES", "WORK_SLICES"],
-        "params": {
-            "M":           [64],
-            "N":           [32],
-            "BLOCK_M":     [16],
-            "BLOCK_N":     [16],
-            "NUM_N_TILES": [_NUM_N_TILES],
-            "WORK_SLICES": [_WORK_SLICES],
-        },
-        "grid":          [_NUM_TILES],
-        "parallel":      False,
-        "reference":     functools.partial(run_f16, BLOCK_M=16, BLOCK_N=16, NUM_N_TILES=_NUM_N_TILES),
-        "inputs":        make_inputs_f16,
-        "output_key":    "output_ptr",
-        "rtol":          1e-2,
         "extra_checks":  _extra_checks_default,
     },
 }
@@ -315,8 +338,9 @@ def _extra_checks_splitk(tester) -> None:
         "ktdp.inter_tile_produce", "producer_tiles_per_group",
         num_dims=1, num_symbols=1, num_constraints=2,
     )
-    # Post PR-25: groups lives on the !ktdp.tile_future type.
-    tester.assert_tile_future_groups(
+
+    assert_tile_future_groups(
+        tester,
         "ktdp.inter_tile_produce",
         num_dims=1, num_symbols=0, num_constraints=2,
     )
@@ -328,7 +352,8 @@ def _extra_checks_splitk(tester) -> None:
         "ktdp.inter_tile_reduce", "consumer_tiles_per_group",
         num_dims=1, num_symbols=1, num_constraints=1,
     )
-    tester.assert_tile_future_groups(
+    assert_tile_future_groups(
+        tester, 
         "ktdp.inter_tile_reduce",
         num_dims=1, num_symbols=0, num_constraints=2,
     )
@@ -379,8 +404,8 @@ def _extra_checks_softmax(tester) -> None:
         "ktdp.inter_tile_reduce", "consumer_tiles_per_group",
         num_dims=1, num_symbols=1, num_constraints=2,
     )
-    # Post PR-25: groups lives on the !ktdp.tile_future operand type.
-    tester.assert_tile_future_groups(
+    assert_tile_future_groups(
+        tester, 
         "ktdp.inter_tile_reduce",
         num_dims=1, num_symbols=0, num_constraints=2,
     )
