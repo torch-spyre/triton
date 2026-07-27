@@ -353,7 +353,7 @@ struct LowerInterTilePass
       return op.emitError("scatter_dimension only valid for reduce_scatter");
 
     if (combiner.empty())
-      return op.emitError("custom combiner regions are not yet supported (see issue #63)");
+      return op.emitError("custom combiner regions are not yet supported");
     auto identities = op.getIdentities();
     if (identities.empty())
       return op.emitError("identities operand group must not be empty");

@@ -1879,10 +1879,18 @@ void init_triton_ir(py::module &&m) {
   // Spyre-only: emit tt.inter_tile_reduce with work-slice op attributes.
   // Python layer derives W from C and serializes both into flat parallel lists.
   //
-  // w_keys / w_vals   : numWkSlicesPerDim (axis → count)
-  // c_keys            : axis names (same order for every tile)
-  // c_vals            : per-tile slice indices, c_vals[tile][axis_idx]
-  // dep_keys / dep_vals: depWkSlices (consumer-local-idx str → [producer-local-idxs])
+  // Given a 3×2 grid with WORK_SLICES = [{x:0,n:0},{x:0,n:1},{x:1,n:0},
+  //                                       {x:1,n:1},{x:2,n:0},{x:2,n:1}]:
+  //
+  // w_keys / w_vals: numWkSlicesPerDim — max+1 per axis.
+  //   w_keys=["x","n"], w_vals=[3,2]  →  {x:3, n:2}
+  //
+  // c_keys / c_vals: coreIdToWkSlice — per-tile coordinate dicts flattened.
+  //   c_keys=["x","n"], c_vals=[[0,0],[0,1],[1,0],[1,1],[2,0],[2,1]]
+  //   → [{x:0,n:0}, {x:0,n:1}, {x:1,n:0}, {x:1,n:1}, {x:2,n:0}, {x:2,n:1}]
+  //
+  // dep_keys / dep_vals: depWkSlices (optional, currently unused) — reserved
+  //   for producer-consumer dependencies when supported.
   TritonOpBuilderBinding.def(
       "create_inter_tile_reduce",
       [](TritonOpBuilder &self,

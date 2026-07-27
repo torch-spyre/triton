@@ -15,7 +15,7 @@ include "mlir/Pass/PassBase.td"
 //                       ↓
 //                 LowerComputeOps
 //                       ↓
-//               LowerInterTile    ← added for spyre (inter-tile collectives)
+//               LowerInterTile
 //                       ↓
 //               ConvertFunctions
 //                       ↓
@@ -138,8 +138,7 @@ def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
             ktdp.inter_tile_produce +
             ktdp.inter_tile_reduce (consumer = pick₀(g))
         - tt.inter_tile_reduce (mode=broadcast, reduce_scatter) →
-            rejected with "not yet supported" diagnostic (P8/R8); delivery ops
-            not yet available in ktir-mlir-frontend#25.
+            rejected with "not yet supported" diagnostic.
         - Axis with numWkSlicesPerDim[axis] == 1 → fold-away (erase op,
             forward partial unchanged).
         - depWkSlices present → producer_dependency_per_consumer affine set;

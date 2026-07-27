@@ -119,7 +119,7 @@ class SpyreBackend(BaseBackend):
         1. LowerDescriptorMemory: tt.descriptor_load/store/gather/scatter -> ktdp.*
         2. LowerScalarLoad: scalar tt.load (+ addptr chain) -> ktdp.* rank-0 read
         3. LowerComputeOps: tt.reduce/broadcast/expand_dims -> linalg/tensor + dead op sweep
-        4. LowerInterTile: tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery  # --- added for spyre
+        4. LowerInterTile: tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery
         5. ConvertFunctions: tt.func/return -> func.func/return, !tt.ptr -> index
            (must run last — memory passes consume !tt.ptr args via getBasePtrAsIndex)
         6. DistributeWork: tt.get_program_id -> ktdp.get_compute_tile_id
