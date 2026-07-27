@@ -74,7 +74,11 @@ jobs:
         run: |
           bash install-ktdp-mlir-bindings.sh
 
-      - name: Run tests
+      - name: Run lit tests
+        run: |
+          uv run lit build/cmake.*/third_party/spyre/test -v
+
+      - name: Run pytest
         run: |
           uv run python -m pytest third_party/spyre/test -v -s --tb=short
 
