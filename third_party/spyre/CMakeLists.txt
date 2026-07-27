@@ -15,6 +15,7 @@ add_subdirectory(lib)
 # installed into triton.tools.extra (see setup.py BackendInstaller).  We use
 # bin/ to follow Triton's top-level bin/ pattern for C++ opt binaries.
 add_subdirectory(bin)
+add_subdirectory(test)
 
 if(TRITON_BUILD_PYTHON_MODULE)
   add_triton_plugin(TritonSpyre

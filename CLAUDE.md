@@ -134,7 +134,30 @@ Current upstream touch points:
 ```bash
 uv run pytest third_party/spyre/test                    # full suite
 uv run pytest third_party/spyre/test -k "not numerical" # structural only
+lit build/cmake.*/third_party/spyre/test -v             # lit/FileCheck tests
 ```
 
 Numerical coverage is a work in progress; known gaps are strict-xfail'd and
 missing oracles skip, so the suite stays green while catching regressions.
+
+### Lit tests and `spyre-triton-opt`
+
+`spyre-triton-opt` registers both Triton (TTIR) and KTDP dialects/passes.
+It lives in `third_party/spyre/bin/` and is built by default. Lit tests
+live in `third_party/spyre/test/` alongside the pytest suite (`.mlir` suffix).
+
+**Generating FileCheck patterns** — use `utils/generate-test-checks.py`
+(from upstream LLVM) to auto-generate CHECK lines from printed IR:
+
+```bash
+# Roundtrip test (parse → print → parse → print → FileCheck):
+spyre-triton-opt foo.mlir | python utils/generate-test-checks.py --source foo.mlir -i
+
+# Pass output test (e.g. lower-compute-ops):
+spyre-triton-opt foo.mlir --lower-compute-ops | python utils/generate-test-checks.py --source foo.mlir -i
+```
+
+The `-i` flag edits the source file in-place, inserting CHECK lines above
+each function. The RUN line must already be present in the file before running
+the script. For `-verify-diagnostics` tests (error checking), write
+`expected-error` annotations manually — there is no auto-generator for those.
