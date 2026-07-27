@@ -10,6 +10,12 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
 add_subdirectory(include)
 add_subdirectory(lib)
+# C++ tool binaries (spyre-triton-opt).  The MLIR convention is tools/ but
+# Triton reserves third_party/<backend>/tools/ for Python tool packages
+# installed into triton.tools.extra (see setup.py BackendInstaller).  We use
+# bin/ to follow Triton's top-level bin/ pattern for C++ opt binaries.
+add_subdirectory(bin)
+add_subdirectory(test)
 
 if(TRITON_BUILD_PYTHON_MODULE)
   add_triton_plugin(TritonSpyre

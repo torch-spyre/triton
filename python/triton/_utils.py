@@ -60,11 +60,20 @@ def is_power_of_two(x):
 
 
 def validate_block_shape(shape: List[int]):
+    # The per-element power-of-2 requirement is a GPU LinearLayout / warp-tiling
+    # artifact, not a Triton IR rule. Spyre lowers block shapes to KTIR/KTDP
+    # tensor descriptors that handle arbitrary sizes, so skip the pow2 check for
+    # Spyre (the numel cap below still applies). Mirrors the is_spyre() gating in
+    # semantic.py (descriptor relaxations, 16-byte contiguity). Imported locally
+    # to avoid a module-load import cycle (_utils <- language <- target_info).
+    from .language import target_info
+    allow_non_pow2 = target_info.is_spyre()
+
     numel = 1
     for i, d in enumerate(shape):
         if not isinstance(d, int):
             raise TypeError(f"Shape element {i} must have type `constexpr[int]`, got `constexpr[{type(d)}]")
-        if not is_power_of_two(d):
+        if not is_power_of_two(d) and not allow_non_pow2:
             raise ValueError(f"Shape element {i} must be a power of 2")
         numel *= d
 

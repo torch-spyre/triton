@@ -60,9 +60,6 @@ jobs:
         env:
           TRITON_BACKENDS: spyre
           MAX_JOBS: "4"
-          # GIT_PAT is used by setup_mlir.py to download the MLIR artifact on
-          # first run (cached in ~/.cache/ktir-mlir/ afterwards).
-          GIT_PAT: ${{ secrets.GITHUB_TOKEN }}
         run: |
           uv pip install -v -e ".[spyre-test]"
 
@@ -77,7 +74,11 @@ jobs:
         run: |
           bash install-ktdp-mlir-bindings.sh
 
-      - name: Run tests
+      - name: Run lit tests
+        run: |
+          uv run lit build/cmake.*/third_party/spyre/test -v
+
+      - name: Run pytest
         run: |
           uv run python -m pytest third_party/spyre/test -v -s --tb=short
 
