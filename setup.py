@@ -798,7 +798,7 @@ setup(
             "ktir-cpu @ git+https://github.com/torch-spyre/ktir-cpu@main",
             "pytest>=7,<9",
             "numpy>=1.24,<2",
-            "lit",
+            "lit>=18,<20",
         ],
     },
     # --- END --- added for spyre
