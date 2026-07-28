@@ -55,6 +55,7 @@ Fixes, in order of preference:
 """
 
 import importlib.util
+import itertools
 import os
 import re
 import subprocess
@@ -180,8 +181,8 @@ def _resolve_variant(
       - ``runtime_signature`` — ``{name: dtype}`` subset of the effective
         ``SIGNATURE`` for arg names not in the variant's ``constexpr``.
       - ``constexprs`` — ``{name: value}`` for arg names in ``constexpr``.
-        The value is ``params[name][0]`` (Cartesian expansion is deferred;
-        see ``fixtures/README.md``).
+        The value is ``params[name][0]`` (always a single-element list by
+        the time this function is called; expansion happens in ``_load_examples``).
       - ``param_values`` — ``{name: value}`` flattened from ``params``
         using ``[0]``. Used by the numerical test to build runtime kwargs.
     """
@@ -222,6 +223,24 @@ def _resolve_variant(
     }
     constexprs = {name: param_values[name] for name in constexpr_names}
     return runtime_signature, constexprs, param_values
+
+
+def _expand_params(params: dict) -> list[dict]:
+    """Return one dict per Cartesian-product point across all param lists."""
+    names = list(params)
+    return [dict(zip(names, combo))
+            for combo in itertools.product(*[params[n] for n in names])]
+
+
+def _sweep_suffix(merged_params: dict, combo: dict) -> str:
+    """Build a ``[k=v, ...]`` suffix for params that have more than one value.
+
+    Returns ``""`` when no param has more than one value (single-combo case).
+    """
+    swept = sorted(k for k, v in merged_params.items() if len(v) > 1)
+    if not swept:
+        return ""
+    return "[" + ", ".join(f"{k}={combo[k]}" for k in swept) + "]"
 
 
 def _load_examples():
@@ -265,15 +284,45 @@ def _load_examples():
             # param_values) don't leak into resolved[] and corrupt later
             # base merges.
             merged = dict(_resolve_base(vname))
-            if module_sig:
-                runtime, constexprs, param_values = _resolve_variant(
-                    module_sig, merged, kernel_name=f"{name}::{vname}"
-                )
-                merged["signature"] = runtime
-                merged["constexprs"] = constexprs
-                merged["param_values"] = param_values
-            key = name if vname == "default" else f"{name}__{vname}"
-            registry[key] = merged
+
+            # Disabled variants: one entry, no expansion.
+            if merged.get("disabled"):
+                key = name if vname == "default" else f"{name}__{vname}"
+                registry[key] = merged
+                continue
+
+            merged_params = merged.get("params", {})
+            combos = _expand_params(merged_params)
+            base_key = name if vname == "default" else f"{name}__{vname}"
+
+            for combo in combos:
+                entry = dict(merged)
+                entry["params"] = {k: [combo[k]] for k in merged_params}
+                suffix = _sweep_suffix(merged_params, combo)
+                key = base_key + suffix
+
+                # extra_checks factory protocol: if the callable accepts
+                # **kwargs, call it with the combo to get the final
+                # (tester)->None. Existing lambda t: (...) lambdas have no
+                # **kwargs and pass through unchanged.
+                # TODO(#71): remove this block when extra_checks is dropped
+                # from fixtures entirely (KTIRStructuralTester removal).
+                ec = entry.get("extra_checks")
+                if ec is not None:
+                    import inspect
+                    sig = inspect.signature(ec)
+                    if any(p.kind == inspect.Parameter.VAR_KEYWORD
+                           for p in sig.parameters.values()):
+                        entry["extra_checks"] = ec(**combo)
+
+                if module_sig:
+                    runtime, constexprs, param_values = _resolve_variant(
+                        module_sig, entry, kernel_name=f"{name}::{vname}{suffix}"
+                    )
+                    entry["signature"]    = runtime
+                    entry["constexprs"]   = constexprs
+                    entry["param_values"] = param_values
+                registry[key] = entry
     return registry
 
 
