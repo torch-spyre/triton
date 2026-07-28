@@ -147,6 +147,7 @@ tt.func @reduce_to_one_with_dep(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tens
 
 // CHECK-LABEL: tt.func @combiner_add
 // CHECK:         linalg.add
+// CHECK-SAME:      outs(%{{.*}} : tensor<8xf32>) -> tensor<8xf32>
 tt.func @combiner_add(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   %0 = tt.inter_tile_reduce
          partials(%p : tensor<8xf32>)
@@ -162,6 +163,7 @@ tt.func @combiner_add(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
 
 // CHECK-LABEL: tt.func @combiner_max
 // CHECK:         linalg.max
+// CHECK-SAME:      outs(%{{.*}} : tensor<8xf32>) -> tensor<8xf32>
 tt.func @combiner_max(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   %0 = tt.inter_tile_reduce
          partials(%p : tensor<8xf32>)
@@ -177,6 +179,7 @@ tt.func @combiner_max(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
 
 // CHECK-LABEL: tt.func @combiner_mul
 // CHECK:         linalg.mul
+// CHECK-SAME:      outs(%{{.*}} : tensor<8xf32>) -> tensor<8xf32>
 tt.func @combiner_mul(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   %0 = tt.inter_tile_reduce
          partials(%p : tensor<8xf32>)

@@ -22,7 +22,7 @@
 // Result type == partial type (no rank reduction; caller collapses dims).
 // Note: the region combiner case is not tested here because tt.reduce.return
 // verifies it has a tt.reduce parent — region combiners are tested end-to-end
-// via test_lower_inter_tile.py.
+// via the lowering lit tests (Conversion/lower-inter-tile.mlir).
 
 // ---------------------------------------------------------------------------
 // (a) all_reduce, shorthand combiner "add"
