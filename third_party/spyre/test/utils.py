@@ -1,6 +1,6 @@
 """Shared utilities for Spyre KTIR tests.
 
-Hoisted out of ``conftest.py`` so that standalone scripts (``gen_ttir.py``,
+Hoisted out of ``conftest.py`` so that standalone scripts (``../scripts/gen_ttir.py``,
 ad-hoc notebooks) can import them without pulling in pytest fixtures.
 
 Contents

@@ -1875,6 +1875,101 @@ void init_triton_ir(py::module &&m) {
                                                   paddingOption);
            });
 
+#ifdef TRITON_BUILD_TTIR_ONLY // --- added for spyre
+  // Spyre-only: emit tt.inter_tile_reduce with work-slice op attributes.
+  // Python layer derives W from C and serializes both into flat parallel lists.
+  //
+  // Given a 3×2 grid with WORK_SLICES = [{x:0,n:0},{x:0,n:1},{x:1,n:0},
+  //                                       {x:1,n:1},{x:2,n:0},{x:2,n:1}]:
+  //
+  // w_keys / w_vals: numWkSlicesPerDim — max+1 per axis.
+  //   w_keys=["x","n"], w_vals=[3,2]  →  {x:3, n:2}
+  //
+  // c_keys / c_vals: coreIdToWkSlice — per-tile coordinate dicts flattened.
+  //   c_keys=["x","n"], c_vals=[[0,0],[0,1],[1,0],[1,1],[2,0],[2,1]]
+  //   → [{x:0,n:0}, {x:0,n:1}, {x:1,n:0}, {x:1,n:1}, {x:2,n:0}, {x:2,n:1}]
+  //
+  // dep_keys / dep_vals: depWkSlices (optional, currently unused) — reserved
+  //   for producer-consumer dependencies when supported.
+  TritonOpBuilderBinding.def(
+      "create_inter_tile_reduce",
+      [](TritonOpBuilder &self,
+         std::vector<Value> &partials,
+         std::vector<Value> &identities,
+         std::string axis, std::string combiner, std::string mode,
+         int64_t scatter_dimension,
+         std::vector<std::string> &w_keys, std::vector<int64_t> &w_vals,
+         std::vector<std::string> &c_keys,
+         std::vector<std::vector<int64_t>> &c_vals,
+         std::vector<std::string> &dep_keys,
+         std::vector<std::vector<int64_t>> &dep_vals)
+          -> std::vector<Value> {
+        auto &builder = self.getBuilder();
+        MLIRContext *ctx = builder.getContext();
+        auto i64Ty = IntegerType::get(ctx, 64);
+
+        // --- numWkSlicesPerDim (W) ---
+        SmallVector<NamedAttribute> wAttrs;
+        for (size_t i = 0; i < w_keys.size(); ++i)
+          wAttrs.push_back({StringAttr::get(ctx, w_keys[i]),
+                            IntegerAttr::get(i64Ty, w_vals[i])});
+        auto numWkSlicesPerDim = DictionaryAttr::get(ctx, wAttrs);
+
+        // --- coreIdToWkSlice (C) ---
+        SmallVector<Attribute> tileAttrs;
+        for (auto &tileVals : c_vals) {
+          SmallVector<NamedAttribute> tileMap;
+          for (size_t j = 0; j < c_keys.size(); ++j)
+            tileMap.push_back({StringAttr::get(ctx, c_keys[j]),
+                               IntegerAttr::get(i64Ty, tileVals[j])});
+          tileAttrs.push_back(DictionaryAttr::get(ctx, tileMap));
+        }
+        auto coreIdToWkSlice = ArrayAttr::get(ctx, tileAttrs);
+
+        // --- depWkSlices (D, optional) ---
+        DictionaryAttr depWkSlices;
+        if (!dep_keys.empty()) {
+          SmallVector<NamedAttribute> depAttrs;
+          for (size_t i = 0; i < dep_keys.size(); ++i) {
+            SmallVector<Attribute> prodIdxs;
+            for (int64_t v : dep_vals[i])
+              prodIdxs.push_back(IntegerAttr::get(i64Ty, v));
+            depAttrs.push_back({StringAttr::get(ctx, dep_keys[i]),
+                                 ArrayAttr::get(ctx, prodIdxs)});
+          }
+          depWkSlices = DictionaryAttr::get(ctx, depAttrs);
+        }
+
+        // Result types == partial types. The ktdp.inter_tile_reduce op
+        // requires result_type == partial_type; the tt op mirrors that
+        // so the lowering can replace each use of a tt result with the
+        // corresponding partial value directly (no reshape needed).
+        SmallVector<Type> resultTypes;
+        for (auto &p : partials)
+          resultTypes.push_back(p.getType());
+
+        // --- optional scatter_dimension ---
+        IntegerAttr scatterDimAttr;
+        if (scatter_dimension >= 0)
+          scatterDimAttr = IntegerAttr::get(i64Ty, scatter_dimension);
+
+        auto op = self.create<triton::InterTileReduceOp>(
+            resultTypes,
+            /*partials=*/ValueRange(partials),
+            /*identities=*/ValueRange(identities),
+            axis, mode, combiner,
+            scatterDimAttr,
+            numWkSlicesPerDim,
+            coreIdToWkSlice,
+            depWkSlices);
+
+        std::vector<Value> results;
+        for (auto r : op.getResults())
+          results.push_back(r);
+        return results;
+      });
+#endif // --- added for spyre
+
   // Add custom operations.
   for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
     for (const auto &op : plugin.listOps()) {

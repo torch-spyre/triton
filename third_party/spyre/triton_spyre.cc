@@ -25,17 +25,29 @@
 namespace py = pybind11;
 
 void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
-  // Pipeline: LowerDescriptorMemory → LowerComputeOps → ConvertFunctions.
+  // Pipeline: LowerDescriptorMemory → LowerScalarLoad → LowerComputeOps →
+  //           LowerInterTile → ConvertFunctions.
   // ConvertFunctions runs last because it replaces !tt.ptr args with index;
-  // memory passes must consume !tt.ptr via getBasePtrAsIndex first.
+  // memory passes must consume !tt.ptr via getBasePtrAsIndex/ptrToIndex first.
+  // LowerInterTile runs after LowerComputeOps (partials are linalg/tensor)
+  // and before ConvertFunctions (reads work-slice function attributes that
+  // ConvertFunctions would rewrite).
   m.def("add_convert_ttir_to_ktdp", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
+    pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
     pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
+    pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
     pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
   });
   // Individual pass bindings for debugging and testing.
+  m.def("add_lower_inter_tile", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
+  });
   m.def("add_lower_descriptor_memory", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
+  });
+  m.def("add_lower_scalar_load", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
   });
   m.def("add_lower_compute_ops", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());

@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/KTDP/Transforms/Passes.h"
+#include "Dialect/KTDP/Transforms/Utility.h"
 #include "Ktdp/KtdpAttrs.hpp"
 #include "Ktdp/KtdpDialect.hpp"
 #include "Ktdp/KtdpOps.hpp"
@@ -72,15 +73,6 @@ static Value getDescriptorMemView(Value desc) {
   return castOp.getInputs()[0];
 }
 
-static Value getBasePtrAsIndex(OpBuilder &builder, Location loc,
-                               Value basePtr) {
-  if (basePtr.getType().isIndex())
-    return basePtr;
-  return UnrealizedConversionCastOp::create(builder, loc,
-                                              builder.getIndexType(), basePtr)
-      .getResult(0);
-}
-
 /// Build a range-set constraint for an N-D coordinate space.
 /// Static dims use arith constants; dynamic dims use IntegerSet symbols,
 /// which are bound positionally to the op's dynamic sizes operands.
@@ -112,15 +104,6 @@ static IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape) {
   return IntegerSet::get(rank, symCount, constraints, eqFlags);
 }
 
-/// Try to extract a compile-time int64 from an SSA value produced by
-/// arith.constant.  Returns std::nullopt if the value is not a constant.
-static std::optional<int64_t> getConstantInt(Value v) {
-  if (auto cst = v.getDefiningOp<arith::ConstantOp>())
-    if (auto attr = dyn_cast<IntegerAttr>(cst.getValue()))
-      return attr.getInt();
-  return std::nullopt;
-}
-
 //===----------------------------------------------------------------------===//
 // Shared memory view construction
 //===----------------------------------------------------------------------===//
@@ -133,13 +116,14 @@ static Value buildBaseMemoryView(OpBuilder &builder, Location loc,
                                  triton::MakeTensorDescOp descOp,
                                  Type elemType) {
   MLIRContext *ctx = builder.getContext();
-  Value baseIndex = getBasePtrAsIndex(builder, loc, descOp.getBase());
+  Value baseIndex =
+      mlir::triton::ktdp::getBasePtrAsIndex(builder, loc, descOp.getBase());
 
   // Extract shape/strides as constants when possible, kDynamic otherwise.
   SmallVector<int64_t> shape;
   SmallVector<Value> dynSizes;
   for (auto s : descOp.getShape()) {
-    if (auto c = getConstantInt(s)) {
+    if (auto c = mlir::triton::ktdp::getConstantInt(s)) {
       shape.push_back(*c);
     } else {
       shape.push_back(ShapedType::kDynamic);
@@ -157,7 +141,7 @@ static Value buildBaseMemoryView(OpBuilder &builder, Location loc,
   SmallVector<int64_t> strides;
   SmallVector<Value> dynStrides;
   for (auto s : descOp.getStrides()) {
-    if (auto c = getConstantInt(s)) {
+    if (auto c = mlir::triton::ktdp::getConstantInt(s)) {
       strides.push_back(*c);
     } else {
       strides.push_back(ShapedType::kDynamic);

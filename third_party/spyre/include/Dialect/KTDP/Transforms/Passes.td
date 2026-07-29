@@ -6,18 +6,24 @@ include "mlir/Pass/PassBase.td"
 // ============================================================================
 // Pass pipeline: TTIR → KTIR
 //
-//   LowerDescriptorMemory   [LowerPointerChainMemory]
-//           └──────────────┬──────────────┘
-//                          ↓
-//                   LowerComputeOps
-//                          |
-//                   ConvertFunctions
-//                          |
-//                    DistributeWork
-//                          |
-//                   canonicalize + CSE
-//                          |
-//                        KTIR
+
+//
+//   LowerDescriptorMemory       [LowerPointerChainMemory]
+//           └───────────┬───────────┘
+//
+//                LowerScalarLoad
+//                       ↓
+//                 LowerComputeOps
+//                       ↓
+//               LowerInterTile
+//                       ↓
+//               ConvertFunctions
+//                       ↓
+//               DistributeWork
+//                       ↓
+//              canonicalize + CSE
+//                       ↓
+//                     KTIR
 //
 // Each pass declares its contract below:
 //   Input    — dialects/ops it expects to see
@@ -47,10 +53,45 @@ def LowerDescriptorMemory : Pass<"lower-descriptor-memory", "mlir::ModuleOp"> {
     ];
 }
 
+def LowerScalarLoad : Pass<"lower-scalar-load", "mlir::ModuleOp"> {
+    let summary = "Lower a scalar tt.load (pointer in, scalar result) to ktdp memory ops.";
+    let description = [{
+        Input: TTIR — triton, arith dialects; !tt.ptr types. Matches only a
+        tt.load whose pointer operand is scalar (!tt.ptr<ElemT>, not a
+        tensor of pointers) — the tensor-of-pointers form is out of scope
+        and left legal for a future [LowerPointerChainMemory].
+
+        Lowering:
+        - scalar tt.addptr chain feeding the matched tt.load → folded into
+          a single index offset (plain adds, no element-size scaling)
+        - scalar tt.load → rank-0 ktdp.construct_memory_view +
+          rank-0 ktdp.construct_access_tile + ktdp.load + tensor.extract
+        - masked scalar tt.load → the mask must be a compile-time constant
+          (a materialized arith.constant i1); constant-true drops straight
+          through to the unconditional read, constant-false skips the read
+          and yields `other` or a materialized zero of the element type.
+          Spyre has no runtime control-flow divergence, so a mask that
+          might depend on runtime data — including a comparison of two
+          constants — is refused with a diagnostic and fails the pass; no
+          scf.if or other runtime branch on the mask is ever emitted.
+        - tt.addptr ops left dead by the fold are swept by cleanup
+
+        Output: tensor-of-pointers tt.load, and all other triton ops this
+        pass doesn't handle, remain unchanged. New ktdp, arith, and tensor
+        ops are introduced.
+    }];
+
+    let dependentDialects = [
+        "mlir::ktdp::KtdpDialect",
+        "mlir::arith::ArithDialect",
+        "mlir::tensor::TensorDialect"
+    ];
+}
+
 def LowerComputeOps : Pass<"lower-compute-ops", "mlir::ModuleOp"> {
     let summary = "Lower tt compute/shape ops to linalg/tensor ops.";
     let description = [{
-        Input: triton + ktdp + arith + memref + scf dialects.
+        Input: triton + ktdp + arith + memref + tensor + scf dialects.
 
         Lowering (Group A — shape manipulation):
         - tt.splat → linalg.fill
@@ -79,6 +120,43 @@ def LowerComputeOps : Pass<"lower-compute-ops", "mlir::ModuleOp"> {
         "mlir::tensor::TensorDialect",
         "mlir::arith::ArithDialect",
         "mlir::math::MathDialect"
+    ];
+}
+
+def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
+    let summary = "Lower tt.inter_tile_reduce to ktdp inter-tile produce/reduce pairs.";
+    let description = [{
+        Input: TTIR after LowerComputeOps — tt.inter_tile_reduce ops whose
+        partial operands are already linalg/tensor values; enclosing func.func
+        carries numWkSlicesPerDim and coreIdToWkSlice function attributes.
+
+        Lowering:
+        - tt.inter_tile_reduce (mode=all_reduce) →
+            ktdp.inter_tile_produce (producer region + ktdp.yield_partial) +
+            ktdp.inter_tile_reduce (full consumer set + ktdp.yield_reduced)
+        - tt.inter_tile_reduce (mode=reduce_to_one) →
+            ktdp.inter_tile_produce +
+            ktdp.inter_tile_reduce (consumer = pick₀(g))
+        - tt.inter_tile_reduce (mode=broadcast, reduce_scatter) →
+            rejected with "not yet supported" diagnostic.
+        - Axis with numWkSlicesPerDim[axis] == 1 → fold-away (erase op,
+            forward partial unchanged).
+        - depWkSlices present → producer_dependency_per_consumer affine set;
+            absent → full-barrier (attribute omitted).
+
+        Must run after LowerComputeOps (partials must be linalg/tensor) and
+        before ConvertFunctions (reads function attributes ConvertFunctions
+        would rewrite).
+
+        Output: no tt.inter_tile_reduce ops remain; ktdp.inter_tile_produce /
+        inter_tile_reduce pairs are introduced; the tile_future is single-use.
+    }];
+
+    let dependentDialects = [
+        "mlir::ktdp::KtdpDialect",
+        "mlir::arith::ArithDialect",
+        "mlir::linalg::LinalgDialect",
+        "mlir::tensor::TensorDialect"
     ];
 }
 

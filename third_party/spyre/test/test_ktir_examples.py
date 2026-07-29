@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Structural and numerical KTIR tests for every kernel variant discovered
-from ``examples/kernels/*/meta.py``.
+from ``fixtures/*/meta.py``.
 
 One class :class:`TestExample` drives everything via pytest parametrize.
 Each test method falls into one of three categories (see the class
@@ -176,7 +176,7 @@ def test_disabled_variants_tracking_tests_exist():
 
 
 class TestExample(KTIRCpuTester, KTIRStructuralTester):
-    """Parametrized suite for every kernel variant under ``examples/kernels/``.
+    """Parametrized suite for every kernel variant under ``fixtures/``.
 
     The test methods split into three groups:
 
@@ -196,7 +196,7 @@ class TestExample(KTIRCpuTester, KTIRStructuralTester):
        Per-variant ``xfail_numerical`` marks in ``meta.py`` express known
        execution-layer gaps (e.g. ``ktir_cpu`` cannot parse dynamic memref).
 
-    New kernels added under ``examples/kernels/`` automatically pick up
+    New kernels added under ``fixtures/`` automatically pick up
     group (1) from discovery; they add group (2) / (3) content in their
     ``meta.py``.
     """
@@ -236,7 +236,7 @@ class TestExample(KTIRCpuTester, KTIRStructuralTester):
         the raw-pointer ops below should never appear. This is a belt-and-
         suspenders check against upstream regressions that might re-
         introduce them. A variant that deliberately uses the raw-pointer
-        idiom (none today; see ``examples/ttir/vector_add_raw_ptr.mlir``
+        idiom (none today; see ``scripts/gen_ttir.py`` for prior examples
         for the shape) would need to opt out.
         """
         self.EXAMPLE = key

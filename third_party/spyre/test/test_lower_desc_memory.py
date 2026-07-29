@@ -328,6 +328,52 @@ class TestDescriptorLoad(LowerDescMemoryTester):
         self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
                                 num_dims=2, num_symbols=2, num_constraints=4)
 
+    @pattern("descriptor-load-dynamic-from-scalar-load", category="memory", example=[
+        "# seqlen is read from memory (e.g. a per-batch sequence length),",
+        "# not a tt.func argument — descriptor still emits memref<?xf16>",
+        "seqlen = tl.load(seqlen_ptr)",
+        "desc = tl.make_tensor_descriptor(ptr, shape=[seqlen], strides=[1],",
+        "                                 block_shape=[BLOCK])",
+        "tile = tl.descriptor_load(desc, [pid * BLOCK])",
+    ])
+    def test_dynamic_shape_from_scalar_load(self):
+        """A shape operand fed by ``tt.load`` still yields kDynamic.
+
+        Runs `LowerDescriptorMemory` alone (`LowerScalarLoad` never runs
+        here) on IR where the shape operand's defining op is an unconverted
+        `tt.load`. `getConstantInt` only recognizes a materialized
+        `arith.constant`, so it treats the `tt.load` result as opaque and
+        falls through to `kDynamic` — pinning that this pass doesn't depend
+        on `LowerScalarLoad` running first.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>, %off: i32, %seqlen_ptr: !tt.ptr<i32>) {
+            // %seqlen comes from tt.load, not arith.constant or a tt.func
+            // argument — SinglePassTester runs only LowerDescriptorMemory,
+            // so this tt.load is never touched by LowerScalarLoad here.
+            %seqlen = tt.load %seqlen_ptr : !tt.ptr<i32>
+            %stride = arith.constant 1 : i64
+            %desc = tt.make_tensor_descriptor %ptr, [%seqlen], [%stride]
+                : <f16>, <64xf16>
+            %data = tt.descriptor_load %desc[%off]
+                : !tt.tensordesc<64xf16> -> tensor<64xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_memory_view", "ktdp.load")
+        self.assert_absent("tt.descriptor_load")
+        # The tt.load survives untouched — LowerDescriptorMemory's
+        # ConversionTarget marks only the four descriptor ops illegal, so
+        # tt.load is neither converted nor required to be legal elsewhere.
+        self.assert_present("tt.load")
+        self.assert_result_type("ktdp.construct_memory_view", "memref<?")
+        self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
+                                num_dims=1, num_symbols=1, num_constraints=2)
+        self.assert_operand("ktdp.construct_memory_view", 1,
+                            defined_by="arith.index_cast", type_substr="index")
+
 
 # =========================================================================
 # tt.descriptor_store → construct_memory_view + construct_access_tile + store
