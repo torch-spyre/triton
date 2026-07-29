@@ -523,7 +523,7 @@ tile = tl.descriptor_load(desc, [pid_m * BLOCK_M, pid_k * BLOCK_K])
 
 **Round-trip evidence**
 
-- `matmul::dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-2d, num-programs-fold)
+- `matmul::dynamic` — M=128, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, dot, program-id-2d, num-programs-fold)
 - `matmul::bmm_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-2d)
 - `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-3d)
@@ -580,11 +580,11 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>
 
 **Round-trip evidence**
 
-- `matmul::default` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-2d, num-programs-fold)
+- `matmul::default` — M=16, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-2d, num-programs-fold)
 - `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-2d)
 - `matmul::bmm_3d_grid` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-3d)
-- `softmax::default` — M=1024, N=1024, BLOCK_SIZE=1024 (also demonstrates: descriptor-store-static, reduce, broadcast, program-id-1d, num-programs-fold)
+- `softmax::default` — M=16, N=1024, BLOCK_SIZE=1024 (also demonstrates: descriptor-store-static, reduce, broadcast, program-id-1d, num-programs-fold)
 
 _+ 7 more variants_
 
@@ -801,7 +801,7 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])
 
 **Round-trip evidence**
 
-- `matmul::dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-2d, num-programs-fold)
+- `matmul::dynamic` — M=128, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-dynamic, dot, program-id-2d, num-programs-fold)
 - `matmul::bmm_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-2d)
 - `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-3d)
@@ -824,11 +824,11 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
 
 **Round-trip evidence**
 
-- `matmul::default` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-2d, num-programs-fold)
+- `matmul::default` — M=16, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-2d, num-programs-fold)
 - `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-2d)
 - `matmul::bmm_3d_grid` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-3d)
-- `softmax::default` — M=1024, N=1024, BLOCK_SIZE=1024 (also demonstrates: descriptor-load-static, reduce, broadcast, program-id-1d, num-programs-fold)
+- `softmax::default` — M=16, N=1024, BLOCK_SIZE=1024 (also demonstrates: descriptor-load-static, reduce, broadcast, program-id-1d, num-programs-fold)
 
 _+ 7 more variants_
 

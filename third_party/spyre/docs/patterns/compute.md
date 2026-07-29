@@ -20,7 +20,7 @@ mat = tl.broadcast_to(row, [M, N])         # tensor<M x N x f32>
 
 **Round-trip evidence**
 
-- `softmax::default` — M=1024, N=1024, BLOCK_SIZE=1024 (also demonstrates: descriptor-load-static, descriptor-store-static, reduce, program-id-1d, num-programs-fold)
+- `softmax::default` — M=16, N=1024, BLOCK_SIZE=1024 (also demonstrates: descriptor-load-static, descriptor-store-static, reduce, program-id-1d, num-programs-fold)
 - `softmax::2pass` — M=1024, N=1024, BLOCK_M=4, BLOCK_N=64 (also demonstrates: descriptor-load-static, descriptor-store-static, reduce, program-id-1d, num-programs-fold)
 
 ## dot
@@ -103,8 +103,8 @@ Expected diagnostics:
 
 **Round-trip evidence**
 
-- `matmul::default` — M=512, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-2d, num-programs-fold)
-- `matmul::dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, program-id-2d, num-programs-fold)
+- `matmul::default` — M=16, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-2d, num-programs-fold)
+- `matmul::dynamic` — M=128, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, program-id-2d, num-programs-fold)
 - `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d, num-programs-fold)
 - `matmul::bmm_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, program-id-1d, num-programs-fold)
 - `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-2d)
@@ -244,8 +244,8 @@ Expected diagnostics:
 
 **Round-trip evidence**
 
-- `softmax::default` — M=1024, N=1024, BLOCK_SIZE=1024 (also demonstrates: descriptor-load-static, descriptor-store-static, broadcast, program-id-1d, num-programs-fold)
-- `softmax::multi_tile` — M=1024, N=1024, BLOCK_N=64 (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d, num-programs-fold)
+- `softmax::default` — M=16, N=1024, BLOCK_SIZE=1024 (also demonstrates: descriptor-load-static, descriptor-store-static, broadcast, program-id-1d, num-programs-fold)
+- `softmax::multi_tile` — M=1000, N=1024, BLOCK_N=32 (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d, num-programs-fold)
 - `softmax::2pass` — M=1024, N=1024, BLOCK_M=4, BLOCK_N=64 (also demonstrates: descriptor-load-static, descriptor-store-static, broadcast, program-id-1d, num-programs-fold)
 
 ## reshape
