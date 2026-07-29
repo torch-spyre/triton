@@ -13,6 +13,31 @@ from . import kernel
 
 
 # ---------------------------------------------------------------------------
+# extra_checks factories (for variants with multi-value params that contain
+# shapes in the check).  Each factory accepts **combo and returns a
+# (tester)->None function.
+# ---------------------------------------------------------------------------
+
+def _make_1d_checks(n_elements, BLOCK_SIZE, **_):
+    def checks(t):
+        if n_elements != BLOCK_SIZE:
+            t.assert_result("ktdp.construct_memory_view", shape_not=[BLOCK_SIZE])
+    return checks
+
+
+def _make_2d_checks(M, N, **_):
+    def checks(t):
+        t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{N}xf32>")
+    return checks
+
+
+def _make_3d_checks(M, N, P, **_):
+    def checks(t):
+        t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{N}x{P}xf32>")
+    return checks
+
+
+# ---------------------------------------------------------------------------
 # Reference (NumPy oracle) + input maker
 # ---------------------------------------------------------------------------
 
@@ -142,39 +167,17 @@ VARIANTS = {
         ),
         "kernel_fn":    kernel.add_kernel,
         "constexpr":    ["n_elements", "BLOCK_SIZE"],
-        "params":       {"n_elements": [2097152], "BLOCK_SIZE": [1024]},
+        "params":       {
+            # n_elements=[1024,2097152,2097153]: absorbs single_block (1024)
+            # and nonaligned (2097153).
+            "n_elements": [1024, 2097152, 2097153], "BLOCK_SIZE": [1024],
+        },
         # 1D kernel (only tl.program_id(0)) on the 32-core Spyre grid.
         "grid":         [32],
         "reference":    run,
         "inputs":       make_inputs,
         "output_key":   "output_ptr",
-        "extra_checks": lambda t: (
-            # construct_memory_view should cover the full tensor
-            # (memref<2097152xf32>), not the block tile shape — the
-            # view is a window over the global buffer, and tiling is
-            # expressed by the access_tile on top of it.
-            t.assert_result("ktdp.construct_memory_view",
-                            shape_not=[1024]),
-        ),
-    },
-    "single_block": {
-        # n_elements=1024=BLOCK_SIZE: only 1 block total.
-        # 31 cores produce a zero-trip scf.for range.
-        # extra_checks omitted: n_elements==BLOCK_SIZE so the full-tensor view
-        # and the tile have the same size; the inherited shape_not check would
-        # be vacuously false.
-        "base":         "default",
-        "params":       {"n_elements": [1024], "BLOCK_SIZE": [1024]},
-        "extra_checks": None,
-    },
-    "nonaligned": {
-        # n_elements=2097153: num_blocks=2049, not divisible by 32 cores.
-        # tl.minimum clamp fires on the last core's block range.
-        "base":   "default",
-        "params": {"n_elements": [2097153], "BLOCK_SIZE": [1024]},
-        "extra_checks": lambda t: (
-            t.assert_result("ktdp.construct_memory_view", shape_not=[1024]),
-        ),
+        "extra_checks": _make_1d_checks,
     },
     "dynamic": {
         # PR #86: flip n_elements from constexpr to runtime i32. Produces
@@ -211,6 +214,7 @@ VARIANTS = {
     },
     # --- 2D variants ---
     "2d": {
+        # M=[512,520]: absorbs 2d_nonaligned (M=520, m_blocks=33 → clamp fires).
         "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-1d", "num-programs-fold"],
         "summary": (
             "2D elementwise add over an `M × N` matrix, tiled in both "
@@ -229,12 +233,12 @@ VARIANTS = {
         "kernel_fn":    kernel.add_kernel_2d,
         "SIGNATURE":    _SIG_2D,
         "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N"],
-        "params":       {"M": [512], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16]},
+        "params":       {
+            # M=[512,520]: absorbs 2d_nonaligned (M=520).
+            "M": [512, 520], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16],
+        },
         "inputs":       make_inputs_2d,
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<512x32xf32>"),
-        ),
+        "extra_checks": _make_2d_checks,
     },
     "2d_dynamic": {
         "base":      "2d",
@@ -255,15 +259,6 @@ VARIANTS = {
                                  "memref<?x?xf32>"),
         ),
     },
-    "2d_nonaligned": {
-        # M=520: m_blocks=33, not divisible by 32 cores → clamp fires.
-        "base":   "2d",
-        "params": {"M": [520], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16]},
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<520x32xf32>"),
-        ),
-    },
     "2d_dynamic_alt": {
         # Different N than the static 2d sibling: confirms the compiled
         # dynamic kernel runs at a shape distinct from its static sibling.
@@ -272,6 +267,7 @@ VARIANTS = {
     },
     # --- 3D variants ---
     "3d": {
+        # M=[64,65,256]: absorbs 3d_nonaligned (M=65) and 3d_active_cores (M=256).
         "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-1d", "num-programs-fold"],
         "summary": (
             "3D elementwise add over an `M × N × P` tensor with "
@@ -289,14 +285,12 @@ VARIANTS = {
         "SIGNATURE":    _SIG_3D,
         "constexpr":    ["M", "N", "P", "BLOCK_M", "BLOCK_N", "BLOCK_P"],
         "params":       {
-            "M": [64], "N": [32], "P": [16],
+            # M=[64,65,256]: absorbs 3d_nonaligned (M=65) and 3d_active_cores (M=256).
+            "M": [64, 65, 256], "N": [32], "P": [16],
             "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
         },
         "inputs":       make_inputs_3d,
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<64x32x16xf32>"),
-        ),
+        "extra_checks": _make_3d_checks,
     },
     "3d_dynamic": {
         "base":      "3d",
@@ -314,31 +308,6 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?x?xf32>"),
-        ),
-    },
-    "3d_nonaligned": {
-        # M=65: m_blocks=9, not divisible by 32 cores → clamp fires.
-        "base":   "3d",
-        "params": {
-            "M": [65], "N": [32], "P": [16],
-            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
-        },
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<65x32x16xf32>"),
-        ),
-    },
-    "3d_active_cores": {
-        # M=256: m_blocks=32, all 32 cores get exactly 1 M-tile.
-        # The 3d default has M=64 (only 8 active cores).
-        "base":   "3d",
-        "params": {
-            "M": [256], "N": [32], "P": [16],
-            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
-        },
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<256x32x16xf32>"),
         ),
     },
     # --- 2D grid variants ---
