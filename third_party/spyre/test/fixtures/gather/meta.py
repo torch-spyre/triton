@@ -911,6 +911,20 @@ VARIANTS = {
         },
         "inputs": make_inputs_full_row,
     },
+    "slice_large_row": {
+        # full_row at 16x wider embedding dim: N=256, BLOCK_COLS=256.
+        # Tests the full-row path (BLOCK_COLS == N, y_offset=0) at a size
+        # that stresses tile-shape computation beyond the small N=16 base.
+        "base":   "full_row",
+        "params": {
+            "M":          [128],
+            "N":          [256],
+            "K_INDICES":  [16],
+            "BLOCK_COLS": [256],
+            "y_offset":   [0],
+        },
+        "inputs": make_inputs_full_row,
+    },
     "min_block_cols": {
         # Smallest legal sizes per the verifier: K_INDICES=8 (verifier
         # minimum) and BLOCK_COLS=8 (verifier minimum for f32, since
@@ -1167,6 +1181,19 @@ VARIANTS = {
         "output_key":   "out_ptr",
         "extra_checks": _EXTRA_CHECKS,
     },
+    "3d_group_end": {
+        # group_idx at the last group (7 of 8) — boundary condition for the
+        # c_y capture. The base has group_idx=3 (middle); this pins that the
+        # subscript map is correct at the upper boundary.
+        "base":   "3d_group",
+        "params": {
+            "M":          [256],
+            "NUM_GROUPS": [8],
+            "HEAD_DIM":   [64],
+            "K_INDICES":  [32],
+            "group_idx":  [7],
+        },
+    },
     "4d": {
         # Rank-4: source [NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM].
         # Block [1, 1, BLOCK_SIZE, INNER_DIM] — two leading 1s for the
@@ -1190,6 +1217,34 @@ VARIANTS = {
         "inputs":       make_inputs_4d,
         "output_key":   "out_ptr",
         "extra_checks": _EXTRA_CHECKS,
+    },
+    "3d_large_k": {
+        # Same 3D block-fetch path as "3d" but K_INDICES=128 (4x the base).
+        # Stresses the descriptor_gather fan-out at higher row count without
+        # changing the lowering path.
+        "base":   "3d",
+        "params": {
+            "M":          [256],
+            "BLOCK_SIZE": [16],
+            "HEAD_DIM":   [64],
+            "K_INDICES":  [128],
+        },
+    },
+    "4d_boundary": {
+        # Last group index (group_idx=3, NUM_GROUPS=4) + K_INDICES equal to
+        # NUM_BLOCKS (64). Both are upper-boundary conditions: group_idx at
+        # the last valid slot exercises the c_y subscript at its maximum;
+        # K_INDICES=NUM_BLOCKS forces every block index to be selected
+        # (unique sampling exhausts the pool without replacement).
+        "base":   "4d",
+        "params": {
+            "NUM_BLOCKS": [64],
+            "NUM_GROUPS": [4],
+            "BLOCK_SIZE": [16],
+            "INNER_DIM":  [64],
+            "K_INDICES":  [64],
+            "group_idx":  [3],
+        },
     },
     "scatter_3d": {
         # Write-back mirror of the "3d" variant.  Reads K_INDICES blocks from
