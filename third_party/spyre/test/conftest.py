@@ -225,22 +225,84 @@ def _resolve_variant(
     return runtime_signature, constexprs, param_values
 
 
-def _expand_params(params: dict) -> list[dict]:
-    """Return one dict per Cartesian-product point across all param lists."""
-    names = list(params)
-    return [dict(zip(names, combo))
-            for combo in itertools.product(*[params[n] for n in names])]
+def _normalise_param_list(
+    pname: str, values: list, kernel_name: str = ""
+) -> list[tuple]:
+    """Normalise *values* to a list of ``(label, value)`` pairs.
 
+    Accepts two forms:
 
-def _sweep_suffix(merged_params: dict, combo: dict) -> str:
-    """Build a ``[k=v, ...]`` suffix for params that have more than one value.
+    - **Plain values** (int, float, str, dict, …) — auto-labelled as
+      ``str(value)``.
+    - **Labelled tuples** ``(label, value)`` where *label* is a ``str`` —
+      returned as-is.
 
-    Returns ``""`` when no param has more than one value (single-combo case).
+    Mixed lists (some tuples, some plain) raise :exc:`ValueError`.  So do
+    tuples whose first element is not a ``str``.
     """
-    swept = sorted(k for k, v in merged_params.items() if len(v) > 1)
+    has_tuple = [isinstance(v, tuple) for v in values]
+    if any(has_tuple) and not all(has_tuple):
+        prefix = f"{kernel_name}: " if kernel_name else ""
+        raise ValueError(
+            f"{prefix}params[{pname!r}] mixes labelled tuples and plain "
+            f"values — use either all (label, value) tuples or all plain "
+            f"values, not both."
+        )
+    if all(has_tuple):
+        for v in values:
+            if len(v) != 2 or not isinstance(v[0], str):
+                prefix = f"{kernel_name}: " if kernel_name else ""
+                raise ValueError(
+                    f"{prefix}params[{pname!r}] labelled tuple must be "
+                    f"(str, value), got {v!r}"
+                )
+        return list(values)
+    else:
+        return [(str(v), v) for v in values]
+
+
+def _expand_params(
+    params: dict, kernel_name: str = ""
+) -> tuple[list[dict], set]:
+    """Return ``(combos, always_suffixed)``.
+
+    *combos* is a list of dicts mapping param name → ``(label, value)`` pair.
+
+    *always_suffixed* is the set of param names whose original list contained
+    labelled tuples — these params always appear in the suffix string even when
+    only one value is present.
+    """
+    normalised: dict = {}
+    always_suffixed: set = set()
+    for name, values in params.items():
+        normed = _normalise_param_list(name, values, kernel_name)
+        normalised[name] = normed
+        if any(isinstance(v, tuple) for v in values):
+            always_suffixed.add(name)
+
+    names = list(normalised)
+    combos = [
+        dict(zip(names, combo))
+        for combo in itertools.product(*[normalised[n] for n in names])
+    ]
+    return combos, always_suffixed
+
+
+def _sweep_suffix(merged_params: dict, combo: dict, always_suffixed: set = frozenset()) -> str:
+    """Build a ``[k=v, ...]`` suffix for params that have more than one value
+    or are explicitly labelled (in *always_suffixed*).
+
+    *combo* maps param name → ``(label, value)`` pair (post-normalisation).
+
+    Returns ``""`` when no param qualifies.
+    """
+    swept = sorted(
+        k for k, v in merged_params.items()
+        if len(v) > 1 or k in always_suffixed
+    )
     if not swept:
         return ""
-    return "[" + ", ".join(f"{k}={combo[k]}" for k in swept) + "]"
+    return "[" + ", ".join(f"{k}={combo[k][0]}" for k in swept) + "]"
 
 
 def _load_examples():
@@ -292,13 +354,15 @@ def _load_examples():
                 continue
 
             merged_params = merged.get("params", {})
-            combos = _expand_params(merged_params)
+            combos, always_suffixed = _expand_params(
+                merged_params, kernel_name=f"{name}::{vname}"
+            )
             base_key = name if vname == "default" else f"{name}__{vname}"
 
             for combo in combos:
                 entry = dict(merged)
-                entry["params"] = {k: [combo[k]] for k in merged_params}
-                suffix = _sweep_suffix(merged_params, combo)
+                entry["params"] = {k: [combo[k][1]] for k in merged_params}
+                suffix = _sweep_suffix(merged_params, combo, always_suffixed)
                 key = base_key + suffix
 
                 # extra_checks factory protocol: if the callable accepts
@@ -313,7 +377,8 @@ def _load_examples():
                     sig = inspect.signature(ec)
                     if any(p.kind == inspect.Parameter.VAR_KEYWORD
                            for p in sig.parameters.values()):
-                        entry["extra_checks"] = ec(**combo)
+                        combo_values = {k: v[1] for k, v in combo.items()}
+                        entry["extra_checks"] = ec(**combo_values)
 
                 if module_sig:
                     runtime, constexprs, param_values = _resolve_variant(
