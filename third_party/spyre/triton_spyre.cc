@@ -20,64 +20,10 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/PassManager.h"
-#include "llvm/ADT/StringRef.h"
-#include <cstdlib>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 namespace py = pybind11;
-
-namespace {
-
-/// Returns true when elementwise tensor arith/math should be converted to
-/// linalg.generic by upstream MLIR's convert-elementwise-to-linalg pass.
-///
-/// Read from the `SPYRE_LINALG_COMPUTE` environment variable, which accepts
-/// "0", "false", or "off" (case-insensitive) to disable. Any other value, and
-/// being unset, enables it. Enabled is the default because the Spyre dataflow
-/// scheduler accepts only linalg ops: KTIR that still carries tensor-typed
-/// arith cannot be scheduled. The off switch exists to bisect a miscompile by
-/// diffing KTIR with the conversion on against KTIR with it off for the same
-/// kernel.
-///
-/// Read once per process. The environment is not expected to change during a
-/// compilation, and re-reading per call would let two kernels compiled in one
-/// process disagree.
-///
-/// This setting is NOT part of `SpyreOptions.hash()` in
-/// `third_party/spyre/backend/compiler.py`, so cached compilation artifacts do
-/// not distinguish the two settings. Clear the Triton cache when toggling it.
-bool elementwiseToLinalgEnabled() {
-  static const bool enabled = [] {
-    const char *raw = std::getenv("SPYRE_LINALG_COMPUTE");
-    if (!raw)
-      return true;
-    llvm::StringRef value = llvm::StringRef(raw).trim();
-    return !(value == "0" || value.equals_insensitive("false") ||
-             value.equals_insensitive("off"));
-  }();
-  return enabled;
-}
-
-/// Appends upstream MLIR's convert-elementwise-to-linalg pass, unless disabled
-/// by `SPYRE_LINALG_COMPUTE`.
-///
-/// The pass rewrites every op carrying the `ElementwiseMappable` trait — all of
-/// `arith` and `math` — that has at least one ranked-tensor operand into a
-/// `linalg.generic` with identity indexing maps and the original scalar op in
-/// its body. Ops with only scalar operands are left alone, which is required:
-/// `linalg.reduce` combiner regions, index arithmetic, and `ktdp` address
-/// computation all hold scalar `arith`.
-///
-/// `arith.constant` with a `DenseElementsAttr` result is also left alone; it
-/// does not carry the trait. Converting those to `tensor.empty` + `linalg.fill`
-/// is deferred — see `docs/designs/linalg-compute-normalization.md`.
-void addElementwiseToLinalg(mlir::PassManager &pm) {
-  if (elementwiseToLinalgEnabled())
-    pm.addPass(mlir::createConvertElementwiseToLinalgPass());
-}
-
-} // namespace
 
 void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // Pipeline: LowerDescriptorMemory → LowerScalarLoad → LowerComputeOps →
@@ -88,16 +34,22 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // and before ConvertFunctions (reads work-slice function attributes that
   // ConvertFunctions would rewrite).
   //
-  // ConvertElementwiseToLinalg runs after LowerComputeOps, not before: the
-  // tt.reduce conversion builds linalg.reduce combiner regions out of scalar
-  // arith, and running the elementwise conversion first would have nothing to
-  // do for them anyway (they are scalar). Running it here also means the ops
-  // LowerInterTile sees as reduction partials are already normalized.
+  // ConvertElementwiseToLinalg is upstream MLIR's pass. It rewrites every op
+  // carrying the ElementwiseMappable trait — all of arith and math — that has
+  // at least one ranked-tensor operand into a linalg.generic with identity
+  // indexing maps and the original scalar op in its body. Ops with only scalar
+  // operands are left alone, which is required: linalg.reduce combiner regions,
+  // index arithmetic, and ktdp address computation all hold scalar arith.
+  // It runs after LowerComputeOps, not before: the tt.reduce conversion builds
+  // linalg.reduce combiner regions out of scalar arith, so running the
+  // elementwise conversion first would have nothing to do for them anyway.
+  // Running it here also means the ops LowerInterTile sees as reduction
+  // partials are already normalized.
   m.def("add_convert_ttir_to_ktdp", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
     pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
     pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
-    addElementwiseToLinalg(pm);
+    pm.addPass(mlir::createConvertElementwiseToLinalgPass());
     pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
     pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
   });
@@ -113,13 +65,6 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   });
   m.def("add_lower_compute_ops", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
-  });
-  // Upstream MLIR's elementwise-to-linalg conversion, exposed separately so
-  // tests can run it in isolation on hand-written MLIR. Unconditional: the
-  // SPYRE_LINALG_COMPUTE switch gates the production pipeline, and a test that
-  // asks for this pass by name should get it.
-  m.def("add_convert_elementwise_to_linalg", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::createConvertElementwiseToLinalgPass());
   });
   m.def("add_convert_functions", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
