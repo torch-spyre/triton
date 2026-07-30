@@ -18,6 +18,9 @@ add_triton_library(KTDPTransforms
   MLIRFuncDialect
   MLIRArithDialect
   MLIRLinalgDialect
+  # createConvertElementwiseToLinalgPass, used by triton_spyre.cc to append
+  # upstream MLIR's elementwise-tensor-arith -> linalg.generic conversion.
+  MLIRLinalgTransforms
   MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect
