@@ -529,7 +529,7 @@ tile = tl.descriptor_load(desc, [pid_m * BLOCK_M, pid_k * BLOCK_K])
 - `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-3d)
 - `vector_add::dynamic` (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
 
-_+ 4 more variants_
+_+ 5 more variants_
 
 ## descriptor-load-dynamic-from-scalar-load
 
@@ -556,6 +556,10 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])
 ```
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:331` (`TestDescriptorLoad.test_dynamic_shape_from_scalar_load`)</sup>
+
+**Round-trip evidence**
+
+- `vector_add::2d_dynamic_from_scalar_load` — N=32, BLOCK_M=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
 
 ## descriptor-load-static
 
@@ -807,7 +811,7 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])
 - `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-3d)
 - `vector_add::dynamic` (also demonstrates: descriptor-load-dynamic, program-id-1d, num-programs-fold)
 
-_+ 4 more variants_
+_+ 6 more variants_
 
 ## descriptor-store-static
 
@@ -835,4 +839,4 @@ _+ 7 more variants_
 
 ---
 
-_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-load-dynamic-from-scalar-load`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`. Add a tagged fixture variant to verify end-to-end._

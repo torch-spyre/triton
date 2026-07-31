@@ -37,6 +37,30 @@ def _make_3d_checks(M, N, P, **_):
     return checks
 
 
+def _make_2d_mixed_checks(N, **_):
+    def checks(t):
+        # Only M is dynamic here; N stays baked in — a mixed extent, not
+        # the fully-dynamic memref<?x?xf32> that "2d_dynamic" asserts.
+        t.assert_result_type("ktdp.construct_memory_view", f"memref<?x{N}xf32>")
+    return checks
+
+
+def _make_2d_scalar_dim_checks(N, **_):
+    def checks(t):
+        # Rank-0 scalar-read chain: construct_memory_view<memref<i32>> ->
+        # construct_access_tile<index> -> ktdp.load -> tensor.extract.
+        t.assert_result_type("ktdp.construct_memory_view", "memref<i32>")
+        t.assert_result_type("ktdp.construct_access_tile", "<index>")
+        t.assert_present("tensor.extract")
+        # arith.index_cast bridges the extracted i32 to index before it
+        # feeds the descriptor's dynamic size operand.
+        t.assert_operand("ktdp.construct_memory_view", 1,
+                         defined_by="arith.index_cast", type_substr="index")
+        # The descriptor shape lowers to a dynamic memref.
+        t.assert_result_type("ktdp.construct_memory_view", f"memref<?x{N}xf32>")
+    return checks
+
+
 # ---------------------------------------------------------------------------
 # Reference (NumPy oracle) + input maker
 # ---------------------------------------------------------------------------
@@ -140,6 +164,16 @@ _SIG_3D = {
     "BLOCK_M":    "i32",
     "BLOCK_N":    "i32",
     "BLOCK_P":    "i32",
+}
+
+_SIG_2D_SCALAR = {
+    "x_ptr":      "*fp32",
+    "y_ptr":      "*fp32",
+    "output_ptr": "*fp32",
+    "seqlen_ptr": "*i32",
+    "N":          "i32",
+    "BLOCK_M":    "i32",
+    "BLOCK_N":    "i32",
 }
 
 VARIANTS = {
@@ -264,6 +298,55 @@ VARIANTS = {
         # dynamic kernel runs at a shape distinct from its static sibling.
         "base":   "2d_dynamic",
         "params": {"M": [256], "N": [64], "BLOCK_M": [16], "BLOCK_N": [16]},
+    },
+    "2d_dynamic_mixed": {
+        # Only M is runtime; N stays a compile-time constant — a mixed
+        # static/dynamic extent, distinct from "2d_dynamic" (both dims
+        # runtime). No existing variant covers a memref with one static
+        # and one dynamic dimension.
+        "base": "2d",
+        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
+        "summary": (
+            "2D elementwise add where only `M` is a runtime argument and "
+            "`N` stays a compile-time constant."
+        ),
+        "doc": (
+            "Same tiling structure as the static 2D add, but only `M` "
+            "arrives as a runtime `i32` argument while `N` is baked in "
+            "at compile time. The descriptor lowers to a mixed "
+            "static/dynamic extent (`memref<?x32xf32>`), unlike "
+            "`2d_dynamic` where both `M` and `N` are runtime."
+        ),
+        "constexpr":    ["N", "BLOCK_M", "BLOCK_N"],
+        "extra_checks": _make_2d_mixed_checks,
+    },
+    # EXPERIMENTAL — KTIR-structural only for now.
+    "2d_dynamic_from_scalar_load": {
+        "base":         "2d",
+        "kernel_fn":    kernel.add_kernel_2d_scalar_dim,
+        "SIGNATURE":    _SIG_2D_SCALAR,
+        "constexpr":    ["N", "BLOCK_M", "BLOCK_N"],
+        "params":       {"N": [32], "BLOCK_M": [16], "BLOCK_N": [16]},
+        "reference":    None,
+        "tags": [
+            "descriptor-load-dynamic-from-scalar-load",
+            "descriptor-store-dynamic", "program-id-1d", "num-programs-fold",
+        ],
+        "summary": (
+            "2D elementwise add where `M` is read from memory via a "
+            "scalar `tl.load`, then used as a tensor descriptor's "
+            "dynamic shape."
+        ),
+        "doc": (
+            "EXPERIMENTAL — KTIR-structural only for now. `M` is not a "
+            "kernel argument here; it is read from `seqlen_ptr` with a "
+            "scalar `tl.load`. This exercises the rank-0 scalar-read "
+            "chain (`construct_memory_view` / `construct_access_tile` / "
+            "`ktdp.load` / `tensor.extract`) feeding the dynamic-shape "
+            "path via an `arith.index_cast` bridge, producing "
+            "`memref<?x32xf32>`."
+        ),
+        "extra_checks": _make_2d_scalar_dim_checks,
     },
     # --- 3D variants ---
     "3d": {
