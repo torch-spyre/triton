@@ -346,3 +346,48 @@ class TestScalarLoad(LowerScalarLoadTester):
         """)
         self.assert_present("tt.load")
         self.assert_absent("ktdp.construct_memory_view")
+
+
+# =========================================================================
+# Pass-ordering: LowerScalarLoad running before LowerDescriptorMemory
+# =========================================================================
+
+class TestScalarLoadFeedsDescriptorShape(LowerScalarLoadTester):
+    # No @pattern here: this file is intentionally absent from
+    # gen_patterns_docs.py's single-pass-test list, so adding one would
+    # harvest every existing test in this module into the generated docs.
+
+    def test_scalar_load_feeds_descriptor_shape(self):
+        """Flow A: this pass runs before `LowerDescriptorMemory` sees the
+        scalar-load result feeding a tensor-descriptor shape operand.
+
+        Runs `LowerScalarLoad` alone on IR where a scalar `tt.load`'s
+        result feeds `tt.make_tensor_descriptor`'s shape operand. The load
+        is rewritten to the rank-0 read chain, and the descriptor op — not
+        touched by this pass — survives with its shape operand rewired
+        from the (now-gone) `tt.load` result to the `tensor.extract`
+        result. Companion to `test_dynamic_shape_from_scalar_load`
+        (`test_lower_desc_memory.py`), which pins the reverse ordering.
+        """
+        self.run("""
+        module {
+          tt.func @k(%ptr: !tt.ptr<f16>, %off: i32, %seqlen_ptr: !tt.ptr<i32>) {
+            %seqlen = tt.load %seqlen_ptr : !tt.ptr<i32>
+            %stride = arith.constant 1 : i64
+            %desc = tt.make_tensor_descriptor %ptr, [%seqlen], [%stride]
+                : <f16>, <64xf16>
+            %data = tt.descriptor_load %desc[%off]
+                : !tt.tensordesc<64xf16> -> tensor<64xf16>
+            tt.return
+          }
+        }
+        """)
+        self.assert_present("ktdp.construct_memory_view", "ktdp.construct_access_tile",
+                            "ktdp.load", "tensor.extract")
+        self.assert_absent("tt.load")
+        # LowerDescriptorMemory never runs here, so the descriptor op
+        # itself is untouched — but its shape operand had to be rewired
+        # off the now-converted tt.load onto the extracted scalar.
+        self.assert_present("tt.make_tensor_descriptor")
+        self.assert_operand("tt.make_tensor_descriptor", 1,
+                            defined_by="tensor.extract")

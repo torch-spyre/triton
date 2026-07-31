@@ -58,7 +58,7 @@ Expected diagnostics:
 - `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-static, descriptor-store-static, dot, program-id-1d)
 - `matmul::bmm_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, program-id-1d)
 
-_+ 14 more variants_
+_+ 16 more variants_
 
 ## program-id-1d
 
@@ -89,7 +89,7 @@ offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 - `matmul::spyre_stick_parallel_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, spyre-tensor-layout)
 - `matmul::spyre_stick_k_dynamic` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, spyre-tensor-layout)
 
-_+ 14 more variants_
+_+ 15 more variants_
 
 ## program-id-2d
 
@@ -122,4 +122,4 @@ col_offset = pid_y * BLOCK_N
 - `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, descriptor-store-static, dot)
 - `matmul::2d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot)
 
-_+ 2 more variants_
+_+ 3 more variants_
