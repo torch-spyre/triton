@@ -26,8 +26,28 @@
 namespace py = pybind11;
 
 void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
-  // Pipeline: LowerDescriptorMemory → LowerScalarLoad → LowerComputeOps →
-  //           ConvertElementwiseToLinalg → LowerInterTile → ConvertFunctions.
+  // Pass order built by add_convert_ttir_to_ktdp:
+  //
+  //     LowerDescriptorMemory      [LowerPointerChainMemory — planned,
+  //              │                  not yet implemented; would handle the
+  //              │                  tensor-of-pointers tt.load that
+  //              │                  LowerScalarLoad leaves legal]
+  //              ↓
+  //       LowerScalarLoad
+  //              ↓
+  //       LowerComputeOps
+  //              ↓
+  //   ConvertElementwiseToLinalg   (upstream MLIR pass)
+  //              ↓
+  //        LowerInterTile
+  //              ↓
+  //       ConvertFunctions
+  //
+  // This is only the nested pipeline. DistributeWork and canonicalize + CSE
+  // run after it, added separately by the `ktir` stage in
+  // third_party/spyre/backend/compiler.py.
+  //
+  // Ordering constraints (each pass also states its own in Passes.td):
   // ConvertFunctions runs last because it replaces !tt.ptr args with index;
   // memory passes must consume !tt.ptr via getBasePtrAsIndex/ptrToIndex first.
   // LowerInterTile runs after LowerComputeOps (partials are linalg/tensor)
@@ -40,28 +60,39 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
     pm.addPass(mlir::createConvertElementwiseToLinalgPass());
     pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
     pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
-  });
-  // Individual pass bindings for debugging and testing.
+  }, py::arg("pm"));
+  // Individual pass bindings. add_convert_ttir_to_ktdp above is the default
+  // order, but a caller that needs a different one — a subset of the passes,
+  // a repeat, or an extra pass slotted between two of them — builds the
+  // sequence from these instead. Used by the `required_fixes` mechanism in
+  // third_party/spyre/backend/compiler.py to insert correctness patches at a
+  // chosen point in the pipeline, and by the per-pass unit tests that run one
+  // pass over inline MLIR. Every pass in the default order has a binding here,
+  // so any reordering expressible in C++ is also expressible from Python.
+  m.def("add_convert_elementwise_to_linalg", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::createConvertElementwiseToLinalgPass());
+  }, py::arg("pm"));
   m.def("add_lower_inter_tile", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
-  });
+  }, py::arg("pm"));
   m.def("add_lower_descriptor_memory", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
-  });
+  }, py::arg("pm"));
   m.def("add_lower_scalar_load", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
-  });
+  }, py::arg("pm"));
   m.def("add_lower_compute_ops", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
-  });
+  }, py::arg("pm"));
   m.def("add_convert_functions", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
-  });
-  m.def("add_distribute_work",
-        [](mlir::PassManager &pm, const std::vector<int64_t> &grid) {
-          pm.addPass(
-              mlir::triton::ktdp::createDistributeWorkPass(grid));
-        });
+  }, py::arg("pm"));
+  m.def(
+      "add_distribute_work",
+      [](mlir::PassManager &pm, const std::vector<int64_t> &grid) {
+        pm.addPass(mlir::triton::ktdp::createDistributeWorkPass(grid));
+      },
+      py::arg("pm"), py::arg("grid"));
 }
 
 void init_triton_spyre_ir_utils(py::module &&m) {

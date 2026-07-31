@@ -4,31 +4,18 @@
 include "mlir/Pass/PassBase.td"
 
 // ============================================================================
-// Pass pipeline: TTIR → KTIR
-//
-
-//
-//   LowerDescriptorMemory       [LowerPointerChainMemory]
-//           └───────────┬───────────┘
-//
-//                LowerScalarLoad
-//                       ↓
-//                 LowerComputeOps
-//                       ↓
-//               LowerInterTile
-//                       ↓
-//               ConvertFunctions
-//                       ↓
-//               DistributeWork
-//                       ↓
-//              canonicalize + CSE
-//                       ↓
-//                     KTIR
+// Passes used to lower TTIR → KTIR.
 //
 // Each pass declares its contract below:
 //   Input    — dialects/ops it expects to see
 //   Lowering — ops it converts and what they become
 //   Output   — what the IR looks like after this pass
+//
+// Ordering constraints are stated per-pass in the descriptions below, since
+// they are properties of the individual pass. For the order the passes are
+// actually run in, see the two places that build the pipeline:
+//   - add_convert_ttir_to_ktdp in third_party/spyre/triton_spyre.cc
+//   - the `ktir` stage in third_party/spyre/backend/compiler.py
 // ============================================================================
 
 def LowerDescriptorMemory : Pass<"lower-descriptor-memory", "mlir::ModuleOp"> {

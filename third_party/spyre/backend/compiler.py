@@ -1,9 +1,28 @@
 import hashlib
 
 from triton.backends.compiler import BaseBackend, GPUTarget
-from dataclasses import dataclass
-from typing import Dict, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Mapping, Tuple
 from types import ModuleType
+
+# The TTIR→KTIR core pass sequence, as binding names on
+# spyre.passes.ttir_to_ktdp.
+_CORE_PIPELINE_PASSES = (
+    "lower_descriptor_memory",
+    "lower_scalar_load",
+    "lower_compute_ops",
+    "convert_elementwise_to_linalg",
+    "lower_inter_tile",
+    "convert_functions",
+)
+
+# Passes that need more than the pass manager, as {pass name: SpyreOptions
+# fields to forward}. Names must match the py::arg names on the binding in
+# third_party/spyre/triton_spyre.cc and the field names on SpyreOptions, since
+# they are passed as keyword arguments.
+_PASS_OPTIONS = {
+    "distribute_work": ("grid",),
+}
 
 
 @dataclass
@@ -15,6 +34,12 @@ class SpyreOptions:
     # 32 cores as 16x2 across axes x and y.
     grid: Tuple[int, ...] = (32,)
     lx_size: int = 2 * 1024 * 1024  # 2 MB scratchpad per core
+    # Optional correctness patches to splice into the TTIR→KTIR pipeline, as
+    # {fix pass name: core pass it runs after}. Both are binding names on
+    # spyre.passes.ttir_to_ktdp.
+    #
+    #   required_fixes = {"fold_addptr_into_base": "lower_scalar_load"}
+    required_fixes: Mapping[str, str] = field(default_factory=dict)
     # Required by Triton code generator
     sanitize_overflow: bool = False
     debug: bool = False
@@ -115,23 +140,55 @@ class SpyreBackend(BaseBackend):
     def _make_ktir(self, mod, metadata, options):
         """Lower optimized TTIR to KTIR using C++ MLIR passes.
 
-        Pipeline (add_convert_ttir_to_ktdp expands to steps 1-5):
-        1. LowerDescriptorMemory: tt.descriptor_load/store/gather/scatter -> ktdp.*
-        2. LowerScalarLoad: scalar tt.load (+ addptr chain) -> ktdp.* rank-0 read
-        3. LowerComputeOps: tt.reduce/broadcast/expand_dims -> linalg/tensor + dead op sweep
-        4. LowerInterTile: tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery
-        5. ConvertFunctions: tt.func/return -> func.func/return, !tt.ptr -> index
-           (must run last — memory passes consume !tt.ptr args via getBasePtrAsIndex)
-        6. DistributeWork: tt.get_program_id -> ktdp.get_compute_tile_id
-        7. canonicalize + CSE
+        Pipeline steps, in the order they are added below:
+
+        _CORE_PIPELINE_PASSES, each optionally followed by fixes anchored to it via
+        options.required_fixes:
+          - LowerDescriptorMemory: tt.descriptor_load/store/gather/scatter -> ktdp.*
+          - LowerScalarLoad: scalar tt.load (+ addptr chain) -> ktdp.* rank-0 read
+          - LowerComputeOps: tt.reduce/broadcast/expand_dims -> linalg/tensor
+            + dead op sweep
+          - ConvertElementwiseToLinalg (upstream MLIR): tensor-typed
+            arith/math -> linalg.generic
+          - LowerInterTile: tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery
+          - ConvertFunctions: tt.func/return -> func.func/return, !tt.ptr -> index
+            (last of the core passes — the memory passes above consume !tt.ptr
+            args via getBasePtrAsIndex)
+
+        then:
+          - DistributeWork: tt.get_program_id -> ktdp.get_compute_tile_id
+          - canonicalize + CSE
         """
         from triton._C.libtriton import ir, passes, spyre
 
-        grid = list(options.grid)
+        fixes = options.required_fixes
+        ttir_to_ktdp = spyre.passes.ttir_to_ktdp
+
+        def add_pass(name):
+            # Passes are exposed as add_<name>, taking the pass manager plus any
+            # SpyreOptions fields named in _PASS_OPTIONS. A missing binding
+            # means a requested fix would silently never run, so raise.
+            adder = getattr(ttir_to_ktdp, f"add_{name}", None)
+            if adder is None:
+                raise ValueError(
+                    f"no pass binding 'add_{name}' on "
+                    "spyre.passes.ttir_to_ktdp; declare it in "
+                    "third_party/spyre/triton_spyre.cc and rebuild libtriton"
+                )
+            adder(pm, **{opt: getattr(options, opt)
+                         for opt in _PASS_OPTIONS.get(name, ())})
 
         pm = ir.pass_manager(mod.context)
-        spyre.passes.ttir_to_ktdp.add_convert_ttir_to_ktdp(pm)
-        spyre.passes.ttir_to_ktdp.add_distribute_work(pm, grid)
+        if fixes:
+            # Compose pass-by-pass so each fix lands after its anchor.
+            for core_pass in _CORE_PIPELINE_PASSES:
+                add_pass(core_pass)
+                for fix, anchor in fixes.items():
+                    if anchor == core_pass:
+                        add_pass(fix)
+        else:
+            add_pass("convert_ttir_to_ktdp")
+        add_pass("distribute_work")
         # Clean up redundant arithmetic (fold muli x,1; simplify cast chains)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
