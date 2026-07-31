@@ -33,18 +33,6 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // LowerInterTile runs after LowerComputeOps (partials are linalg/tensor)
   // and before ConvertFunctions (reads work-slice function attributes that
   // ConvertFunctions would rewrite).
-  //
-  // ConvertElementwiseToLinalg is upstream MLIR's pass. It rewrites every op
-  // carrying the ElementwiseMappable trait — all of arith and math — that has
-  // at least one ranked-tensor operand into a linalg.generic with identity
-  // indexing maps and the original scalar op in its body. Ops with only scalar
-  // operands are left alone, which is required: linalg.reduce combiner regions,
-  // index arithmetic, and ktdp address computation all hold scalar arith.
-  // It runs after LowerComputeOps, not before: the tt.reduce conversion builds
-  // linalg.reduce combiner regions out of scalar arith, so running the
-  // elementwise conversion first would have nothing to do for them anyway.
-  // Running it here also means the ops LowerInterTile sees as reduction
-  // partials are already normalized.
   m.def("add_convert_ttir_to_ktdp", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
     pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
