@@ -33,13 +33,14 @@ class SpyreOptions:
     # case. A 2D kernel with grid = (16, 2) would partition the same
     # 32 cores as 16x2 across axes x and y.
     grid: Tuple[int, ...] = (32,)
-    lx_size: int = 2 * 1024 * 1024  # 2 MB scratchpad per core
+
     # Optional correctness patches to splice into the TTIR→KTIR pipeline, as
     # {fix pass name: core pass it runs after}. Both are binding names on
     # spyre.passes.ttir_to_ktdp.
     #
     #   required_fixes = {"fold_addptr_into_base": "lower_scalar_load"}
     required_fixes: Mapping[str, str] = field(default_factory=dict)
+    lx_size: int = 2 * 1024 * 1024  # 2 MB scratchpad per core
     # Required by Triton code generator
     sanitize_overflow: bool = False
     debug: bool = False
