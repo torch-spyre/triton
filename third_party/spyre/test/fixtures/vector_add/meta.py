@@ -37,14 +37,6 @@ def _make_3d_checks(M, N, P, **_):
     return checks
 
 
-def _make_2d_mixed_checks(N, **_):
-    def checks(t):
-        # Only M is dynamic here; N stays baked in — a mixed extent, not
-        # the fully-dynamic memref<?x?xf32> that "2d_dynamic" asserts.
-        t.assert_result_type("ktdp.construct_memory_view", f"memref<?x{N}xf32>")
-    return checks
-
-
 def _make_2d_scalar_dim_checks(N, **_):
     def checks(t):
         # Rank-0 scalar-read chain: construct_memory_view<memref<i32>> ->
@@ -101,6 +93,22 @@ def make_inputs_2d(M: int, N: int, BLOCK_M: int, BLOCK_N: int) -> dict:
     y = np.cos(t * 2.0 * np.pi / total).astype(np.float32).reshape(M, N)
     output = np.zeros((M, N), dtype=np.float32)
     return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
+
+
+def make_inputs_2d_scalar_dim(N: int, BLOCK_M: int, BLOCK_N: int, M: int = 32) -> dict:
+    """2D inputs for add_kernel_2d_scalar_dim.
+
+    `M` is not part of the kernel's SIGNATURE (it is read from
+    `seqlen_ptr`, not passed as an arg), so it is a keyword default here
+    rather than a `params` entry — a `params` entry would otherwise leak
+    into ``run_cpu``'s kwargs and fail its "unknown kwarg" check, since
+    `add_kernel_2d_scalar_dim` has no `M` parameter. Delegates to
+    ``make_inputs_2d`` for the x/y/output buffers and adds the scalar
+    read as a rank-1 buffer of length 1.
+    """
+    inputs = make_inputs_2d(M, N, BLOCK_M, BLOCK_N)
+    inputs["seqlen_ptr"] = np.array([M], dtype=np.int32)
+    return inputs
 
 
 def make_inputs_3d(
@@ -299,35 +307,14 @@ VARIANTS = {
         "base":   "2d_dynamic",
         "params": {"M": [256], "N": [64], "BLOCK_M": [16], "BLOCK_N": [16]},
     },
-    "2d_dynamic_mixed": {
-        # Only M is runtime; N stays a compile-time constant — a mixed
-        # static/dynamic extent, distinct from "2d_dynamic" (both dims
-        # runtime). No existing variant covers a memref with one static
-        # and one dynamic dimension.
-        "base": "2d",
-        "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
-        "summary": (
-            "2D elementwise add where only `M` is a runtime argument and "
-            "`N` stays a compile-time constant."
-        ),
-        "doc": (
-            "Same tiling structure as the static 2D add, but only `M` "
-            "arrives as a runtime `i32` argument while `N` is baked in "
-            "at compile time. The descriptor lowers to a mixed "
-            "static/dynamic extent (`memref<?x32xf32>`), unlike "
-            "`2d_dynamic` where both `M` and `N` are runtime."
-        ),
-        "constexpr":    ["N", "BLOCK_M", "BLOCK_N"],
-        "extra_checks": _make_2d_mixed_checks,
-    },
-    # EXPERIMENTAL — KTIR-structural only for now.
+    # EXPERIMENTAL — not wired into any dataflow-scheduler/DFIR path.
     "2d_dynamic_from_scalar_load": {
         "base":         "2d",
         "kernel_fn":    kernel.add_kernel_2d_scalar_dim,
         "SIGNATURE":    _SIG_2D_SCALAR,
         "constexpr":    ["N", "BLOCK_M", "BLOCK_N"],
         "params":       {"N": [32], "BLOCK_M": [16], "BLOCK_N": [16]},
-        "reference":    None,
+        "inputs":       make_inputs_2d_scalar_dim,
         "tags": [
             "descriptor-load-dynamic-from-scalar-load",
             "descriptor-store-dynamic", "program-id-1d", "num-programs-fold",
@@ -338,13 +325,23 @@ VARIANTS = {
             "dynamic shape."
         ),
         "doc": (
-            "EXPERIMENTAL — KTIR-structural only for now. `M` is not a "
-            "kernel argument here; it is read from `seqlen_ptr` with a "
-            "scalar `tl.load`. This exercises the rank-0 scalar-read "
-            "chain (`construct_memory_view` / `construct_access_tile` / "
+            "EXPERIMENTAL — not wired into any dataflow-scheduler/DFIR "
+            "flow (`kDynamic` has no `AddressAssignment` / "
+            "`NormalizeGridTo1D` path yet). `M` is not a kernel argument "
+            "here; it is read from `seqlen_ptr` with a scalar `tl.load`. "
+            "This exercises the rank-0 scalar-read chain "
+            "(`construct_memory_view` / `construct_access_tile` / "
             "`ktdp.load` / `tensor.extract`) feeding the dynamic-shape "
             "path via an `arith.index_cast` bridge, producing "
-            "`memref<?x32xf32>`."
+            "`memref<?x32xf32>`. Reuses the same `x + y` oracle as `2d` "
+            "(via `make_inputs_2d_scalar_dim`), but the numerical check "
+            "currently `xfail`s: `ktir_cpu`'s MLIR frontend parser can't "
+            "parse a rank-0 `memref<i32>` result type."
+        ),
+        "xfail_numerical": (
+            "ktir_cpu's MLIRFrontendParser cannot parse a rank-0 "
+            "ktdp.construct_memory_view result type (memref<i32>): "
+            "ValueError: cannot parse dtype from 'memref<i32>'."
         ),
         "extra_checks": _make_2d_scalar_dim_checks,
     },
