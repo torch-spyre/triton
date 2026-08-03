@@ -559,7 +559,8 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])
 
 **Round-trip evidence**
 
-- `vector_add::2d_dynamic_from_scalar_load` — N=32, BLOCK_M=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
+- `vector_add::dynamic_from_scalar_load` — BLOCK_SIZE=1024 (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
+- `vector_add::2d_dynamic_from_scalar_load` — N=32, BLOCK_M=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, program-id-2d, num-programs-fold)
 
 ## descriptor-load-static
 
@@ -811,7 +812,7 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])
 - `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-3d)
 - `vector_add::dynamic` (also demonstrates: descriptor-load-dynamic, program-id-1d, num-programs-fold)
 
-_+ 5 more variants_
+_+ 6 more variants_
 
 ## descriptor-store-static
 
