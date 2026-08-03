@@ -86,6 +86,14 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
             mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
       },
       py::arg("pm"), py::arg("data_layout") = "device");
+  // Not in add_convert_ttir_to_ktdp above: this is a fix pass, spliced into the
+  // pipeline from Python via SpyreOptions.required_fixes. It must be anchored on
+  // convert_elementwise_to_linalg, which is the pass that creates the ins/outs
+  // aliasing it removes; anchoring it on anything earlier is a silent no-op,
+  // since the pass only rewrites aliasing that already exists.
+  m.def("add_unalias_linalg_outs", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::ktdp::createUnaliasLinalgOutsPass());
+  });
   m.def("add_lower_inter_tile", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
   });

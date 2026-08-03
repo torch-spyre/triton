@@ -162,6 +162,52 @@ def LowerComputeOps : Pass<"lower-compute-ops", "mlir::ModuleOp"> {
     ];
 }
 
+def UnaliasLinalgOuts : Pass<"unalias-linalg-outs", "mlir::ModuleOp"> {
+    let summary = "Replace a linalg 'outs' operand that aliases an 'ins' operand "
+                  "with a fresh tensor.empty.";
+    let description = [{
+        Input: any IR containing linalg ops on ranked tensors. Matches the
+        LinalgOp interface, so both named ops (linalg.add, linalg.mul, …) and
+        linalg.generic are covered.
+
+        Lowering:
+        - linalg op whose outs[i] is the same SSA value as one of its ins
+          operands, and whose body does not read that operand's initial value
+          → outs[i] replaced with a fresh tensor.empty of the same type.
+        - Same aliasing, but the body does read the initial value (an
+          accumulating op such as linalg.reduce or linalg.matmul) → rejected
+          with a diagnostic; the initial value is live, so no replacement
+          preserves the result.
+        - Same aliasing on a non-tensor or dynamically shaped outs → rejected
+          with a diagnostic.
+
+        A linalg op is in destination-passing style: its outs operands supply
+        both the result shape and the initial value of each output element.
+        tensor.empty preserves the shape and drops the initial value, which is
+        why the rewrite is only applied where that value is provably unread.
+
+        Motivation: upstream MLIR's ConvertElementwiseToLinalg reuses the first
+        type-matching operand as outs rather than creating a fresh one, with no
+        flag to suppress it. The Spyre dataflow-scheduler maps each operand of a
+        compute op to a freshly loaded value, so a value appearing in both ins
+        and outs is mapped twice and the second mapping overwrites the first,
+        producing invalid SSA ordering.
+
+        Ordering: must run after any pass that can introduce the aliasing —
+        ConvertElementwiseToLinalg is the known source, so running after it
+        covers the current pipeline. Independent of ConvertFunctions: this pass
+        reads neither !tt.ptr values nor function attributes.
+
+        Output: no linalg op has an outs operand that also appears in its ins.
+        New tensor.empty ops are introduced.
+    }];
+
+    let dependentDialects = [
+        "mlir::linalg::LinalgDialect",
+        "mlir::tensor::TensorDialect"
+    ];
+}
+
 def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
     let summary = "Lower tt.inter_tile_reduce to ktdp inter-tile produce/reduce pairs.";
     let description = [{
