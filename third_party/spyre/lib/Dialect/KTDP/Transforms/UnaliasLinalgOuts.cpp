@@ -8,10 +8,25 @@
 //   `outs` operands. Upstream MLIR's --convert-elementwise-to-linalg reuses the
 //   first operand whose type matches the result as the `outs` buffer instead of
 //   creating a fresh one, and offers no flag to suppress that. The resulting op
-//   has the same value in both `ins` and `outs`. Downstream, the Spyre
-//   dataflow-scheduler's three-stage-pipeline construction maps each operand to
-//   a freshly loaded value; a value appearing twice is mapped twice, the second
-//   mapping overwrites the first, and the result is invalid SSA ordering.
+//   has the same value in both `ins` and `outs`.
+//
+//   Downstream, the dataflow-scheduler consumes that IR and cannot handle it:
+//
+//     repo: https://github.com/torch-spyre/dataflow-scheduler
+//     pass: ConstructThreeStagePipeline
+//     file: lib/Conversion/frontend/KTIRToScheduleIR/
+//           ConstructThreeStagePipeline.cpp
+//     func: ConstructThreeStagePipelinePass::createComputeOps
+//
+//   (Named by symbol rather than deep-linked by line: a blob URL with a line
+//   anchor goes stale on the next edit to that file.)
+//
+//   createComputeOps builds one mlir::IRMapping for the compute op it is about
+//   to clone. First it maps each `ins` operand to the ktdf.read_from_fifo result
+//   that supplies the loaded tile. Then it maps the first `outs` operand to a
+//   fresh tensor.empty. When `ins` and `outs` hold the same value, that second
+//   map() call overwrites the first on the same key, so the cloned op reads the
+//   uninitialized tensor.empty instead of the loaded data.
 //
 // Why the rewrite is sound:
 //   An `outs` operand serves two roles: it supplies the shape of the result,
@@ -24,9 +39,12 @@
 //   only operands whose initial value is provably dead are rewritten.
 //
 // Algorithm:
-//   1. Collect all linalg ops (collect-then-rewrite, to keep the walk cursor
-//      valid against the tensor.empty ops inserted during rewriting).
-//   2. For each op, for each `outs` operand that also appears in `ins`:
+//   1. Walk the module and collect the linalg ops that have at least one `outs`
+//      operand aliasing an `ins` operand. Collect first and rewrite after: the
+//      tensor.empty ops inserted while rewriting would invalidate the walk
+//      cursor.
+//   2. For each collected op, for each `outs` operand that also appears in
+//      `ins`:
 //      a. Reject  — body reads the initial value, or the type is not a
 //                   statically shaped tensor.
 //      b. Rewrite — point the operand at a fresh tensor.empty of same type.
@@ -34,6 +52,10 @@
 // An aliased `outs` that cannot be rewritten is reported as an error rather
 // than skipped: leaving it in place crashes the scheduler much later, with
 // nothing pointing back to here.
+//
+// Trace what the pass collected and rewrote with
+// `spyre-triton-opt ... -debug-only=unalias-linalg-outs` (needs an LLVM built
+// with assertions).
 //
 //===----------------------------------------------------------------------===//
 
@@ -46,6 +68,10 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+
+#define DEBUG_TYPE "unalias-linalg-outs"
 
 using namespace mlir;
 
@@ -56,6 +82,17 @@ namespace mlir::triton::ktdp {
 
 namespace {
 
+/// Inline capacity for the `ins`-operand sets built below. This is an
+/// allocation hint only: a SmallPtrSet holds this many pointers in its own
+/// stack storage and spills to a heap table beyond that, so the value bounds
+/// neither the operand count nor the pass's behavior — an op with more inputs
+/// is handled identically, just with one malloc. Sized for the ops this pass
+/// actually sees: --convert-elementwise-to-linalg produces unary and binary
+/// elementwise ops, so 1-2 inputs is the norm and 3 (e.g. a select) the
+/// outlier. The capacity is a template parameter and therefore cannot be
+/// derived from the op at runtime.
+constexpr unsigned kExpectedNumInputs = 4;
+
 struct UnaliasLinalgOutsPass
     : public mlir::triton::ktdp::impl::UnaliasLinalgOutsBase<
           UnaliasLinalgOutsPass> {
@@ -63,36 +100,76 @@ struct UnaliasLinalgOutsPass
     ModuleOp mod = getOperation();
     IRRewriter rewriter(&getContext());
 
-    // Collect all linalg ops first (collect-then-rewrite).
+    // Collect the ops to rewrite before rewriting any of them: inserting a
+    // tensor.empty during a walk invalidates the walk cursor.
     SmallVector<linalg::LinalgOp> ops;
-    mod.walk([&](linalg::LinalgOp op) { ops.push_back(op); });
+    mod.walk([&](linalg::LinalgOp op) {
+      if (hasAliasedInit(op))
+        ops.push_back(op);
+    });
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "[" DEBUG_TYPE "] collected " << ops.size()
+                   << " linalg op(s) with an 'outs' operand aliasing an 'ins' "
+                      "operand\n";
+      for (linalg::LinalgOp op : ops)
+        llvm::dbgs() << "  " << op->getName() << " at " << op->getLoc() << "\n";
+    });
 
     // Keep going after a rejection so one run reports every op it cannot
     // handle. Bailing out on the first would cost the user one rebuild per
     // aliased op.
     bool anyFailed = false;
     for (auto op : ops) {
-      if (failed(unaliasOne(op, rewriter)))
+      if (failed(rewriteOrRejectAliasedInits(op, rewriter)))
         anyFailed = true;
     }
     if (anyFailed)
       signalPassFailure();
   }
 
-  /// Un-aliases every `outs` operand of `op` that shares its SSA value with an
-  /// `ins` operand. Returns failure if any aliased operand cannot be rewritten,
-  /// after emitting one diagnostic on `op` per such operand. Operands that can
-  /// be rewritten are rewritten even when a sibling operand is rejected, so the
+  /// Returns true if `op` has at least one `outs` operand holding the same SSA
+  /// value as one of its `ins` operands — the only situation this pass rewrites.
+  /// Used to filter the collection walk so that every collected op is one
+  /// rewriteOrRejectAliasedInits will actually modify or reject.
+  static bool hasAliasedInit(linalg::LinalgOp op) {
+    // getDpsInputs/getDpsInits return by value, so bind the vectors rather
+    // than a ValueRange view into a temporary.
+    SmallVector<Value> inputs = op.getDpsInputs();
+    if (inputs.empty())
+      return false;
+    llvm::SmallPtrSet<Value, kExpectedNumInputs> ins(inputs.begin(),
+                                                     inputs.end());
+    return llvm::any_of(op.getDpsInits(),
+                        [&](Value init) { return ins.contains(init); });
+  }
+
+  /// Visits every `outs` operand of `op` that shares its SSA value with an
+  /// `ins` operand and either rewrites it to a fresh tensor.empty or rejects it.
+  /// An operand is rejected when the rewrite would change the op's result — the
+  /// body reads the initial value — or when its type is one this pass cannot
+  /// build an empty for. Each rejection emits a diagnostic on `op` and makes the
+  /// return value failure.
+  ///
+  /// Rejecting one operand does not stop the others from being rewritten, so the
   /// IR is left partially modified on failure; callers must not rely on the
   /// module being unchanged when this returns failure.
-  LogicalResult unaliasOne(linalg::LinalgOp op, IRRewriter &rewriter) {
+  ///
+  /// Precondition: `hasAliasedInit(op)` holds. Callers filter with it so that
+  /// this function is never invoked on an op it would leave untouched.
+  LogicalResult rewriteOrRejectAliasedInits(linalg::LinalgOp op,
+                                            IRRewriter &rewriter) {
+    assert(hasAliasedInit(op) && "rewriteOrRejectAliasedInits requires an op "
+                                 "with an aliased 'outs' operand");
+
     // The `ins` operands as a set, so alias testing is a lookup rather than a
     // scan per output. Built once: setting an `outs` operand below never
-    // changes which values are in `ins`.
-    llvm::SmallPtrSet<Value, 4> ins(op.getDpsInputs().begin(),
-                                    op.getDpsInputs().end());
-    if (ins.empty())
-      return success();
+    // changes which values are in `ins`. getDpsInputs returns by value, so hold
+    // the vector — calling .begin()/.end() on it directly would produce
+    // iterators into two separate destroyed temporaries.
+    SmallVector<Value> inputs = op.getDpsInputs();
+    llvm::SmallPtrSet<Value, kExpectedNumInputs> ins(inputs.begin(),
+                                                     inputs.end());
 
     rewriter.setInsertionPoint(op);
     LogicalResult result = success();
@@ -134,6 +211,11 @@ struct UnaliasLinalgOutsPass
         result = failure();
         continue;
       }
+
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[" DEBUG_TYPE "] " << op->getName() << ": repointing 'outs' operand #"
+                 << out.getOperandNumber() << " at a fresh tensor.empty of type "
+                 << tensorType << "\n");
 
       out.set(tensor::EmptyOp::create(rewriter, op.getLoc(),
                                       tensorType.getShape(),
