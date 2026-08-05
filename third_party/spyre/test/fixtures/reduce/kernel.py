@@ -54,3 +54,49 @@ def reduce_spyre(
     for m_sub in range(m_start, m_end):
         a_tile = in_desc.load([m_sub * BLOCK_M, 0])
         out_desc.store([m_sub * BLOCK_M], a_tile.sum(1))
+
+
+@triton.jit
+def reduce_middle_axis_spyre(
+    in_ptr,
+    out_ptr,
+    D0: tl.constexpr,
+    D1: tl.constexpr,
+    D2: tl.constexpr,
+    IN_LAYOUT: tl.constexpr,
+    OUT_LAYOUT: tl.constexpr,
+):
+    """Rank-3 reduce over the NON-TRAILING middle axis.
+
+    out[d0, d2] = sum(in[d0, :, d2]) over the D1 axis.
+
+    Single program covering the whole tensor, so the reduce is the only
+    interesting structure. With three distinct extents, reducing the wrong
+    axis fails loudly: the pass must rotate the reduced (D1) axis to the end
+    via linalg.transpose before linalg.reduce, which always takes the
+    trailing dims.
+
+    IN_LAYOUT  — stick-tiling for in_ptr's [D0, D1, D2] extent.
+    OUT_LAYOUT — stick-tiling for out_ptr's [D0, D2] extent.
+    Pass 0 for no layout annotation.
+    """
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[D0, D1, D2],
+        strides=[D1 * D2, D2, 1],
+        block_shape=[D0, D1, D2],
+    )
+    if IN_LAYOUT is not None and IN_LAYOUT != 0:
+        tl.spyre_tensor_layout(in_desc, IN_LAYOUT)
+
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[D0, D2],
+        strides=[D2, 1],
+        block_shape=[D0, D2],
+    )
+    if OUT_LAYOUT is not None and OUT_LAYOUT != 0:
+        tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
+
+    a_tile = in_desc.load([0, 0, 0])
+    out_desc.store([0, 0], a_tile.sum(1))

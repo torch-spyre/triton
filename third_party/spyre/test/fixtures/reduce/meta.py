@@ -1,12 +1,17 @@
 """SIGNATURE + VARIANTS + reference oracle + input generators for reduce.
 
-Row-sum reduce: out[m] = sum(in[m, :]) over the N axis, producing a
-vector of M elements.
+Two shapes of reduce:
 
-Variants:
-- ``default``     -- 2D input, static M/N, no layout annotation.
+2D, trailing axis -- out[m] = sum(in[m, :]) over N, giving an M-vector.
+- ``default``     -- static M/N, no layout annotation.
 - ``spyre_stick`` -- input annotated stick-on-N; exercises the
                      RewriteDescriptorLayout source reduce path.
+
+Rank-3, non-trailing middle axis -- out[d0, d2] = sum(in[d0, :, d2]).
+- ``middle_axis``             -- no layout annotation.
+- ``middle_axis_spyre_stick`` -- input annotated stick-on-D2, so the reduced
+                                 axis is non-trailing in the physical tile and
+                                 the pass must transpose it to the end.
 
 See ``fixtures/README.md`` for the field reference and discovery rules.
 """
@@ -42,6 +47,19 @@ def run(inputs: dict) -> np.ndarray:
     return inputs["in_ptr"].sum(axis=1)
 
 
+def make_inputs_3d(D0: int, D1: int, D2: int, *, dtype=np.float32, **_unused) -> dict:
+    """Build ``[D0, D1, D2]`` input and ``[D0, D2]`` output buffers."""
+    rng = np.random.default_rng(seed=7)
+    x = rng.standard_normal((D0, D1, D2)).astype(dtype)
+    out = np.zeros((D0, D2), dtype=dtype)
+    return {"in_ptr": x, "out_ptr": out}
+
+
+def run_3d_middle(inputs: dict) -> np.ndarray:
+    """NumPy oracle: reduce the middle (non-trailing) axis of a rank-3 input."""
+    return inputs["in_ptr"].sum(axis=1)
+
+
 # ---------------------------------------------------------------------------
 # SIGNATURE — module-level default (matches reduce_spyre's arg list).
 # ---------------------------------------------------------------------------
@@ -66,6 +84,18 @@ _SIG_SPYRE = {
     "OUT_LAYOUT": "constexpr",
 }
 _SS = functools.partial(_sticksize, _SIG_SPYRE)
+
+# Rank-3 middle-axis reduce: [D0, D1, D2] -> [D0, D2].
+_SIG_3D = {
+    "in_ptr":     "*fp32",
+    "out_ptr":    "*fp32",
+    "D0":         "i32",
+    "D1":         "i32",
+    "D2":         "i32",
+    "IN_LAYOUT":  "constexpr",
+    "OUT_LAYOUT": "constexpr",
+}
+_S3 = functools.partial(_sticksize, _SIG_3D)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +150,67 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.reduce"),
+        ),
+    },
+    # Rank-3 reduce over the NON-TRAILING middle axis: [D0, D1, D2] -> [D0, D2].
+    # Numerical counterpart of the @reduce_middle_axis lit case. The three
+    # extents are distinct, so reducing the wrong axis changes the output shape
+    # and fails loudly.
+    "middle_axis": {
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce"],
+        "summary": (
+            "Rank-3 reduce over the non-trailing middle axis "
+            "(out[d0,d2] = sum(in[d0,:,d2])), no layout annotation."
+        ),
+        "kernel_fn":  kernel.reduce_middle_axis_spyre,
+        "SIGNATURE":  _SIG_3D,
+        "constexpr":  ["D0", "D1", "D2", "IN_LAYOUT", "OUT_LAYOUT"],
+        "params": {
+            # Distinct extents so a wrong-axis reduce cannot accidentally match.
+            "D0": [16], "D1": [96], "D2": [64],
+            "IN_LAYOUT": [0], "OUT_LAYOUT": [0],
+        },
+        "grid":       [1],
+        "parallel":   False,
+        "reference":  run_3d_middle,
+        "inputs":     make_inputs_3d,
+        "output_key": "out_ptr",
+        "rtol":       1e-4,
+        # linalg.reduce accumulates the 96 terms in a different order than
+        # NumPy's sum, so fp32 drifts ~1e-5 absolute on a few elements.
+        "atol":       1e-4,
+        "extra_checks": lambda t: (
+            t.assert_present("linalg.reduce"),
+            t.assert_absent("tt.reduce"),
+        ),
+    },
+    "middle_axis_spyre_stick": {
+        # in_ptr stick-on-D2 (fp32 stick = 32, D2 = 64 = 2 sticks exactly):
+        #   phys [D2//32, D0, D1, D2%32] = [2, 16, 96, 32]
+        # The reduced axis (D1) is non-trailing in the physical tile, so the
+        # pass must emit a linalg.transpose rotating it to the end before
+        # linalg.reduce. A slot-index-derived permutation would be identity
+        # here and would reduce the wrong axis.
+        "base": "middle_axis",
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "spyre-tensor-layout"],
+        "summary": (
+            "Rank-3 middle-axis reduce with in_ptr stick-on-D2. The reduced "
+            "axis is non-trailing, so the pass must transpose it to the end "
+            "before linalg.reduce."
+        ),
+        "params": {
+            "D0": [16], "D1": [96], "D2": [64],
+            "IN_LAYOUT": [[(2, "floordiv", _S3("in_ptr")), 0, 1,
+                           (2, "mod", _S3("in_ptr"))]],
+            "OUT_LAYOUT": [0],
+        },
+        "data_layout": "host",
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.reduce"),
+            # The reduced (D1) axis must be rotated to the trailing position.
+            t.assert_present("linalg.transpose"),
         ),
     },
 }
