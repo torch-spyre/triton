@@ -64,6 +64,12 @@ SIGNATURE = {
 #
 # 1D grid across all 32 cores: each kernel reads only tl.program_id(0)
 # and partitions rows internally via an explicit rows_per_core loop.
+#
+# No tt.spyre_tensor_layout variant: RewriteDescriptorLayout physicalizes the
+# loaded row to rank 3, but the broadcast of row_max stays rank 2, so
+# `row - row_max` fails with "'arith.subf' op requires the same type for all
+# operands and results". The pass does not re-derive broadcasts against the
+# physical rank. Softmax layout support needs that first.
 # ---------------------------------------------------------------------------
 
 VARIANTS = {
