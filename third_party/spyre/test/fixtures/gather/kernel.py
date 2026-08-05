@@ -537,6 +537,8 @@ def gather_4d_kernel(
     BLOCK_SIZE: tl.constexpr,
     INNER_DIM: tl.constexpr,
     K_INDICES: tl.constexpr,
+    IN_LAYOUT: tl.constexpr,
+    OUT_LAYOUT: tl.constexpr,
 ):
     """Single-program 4D gather: block_id × group × BLOCK_SIZE × INNER_DIM.
 
@@ -557,6 +559,9 @@ def gather_4d_kernel(
       - ``K_INDICES >= 8``.
       - ``INNER_DIM`` is a power of two.
       - ``0 <= group_idx < NUM_GROUPS``.
+
+    ``IN_LAYOUT`` / ``OUT_LAYOUT`` are optional Spyre stick-tiling layouts for
+    the source and output descriptors; pass 0 (the default) to lower logically.
     """
     idx_desc = tl.make_tensor_descriptor(
         idx_ptr,
@@ -573,6 +578,9 @@ def gather_4d_kernel(
                  BLOCK_SIZE * INNER_DIM, INNER_DIM, 1],
         block_shape=[1, 1, BLOCK_SIZE, INNER_DIM],
     )
+    if IN_LAYOUT is not None and IN_LAYOUT != 0:
+        tl.spyre_tensor_layout(in_desc, IN_LAYOUT)
+
     result = in_desc.gather(idx, group_idx)
 
     out_desc = tl.make_tensor_descriptor(
@@ -581,6 +589,9 @@ def gather_4d_kernel(
         strides=[BLOCK_SIZE * INNER_DIM, BLOCK_SIZE * INNER_DIM, INNER_DIM, 1],
         block_shape=[K_INDICES, 1, BLOCK_SIZE, INNER_DIM],
     )
+    if OUT_LAYOUT is not None and OUT_LAYOUT != 0:
+        tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
+
     out_desc.store([0, 0, 0, 0], result)
 
 
