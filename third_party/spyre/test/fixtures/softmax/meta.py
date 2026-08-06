@@ -69,7 +69,17 @@ SIGNATURE = {
 # loaded row to rank 3, but the broadcast of row_max stays rank 2, so
 # `row - row_max` fails with "'arith.subf' op requires the same type for all
 # operands and results". The pass does not re-derive broadcasts against the
-# physical rank. Softmax layout support needs that first.
+# physical rank -- `retypeChain` walks forward along operand 0 only
+# (RewriteDescriptorLayout.cpp:624-633), and the broadcast is a sibling operand
+# of the subf whose producer traces back to the reduce, not to the physicalized
+# load, so no forward walk can reach it.
+#
+# Splitting the reduced axis is NOT what makes this hard: stick-on-M (the
+# non-reduced axis, with a multi-row block so the stick dim is not sub-stick)
+# fails with the identical diagnostic. The reduce's `dimensions` are untouched
+# there, so the stale broadcast target alone is sufficient to break it. Fixing
+# just the broadcast re-derivation would therefore unblock a stick-on-M variant;
+# multi-dim reduce is only additionally needed to split the reduced axis.
 # ---------------------------------------------------------------------------
 
 VARIANTS = {
