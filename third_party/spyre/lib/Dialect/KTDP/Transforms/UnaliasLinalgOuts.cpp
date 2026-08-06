@@ -45,9 +45,11 @@
 //      cursor.
 //   2. For each collected op, for each `outs` operand that also appears in
 //      `ins`:
-//      a. Reject  — body reads the initial value, or the type is not a
-//                   statically shaped tensor.
-//      b. Rewrite — point the operand at a fresh tensor.empty of same type.
+//      a. Reject  — body reads the initial value, or the type is not a ranked
+//                   tensor.
+//      b. Rewrite — point the operand at a fresh tensor.empty of same type. A
+//                   dynamic dimension is sized by a tensor.dim on the operand
+//                   being replaced.
 //
 // An aliased `outs` that cannot be rewritten is reported as an error rather
 // than skipped: leaving it in place crashes the scheduler much later, with
@@ -60,9 +62,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/KTDP/Transforms/Passes.h"
+#include "Dialect/KTDP/Transforms/Utility.h"
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -82,16 +84,9 @@ namespace mlir::triton::ktdp {
 
 namespace {
 
-/// Inline capacity for the `ins`-operand sets built below. This is an
-/// allocation hint only: a SmallPtrSet holds this many pointers in its own
-/// stack storage and spills to a heap table beyond that, so the value bounds
-/// neither the operand count nor the pass's behavior — an op with more inputs
-/// is handled identically, just with one malloc. Sized for the ops this pass
-/// actually sees: --convert-elementwise-to-linalg produces unary and binary
-/// elementwise ops, so 1-2 inputs is the norm and 3 (e.g. a select) the
-/// outlier. The capacity is a template parameter and therefore cannot be
-/// derived from the op at runtime.
-constexpr unsigned kExpectedNumInputs = 4;
+/// Stack slots in the `ins`-operand sets below before they spill to the heap.
+/// An allocation hint only; any operand count behaves identically.
+constexpr unsigned kInlineInsCapacity = 4;
 
 struct UnaliasLinalgOutsPass
     : public mlir::triton::ktdp::impl::UnaliasLinalgOutsBase<
@@ -138,7 +133,7 @@ struct UnaliasLinalgOutsPass
     SmallVector<Value> inputs = op.getDpsInputs();
     if (inputs.empty())
       return false;
-    llvm::SmallPtrSet<Value, kExpectedNumInputs> ins(inputs.begin(),
+    llvm::SmallPtrSet<Value, kInlineInsCapacity> ins(inputs.begin(),
                                                      inputs.end());
     return llvm::any_of(op.getDpsInits(),
                         [&](Value init) { return ins.contains(init); });
@@ -168,7 +163,7 @@ struct UnaliasLinalgOutsPass
     // the vector — calling .begin()/.end() on it directly would produce
     // iterators into two separate destroyed temporaries.
     SmallVector<Value> inputs = op.getDpsInputs();
-    llvm::SmallPtrSet<Value, kExpectedNumInputs> ins(inputs.begin(),
+    llvm::SmallPtrSet<Value, kInlineInsCapacity> ins(inputs.begin(),
                                                      inputs.end());
 
     rewriter.setInsertionPoint(op);
@@ -200,26 +195,23 @@ struct UnaliasLinalgOutsPass
         result = failure();
         continue;
       }
-      // Each dynamic dimension would need its own size operand on the
-      // tensor.empty. The pipeline is fully static, so name what is missing
-      // instead of emitting an under-specified op.
-      if (!tensorType.hasStaticShape()) {
-        op->emitError("linalg 'outs' operand #")
-            << out.getOperandNumber()
-            << " aliases an 'ins' operand but has dynamic shape " << tensorType
-            << "; dynamic sizes are not supported";
-        result = failure();
-        continue;
-      }
-
       LLVM_DEBUG(llvm::dbgs()
                  << "[" DEBUG_TYPE "] " << op->getName() << ": repointing 'outs' operand #"
                  << out.getOperandNumber() << " at a fresh tensor.empty of type "
                  << tensorType << "\n");
 
-      out.set(tensor::EmptyOp::create(rewriter, op.getLoc(),
-                                      tensorType.getShape(),
-                                      tensorType.getElementType()));
+      // A dynamically shaped outs needs one size operand per `?` on the
+      // replacement tensor.empty, measured off the value being replaced.
+      // outValue is an `ins` operand of this same op, so it is defined before
+      // the op and dominates the insertion point. A fully static type needs no
+      // size operands, so it is built from the type alone.
+      Value empty =
+          tensorType.hasStaticShape()
+              ? mlir::triton::ktdp::createEmptyTensor(rewriter, op.getLoc(),
+                                                      tensorType)
+              : mlir::triton::ktdp::createEmptyTensor(rewriter, op.getLoc(),
+                                                      tensorType, outValue);
+      out.set(empty);
     }
     return result;
   }

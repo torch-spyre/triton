@@ -49,26 +49,6 @@ func.func @aliased_reduction(%a: tensor<4xf32>) -> tensor<4xf32> {
 
 #map = affine_map<(d0) -> (d0)>
 
-// A dynamically shaped outs would need one size operand per '?' dimension on
-// the replacement tensor.empty. The Spyre pipeline is fully static, so the pass
-// names what is missing instead of emitting an under-specified op.
-
-func.func @dynamic_shape(%a: tensor<?xf32>) -> tensor<?xf32> {
-// expected-error @below {{aliases an 'ins' operand but has dynamic shape 'tensor<?xf32>'; dynamic sizes are not supported}}
-  %0 = linalg.generic {indexing_maps = [#map, #map],
-                       iterator_types = ["parallel"]}
-       ins(%a : tensor<?xf32>) outs(%a : tensor<?xf32>) {
-  ^bb0(%in: f32, %out: f32):
-    %1 = arith.mulf %in, %in : f32
-    linalg.yield %1 : f32
-  } -> tensor<?xf32>
-  return %0 : tensor<?xf32>
-}
-
-// -----
-
-#map = affine_map<(d0) -> (d0)>
-
 // linalg on memrefs (post-bufferization form) has no results and an aliased
 // memref outs would need an allocation, not a tensor.empty. The Spyre pipeline
 // runs entirely on tensors, so this is out of scope and rejected rather than

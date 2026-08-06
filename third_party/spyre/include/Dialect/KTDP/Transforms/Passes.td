@@ -170,6 +170,9 @@ def UnaliasLinalgOuts : Pass<"unalias-linalg-outs", "mlir::ModuleOp"> {
         LinalgOp interface, so both named ops (linalg.add, linalg.mul, …) and
         linalg.generic are covered.
 
+        Ops outside the LinalgOp interface (linalg.yield, linalg.index,
+        linalg.softmax, winograd_*) are not matched.
+
         Lowering:
         - linalg op whose outs[i] is the same SSA value as one of its ins
           operands, and whose body does not read that operand's initial value
@@ -178,20 +181,22 @@ def UnaliasLinalgOuts : Pass<"unalias-linalg-outs", "mlir::ModuleOp"> {
           accumulating op such as linalg.reduce or linalg.matmul) → rejected
           with a diagnostic; the initial value is live, so no replacement
           preserves the result.
-        - Same aliasing on a non-tensor or dynamically shaped outs → rejected
-          with a diagnostic.
+        - Same aliasing on a dynamically shaped outs → rewritten, with one
+          tensor.dim per dynamic dimension measuring the extent off the aliased
+          ins operand to size the tensor.empty.
+        - Same aliasing on a non-tensor outs → rejected with a diagnostic.
 
-        A linalg op is in destination-passing style: its outs operands supply
-        both the result shape and the initial value of each output element.
-        tensor.empty preserves the shape and drops the initial value, which is
-        why the rewrite is only applied where that value is provably unread.
+        Every op matching the LinalgOp interface is in destination-passing
+        style: its outs operands supply both the result shape and the initial
+        value of each output element. tensor.empty preserves the shape and
+        drops the initial value, which is why the rewrite is only applied where
+        that value is provably unread.
 
-        Motivation: upstream MLIR's ConvertElementwiseToLinalg reuses the first
-        type-matching operand as outs rather than creating a fresh one, with no
-        flag to suppress it. The Spyre dataflow-scheduler maps each operand of a
-        compute op to a freshly loaded value, so a value appearing in both ins
-        and outs is mapped twice and the second mapping overwrites the first,
-        producing invalid SSA ordering.
+        Motivation: the Spyre dataflow-scheduler maps each operand of a compute
+        op to a freshly loaded value, so a value appearing in both ins and outs
+        is mapped twice and the second mapping overwrites the first. The main
+        known source is upstream MLIR's ConvertElementwiseToLinalg, which reuses
+        the first type-matching operand as outs with no flag to suppress it.
 
         Ordering: must run after any pass that can introduce the aliasing —
         ConvertElementwiseToLinalg is the known source, so running after it
