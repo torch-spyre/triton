@@ -252,7 +252,8 @@ result = tl.descriptor_gather(src_desc, indices, group_idx)
 
 **Round-trip evidence**
 
-- `gather::4d` — NUM_BLOCKS=64, NUM_GROUPS=4, BLOCK_SIZE=16, INNER_DIM=64, K_INDICES=32, group_idx=1
+- `gather::4d` — NUM_BLOCKS=64, NUM_GROUPS=4, BLOCK_SIZE=16, INNER_DIM=64, K_INDICES=32, group_idx=1, IN_LAYOUT=None, OUT_LAYOUT=None
+- `gather::4d_spyre_stick_output` — NUM_BLOCKS=64, NUM_GROUPS=4, BLOCK_SIZE=16, INNER_DIM=64, K_INDICES=32, group_idx=1, IN_LAYOUT=None, OUT_LAYOUT=[(3, 'floordiv', 64), 0, 1, 2, (3, 'mod', 64)] (also demonstrates: spyre-tensor-layout)
 
 ## descriptor-gather-5d
 
@@ -523,7 +524,7 @@ tile = tl.descriptor_load(desc, [pid_m * BLOCK_M, pid_k * BLOCK_K])
 
 **Round-trip evidence**
 
-- `matmul::dynamic` — M=128, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-store-dynamic, dot, program-id-2d, num-programs-fold)
+- `matmul::dynamic` — M=128, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-store-dynamic, dot, program-id-2d, num-programs-fold)
 - `matmul::bmm_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-2d)
 - `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-3d)
@@ -580,13 +581,13 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>
 
 **Round-trip evidence**
 
-- `matmul::default` — M=16, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-store-static, dot, program-id-2d, num-programs-fold)
-- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-store-static, dot, program-id-1d, num-programs-fold)
+- `matmul::default` — M=16, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-store-static, dot, program-id-2d, num-programs-fold)
+- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-store-static, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-2d)
 - `matmul::bmm_3d_grid` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-3d)
 - `matmul::spyre_stick_k_reduction` — M=64, K=128, N=256, BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, A_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-store-static, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 12 more variants_
+_+ 15 more variants_
 
 ## descriptor-offset-base
 
@@ -801,7 +802,7 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])
 
 **Round-trip evidence**
 
-- `matmul::dynamic` — M=128, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-load-dynamic, dot, program-id-2d, num-programs-fold)
+- `matmul::dynamic` — M=128, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-dynamic, dot, program-id-2d, num-programs-fold)
 - `matmul::bmm_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-2d)
 - `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-3d)
@@ -824,13 +825,13 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
 
 **Round-trip evidence**
 
-- `matmul::default` — M=16, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-load-static, dot, program-id-2d, num-programs-fold)
-- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=0, B_LAYOUT=0, C_LAYOUT=0 (also demonstrates: descriptor-load-static, dot, program-id-1d, num-programs-fold)
+- `matmul::default` — M=16, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-static, dot, program-id-2d, num-programs-fold)
+- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-static, dot, program-id-1d, num-programs-fold)
 - `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-2d)
 - `matmul::bmm_3d_grid` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-3d)
 - `matmul::spyre_stick_k_reduction` — M=64, K=128, N=256, BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, A_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 12 more variants_
+_+ 15 more variants_
 
 
 ---
