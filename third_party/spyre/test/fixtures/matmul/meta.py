@@ -23,6 +23,7 @@ import functools
 import numpy as np
 
 from . import kernel
+from utils import sticksize
 
 
 # ---------------------------------------------------------------------------
@@ -50,21 +51,6 @@ def _make_2d_grid_checks(M, K, **_):
 # Reference (NumPy oracle) + input makers
 # ---------------------------------------------------------------------------
 
-# - Move this when more fixtures use spyre layout annotations
-_DTYPE_MAP = {
-    "fp32": np.float32,
-    "fp16": np.float16,
-}
-
-# - Move this when more fixtures use spyre layout annotations
-def _np_dtype(signature, key):
-    """Map a SIGNATURE pointer type like ``'*fp16'`` to a NumPy dtype."""
-    triton_type = signature[key].lstrip("*")
-    return _DTYPE_MAP[triton_type]
-
-def _sticksize(signature, key):
-    """Spyre stick size = 128 bytes / element-size (derived from dtype)."""
-    return 128 // np.dtype(_np_dtype(signature, key)).itemsize
 
 
 def make_inputs(M: int, K: int, N: int, *, dtype=np.float32, **_unused) -> dict:
@@ -165,7 +151,7 @@ _SIG_BMM_SPYRE = {
     "B_LAYOUT": "constexpr",
     "C_LAYOUT": "constexpr",
 }
-_SB = functools.partial(_sticksize, _SIG_BMM_SPYRE)
+_SB = functools.partial(sticksize, _SIG_BMM_SPYRE)
 
 # Spyre physical-layout variants: same arg list as matmul_kernel plus the
 # three optional layout constexprs (A/B/C_LAYOUT) carrying the stick-tiling.
@@ -183,7 +169,7 @@ _SIG_SPYRE = {
     "B_LAYOUT": "constexpr",
     "C_LAYOUT": "constexpr",
 }
-_SS = functools.partial(_sticksize, _SIG_SPYRE)
+_SS = functools.partial(sticksize, _SIG_SPYRE)
 
 _SIG_2D_GRID = {
     "a_ptr":   "*fp32",
@@ -242,7 +228,7 @@ _SIG_CHAINED = {
     "C_LAYOUT": "constexpr",
     "D_LAYOUT": "constexpr",
 }
-_SC = functools.partial(_sticksize, _SIG_CHAINED)
+_SC = functools.partial(sticksize, _SIG_CHAINED)
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +488,7 @@ VARIANTS = {
     # All annotate A, B, C with a stick-tiling layout so the kernel lowers
     # through RewriteDescriptorLayout's loop synthesis (source matmul stage +
     # store sink stage) instead of staying logical. Stick size is derived from
-    # the element dtype via _sticksize (fp16 → 64 = 128 bytes / 2).
+    # the element dtype via sticksize (fp16 → 64 = 128 bytes / 2).
     #   stick-on-X layout: phys [X//stick, other, X%stick]
     #     = [(X_logical, "floordiv", stick), other_logical, (X_logical, "mod", stick)]
     "spyre_stick_k_reduction": {

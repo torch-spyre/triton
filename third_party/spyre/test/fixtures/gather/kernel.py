@@ -206,17 +206,22 @@ def gather_kernel_spyre(
     if OUT_LAYOUT is not None:
         tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
 
+    # rows_per_core rounds up, so the last core's unclamped end
+    # (m_start + rows_per_core) can exceed m_blocks whenever grid_m does not
+    # divide m_blocks. Clamp to m_blocks so no core walks past the output.
+    # The loop counts absolute block indices, so m_block is the loop variable
+    # directly; offset_m converts that block index to an element offset.
     m_start = pid_m * rows_per_core
+    m_end   = tl.minimum(m_start + rows_per_core, m_blocks)
 
-    for m_sub in range(0, rows_per_core):
-      for col_stick in range(n_blocks):
-          m_block = m_start + m_sub
-          offset_m = m_block * BLOCK_ROWS
-          col_offset = col_stick * BLOCK_COLS
+    for m_block in range(m_start, m_end):
+        for col_stick in range(n_blocks):
+            offset_m = m_block * BLOCK_ROWS
+            col_offset = col_stick * BLOCK_COLS
 
-          idx = idx_desc.load([offset_m])
-          result = in_desc.gather(idx, col_offset)
-          out_desc.store([offset_m, col_offset], result)
+            idx = idx_desc.load([offset_m])
+            result = in_desc.gather(idx, col_offset)
+            out_desc.store([offset_m, col_offset], result)
 
 
 @triton.jit
