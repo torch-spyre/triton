@@ -66,11 +66,11 @@ def matmul_kernel(
         c_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
     )
 
-    if A_LAYOUT is not None and A_LAYOUT != 0:
+    if A_LAYOUT is not None:
         tl.spyre_tensor_layout(a_desc, A_LAYOUT)
-    if B_LAYOUT is not None and B_LAYOUT != 0:
+    if B_LAYOUT is not None:
         tl.spyre_tensor_layout(b_desc, B_LAYOUT)
-    if C_LAYOUT is not None and C_LAYOUT != 0:
+    if C_LAYOUT is not None:
         tl.spyre_tensor_layout(c_desc, C_LAYOUT)
 
     m_blocks = tl.cdiv(M, BLOCK_M)
@@ -141,11 +141,11 @@ def bmm_matmul_kernel(
         shape=[B, M, N], strides=[M*N, N, 1], block_shape=[BLOCK_B, BLOCK_M, BLOCK_N],
     )
 
-    if A_LAYOUT is not None and A_LAYOUT != 0:
+    if A_LAYOUT is not None:
         tl.spyre_tensor_layout(a_desc, A_LAYOUT)
-    if B_LAYOUT is not None and B_LAYOUT != 0:
+    if B_LAYOUT is not None:
         tl.spyre_tensor_layout(b_desc, B_LAYOUT)
-    if C_LAYOUT is not None and C_LAYOUT != 0:
+    if C_LAYOUT is not None:
         tl.spyre_tensor_layout(c_desc, C_LAYOUT)
 
     for bm in range(bm_start, bm_end):
@@ -319,13 +319,13 @@ def chained_matmul_kernel(
         d_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
     )
 
-    if A_LAYOUT is not None and A_LAYOUT != 0:
+    if A_LAYOUT is not None:
         tl.spyre_tensor_layout(a_desc, A_LAYOUT)
-    if B_LAYOUT is not None and B_LAYOUT != 0:
+    if B_LAYOUT is not None:
         tl.spyre_tensor_layout(b_desc, B_LAYOUT)
-    if C_LAYOUT is not None and C_LAYOUT != 0:
+    if C_LAYOUT is not None:
         tl.spyre_tensor_layout(c_desc, C_LAYOUT)
-    if D_LAYOUT is not None and D_LAYOUT != 0:
+    if D_LAYOUT is not None:
         tl.spyre_tensor_layout(d_desc, D_LAYOUT)
 
     m_blocks = tl.cdiv(M, BLOCK_M)

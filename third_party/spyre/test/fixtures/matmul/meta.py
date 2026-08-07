@@ -280,7 +280,7 @@ VARIANTS = {
             # M=[16,512,520]: absorbs single_tile (M=16) and nonaligned (M=520)
             "M": [16, 512, 520], "K": [64], "N": [256],
             "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
-            "A_LAYOUT": [0], "B_LAYOUT": [0], "C_LAYOUT": [0],
+            "A_LAYOUT": [None], "B_LAYOUT": [None], "C_LAYOUT": [None],
         },
         "grid":         [32],
         "reference":    run,
@@ -315,7 +315,7 @@ VARIANTS = {
             # dynamic_nonaligned (M=500), and dynamic_large (M=1024).
             "M": [128, 500, 512, 1024], "K": [64], "N": [256],
             "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
-            "A_LAYOUT": [0], "B_LAYOUT": [0], "C_LAYOUT": [0],
+            "A_LAYOUT": [None], "B_LAYOUT": [None], "C_LAYOUT": [None],
         },
         "extra_checks": lambda t: (
             t.assert_present("linalg.matmul"),
@@ -335,7 +335,7 @@ VARIANTS = {
             # B=[4,5]: absorbs bmm_nonaligned (B=5).
             "B": [4, 5], "M": [128], "K": [32], "N": [64],
             "BLOCK_B": [1], "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
-            "A_LAYOUT": [0], "B_LAYOUT": [0], "C_LAYOUT": [0],
+            "A_LAYOUT": [None], "B_LAYOUT": [None], "C_LAYOUT": [None],
         },
         "reference":    run_bmm,
         "inputs":       make_inputs_bmm,
@@ -360,7 +360,7 @@ VARIANTS = {
         "params": {
             "B": [8], "M": [256], "K": [32], "N": [64],
             "BLOCK_B": [1], "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
-            "A_LAYOUT": [0], "B_LAYOUT": [0], "C_LAYOUT": [0],
+            "A_LAYOUT": [None], "B_LAYOUT": [None], "C_LAYOUT": [None],
         },
     },
     # --- 2D grid variant ---
@@ -525,8 +525,18 @@ VARIANTS = {
         "constexpr":    ["M", "K", "N", "BLOCK_M", "BLOCK_K", "BLOCK_N",
                          "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
         "params":       {
-            # M=64, K=128 (2 K-sticks), N=256 (4 N-sticks)
-            "M": [64], "K": [128], "N": [256],
+            # fp16 stick = 64 elements. Every stickified extent must stay a
+            # multiple of it: a ragged (non-divisible) split silently produces
+            # an out-of-bounds physical view, so sweeping onto a non-multiple
+            # would encode broken behavior rather than test it.
+            #   K sweeps 128 -> 192: 2 -> 3 K-sticks, so the synthesized
+            #   K-stick loop changes trip count (and 192 is an odd multiple,
+            #   which a power-of-two assumption would miss).
+            #   N sweeps 256 -> 128: 4 -> 2 N-sticks on B/C.
+            # M is not stickified here, so it sweeps freely; BLOCK_* is held
+            # equal to the full extent so the sweep isolates stick counts from
+            # tiling.
+            "M": [64], "K": [128, 192], "N": [256, 128],
             "BLOCK_M": [64], "BLOCK_K": [128], "BLOCK_N": [64],
             # A[M,K] stick-on-K: phys [K//_S, M, K%_S]
             "A_LAYOUT": [[(1, "floordiv", _SS("a_ptr")), 0, (1, "mod", _SS("a_ptr"))]],
@@ -722,7 +732,7 @@ VARIANTS = {
                           (1, "mod", _SB("a_ptr")), (2, "mod", _SB("a_ptr"))]],
             # B_operand[B,K,N] split on K(dim 1): phys [K/S, B, K%S, N]
             "B_LAYOUT": [[(1, "floordiv", _SB("b_ptr")), 0, (1, "mod", _SB("b_ptr")), 2]],
-            "C_LAYOUT": [0],
+            "C_LAYOUT": [None],
         },
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
