@@ -21,18 +21,12 @@ import functools
 import numpy as np
 
 from . import kernel
+from utils import sticksize
 
 
 # ---------------------------------------------------------------------------
 # Reference (NumPy oracle) + input maker
 # ---------------------------------------------------------------------------
-
-def _sticksize(sig, key):
-    """Compute the stick size (elements per 128-byte line) for a pointer arg."""
-    _DTYPE_MAP = {"fp32": np.float32, "fp16": np.float16}
-    np_dtype = _DTYPE_MAP[sig[key].lstrip("*")]
-    return 128 // np.dtype(np_dtype).itemsize
-
 
 def make_inputs(M: int, N: int, *, dtype=np.float32, **_unused) -> dict:
     """Build ``[M, N]`` input and ``[M]`` output buffers for reduce_spyre."""
@@ -83,7 +77,7 @@ _SIG_SPYRE = {
     "IN_LAYOUT":  "constexpr",
     "OUT_LAYOUT": "constexpr",
 }
-_SS = functools.partial(_sticksize, _SIG_SPYRE)
+_SS = functools.partial(sticksize, _SIG_SPYRE)
 
 # Rank-3 middle-axis reduce: [D0, D1, D2] -> [D0, D2].
 _SIG_3D = {
@@ -95,7 +89,7 @@ _SIG_3D = {
     "IN_LAYOUT":  "constexpr",
     "OUT_LAYOUT": "constexpr",
 }
-_S3 = functools.partial(_sticksize, _SIG_3D)
+_S3 = functools.partial(sticksize, _SIG_3D)
 
 
 # ---------------------------------------------------------------------------

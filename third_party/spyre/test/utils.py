@@ -10,10 +10,66 @@ Contents
 - :func:`walk_module`           — build flat OpInfo list from a live ir.module
 - :func:`make_ktir_mod`         — TTIR → KTIR pipeline, returns live ir.module
 - :class:`StructuralAssertions` — query/assertion mixin over a flat ops list
+- :func:`np_dtype`              — SIGNATURE type string → NumPy dtype
+- :func:`sticksize`             — Spyre stick size (elements per stick) for an arg
 """
 
 import re
 from dataclasses import dataclass, field
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Spyre layout helpers — dtype / stick-size derivation from a SIGNATURE
+# ---------------------------------------------------------------------------
+
+#: Triton element-type spelling (as it appears in a fixture ``SIGNATURE``,
+#: with any leading ``*`` pointer marker stripped) → NumPy dtype.
+DTYPE_MAP = {
+    "fp32": np.float32,
+    "fp16": np.float16,
+}
+
+#: Spyre stick width in bytes. A "stick" is the hardware's contiguous
+#: innermost memory unit, so the number of *elements* per stick depends on the
+#: element size: 32 for fp32, 64 for fp16.
+STICK_BYTES = 128
+
+
+def np_dtype(signature, key):
+    """Map a ``SIGNATURE`` entry to its NumPy dtype.
+
+    ``signature`` is a fixture's arg-name → Triton-type-string dict (e.g.
+    ``{"a_ptr": "*fp16"}``); ``key`` is the arg name. A leading ``*``
+    (pointer) marker is ignored, so ``"*fp16"`` and ``"fp16"`` both map to
+    ``np.float16``.
+
+    Raises ``KeyError`` if the element type is not in :data:`DTYPE_MAP`.
+    """
+    triton_type = signature[key].lstrip("*")
+    if triton_type not in DTYPE_MAP:
+        raise KeyError(
+            f"{key!r} has element type {triton_type!r}, which has no NumPy "
+            f"mapping; known types: {sorted(DTYPE_MAP)}"
+        )
+    return DTYPE_MAP[triton_type]
+
+
+def sticksize(signature, key):
+    """Number of elements in one Spyre stick for the arg named ``key``.
+
+    Derived as :data:`STICK_BYTES` / element-size, so it tracks the dtype
+    declared in ``signature`` rather than being hardcoded per fixture:
+    fp32 → 32, fp16 → 64.
+
+    Fixtures typically bind the signature once and reuse the result::
+
+        _SS = functools.partial(sticksize, _SIG_SPYRE)
+        ...
+        "A_LAYOUT": [[(1, "floordiv", _SS("a_ptr")), 0, (1, "mod", _SS("a_ptr"))]]
+    """
+    return STICK_BYTES // np.dtype(np_dtype(signature, key)).itemsize
 
 
 # ---------------------------------------------------------------------------

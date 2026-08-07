@@ -12,6 +12,7 @@ import functools
 import numpy as np
 
 from . import kernel
+from utils import sticksize
 
 
 # ---------------------------------------------------------------------------
@@ -156,13 +157,7 @@ _SIG_2D_SPYRE = {
 }
 
 
-def _sticksize(sig, key):
-    """Spyre stick size = 128 bytes / element size."""
-    _DTYPE_MAP = {"fp32": np.float32, "fp16": np.float16}
-    return 128 // np.dtype(_DTYPE_MAP[sig[key].lstrip("*")]).itemsize
-
-
-_S2 = functools.partial(_sticksize, _SIG_2D_SPYRE)
+_S2 = functools.partial(sticksize, _SIG_2D_SPYRE)
 
 _SIG_3D = {
     "x_ptr":      "*fp32",

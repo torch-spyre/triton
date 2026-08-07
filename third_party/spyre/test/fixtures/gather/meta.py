@@ -41,6 +41,7 @@ import functools
 import numpy as np
 
 from . import kernel
+from utils import sticksize
 
 
 # ---------------------------------------------------------------------------
@@ -698,14 +699,6 @@ SIGNATURE = {
     "BLOCK_COLS": "i32",
 }
 
-_DTYPE_MAP = {"fp32": np.float32, "fp16": np.float16}
-
-def _np_dtype(sig, key):
-    return _DTYPE_MAP[sig[key].lstrip("*")]
-
-def _sticksize(sig, key):
-    return 128 // np.dtype(_np_dtype(sig, key)).itemsize
-
 _SIG_SPYRE = {
     "in_ptr":      "*fp16",
     "out_ptr":     "*fp16",
@@ -719,7 +712,7 @@ _SIG_SPYRE = {
     "IN_LAYOUT":   "constexpr",
     "OUT_LAYOUT":  "constexpr",
 }
-_SS = functools.partial(_sticksize, _SIG_SPYRE)
+_SS = functools.partial(sticksize, _SIG_SPYRE)
 
 # 2D kernel has no ``y_offset`` argument and adds ``BLOCK_ROWS``.
 _SIG_2D = {
@@ -782,7 +775,7 @@ _SIG_4D_SPYRE = {
     "IN_LAYOUT":  "constexpr",
     "OUT_LAYOUT": "constexpr",
 }
-_S4 = functools.partial(_sticksize, _SIG_4D_SPYRE)
+_S4 = functools.partial(sticksize, _SIG_4D_SPYRE)
 
 _SIG_SCATTER_3D = {
     "dst_ptr":    "*fp32",
