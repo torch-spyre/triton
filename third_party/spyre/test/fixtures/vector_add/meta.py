@@ -271,7 +271,7 @@ VARIANTS = {
         "params":       {
             # M=[512,520]: absorbs 2d_nonaligned (M=520).
             "M": [512, 520], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16],
-            "X_LAYOUT": [0], "Y_LAYOUT": [0], "OUT_LAYOUT": [0],
+            "X_LAYOUT": [None], "Y_LAYOUT": [None], "OUT_LAYOUT": [None],
         },
         "inputs":       make_inputs_2d,
         "extra_checks": _make_2d_checks,
@@ -302,7 +302,7 @@ VARIANTS = {
         "base":   "2d_dynamic",
         "params": {
             "M": [256], "N": [64], "BLOCK_M": [16], "BLOCK_N": [16],
-            "X_LAYOUT": [0], "Y_LAYOUT": [0], "OUT_LAYOUT": [0],
+            "X_LAYOUT": [None], "Y_LAYOUT": [None], "OUT_LAYOUT": [None],
         },
     },
     "2d_spyre_stick": {

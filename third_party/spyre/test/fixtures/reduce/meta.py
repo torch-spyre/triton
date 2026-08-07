@@ -110,9 +110,14 @@ VARIANTS = {
         "kernel_fn": kernel.reduce_spyre,
         "SIGNATURE": SIGNATURE,
         "constexpr":  ["M", "N", "BLOCK_M", "IN_LAYOUT", "OUT_LAYOUT"],
+        # BLOCK_M is fixed while M and N sweep: BLOCK_M interacts with the
+        # grid partition (rows_per_core = cdiv(cdiv(M, BLOCK_M), grid)), so
+        # sweeping both at once would conflate tiling and distribution.
+        # M = 512 divides 16 evenly; 768 gives a non-multiple block count
+        # (48 blocks over 32 cores -> ragged rows_per_core).
         "params": {
-            "M": [512], "N": [64], "BLOCK_M": [16],
-            "IN_LAYOUT": [0], "OUT_LAYOUT": [0],
+            "M": [512, 768], "N": [64, 256], "BLOCK_M": [16],
+            "IN_LAYOUT": [None], "OUT_LAYOUT": [None],
         },
         "grid":       [32],
         "reference":  run,
@@ -164,14 +169,16 @@ VARIANTS = {
         ),
         "kernel_fn":  kernel.reduce_middle_axis_spyre,
         "SIGNATURE":  _SIG_3D,
-        "constexpr":  ["D0", "D1", "D2", "IN_LAYOUT", "OUT_LAYOUT"],
+        "constexpr":  ["D0", "D1", "D2", "BLOCK_D0", "IN_LAYOUT", "OUT_LAYOUT"],
         "params": {
             # Distinct extents so a wrong-axis reduce cannot accidentally match.
-            "D0": [16], "D1": [96], "D2": [64],
-            "IN_LAYOUT": [0], "OUT_LAYOUT": [0],
+            # BLOCK_D0 == D0 keeps grid=[1] a single full-tensor block, so the
+            # reduce stays the only interesting structure at the default grid;
+            # the middle_axis_grid variant below splits it across cores.
+            "D0": [16], "D1": [96], "D2": [64], "BLOCK_D0": [16],
+            "IN_LAYOUT": [None], "OUT_LAYOUT": [None],
         },
         "grid":       [1],
-        "parallel":   False,
         "reference":  run_3d_middle,
         "inputs":     make_inputs_3d,
         "output_key": "out_ptr",
@@ -200,10 +207,10 @@ VARIANTS = {
             "before linalg.reduce."
         ),
         "params": {
-            "D0": [16], "D1": [96], "D2": [64],
+            "D0": [16], "D1": [96], "D2": [64], "BLOCK_D0": [16],
             "IN_LAYOUT": [[(2, "floordiv", _S3("in_ptr")), 0, 1,
                            (2, "mod", _S3("in_ptr"))]],
-            "OUT_LAYOUT": [0],
+            "OUT_LAYOUT": [None],
         },
         "data_layout": "host",
         "extra_checks": lambda t: (
@@ -212,5 +219,37 @@ VARIANTS = {
             # The reduced (D1) axis must be rotated to the trailing position.
             t.assert_present("linalg.transpose"),
         ),
+    },
+    # ---- Grid variation -----------------------------------------------------
+    # `grid` is a top-level entry field, read once per variant, so it is not
+    # sweepable through `params` — varying it means sibling variants. BLOCK_* is
+    # held fixed and the extents vary, per the tiling/distribution separation
+    # noted on `default`.
+    "grid_8": {
+        "base": "default",
+        "summary": (
+            "Row-sum reduce on 8 cores instead of 32 — same work, more rows "
+            "per core, exercising a different DistributeWork split."
+        ),
+        "params": {
+            "M": [512, 768], "N": [64], "BLOCK_M": [16],
+            "IN_LAYOUT": [None], "OUT_LAYOUT": [None],
+        },
+        "grid": [8],
+    },
+    "middle_axis_grid": {
+        # D0 = 16 over BLOCK_D0 = 4 gives 4 blocks, one per core at grid=[4],
+        # so every core takes exactly one iteration of the outer loop. The
+        # reduced axis (D1) is untouched by the split.
+        "base": "middle_axis",
+        "summary": (
+            "Rank-3 middle-axis reduce distributed over a 4-core grid, "
+            "exercising the program-id + outer-loop path."
+        ),
+        "params": {
+            "D0": [16], "D1": [96], "D2": [64], "BLOCK_D0": [4],
+            "IN_LAYOUT": [None], "OUT_LAYOUT": [None],
+        },
+        "grid": [4],
     },
 }

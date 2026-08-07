@@ -194,7 +194,7 @@ def gather_kernel_spyre(
         strides=[N, 1],
         block_shape=[1, BLOCK_COLS],
     )
-    if IN_LAYOUT is not None and IN_LAYOUT != 0:
+    if IN_LAYOUT is not None:
         tl.spyre_tensor_layout(in_desc, IN_LAYOUT)
 
     out_desc = tl.make_tensor_descriptor(
@@ -203,7 +203,7 @@ def gather_kernel_spyre(
         strides=[N, 1],
         block_shape=[BLOCK_ROWS, BLOCK_COLS],
     )
-    if OUT_LAYOUT is not None and OUT_LAYOUT != 0:
+    if OUT_LAYOUT is not None:
         tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
 
     m_start = pid_m * rows_per_core
@@ -561,7 +561,7 @@ def gather_4d_kernel(
       - ``0 <= group_idx < NUM_GROUPS``.
 
     ``IN_LAYOUT`` / ``OUT_LAYOUT`` are optional Spyre stick-tiling layouts for
-    the source and output descriptors; pass 0 (the default) to lower logically.
+    the source and output descriptors; pass None (the default) to lower logically.
     """
     idx_desc = tl.make_tensor_descriptor(
         idx_ptr,
@@ -578,7 +578,7 @@ def gather_4d_kernel(
                  BLOCK_SIZE * INNER_DIM, INNER_DIM, 1],
         block_shape=[1, 1, BLOCK_SIZE, INNER_DIM],
     )
-    if IN_LAYOUT is not None and IN_LAYOUT != 0:
+    if IN_LAYOUT is not None:
         tl.spyre_tensor_layout(in_desc, IN_LAYOUT)
 
     result = in_desc.gather(idx, group_idx)
@@ -589,7 +589,7 @@ def gather_4d_kernel(
         strides=[BLOCK_SIZE * INNER_DIM, BLOCK_SIZE * INNER_DIM, INNER_DIM, 1],
         block_shape=[K_INDICES, 1, BLOCK_SIZE, INNER_DIM],
     )
-    if OUT_LAYOUT is not None and OUT_LAYOUT != 0:
+    if OUT_LAYOUT is not None:
         tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
 
     out_desc.store([0, 0, 0, 0], result)

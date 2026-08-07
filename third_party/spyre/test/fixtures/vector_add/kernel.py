@@ -81,26 +81,26 @@ def add_kernel_2d(
     """2D elementwise add: out[M, N] = x[M, N] + y[M, N].
 
     ``X_LAYOUT`` / ``Y_LAYOUT`` / ``OUT_LAYOUT`` are optional Spyre stick-tiling
-    layouts for the matching descriptor; pass 0 to lower logically.
+    layouts for the matching descriptor; pass None to lower logically.
     """
     pid = tl.program_id(0)
 
     x_desc = tl.make_tensor_descriptor(
         x_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
     )
-    if X_LAYOUT is not None and X_LAYOUT != 0:
+    if X_LAYOUT is not None:
         tl.spyre_tensor_layout(x_desc, X_LAYOUT)
 
     y_desc = tl.make_tensor_descriptor(
         y_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
     )
-    if Y_LAYOUT is not None and Y_LAYOUT != 0:
+    if Y_LAYOUT is not None:
         tl.spyre_tensor_layout(y_desc, Y_LAYOUT)
 
     out_desc = tl.make_tensor_descriptor(
         output_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
     )
-    if OUT_LAYOUT is not None and OUT_LAYOUT != 0:
+    if OUT_LAYOUT is not None:
         tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
 
     num_cores = tl.num_programs(0)
