@@ -431,6 +431,17 @@ class KTIRStructuralTester(StructuralAssertions):
             return
         entry = EXAMPLES[self.EXAMPLE]
         grid = entry.get("grid")  # None → backend default
+        # A fixture entry mixes SpyreOptions fields with test metadata
+        # (kernel_fn, tags, atol, ...), so forward only the keys that name an
+        # actual option — make_ktir_mod raises on anything it can't map.
+        # ``grid`` stays a named argument because None must mean "use the
+        # default" rather than override it.
+        from backend.compiler import SpyreOptions
+        option_fields = SpyreOptions.__dataclass_fields__
+        options = {
+            k: v for k, v in entry.items()
+            if k != "grid" and k in option_fields
+        }
 
         if "kernel_fn" in entry:
             ttir_text = compile_to_ttir(
@@ -442,9 +453,9 @@ class KTIRStructuralTester(StructuralAssertions):
                     mode="w", suffix=".mlir", delete_on_close=False) as f:
                 f.write(ttir_text)
                 f.flush()
-                self.mod = make_ktir_mod(f.name, grid=grid)
+                self.mod = make_ktir_mod(f.name, grid=grid, **options)
         else:
-            self.mod = make_ktir_mod(entry["path"], grid=grid)
+            self.mod = make_ktir_mod(entry["path"], grid=grid, **options)
 
         self.ops = walk_module(self.mod)
         self._def_map = None

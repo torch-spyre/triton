@@ -41,6 +41,7 @@ import functools
 import numpy as np
 
 from . import kernel
+from utils import sticksize
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,28 @@ def make_inputs_large_k(M, N, K_INDICES, BLOCK_COLS, y_offset,
                         **_unused) -> dict:
     return _make_inputs(M, N, K_INDICES, BLOCK_COLS, y_offset,
                         seed=1006, allow_duplicates=True)
+
+
+def make_inputs_spyre(M, N, K_INDICES, BLOCK_COLS, y_offset,
+                      **_unused) -> dict:
+    """fp16 inputs for the Spyre physical-layout variant."""
+    rng = np.random.default_rng(seed=42)
+    in_data = rng.standard_normal((M, N)).astype(np.float16)
+    idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
+    out_data = np.zeros((K_INDICES, N), dtype=np.float16)
+    return {
+        "in_ptr":   in_data,
+        "out_ptr":  out_data,
+        "idx_ptr":  idx_data,
+        "y_offset": y_offset,
+    }
+
+
+def run_spyre(inputs: dict) -> np.ndarray:
+    """NumPy oracle for the Spyre variant: gather full rows, fp16."""
+    in_data = inputs["in_ptr"]
+    idx = inputs["idx_ptr"]
+    return in_data[idx, :]
 
 
 def run(inputs: dict) -> np.ndarray:
@@ -330,6 +353,7 @@ def run_3d_group(inputs: dict) -> np.ndarray:
 def make_inputs_4d(
     NUM_BLOCKS: int, NUM_GROUPS: int, BLOCK_SIZE: int, INNER_DIM: int,
     K_INDICES: int, group_idx: int,
+    *, dtype=np.float32,
     **_unused,
 ) -> dict:
     """Inputs for ``gather_4d_kernel``:
@@ -341,9 +365,9 @@ def make_inputs_4d(
     rng = np.random.default_rng(2003)
     in_data = rng.standard_normal(
         (NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM)
-    ).astype(np.float32)
+    ).astype(dtype)
     idx_data = rng.choice(NUM_BLOCKS, size=K_INDICES, replace=False).astype(np.int32)
-    out_data = np.zeros((K_INDICES, 1, BLOCK_SIZE, INNER_DIM), dtype=np.float32)
+    out_data = np.zeros((K_INDICES, 1, BLOCK_SIZE, INNER_DIM), dtype=dtype)
     return {
         "in_ptr":    in_data,
         "out_ptr":   out_data,
@@ -362,6 +386,7 @@ def run_4d(inputs: dict) -> np.ndarray:
 
 def make_inputs_scatter_3d(
     M: int, BLOCK_SIZE: int, HEAD_DIM: int, K_INDICES: int,
+    *, dtype=np.float32,
     **_unused,
 ) -> dict:
     """Inputs for ``scatter_3d_kernel``.
@@ -372,8 +397,8 @@ def make_inputs_scatter_3d(
     """
     _check_rank_n_preconditions(K_INDICES, M=M)
     rng = np.random.default_rng(2004)
-    dst = np.zeros((M, BLOCK_SIZE, HEAD_DIM), dtype=np.float32)
-    src = rng.standard_normal((K_INDICES, BLOCK_SIZE, HEAD_DIM)).astype(np.float32)
+    dst = np.zeros((M, BLOCK_SIZE, HEAD_DIM), dtype=dtype)
+    src = rng.standard_normal((K_INDICES, BLOCK_SIZE, HEAD_DIM)).astype(dtype)
     idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
     return {"dst_ptr": dst, "data_ptr": src, "idx_ptr": idx_data}
 
@@ -674,6 +699,21 @@ SIGNATURE = {
     "BLOCK_COLS": "i32",
 }
 
+_SIG_SPYRE = {
+    "in_ptr":      "*fp16",
+    "out_ptr":     "*fp16",
+    "idx_ptr":     "*i32",
+    "y_offset":    "i32",
+    "M":           "i32",
+    "N":           "i32",
+    "K_INDICES":   "i32",
+    "BLOCK_ROWS":  "constexpr",
+    "BLOCK_COLS":  "constexpr",
+    "IN_LAYOUT":   "constexpr",
+    "OUT_LAYOUT":  "constexpr",
+}
+_SS = functools.partial(sticksize, _SIG_SPYRE)
+
 # 2D kernel has no ``y_offset`` argument and adds ``BLOCK_ROWS``.
 _SIG_2D = {
     "in_ptr":     "*fp32",
@@ -718,7 +758,24 @@ _SIG_4D = {
     "BLOCK_SIZE": "i32",
     "INNER_DIM":  "i32",
     "K_INDICES":  "i32",
+    "IN_LAYOUT":  "constexpr",
+    "OUT_LAYOUT": "constexpr",
 }
+
+_SIG_4D_SPYRE = {
+    "in_ptr":     "*fp16",
+    "out_ptr":    "*fp16",
+    "idx_ptr":    "*i32",
+    "group_idx":  "i32",
+    "NUM_BLOCKS": "i32",
+    "NUM_GROUPS": "i32",
+    "BLOCK_SIZE": "i32",
+    "INNER_DIM":  "i32",
+    "K_INDICES":  "i32",
+    "IN_LAYOUT":  "constexpr",
+    "OUT_LAYOUT": "constexpr",
+}
+_S4 = functools.partial(sticksize, _SIG_4D_SPYRE)
 
 _SIG_SCATTER_3D = {
     "dst_ptr":    "*fp32",
@@ -1201,7 +1258,8 @@ VARIANTS = {
         # group_idx=1 (non-zero) for the same reason as 3d_group.
         "kernel_fn":    kernel.gather_4d_kernel,
         "SIGNATURE":    _SIG_4D,
-        "constexpr":    ["NUM_BLOCKS", "NUM_GROUPS", "BLOCK_SIZE", "INNER_DIM", "K_INDICES"],
+        "constexpr":    ["NUM_BLOCKS", "NUM_GROUPS", "BLOCK_SIZE", "INNER_DIM",
+                         "K_INDICES", "IN_LAYOUT", "OUT_LAYOUT"],
         "params": {
             "NUM_BLOCKS": [64],
             "NUM_GROUPS": [4],
@@ -1209,6 +1267,8 @@ VARIANTS = {
             "INNER_DIM":  [64],
             "K_INDICES":  [32],
             "group_idx":  [1],
+            "IN_LAYOUT":  [None],
+            "OUT_LAYOUT": [None],
         },
         "tags":         ["descriptor-gather-4d"],
         "grid":         [32],
@@ -1244,7 +1304,55 @@ VARIANTS = {
             "INNER_DIM":  [64],
             "K_INDICES":  [64],
             "group_idx":  [3],
+            "IN_LAYOUT":  [None],
+            "OUT_LAYOUT": [None],
         },
+    },
+    "4d_spyre_stick_output": {
+        # 4D gather with the output annotated stick-on-INNER_DIM. Only the
+        # output can carry a layout here: rewriteIndirectAccessTile gates
+        # source physicalization on logical rank 2, so annotating the rank-4
+        # source is rejected by design.
+        # out [K_INDICES, 1, BLOCK_SIZE, INNER_DIM] stick-on-dim-3
+        #   -> phys [INNER/S, K_INDICES, 1, BLOCK_SIZE, INNER%S]
+        "base":      "4d",
+        "tags":      ["descriptor-gather-4d", "spyre-tensor-layout"],
+        "summary": (
+            "4D gather with the output annotated stick-on-INNER_DIM. The "
+            "output layout drives the store sink; the rank-4 source gather "
+            "stays logical."
+        ),
+        "SIGNATURE": _SIG_4D_SPYRE,
+        "constexpr": ["NUM_BLOCKS", "NUM_GROUPS", "BLOCK_SIZE", "INNER_DIM",
+                      "K_INDICES", "IN_LAYOUT", "OUT_LAYOUT"],
+        "params": {
+            "NUM_BLOCKS": [64],
+            "NUM_GROUPS": [4],
+            "BLOCK_SIZE": [16],
+            # INNER_DIM = 64 = exactly one fp16 stick.
+            "INNER_DIM":  [64],
+            "K_INDICES":  [32],
+            "group_idx":  [1],
+            "IN_LAYOUT":  [None],
+            "OUT_LAYOUT": [[(3, "floordiv", _S4("out_ptr")), 0, 1, 2,
+                            (3, "mod", _S4("out_ptr"))]],
+        },
+        "data_layout": "host",
+        "inputs":    functools.partial(make_inputs_4d, dtype=np.float16),
+        "rtol":      1e-2,
+        "atol":      5e-2,
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            # Source stays logical rank-4 (indirect physicalization is gated
+            # to rank 2), so the gather tile keeps the [32, 1, 16, 64] block.
+            t.assert_result_type("ktdp.construct_memory_view", "64x4x16x64xf16"),
+            t.assert_result(
+                "ktdp.construct_indirect_access_tile", shape=[32, 1, 16, 64]),
+            # Output physicalizes to rank-5 [INNER/64, K, 1, BLOCK, INNER%64]
+            # = [1, 32, 1, 16, 64]; insert_slice bridges rank-4 -> rank-5.
+            t.assert_result_type("ktdp.construct_memory_view", "1x32x1x16x64xf16"),
+            t.assert_present("tensor.insert_slice"),
+        ),
     },
     "scatter_3d": {
         # Write-back mirror of the "3d" variant.  Reads K_INDICES blocks from
@@ -1258,6 +1366,14 @@ VARIANTS = {
         "inputs":     make_inputs_scatter_3d,
         "output_key": "dst_ptr",
     },
+    # No scatter layout variant: neither annotation direction compiles today.
+    #  - DST_LAYOUT  (the indirect side, rank 3) is rejected by the documented
+    #    rank-2 capability gate in rewriteIndirectAccessTile.
+    #  - DATA_LAYOUT physicalizes the direct data load to rank 4, but the
+    #    unannotated indirect scatter tile stays rank 3, so ktdp.store rejects
+    #    the mismatch (same root cause as gather source-only).
+    # scatter_3d_kernel is therefore left without layout constexprs until one
+    # of the two paths is supported.
     # ------------------------------------------------------------------
     # Partial-extent rank-3 variants: block dim 1 is a strict divisor of
     # source dim 1 (``TOKEN_BLOCK | NUM_TOKENS``, ``TOKEN_BLOCK < NUM_TOKENS``);
@@ -1422,5 +1538,94 @@ VARIANTS = {
         },
         "reference": functools.partial(run_2d_index_3d_block, BLOCK_B=2, BLOCK_L=64, BLOCK_H=4),
         "inputs":    make_inputs_2d_index_3d_block_large,
+    },
+    # ------------------------------------------------------------------
+    # Spyre physical-layout variant.
+    # in_desc [M, N] annotated stick-on-N; out_desc [K_INDICES, BLOCK_COLS]
+    # annotated stick-on-N. idx_desc is not annotated.
+    # Loops over all N columns in BLOCK_COLS-wide sticks so the full row
+    # is gathered into out_ptr[K_INDICES, N].
+    # ------------------------------------------------------------------
+    "spyre_stick": {
+        "kernel_fn":  kernel.gather_kernel_spyre,
+        "SIGNATURE":  _SIG_SPYRE,
+        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_ROWS", "BLOCK_COLS",
+                       "IN_LAYOUT", "OUT_LAYOUT"],
+        "params": {
+            "M":          [256],
+            # N spans multiple source N-sticks (256/64 = 4) so the physical
+            # in_desc first dim is > 1 and the gather's floordiv/mod actually
+            # selects a source stick rather than collapsing to stick 0.
+            "N":          [256],
+            "K_INDICES":  [32],
+            "BLOCK_ROWS": [32],
+            # BLOCK_COLS = 128 = 2 sticks per gather call; the col_stick loop
+            # runs N//BLOCK_COLS = 256//128 = 2 times.
+            "BLOCK_COLS": [128],
+            # y_offset unused by the kernel (full-row gather), but kept in
+            # the signature as a runtime scalar to satisfy run_cpu plumbing.
+            "y_offset":   [0],
+            # in_ptr [M, N]: stick-on-N -> [N//_S, M, _S]
+            "IN_LAYOUT":  [[(1, "floordiv", _SS("in_ptr")), 0, (1, "mod", _SS("in_ptr"))]],
+            # out_ptr [K_INDICES, N]: stick-on-N -> [N//_S, K_INDICES, _S]
+            "OUT_LAYOUT": [[(1, "floordiv", _SS("out_ptr")), 0, (1, "mod", _SS("out_ptr"))]],
+        },
+        "tags":       ["descriptor-gather", "spyre-tensor-layout"],
+        "grid":       [1],
+        "data_layout": "host",
+        "parallel":   False,
+        "reference":  run_spyre,
+        "inputs":     make_inputs_spyre,
+        "output_key": "out_ptr",
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            # in_desc is physicalized stick-on-N -> rank-3 [N//stick, M, stick]
+            # view = [4, 256, 64] (4 source N-sticks).
+            t.assert_result_type(
+                "ktdp.construct_memory_view", "4x256x64xf16"),
+            # Each gather reads BLOCK_COLS=128 (2 sticks) for K_INDICES=32
+            # rows, so the indirect access tile is rank-3 [2, 32, 64].
+            t.assert_result(
+                "ktdp.construct_indirect_access_tile", shape=[2, 32, 64]),
+            # The rank-3 load result flows straight into the rank-3 store sink,
+            # so no insert_slice is synthesized (ranks already match).
+            t.assert_absent("tensor.insert_slice"),
+        ),
+    },
+    # Annotation asymmetry: gather_kernel_spyre guards IN_LAYOUT and
+    # OUT_LAYOUT independently, so each can be annotated alone. Only the
+    # output-only case is covered here — source-only currently fails to
+    # compile (RewriteDescriptorLayout rebuilds the indirect access tile over
+    # the rank-3 physical source view but leaves the unannotated store sink at
+    # logical rank 2, so ktdp.store rejects the rank mismatch).
+    "spyre_stick_output_only": {
+        # out_desc annotated stick-on-N, in_desc left logical. Only the store
+        # sink is physicalized: the rank-2 gather result is written through the
+        # rank-3 physical out view.
+        "base": "spyre_stick",
+        "summary": (
+            "Gather with only the output annotated stick-on-N. The output "
+            "layout drives the store sink, so a rank-3 physical out view is "
+            "built while the source gather stays logical."
+        ),
+        "params": {
+            "M":          [256],
+            "N":          [256],
+            "K_INDICES":  [32],
+            "BLOCK_ROWS": [32],
+            "BLOCK_COLS": [128],
+            "y_offset":   [0],
+            "IN_LAYOUT":  [None],
+            "OUT_LAYOUT": [[(1, "floordiv", _SS("out_ptr")), 0, (1, "mod", _SS("out_ptr"))]],
+        },
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            # out_ptr [K_INDICES, N] stick-on-N -> rank-3 [N//64, 32, 64]
+            # = [4, 32, 64]; the store sink consumes it.
+            t.assert_result_type("ktdp.construct_memory_view", "4x32x64xf16"),
+            # Source is logical, so the gather tile is rank-2 [32, 128].
+            t.assert_result(
+                "ktdp.construct_indirect_access_tile", shape=[32, 128]),
+        ),
     },
 }

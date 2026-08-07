@@ -16,6 +16,21 @@ reduce_to_one (splitk):
   Only pick₀ (``pid_in==0``) writes to C.  The outer distribution loop
   handles arbitrary M for the fixed grid.
 
+No tt.spyre_tensor_layout variant: RewriteDescriptorLayout physicalizes the
+loaded partial (and, via retypeChain, the tt.inter_tile result), but the
+``identities`` operand stays at logical rank -- it is a sibling operand of the
+op, not a successor in the retype chain, so the forward walk never reaches it.
+LowerInterTile then forwards that stale value verbatim
+(``LowerInterTile.cpp:417``) while deriving ``resultTypes`` from the
+physicalized partials (``:413``), so the op fails its own verifier:
+
+    'ktdp.inter_tile_reduce' op failed to verify that identity types must
+    match result types
+
+with future/result at ``tensor<2x16x32xf32>`` and identity still
+``tensor<16x64xf32>``. Layout support here needs the identity retyped
+alongside the partials.
+
 See ``fixtures/README.md`` for the field reference.
 """
 

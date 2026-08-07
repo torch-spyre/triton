@@ -7,9 +7,12 @@ at increasing dimensionality and static-vs-dynamic shape lowering.
 See ``fixtures/README.md`` for the field reference and discovery rules.
 """
 
+import functools
+
 import numpy as np
 
 from . import kernel
+from utils import sticksize
 
 
 # ---------------------------------------------------------------------------
@@ -68,14 +71,15 @@ def run(inputs: dict) -> np.ndarray:
     return inputs["x_ptr"] + inputs["y_ptr"]
 
 
-def make_inputs_2d(M: int, N: int, BLOCK_M: int, BLOCK_N: int) -> dict:
+def make_inputs_2d(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
+                   *, dtype=np.float32, **_unused) -> dict:
     """Build 2D pointer-tensor inputs for add_kernel_2d."""
     del BLOCK_M, BLOCK_N
     total = M * N
     t = np.arange(total, dtype=np.float32)
-    x = np.sin(t * 2.0 * np.pi / total).astype(np.float32).reshape(M, N)
-    y = np.cos(t * 2.0 * np.pi / total).astype(np.float32).reshape(M, N)
-    output = np.zeros((M, N), dtype=np.float32)
+    x = np.sin(t * 2.0 * np.pi / total).astype(dtype).reshape(M, N)
+    y = np.cos(t * 2.0 * np.pi / total).astype(dtype).reshape(M, N)
+    output = np.zeros((M, N), dtype=dtype)
     return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
 
 
@@ -129,6 +133,31 @@ _SIG_2D = {
     "BLOCK_M":    "i32",
     "BLOCK_N":    "i32",
 }
+
+# add_kernel_2d carries the optional layout constexprs; add_kernel_2d_grid
+# (which shares _SIG_2D) does not.
+_SIG_2D_LAYOUT = {
+    **_SIG_2D,
+    "X_LAYOUT":   "constexpr",
+    "Y_LAYOUT":   "constexpr",
+    "OUT_LAYOUT": "constexpr",
+}
+
+_SIG_2D_SPYRE = {
+    "x_ptr":      "*fp16",
+    "y_ptr":      "*fp16",
+    "output_ptr": "*fp16",
+    "M":          "i32",
+    "N":          "i32",
+    "BLOCK_M":    "i32",
+    "BLOCK_N":    "i32",
+    "X_LAYOUT":   "constexpr",
+    "Y_LAYOUT":   "constexpr",
+    "OUT_LAYOUT": "constexpr",
+}
+
+
+_S2 = functools.partial(sticksize, _SIG_2D_SPYRE)
 
 _SIG_3D = {
     "x_ptr":      "*fp32",
@@ -231,11 +260,13 @@ VARIANTS = {
             "descriptor shape is fully static (`memref<512x32xf32>`)."
         ),
         "kernel_fn":    kernel.add_kernel_2d,
-        "SIGNATURE":    _SIG_2D,
-        "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N"],
+        "SIGNATURE":    _SIG_2D_LAYOUT,
+        "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N",
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT"],
         "params":       {
             # M=[512,520]: absorbs 2d_nonaligned (M=520).
             "M": [512, 520], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16],
+            "X_LAYOUT": [None], "Y_LAYOUT": [None], "OUT_LAYOUT": [None],
         },
         "inputs":       make_inputs_2d,
         "extra_checks": _make_2d_checks,
@@ -253,7 +284,8 @@ VARIANTS = {
             "lowers to `memref<?x?xf32>`, so the compiled kernel runs "
             "unchanged across a range of matrix shapes."
         ),
-        "constexpr":    ["BLOCK_M", "BLOCK_N"],
+        "constexpr":    ["BLOCK_M", "BLOCK_N",
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT"],
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?xf32>"),
@@ -263,7 +295,44 @@ VARIANTS = {
         # Different N than the static 2d sibling: confirms the compiled
         # dynamic kernel runs at a shape distinct from its static sibling.
         "base":   "2d_dynamic",
-        "params": {"M": [256], "N": [64], "BLOCK_M": [16], "BLOCK_N": [16]},
+        "params": {
+            "M": [256], "N": [64], "BLOCK_M": [16], "BLOCK_N": [16],
+            "X_LAYOUT": [None], "Y_LAYOUT": [None], "OUT_LAYOUT": [None],
+        },
+    },
+    "2d_spyre_stick": {
+        # Elementwise add with all three operands stick-on-N. Every operand
+        # physicalizes identically, so the add stays a pure elementwise op on
+        # rank-3 tiles [N//S, M, N%S] = [2, 64, 64] and no transpose or
+        # reduction loop is synthesized.
+        "base": "2d",
+        "tags": ["descriptor-load-static", "descriptor-store-static",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "2D elementwise add with x/y/out all annotated stick-on-N. "
+            "Exercises the layout path on a pure elementwise kernel."
+        ),
+        "SIGNATURE": _SIG_2D_SPYRE,
+        "params": {
+            # fp16 stick = 64; N = 128 = 2 sticks exactly.
+            "M": [64], "N": [128], "BLOCK_M": [64], "BLOCK_N": [128],
+            "X_LAYOUT":   [[(1, "floordiv", _S2("x_ptr")), 0,
+                            (1, "mod", _S2("x_ptr"))]],
+            "Y_LAYOUT":   [[(1, "floordiv", _S2("y_ptr")), 0,
+                            (1, "mod", _S2("y_ptr"))]],
+            "OUT_LAYOUT": [[(1, "floordiv", _S2("output_ptr")), 0,
+                            (1, "mod", _S2("output_ptr"))]],
+        },
+        "grid":        [1],
+        "data_layout": "host",
+        "inputs":      functools.partial(make_inputs_2d, dtype=np.float16),
+        "rtol":        1e-2,
+        "atol":        5e-2,
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            # All three operands share the rank-3 physical view [2, 64, 64].
+            t.assert_result_type("ktdp.construct_memory_view", "2x64x64xf16"),
+        ),
     },
     # --- 3D variants ---
     "3d": {
