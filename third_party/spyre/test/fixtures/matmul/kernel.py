@@ -1,6 +1,6 @@
 """Matmul kernels: 2D and batched (BMM).
 
-Six @triton.jit functions exercising tt.dot -> linalg.matmul (rank-2 operands)
+Five @triton.jit functions exercising tt.dot -> linalg.matmul (rank-2 operands)
 or linalg.batch_matmul (rank-3 operands) with tensor descriptors. Three groups:
 
 1D-grid kernels — one axis distributes work via an explicit loop:
