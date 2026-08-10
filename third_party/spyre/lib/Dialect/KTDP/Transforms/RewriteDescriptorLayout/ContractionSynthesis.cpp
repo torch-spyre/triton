@@ -27,6 +27,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
@@ -267,8 +268,17 @@ Value emitSourceStage(
         f = plan.coords.physBlock[p];
       if (f <= 1)
         continue;
-      if (stickFactor != 1 && stickFactor != f)
-        llvm_unreachable("emitSourceStage: plans disagree on stickFactor");
+      if (stickFactor != 1 && stickFactor != f) {
+        op.emitError() << "spyre_tensor_layout: operands disagree on the "
+                          "reduction-stick trip count on the contraction axis "
+                          "— one annotated operand needs "
+                       << stickFactor << " sticks, another needs " << f
+                       << ". The rebuilt contraction walks the sticks with a "
+                          "single loop, so one trip count has to serve every "
+                          "annotated operand; annotate them with stick widths "
+                          "that give the same stick count on that axis";
+        return Value{};
+      }
       stickFactor = f;
     }
   }
@@ -295,9 +305,25 @@ Value emitSourceStage(
       if (role < 0 || plan.coords.physBlock[p] <= 1)
         continue;
       int64_t f = plan.coords.physBlock[p];
-      if (parallelFactor != 1 &&
-          (parallelFactor != f || parallelAccAxis != role))
-        return Value{}; // caller reports; see dispatchSource
+      if (parallelFactor != 1 && parallelFactor != f) {
+        op.emitError() << "spyre_tensor_layout: operands disagree on the "
+                          "parallel multi-stick scatter trip count — one "
+                          "annotated operand scatters across "
+                       << parallelFactor << " sticks, another across " << f
+                       << ". One scatter loop cannot serve both, and two "
+                          "independent scatter loops are not supported";
+        return Value{};
+      }
+      if (parallelAccAxis >= 0 && parallelAccAxis != role) {
+        op.emitError() << "spyre_tensor_layout: operands disagree on which "
+                          "output axis the parallel multi-stick scatter runs "
+                          "over — one annotated operand scatters on output "
+                          "axis "
+                       << parallelAccAxis << ", another on axis " << role
+                       << ". One scatter loop cannot serve both, and two "
+                          "independent scatter loops are not supported";
+        return Value{};
+      }
       parallelFactor = f;
       parallelAccAxis = role;
       parallelStickSize = plan.coords.physBlock[plan.dims.lane];
@@ -459,12 +485,13 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
 
   OpBuilder b(op.getOperation());
   Value result = emitSourceStage(op, b, spec.emitOp, plans);
-  if (!result)
-    return emitFatalError(op, ctx,
-        "spyre_tensor_layout: operands disagree on the parallel multi-stick "
-        "scatter — two annotated operands carry parallel floor dims with "
-        "different trip counts or on different output axes, which would need "
-        "two independent scatter loops (not supported)");
+  if (!result) {
+    // emitSourceStage already emitted a diagnostic naming which of its
+    // conditions failed. Only the fatal flag is left to set, so the pass fails
+    // instead of returning a module with the op unrewritten.
+    ctx.hadError = true;
+    return failure();
+  }
   rewriter.replaceOp(op, result);
   return success();
 }
@@ -656,6 +683,7 @@ static LogicalResult rewriteMatmulLike(
 //===----------------------------------------------------------------------===//
 
 struct RewriteMatmulPattern : OpRewritePattern<linalg::MatmulOp> {
+  using ConsumedOp = linalg::MatmulOp;
   const PassContext &ctx;
   RewriteMatmulPattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
       : OpRewritePattern(mlirCtx, /*benefit=*/2), ctx(layoutCtx) {}
@@ -681,6 +709,7 @@ struct RewriteMatmulPattern : OpRewritePattern<linalg::MatmulOp> {
 //===----------------------------------------------------------------------===//
 
 struct RewriteBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
+  using ConsumedOp = linalg::BatchMatmulOp;
   const PassContext &ctx;
   RewriteBatchMatmulPattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
       : OpRewritePattern(mlirCtx, /*benefit=*/2), ctx(layoutCtx) {}
@@ -704,6 +733,7 @@ struct RewriteBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
 //===----------------------------------------------------------------------===//
 
 struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
+  using ConsumedOp = linalg::ReduceOp;
   const PassContext &ctx;
   RewriteReducePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
       : OpRewritePattern(mlirCtx, /*benefit=*/2), ctx(layoutCtx) {}
@@ -804,6 +834,7 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
 //===----------------------------------------------------------------------===//
 
 struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
+  using ConsumedOp = mlir::ktdp::StoreOp;
   const PassContext &ctx;
   RewriteStorePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
       : OpRewritePattern(mlirCtx, /*benefit=*/1), ctx(layoutCtx) {}
@@ -844,12 +875,62 @@ namespace mlir::triton::ktdp {
 // Entry point
 //===----------------------------------------------------------------------===//
 
+namespace {
+
+/// Derives everything Phase 2 needs to know about its supported consumers from
+/// one list of patterns.
+///
+/// Three things must agree about that set: which patterns the greedy driver is
+/// given, which ops are handed to it as candidates, and which op names a
+/// diagnostic advertises. Spelling the set out three times invites the copies to
+/// drift, and the dangerous direction is silent — a pattern that is registered
+/// but missing from the candidate list is never offered its op, so the pass
+/// reports success on IR it did not repair.
+///
+/// Each pattern names its own op type as a `ConsumedOp` typedef, so the list of
+/// patterns is sufficient to derive the other two, and `SupportedConsumers`
+/// below is the only place the set appears. (`OpRewritePattern` takes the op as
+/// a template parameter but does not re-export it, which is why the patterns
+/// declare `ConsumedOp` themselves.)
+///
+/// Adding a consumer is two lines, both next to each other: write the pattern
+/// with its `ConsumedOp`, add it to `SupportedConsumers`. Forgetting the second
+/// fails loudly rather than silently — the pattern never runs, so Phase 3
+/// reports its op by name.
+template <typename... Pats> struct ConsumerPatterns {
+  static void populate(RewritePatternSet &patterns, const PassContext &ctx) {
+    patterns.add<Pats...>(patterns.getContext(), ctx);
+  }
+
+  static bool contains(Operation *op) {
+    return isa<typename Pats::ConsumedOp...>(op);
+  }
+
+  static std::string names() {
+    llvm::SmallVector<llvm::StringRef, sizeof...(Pats)> parts{
+        Pats::ConsumedOp::getOperationName()...};
+    return llvm::join(parts, ", ");
+  }
+};
+
+/// The supported set. Per-pattern rewrite benefit is set in each pattern's own
+/// constructor (sources at 2, the store sink at 1), so listing them together
+/// here does not change their relative priority.
+using SupportedConsumers =
+    ConsumerPatterns<RewriteMatmulPattern, RewriteBatchMatmulPattern,
+                     RewriteReducePattern, RewriteStorePattern>;
+
+} // namespace
+
 void populateContractionPatterns(RewritePatternSet &patterns,
                                  const PassContext &ctx) {
-  MLIRContext *mlirCtx = patterns.getContext();
-  patterns.add<RewriteMatmulPattern, RewriteBatchMatmulPattern,
-               RewriteReducePattern>(mlirCtx, ctx);
-  patterns.add<RewriteStorePattern>(mlirCtx, ctx);
+  SupportedConsumers::populate(patterns, ctx);
 }
+
+bool isSupportedConsumer(Operation *op) {
+  return SupportedConsumers::contains(op);
+}
+
+std::string supportedConsumerNames() { return SupportedConsumers::names(); }
 
 } // namespace mlir::triton::ktdp

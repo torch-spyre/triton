@@ -85,7 +85,7 @@ tt.func @parallel_scatter_axis_disagreement(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, 
   %bv = tt.descriptor_load %bd[%z, %z, %z] : !tt.tensordesc<2x128x128xf16> -> tensor<2x128x128xf16>
   %cd = tt.make_tensor_descriptor %c, [%b2, %m, %m], [%s16384, %s128, %s1] : !tt.ptr<f16>, !tt.tensordesc<2x128x128xf16>
   %cv = tt.descriptor_load %cd[%z, %z, %z] : !tt.tensordesc<2x128x128xf16> -> tensor<2x128x128xf16>
-  // expected-error @below {{spyre_tensor_layout: operands disagree on the parallel multi-stick scatter}}
+  // expected-error @below {{operands disagree on which output axis the parallel multi-stick scatter runs over — one annotated operand scatters on output axis 1, another on axis 2}}
   %d = tt.dot %av, %bv, %cv : tensor<2x128x128xf16> * tensor<2x128x128xf16> -> tensor<2x128x128xf16>
   tt.descriptor_store %cd[%z, %z, %z], %d : !tt.tensordesc<2x128x128xf16>, tensor<2x128x128xf16>
   tt.return
