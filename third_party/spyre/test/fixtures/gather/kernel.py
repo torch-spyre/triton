@@ -29,7 +29,8 @@ Three ``@triton.jit`` functions for rank-2 and rank-1 sources:
                               reshaped to rank-1 ``[BLOCK_ROWS]`` before
                               storing back to a 1D output buffer.
 
-Four ``@triton.jit`` functions for rank-N (N ≥ 3) sources:
+Six ``@triton.jit`` functions for rank-N (N ≥ 3) sources — four gathers and
+two write-back mirrors:
 
 - :func:`gather_3d_kernel`       — rank-3 source ``[M, BLOCK_SIZE, HEAD_DIM]``;
                                     block-fetch gather shape.
@@ -51,6 +52,23 @@ Four ``@triton.jit`` functions for rank-N (N ≥ 3) sources:
 - :func:`scatter_3d_kernel`      — write-back mirror of :func:`gather_3d_kernel`.
 - :func:`scatter_3d_partial_kernel` — write-back mirror of
                                        :func:`gather_3d_partial_kernel`.
+
+Three ``@triton.jit`` functions driven by a rank-2 index *grid* rather than a
+1D index list. The index buffer is an ``S0 x S1`` grid of row positions (e.g.
+one page per ``(sequence, head)`` pair), so the gather fans out one source row
+per grid cell and the result gains a rank:
+
+- :func:`gather_2d_index_kernel`          — rank-2 source, rank-2 index grid;
+                                             ``result[i, j, :] =
+                                             in[idx[i, j], y : y+BLOCK_COLS]``.
+- :func:`gather_scatter_2d_index_kernel`  — round-trip: gathers with the rank-2
+                                             index grid, then scatters the same
+                                             tile back to the same indexed rows.
+- :func:`gather_2d_index_3d_block_kernel` — composes both relaxations: rank-2
+                                             index grid *and* a rank-3
+                                             descriptor block
+                                             ``[1, BLOCK_H, D]``, giving a
+                                             rank-4 result tile.
 """
 
 import triton
@@ -70,7 +88,7 @@ def gather_kernel(
 ):
     """Single-program gather: pull K_INDICES rows from a [M, N] source matrix.
 
-    Vocabulary (matches ``docs/tiling_concepts.md``):
+    Vocabulary (matches ``meta.py``):
 
     - **Source matrix** ``in[M, N]`` — the data being read from. Conceptually
       a "vocabulary table" or "page pool"; rows are the gather targets.
@@ -108,8 +126,8 @@ def gather_kernel(
       emits ``tt.splat`` + ``tt.addptr`` + ``tt.load`` on a tensor of
       ``!tt.ptr<i32>``. The Spyre ``LowerComputeOps`` pass cannot lower
       that (``linalg.fill`` rejects ``!tt.ptr`` operands). A descriptor
-      load lowers cleanly through ``LowerDescriptorMemory``, so we use
-      that pattern here. See ``docs/gather.md`` for the full discussion.
+      load lowers cleanly through ``LowerDescriptorMemory``, which is why
+      the index array is fetched that way here.
     """
     # 1. Load the K_INDICES row indices via a 1D descriptor.
     #    Workaround for the raw-pointer load gap — see docstring.
@@ -831,9 +849,8 @@ def gather_2d_index_kernel(
         result[i, j, :] = in[idx[i, j], y_offset : y_offset + BLOCK_COLS]
 
     Lowers to a single ``ktdp.construct_indirect_access_tile`` whose
-    indirect base dim carries a 2-D address into the index view (see
-    ``docs/impl-strategy-2d-x-offsets.md``), then a ``ktdp.load`` of the
-    rank-3 ``[S0, S1, BLOCK_COLS]`` result tile.
+    indirect base dim carries a 2-D address into the index view, then a
+    ``ktdp.load`` of the rank-3 ``[S0, S1, BLOCK_COLS]`` result tile.
     """
     idx_desc = tl.make_tensor_descriptor(
         idx_ptr,

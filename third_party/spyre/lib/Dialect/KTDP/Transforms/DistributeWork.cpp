@@ -16,8 +16,7 @@
 // share the same grid rank / shape (the pass takes a single
 // ArrayRef<int64_t> grid option). This is fine for today's
 // one-kernel-per-module compilation model but needs a per-function
-// spyre.grid attribute before we compile mixed-rank modules. See
-// PLAN_kernel_examples.md G4.
+// spyre.grid attribute before mixed-rank modules can be compiled.
 //
 // Before:                              After:
 //   %px = tt.get_program_id x : i32      %px_i, %py_i = ktdp.get_compute_tile_id

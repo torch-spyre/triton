@@ -645,9 +645,8 @@ class TestDescriptorGather(LowerDescMemoryTester):
         # the x_offsets buffer and a region with the per-row subscript maps.
         #
         # x_offsets is staged via a 1-D descriptor_load — the only provenance
-        # the gather pattern accepts after the fallback removal (see
-        # docs/gather_fallback_deep_dive.md).  Spyre kernels always pass index
-        # buffers as !tt.ptr<i32> + tt.descriptor_load.
+        # the gather pattern accepts after the fallback removal.  Spyre kernels
+        # always pass index buffers as !tt.ptr<i32> + tt.descriptor_load.
         self.run(f"""
         module {{
           tt.func @k(%ptr: !tt.ptr<f16>,
@@ -1677,7 +1676,7 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
 # tt.descriptor_gather / scatter — 2-D (rank-N) x_offsets
 # =========================================================================
 #
-# STATUS: implemented (Steps 1–4 of docs/impl-strategy-2d-x-offsets.md).
+# STATUS: implemented.
 #
 # The N-D relaxation (#8) widened the *descriptor block* and *result* to
 # rank ≥ 2 but kept ``x_offsets`` strictly 1-D.  The rank-K relaxation lets
@@ -1702,7 +1701,6 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
 # an indirect subscript map's result count to equal the index memref rank
 # (KtdpOps.cpp).  So the printed access tile has R subscripts (one per base
 # dim), of which the first is ``ind(idx[c_x0 + d_0, ..., c_x{K-1} + d_{K-1}])``.
-# See ``docs/impl-strategy-2d-x-offsets.md``.
 
 class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
     """Lowering of ``tt.descriptor_gather`` / ``tt.descriptor_scatter`` with a

@@ -22,7 +22,7 @@ tiles_per_core = tl.cdiv(num_tiles, num_cores)
 start = pid * tiles_per_core
 ```
 
-<sup>Source: `third_party/spyre/test/test_distribute_work.py:585` (`TestNumProgramsFold1D.test_addi_rhs_is_constant_32`)</sup>
+<sup>Source: `third_party/spyre/test/test_distribute_work.py:584` (`TestNumProgramsFold1D.test_addi_rhs_is_constant_32`)</sup>
 
 ### Rejected
 
@@ -48,7 +48,7 @@ Expected diagnostics:
 - `never tt.get_program_id`
 - `without locating itself in the grid`
 
-<sup>Source: `third_party/spyre/test/test_distribute_work.py:656` (`TestNumProgramsWithoutPidErrors.test_errors`)</sup>
+<sup>Source: `third_party/spyre/test/test_distribute_work.py:655` (`TestNumProgramsWithoutPidErrors.test_errors`)</sup>
 
 **Round-trip evidence**
 

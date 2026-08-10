@@ -2,10 +2,9 @@
 
 Exercises ``tl.descriptor_gather`` — indirect row-indexed loads via a
 1D index tensor.  The compile path lowers to
-``ktdp.construct_indirect_access_tile`` + ``ktdp.load`` (see
-``docs/gather.md``).
+``ktdp.construct_indirect_access_tile`` + ``ktdp.load``.
 
-Vocabulary (matches ``kernel.py`` and ``docs/tiling_concepts.md``):
+Vocabulary (matches ``kernel.py``):
 
   - ``M``, ``N``         — source matrix dims (rows, cols)
   - ``K_INDICES``        — number of rows to gather
@@ -499,7 +498,6 @@ def run_scatter_3d_partial(inputs: dict) -> np.ndarray:
 # These drive ``gather_2d_index_kernel`` / ``gather_scatter_2d_index_kernel``,
 # which take a 2-D (S0 x S1) index *grid* rather than a 1-D index list. The
 # index buffer is shaped [S0, S1]; the gather result is [S0, S1, BLOCK_COLS].
-# See docs/impl-strategy-2d-x-offsets.md.
 # ---------------------------------------------------------------------------
 
 def _make_inputs_2d_index(
@@ -586,7 +584,6 @@ def run_2d_index_roundtrip(inputs: dict) -> np.ndarray:
 # the [0,0,0,0] corner of a [IS0, IS1, D1, D2] output table. ``y_offset`` is
 # non-zero, exercising the direct subscript on the inner (D1) axis. f16 source
 # (a pure indexed copy, so the oracle compares bit-exactly).
-# See docs/impl-strategy-2d-x-offsets.md.
 # ---------------------------------------------------------------------------
 
 def _make_inputs_2d_index_4d_out(
@@ -1431,7 +1428,7 @@ VARIANTS = {
     # an S0 x S1 index grid (no K_INDICES; adds S0/S1).  These are the
     # numerical oracles for the rank-K x_offsets relaxation — they confirm
     # the K-D indirect read (and scatter write) executes with correct
-    # numerics on ktir_cpu.  See docs/impl-strategy-2d-x-offsets.md.
+    # numerics on ktir_cpu.
     # ------------------------------------------------------------------
     "2d_index_gather": {
         # 8x4 index grid → gather a [8, 4, 32] tile from a [1024, 64]

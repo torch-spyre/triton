@@ -1,19 +1,32 @@
 """SIGNATURE + VARIANTS + reference oracle + input generators for matmul.
 
-Eight variants exercise ``tt.dot`` → ``linalg.matmul`` at increasing complexity.
-Two grid styles:
+Twelve variants exercise ``tt.dot`` → ``linalg.matmul`` (rank-2 operands) or
+``linalg.batch_matmul`` (rank-3 operands) at increasing complexity.
+Three groups:
 
 1D-grid variants (loop-distributed):
 - ``default``       -- 2D static
 - ``dynamic``       -- 2D dynamic
 - ``bmm``           -- batched 3D static
 - ``bmm_dynamic``   -- batched 3D dynamic
+- ``bmm_multi_bm``  -- batched, sized so each core's flattened batch×M loop
+                       runs several iterations rather than exactly one
 
 Multi-axis grid variants (one tile per core):
 - ``2d_grid``           -- 2D grid, static
 - ``2d_grid_dynamic``   -- 2D grid, dynamic
+- ``2d_grid_both_axes`` -- 2D grid sized so the M and N distribution loops
+                           both run multi-iteration at the same time
 - ``bmm_3d_grid``       -- 3D grid BMM, static
 - ``bmm_3d_grid_dynamic`` -- 3D grid BMM, dynamic
+
+Pointer-arithmetic descriptor variants — per-batch descriptors built on a
+``tt.addptr``-advanced base pointer instead of directly on the argument.
+Both are currently ``disabled``: ``tt.addptr`` into
+``tt.make_tensor_descriptor`` is not yet lowered by ``LowerDescriptorMemory``
+(pinned by ``test_lower_desc_memory.py::TestAddptrIntoDescriptor``).
+- ``bmm_addptr``         -- batched addptr descriptors, static
+- ``bmm_addptr_dynamic`` -- batched addptr descriptors, dynamic
 
 See ``fixtures/README.md`` for the field reference and discovery rules.
 """

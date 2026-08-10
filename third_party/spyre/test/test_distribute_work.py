@@ -483,8 +483,7 @@ class TestGridRankMismatchTooLong(DistributeWorkTester):
 #
 # The pass takes one grid per run, so both functions must agree on
 # dimensionality. Each function gets its own ktdp op and its own grid
-# attribute. Per-function grid override is a follow-up (see
-# PLAN_kernel_examples.md G4).
+# attribute. Per-function grid override is a follow-up.
 # ---------------------------------------------------------------------------
 
 class TestMultipleFunctions(DistributeWorkTester):

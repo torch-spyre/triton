@@ -2,14 +2,21 @@
 
 Variants:
 
-all_reduce (default, f16):
+default (all_reduce, f32):
   Flat 1D grid of 8 tiles, 4 row-groups × 2 x-tiles per group.  Every tile
   loads a column-block partial; all tiles in the same group cooperate via
   ``tl.inter_tile(mode="all_reduce")`` so each receives the fully-reduced sum.
   ``work_slices[tile_id]["x"]`` is the group label (0–3); ``W["x"]=4``,
   ``gsize=2``.
 
-reduce_to_one (splitk):
+softmax (all_reduce, f16):
+  Row-wise softmax over a 32-tile grid, 2 out-groups × 16 mb-tiles.  Each
+  core owns a ``[BLOCK_ROWS, BLOCK_COLS]`` column-block and runs two
+  cross-tile all-reduces over the mb-axis — one for the row max, one for the
+  row sum — to turn per-column-block partials into true per-row values.  The
+  grid exactly covers ``[M, N]``, so no distribution loop is needed.
+
+splitk (reduce_to_one, f32):
   Split-K matmul C[M,N]=A[M,K]@B[K,N].  K split across ``NUM_IN_TILES=2``
   tiles per output block; each tile accumulates its K-shard partial and
   contributes it via ``tl.inter_tile(mode="reduce_to_one")`` on the in-axis.

@@ -1,7 +1,7 @@
 //===- LowerComputeOps.cpp - Lower tt compute ops to linalg/tensor --------===//
 //
 // Lowers Triton compute ops to linalg and tensor dialect.
-// Patterns are organized into groups (see managing_compute_ops.md):
+// Patterns are organized into groups:
 //
 //   Group A — Shape manipulation (no compute, 1:1 structural rewrites)
 //   Group B — Reduction (combiner region, identity element)

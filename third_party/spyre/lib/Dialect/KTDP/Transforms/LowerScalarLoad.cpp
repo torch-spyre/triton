@@ -260,10 +260,9 @@ struct LowerScalarLoadPass
 
     // ---- Precondition check: a masked scalar `tt.load`'s mask must be a
     // compile-time constant. Spyre has no user-programmable control-flow
-    // divergence (see wiki/foundations/hardware/execution-model.md), so a
-    // mask whose value could depend on runtime data — including a
-    // comparison of two constants, which this deliberately does not fold
-    // — cannot be lowered.
+    // divergence, so a mask whose value could depend on runtime data —
+    // including a comparison of two constants, which this deliberately does
+    // not fold — cannot be lowered.
     auto preCheck = module.walk([&](triton::LoadOp op) -> WalkResult {
       if (!isScalarPtr(op.getPtr()) || !op.getMask())
         return WalkResult::advance();

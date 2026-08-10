@@ -122,10 +122,12 @@ from utils import (  # noqa: E402
 #   extra_checks  : optional (tester) -> None for variant-specific asserts
 #   xfail_numerical : optional str | dict for the numerical-test xfail mark
 #
-# Deferred (DISCUSSION_kernel_examples.md): the ``constexprs`` grammar
-# currently supports only ``dict[str, scalar]``. List-valued keys for
-# Cartesian sweeps and list[dict] for heterogeneous concat will land when
-# rms_norm or matmul need parameter sweeps.
+# The ``constexprs`` grammar supports only ``dict[str, scalar]`` — each entry
+# names one arg to bake into TTIR as a single compile-time constant. Sweeping
+# which value a combination uses is a separate mechanism, the ``params`` dict
+# (see _expand_params below), which already supports multi-value lists and
+# Cartesian expansion across them. List-valued ``constexprs`` keys and
+# list[dict] for heterogeneous concat remain unimplemented.
 # ---------------------------------------------------------------------------
 
 

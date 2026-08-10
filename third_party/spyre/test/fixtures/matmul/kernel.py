@@ -1,7 +1,7 @@
 """Matmul kernels: 2D and batched (BMM).
 
-Five @triton.jit functions exercising tt.dot -> linalg.matmul with tensor
-descriptors. Two grid styles:
+Six @triton.jit functions exercising tt.dot -> linalg.matmul (rank-2 operands)
+or linalg.batch_matmul (rank-3 operands) with tensor descriptors. Three groups:
 
 1D-grid kernels — one axis distributes work via an explicit loop:
 - matmul_kernel          -- 2D: C[M,N] = A[M,K] @ B[K,N], pid distributes M
@@ -12,6 +12,11 @@ Multi-axis grid kernels — each grid axis distributes work via a loop:
 - matmul_kernel_2d_grid  -- 2D grid: pid_0 loops M-tiles, pid_1 loops N-tiles
 - bmm_matmul_kernel_3d_grid -- 3D grid: pid_0 loops B-tiles, pid_1 loops M-tiles,
                                pid_2 loops N-tiles
+
+Pointer-arithmetic descriptor construction — exercises the addptr-into-
+descriptor path instead of a direct tl.make_tensor_descriptor on the argument:
+- bmm_matmul_kernel_addptr -- batched matmul whose per-batch descriptors are
+                              built on a tt.addptr-advanced base pointer
 """
 
 import triton
