@@ -266,8 +266,7 @@ def ConvertFunctions : Pass<"convert-ttir-functions", "mlir::ModuleOp"> {
     }];
 
     let dependentDialects = [
-        "mlir::func::FuncDialect",
-        "mlir::arith::ArithDialect"
+        "mlir::func::FuncDialect"
     ];
 }
 

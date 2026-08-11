@@ -56,6 +56,11 @@ func.func @three_addrs(%a: index, %b: index, %c: index) {
 // A private function is untouched. A private helper is not a kernel boundary —
 // its arguments come from its caller, not from the runtime — so both `index`
 // args survive even though the pass has three addresses to spend.
+//
+// The input is written directly as func.func to keep this test to the one pass
+// it names. ConvertFunctions preserves the `private` marker on the way here, so
+// a tt.func private reaching this pass arrives still private; the marker's
+// survival is pinned in Conversion/convert-functions.mlir.
 
 // CHECK-LABEL:   func.func private @helper(
 // CHECK-SAME:      %[[ARG_0:.*]]: index,
