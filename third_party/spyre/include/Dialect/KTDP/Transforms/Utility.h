@@ -43,6 +43,29 @@ Value getBasePtrAsIndex(OpBuilder &builder, Location loc, Value basePtr);
 /// materialized constant.
 std::optional<int64_t> getConstantInt(Value v);
 
+/// Build a `tensor.empty` of `type` — an uninitialized tensor used as the
+/// `outs` operand of a destination-passing-style op, where it supplies the
+/// result shape but no initial element values.
+///
+/// `type` must be statically shaped. For a type with dynamic dimensions, use
+/// the overload below, which takes the value to measure them from.
+Value createEmptyTensor(OpBuilder &builder, Location loc,
+                        RankedTensorType type);
+
+/// Build a `tensor.empty` of `type`, taking the extent of each dynamic
+/// dimension from the corresponding dimension of `shapeSource` via
+/// `tensor.dim`.
+///
+/// `tensor.empty` needs one size operand per dynamic dimension, so a type such
+/// as `tensor<?x4xf32>` cannot be built from the type alone. `shapeSource` must
+/// have the same rank as `type` and must dominate the insertion point; passing
+/// a value the op being rewritten already uses satisfies both by construction.
+/// Statically sized dimensions are taken from `type` and no `tensor.dim` is
+/// emitted for them, so a fully static `type` produces the same op as the
+/// overload above.
+Value createEmptyTensor(OpBuilder &builder, Location loc,
+                        RankedTensorType type, Value shapeSource);
+
 } // namespace mlir::triton::ktdp
 
 #endif // KTDP_TRANSFORMS_UTILITY_H

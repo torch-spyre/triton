@@ -54,6 +54,16 @@ class SpyreOptions:
     # spyre.passes.ttir_to_ktdp.
     #
     #   required_fixes = {"convert_elementwise_to_linalg": "lower_compute_ops"}
+    #
+    # Choose the anchor by what the fix depends on. A pass that repairs IR its
+    # anchor produces must run after it, and anchoring earlier silently does
+    # nothing — unalias_linalg_outs anchors on convert_elementwise_to_linalg for
+    # exactly that reason. Other fixes may instead need to land before a later
+    # consumer.
+    #
+    # The anchor must be one of _CORE_PIPELINE_PASSES. Any other name — a typo,
+    # or a plausible-looking "distribute_work" — is silently ignored and the fix
+    # never runs. A missing pass *binding* raises; a bad *anchor* does not.
     required_fixes: Mapping[str, str] = field(default_factory=dict)
     lx_size: int = 2 * 1024 * 1024  # 2 MB scratchpad per core
     # HBM data layout: "device" (stickified row-major physical strides) or

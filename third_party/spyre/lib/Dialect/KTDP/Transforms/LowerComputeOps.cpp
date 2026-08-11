@@ -40,12 +40,6 @@ namespace {
 // Helpers
 //===----------------------------------------------------------------------===//
 
-static Value createEmptyTensor(OpBuilder &b, Location loc,
-                               RankedTensorType type) {
-  return tensor::EmptyOp::create(b, loc, type.getShape(),
-                                 type.getElementType());
-}
-
 /// Returns the identity attribute for a reduction combiner op.
 /// Returns std::nullopt if the combiner op is not recognised.
 static std::optional<TypedAttr>
@@ -106,7 +100,8 @@ struct ConvertTTSplat : public OpConversionPattern<triton::SplatOp> {
   matchAndRewrite(triton::SplatOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
-    Value empty = createEmptyTensor(rewriter, op.getLoc(), resultType);
+    Value empty = mlir::triton::ktdp::createEmptyTensor(rewriter, op.getLoc(),
+                                                        resultType);
     auto fill = linalg::FillOp::create(rewriter, op.getLoc(),
                                        adaptor.getSrc(), empty);
     rewriter.replaceOp(op, fill.getResult(0));
@@ -252,7 +247,8 @@ struct ConvertTTTrans : public OpConversionPattern<triton::TransOp> {
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
-    Value empty = createEmptyTensor(rewriter, loc, resultType);
+    Value empty =
+        mlir::triton::ktdp::createEmptyTensor(rewriter, loc, resultType);
 
     SmallVector<int64_t> perm(op.getOrder().begin(), op.getOrder().end());
     auto transpose = linalg::TransposeOp::create(
