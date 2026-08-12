@@ -640,9 +640,18 @@ struct RewriteDescriptorLayoutPass
   // forms whose shape contract this function encodes. It returns true for
   // anything else, so callers must filter rather than pass the whole module;
   // see the Phase 3a walk.
+  // Operand number of `ktdp.store`'s data tile. The store branch of
+  // `stillNeedsRepair` does not read its `operandIndex` argument — it reaches both
+  // operands by accessor name — so the caller has to pick which operand number the
+  // resulting diagnostic names. The data tile is the correct one: it is the operand
+  // physicalization leaves at logical rank while the access tile is rewritten.
+  static constexpr unsigned kStoreDataTileIndex = 0;
+
   static bool stillNeedsRepair(Operation *op, unsigned operandIndex) {
     // A store is valid exactly when its data tile and access tile shapes agree;
-    // this is the condition StoreOp::verify() enforces.
+    // this is the condition StoreOp::verify() enforces. Whole-op, not per-operand:
+    // `operandIndex` is unused here, so every operand number gives the same answer.
+    // The Phase 3a walk therefore asks once, with kStoreDataTileIndex.
     if (auto st = dyn_cast<mlir::ktdp::StoreOp>(op)) {
       auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
       auto tileTy =
@@ -1108,7 +1117,12 @@ struct RewriteDescriptorLayoutPass
     SmallVector<std::pair<Operation *, unsigned>> unrepaired;
     SmallVector<Operation *> misretyped;
     module.walk([&](Operation *op) {
-      if (!isa<mlir::ktdp::StoreOp, linalg::LinalgOp>(op))
+      if (isa<mlir::ktdp::StoreOp>(op)) {
+        if (stillNeedsRepair(op, kStoreDataTileIndex))
+          unrepaired.push_back({op, kStoreDataTileIndex});
+        return;
+      }
+      if (!isa<linalg::LinalgOp>(op))
         return;
       for (OpOperand &use : op->getOpOperands())
         if (stillNeedsRepair(op, use.getOperandNumber()))
