@@ -139,8 +139,9 @@ struct RewriteDescriptorLayoutPass
   // an elementwise op and false for one that also pins its result shape in its
   // own attributes. Phase 3 re-verifies these so a wrong assumption surfaces as
   // a layout diagnostic here rather than as a shape error from a later verifier
-  // that cannot mention layouts. Ops erased before Phase 3 are skipped via
-  // `getBlock()`.
+  // that cannot mention layouts. Phase 2 cannot erase these ops; the `getBlock()`
+  // tripwire in Phase 3a records why, and what would have to change if that stops
+  // holding.
   SmallVector<Operation *> retypedOps;
 
   // Resolved from the pass option: true = "device" (physical row-major strides),
@@ -651,9 +652,15 @@ struct RewriteDescriptorLayoutPass
       return dataTy.getShape() != tileTy.getShape();
     }
 
-    // A structured op is valid when each operand's rank matches the number of
+    // A structured op is valid when no operand's rank exceeds the number of
     // dimensions its indexing map consumes. A physicalized operand that was
     // never rebuilt carries extra stick dimensions beyond that.
+    //
+    // One-sided on purpose: physicalization only ever adds dimensions, so `>` is
+    // the only direction this pass can produce. A rank below the map's result
+    // count is also invalid, but linalg's own verifier reports it, naming both
+    // ranks — a better message than this one, which would blame layout repair for
+    // a mismatch no layout repair can fix.
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
       OpOperand &use = op->getOpOperand(operandIndex);
       auto ty = dyn_cast<RankedTensorType>(use.get().getType());
@@ -1106,9 +1113,16 @@ struct RewriteDescriptorLayoutPass
     // contradicting the op's own attributes, which is exactly what its verifier
     // checks. Diagnostics are suppressed so only this pass's message is emitted.
     for (Operation *op : retypedOps) {
-      // Phase 2's greedy driver erases ops (a dead candidate, or one it replaced),
-      // and `retypedOps` holds raw pointers recorded in Phase 1. Skip anything
-      // already detached rather than dereference a freed op.
+      // Tripwire, not a liveness test. Phase 2 cannot erase these ops: with
+      // `ExistingAndNewOps` strictness the driver's worklist admits only the
+      // seeded consumer candidates and newly inserted ops, so a retyped
+      // elementwise op never reaches the driver's DCE; folding and constant CSE
+      // are disabled, closing the remaining erase paths.
+      //
+      // Widening the candidate set does not make this check sufficient:
+      // `Operation::erase()` frees the op, so `getBlock()` would itself be the
+      // use-after-free. That needs a `notifyOperationErased` listener pruning
+      // `retypedOps`.
       if (!op->getBlock())
         continue;
       DiagnosticEngine::HandlerID id =
