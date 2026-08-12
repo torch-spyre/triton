@@ -1023,6 +1023,16 @@ struct RewriteDescriptorLayoutPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
+    // Drop state from a previous invocation. MLIR resets only its own
+    // `passState` between runs; fields of the derived class survive, so a
+    // PassManager reused across modules would reach Phase 3 holding
+    // `Operation *` into ops freed with the earlier module — and `retypedOps` is
+    // dereferenced there (`op->getBlock()`), not merely looked up.
+    physMemViewToMarker.clear();
+    rescaledLoops.clear();
+    physicalLoadToTransposePerm.clear();
+    retypedOps.clear();
+
     // Resolve the data-layout option. Reject anything unrecognized rather
     // than silently falling through to the "host" branch below — the pass is
     // also invocable directly (spyre-triton-opt), bypassing the frontend's
