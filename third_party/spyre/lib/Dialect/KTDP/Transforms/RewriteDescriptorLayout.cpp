@@ -1168,9 +1168,17 @@ struct RewriteDescriptorLayoutPass
       // for two ops in the same block. Unrepaired ops can sit in different blocks
       // (a store inside an scf.for and one outside it), so a block-relative
       // comparison is not a total order here.
-      llvm::sort(unrepaired, [](const auto &a, const auto &b) {
+      // `stable_sort` rather than `sort`: keys collide whenever two ops share a
+      // line, or when neither carries a resolvable position. An unstable sort
+      // leaves colliding entries in an arbitrary order, which would make a
+      // multi-error `-verify-diagnostics` test flaky.
+      llvm::stable_sort(unrepaired, [](const auto &a, const auto &b) {
         auto key = [](const auto &e) {
-          auto loc = mlir::dyn_cast<mlir::FileLineColLoc>(e.first->getLoc());
+          // `findInstanceOf` walks through Name/Fused/CallSite wrappers, which a
+          // frontend-generated kernel carries; a bare `dyn_cast` would miss the
+          // real position and collapse every key to (0, 0).
+          mlir::LocationAttr locAttr = e.first->getLoc();
+          auto loc = locAttr.findInstanceOf<mlir::FileLineColLoc>();
           return std::tuple<unsigned, unsigned, unsigned>{
               loc ? loc.getLine() : 0, loc ? loc.getColumn() : 0, e.second};
         };
