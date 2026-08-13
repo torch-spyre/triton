@@ -632,13 +632,17 @@ struct RewriteDescriptorLayoutPass
   // may still be retyped while rewriting a later one, so a mid-Phase-1 comparison
   // can see a mismatch that Phase 1 goes on to resolve.
   //
-  // An identity layout (phys_op all 0) is the common case that answers false:
-  // physical shape equals logical shape, so nothing moved and the op is already
-  // valid. A pointwise kernel therefore reaches Phase 3 with nothing to report.
+  // A layout that leaves the physical shape equal to the logical shape answers
+  // false, so a pointwise kernel reaches Phase 3 with nothing to report.
+  //
+  // Compares shapes, not ranks. Equal rank is not enough to conclude a store is
+  // fine: a layout can reorder or resize dimensions without adding any, and such a
+  // store is still invalid. See the store emit site, which reports both the
+  // equal-rank and differing-rank cases.
   //
   // PRECONDITION: `op` is a `ktdp.store` or a `linalg.LinalgOp` — the two op
-  // forms whose shape contract this function encodes. It returns true for
-  // anything else, so callers must filter rather than pass the whole module;
+  // forms whose shape contract this function encodes. It reports anything else,
+  // so callers must filter rather than pass the whole module;
   // see the Phase 3a walk.
   // Operand number of `ktdp.store`'s data tile. The store branch of
   // `stillNeedsRepair` does not read its `operandIndex` argument — it reaches both
@@ -647,19 +651,31 @@ struct RewriteDescriptorLayoutPass
   // physicalization leaves at logical rank while the access tile is rewritten.
   static constexpr unsigned kStoreDataTileIndex = 0;
 
+  // True for a `ktdp.store` whose data tile and access tile shapes disagree, which
+  // is the only reason a store appears in the unrepaired list.
+  //
+  // Exists so the emit site can give stores their own message. `RewriteStorePattern`
+  // is on the supported-consumer list, so calling a store an unsupported consumer
+  // would contradict the list printed in the same sentence.
+  static bool isUnrepairedStore(Operation *op) {
+    auto st = dyn_cast<mlir::ktdp::StoreOp>(op);
+    if (!st)
+      return false;
+    auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
+    auto tileTy =
+        dyn_cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
+    if (!dataTy || !tileTy)
+      return false;
+    return dataTy.getShape() != tileTy.getShape();
+  }
+
   static bool stillNeedsRepair(Operation *op, unsigned operandIndex) {
     // A store is valid exactly when its data tile and access tile shapes agree;
     // this is the condition StoreOp::verify() enforces. Whole-op, not per-operand:
     // `operandIndex` is unused here, so every operand number gives the same answer.
     // The Phase 3a walk therefore asks once, with kStoreDataTileIndex.
-    if (auto st = dyn_cast<mlir::ktdp::StoreOp>(op)) {
-      auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
-      auto tileTy =
-          dyn_cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
-      if (!dataTy || !tileTy)
-        return false;
-      return dataTy.getShape() != tileTy.getShape();
-    }
+    if (isa<mlir::ktdp::StoreOp>(op))
+      return isUnrepairedStore(op);
 
     // A structured op is valid when no operand's rank exceeds the number of
     // dimensions its indexing map consumes. A physicalized operand that was
@@ -1108,8 +1124,8 @@ struct RewriteDescriptorLayoutPass
     // The check reads only the final IR. It does not consult a record of what
     // Phase 1 skipped or what Phase 2 rebuilt, which is what lets it stay a
     // simple walk: a repair that happened leaves the shapes in agreement, so the
-    // op drops out on its own. An identity layout (phys_op all 0) never disagrees
-    // at all, so a pointwise kernel reaches here with nothing to report.
+    // op drops out on its own. A layout that moves nothing never disagrees in the
+    // first place, so a pointwise kernel reaches here with nothing to report.
     //
     // Scoped to the two op forms `stillNeedsRepair` encodes a shape contract for.
     // It reports anything else by default, so handing it the whole module would
@@ -1184,10 +1200,36 @@ struct RewriteDescriptorLayoutPass
         };
         return key(a) < key(b);
       });
-      for (auto [op, operandIndex] : unrepaired)
+      for (auto [op, operandIndex] : unrepaired) {
+        // Streaming a `Type` into a Diagnostic already wraps it in quotes, so the
+        // store format strings add none of their own — unlike the `OperationName`
+        // case at the end, which does.
+        if (isUnrepairedStore(op)) {
+          auto st = cast<mlir::ktdp::StoreOp>(op);
+          auto dataTy = cast<RankedTensorType>(st.getDataTile().getType());
+          auto tileTy =
+              cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
+          InFlightDiagnostic diag =
+              op->emitError("spyre_tensor_layout: store data tile ")
+              << dataTy << " and access tile " << tileTy;
+          // Split on rank because that is what `RewriteStorePattern` matches on, so
+          // the two branches correspond to "the pattern never looked at this store"
+          // and "the pattern looked and declined".
+          if (dataTy.getRank() == (int64_t)tileTy.getShape().size())
+            diag << " have equal rank but different shapes. The store sink pattern "
+                    "only rewrites a store whose operands differ in rank, so this "
+                    "layout is not supported on a store";
+          else
+            diag << " have different ranks. The store sink pattern rewrites this "
+                    "shape, but resolves the layout from the access tile, which "
+                    "carries no spyre_tensor_layout marker; annotate the descriptor "
+                    "this store writes to";
+          continue;
+        }
         op->emitError("spyre_tensor_layout: unsupported consumer '")
             << op->getName() << "' for a physicalized operand #" << operandIndex
             << "; contraction synthesis supports " << supportedConsumerNames();
+      }
       return signalPassFailure();
     }
 
