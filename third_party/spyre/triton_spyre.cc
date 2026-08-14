@@ -7,8 +7,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Ktdp/KtdpDialect.hpp"
-#include "Ktdp/KtdpOps.hpp"
+#include "ktir/Dialect/KTDP/KTDP.h"
+#include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
