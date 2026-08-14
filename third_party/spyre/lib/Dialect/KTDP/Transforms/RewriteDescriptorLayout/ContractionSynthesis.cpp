@@ -13,8 +13,8 @@
 #include "RewriteDescriptorLayout/PermutationUtils.h"
 #include "RewriteDescriptorLayout/Types.h"
 
-#include "Ktdp/KtdpOps.hpp"
-#include "Ktdp/KtdpTypes.hpp"
+#include "ktir/Dialect/KTDP/KTDP.h"
+#include "ktir/Dialect/KTDP/KTDPTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
