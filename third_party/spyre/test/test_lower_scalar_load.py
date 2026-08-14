@@ -346,7 +346,3 @@ class TestScalarLoad(LowerScalarLoadTester):
         """)
         self.assert_present("tt.load")
         self.assert_absent("ktdp.construct_memory_view")
-
-# Pass-ordering coverage for LowerScalarLoad running before
-# LowerDescriptorMemory lives in the lit test
-# Transforms/lower-scalar-load-feeds-descriptor-shape.mlir, not here.

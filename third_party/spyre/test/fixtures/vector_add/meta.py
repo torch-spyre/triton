@@ -322,7 +322,6 @@ VARIANTS = {
         "base":   "dynamic",
         "params": {"n_elements": [4096], "BLOCK_SIZE": [1024]},
     },
-    # EXPERIMENTAL — not wired into any dataflow-scheduler/DFIR path.
     "dynamic_from_scalar_load": {
         "base":         "dynamic",
         "kernel_fn":    kernel.add_kernel_scalar_dim,
@@ -340,7 +339,7 @@ VARIANTS = {
             "dynamic shape."
         ),
         "doc": (
-            "EXPERIMENTAL — not wired into any dataflow-scheduler/DFIR "
+            "not yet wired into any dataflow-scheduler/DFIR "
             "flow (`kDynamic` has no `AddressAssignment` / "
             "`NormalizeGridTo1D` path yet). `n_elements` is not a kernel "
             "argument here; it is read from `seqlen_ptr` with a scalar "
@@ -455,7 +454,6 @@ VARIANTS = {
             t.assert_result_type("ktdp.construct_memory_view", "2x64x64xf16"),
         ),
     },
-    # EXPERIMENTAL — not wired into any dataflow-scheduler/DFIR path.
     "2d_dynamic_from_scalar_load": {
         "base":         "2d",
         "kernel_fn":    kernel.add_kernel_2d_scalar_dim,
@@ -477,7 +475,7 @@ VARIANTS = {
             "descriptor's dynamic shape; `N` is chunked the same way."
         ),
         "doc": (
-            "EXPERIMENTAL — not wired into any dataflow-scheduler/DFIR "
+            "not yet wired into any dataflow-scheduler/DFIR "
             "flow (`kDynamic` has no `AddressAssignment` / "
             "`NormalizeGridTo1D` path yet). `M` is not a kernel argument "
             "here; it is read from `seqlen_ptr` with a scalar `tl.load`. "
