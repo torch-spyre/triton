@@ -99,8 +99,8 @@ static Value buildBaseMemoryView(OpBuilder &builder, Location loc,
   }
 
   auto memrefType = MemRefType::get(shape, elemType);
-  auto memSpaceAttr = mlir::ktdp::SpyreMemorySpaceAttr::get(
-      ctx, mlir::ktdp::SpyreMemorySpaceKind::HBM, /*core=*/-1);
+  auto memSpaceAttr = mlir::ktdp::MemorySpaceAttr::get(
+      ctx, mlir::ktdp::MemorySpaceKind::global, /*ct_id=*/-1);
 
   auto memView = mlir::ktdp::ConstructMemoryViewOp::create(
       builder, loc, memrefType, baseIndex,

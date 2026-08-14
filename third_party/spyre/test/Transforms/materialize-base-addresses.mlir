@@ -32,21 +32,21 @@
 // CHECK:           %[[VAL_0:.*]] = arith.constant 1024 : index
 // CHECK:           %[[VAL_1:.*]] = arith.constant 12288 : index
 // CHECK:           %[[VAL_2:.*]] = arith.constant 18432 : index
-// CHECK:           %[[VAL_3:.*]] = ktdp.construct_memory_view %[[VAL_0]], sizes: [32, 64], strides: [64, 1] {coordinate_set = #{{.*}}, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<32x64xf16>
-// CHECK:           %[[VAL_4:.*]] = ktdp.construct_memory_view %[[VAL_1]], sizes: [32, 64], strides: [64, 1] {coordinate_set = #{{.*}}, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<32x64xf16>
-// CHECK:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_2]], sizes: [32, 64], strides: [64, 1] {coordinate_set = #{{.*}}, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<32x64xf16>
+// CHECK:           %[[VAL_3:.*]] = ktdp.construct_memory_view %[[VAL_0]], sizes: [32, 64], strides: [64, 1] {coordinate_set = #{{.*}}, memory_space = #ktdp.memory_space<global>} : memref<32x64xf16>
+// CHECK:           %[[VAL_4:.*]] = ktdp.construct_memory_view %[[VAL_1]], sizes: [32, 64], strides: [64, 1] {coordinate_set = #{{.*}}, memory_space = #ktdp.memory_space<global>} : memref<32x64xf16>
+// CHECK:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_2]], sizes: [32, 64], strides: [64, 1] {coordinate_set = #{{.*}}, memory_space = #ktdp.memory_space<global>} : memref<32x64xf16>
 // CHECK:           return
 // CHECK:         }
 #set2d = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 63 >= 0)>
 func.func @three_addrs(%a: index, %b: index, %c: index) {
   %va = ktdp.construct_memory_view %a, sizes: [32, 64], strides: [64, 1] {
-      coordinate_set = #set2d, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set2d, memory_space = #ktdp.memory_space<global>
   } : memref<32x64xf16>
   %vb = ktdp.construct_memory_view %b, sizes: [32, 64], strides: [64, 1] {
-      coordinate_set = #set2d, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set2d, memory_space = #ktdp.memory_space<global>
   } : memref<32x64xf16>
   %vc = ktdp.construct_memory_view %c, sizes: [32, 64], strides: [64, 1] {
-      coordinate_set = #set2d, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set2d, memory_space = #ktdp.memory_space<global>
   } : memref<32x64xf16>
   return
 }
@@ -60,18 +60,18 @@ func.func @three_addrs(%a: index, %b: index, %c: index) {
 // CHECK-LABEL:   func.func private @helper(
 // CHECK-SAME:      %[[ARG_0:.*]]: index,
 // CHECK-SAME:      %[[ARG_1:.*]]: index) {
-// CHECK:           %[[VAL_0:.*]] = ktdp.construct_memory_view %[[ARG_0]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4xf16>
-// CHECK:           %[[VAL_1:.*]] = ktdp.construct_memory_view %[[ARG_1]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4xf16>
+// CHECK:           %[[VAL_0:.*]] = ktdp.construct_memory_view %[[ARG_0]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.memory_space<global>} : memref<4xf16>
+// CHECK:           %[[VAL_1:.*]] = ktdp.construct_memory_view %[[ARG_1]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.memory_space<global>} : memref<4xf16>
 // CHECK:           return
 // CHECK:         }
 // CHECK-NOT:     arith.constant
 #set1d = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>
 func.func private @helper(%a: index, %b: index) {
   %va = ktdp.construct_memory_view %a, sizes: [4], strides: [1] {
-      coordinate_set = #set1d, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1d, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   %vb = ktdp.construct_memory_view %b, sizes: [4], strides: [1] {
-      coordinate_set = #set1d, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1d, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   return
 }
@@ -88,22 +88,22 @@ func.func private @helper(%a: index, %b: index) {
 // CHECK:           %[[VAL_0:.*]] = arith.constant 1024 : index
 // CHECK:           %[[VAL_1:.*]] = arith.constant 12288 : index
 // CHECK:           %[[VAL_2:.*]] = arith.constant 18432 : index
-// CHECK:           %[[VAL_3:.*]] = ktdp.construct_memory_view %[[VAL_0]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4xf16>
-// CHECK:           %[[VAL_4:.*]] = ktdp.construct_memory_view %[[VAL_1]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4xf16>
-// CHECK:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_2]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4xf16>
+// CHECK:           %[[VAL_3:.*]] = ktdp.construct_memory_view %[[VAL_0]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.memory_space<global>} : memref<4xf16>
+// CHECK:           %[[VAL_4:.*]] = ktdp.construct_memory_view %[[VAL_1]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.memory_space<global>} : memref<4xf16>
+// CHECK:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_2]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.memory_space<global>} : memref<4xf16>
 // CHECK:           %[[VAL_6:.*]] = arith.addi %[[N]], %[[N]] : i32
 // CHECK:           return
 // CHECK:         }
 #set1db = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>
 func.func @trailing_scalar_survives(%a: index, %b: index, %c: index, %n: i32) {
   %va = ktdp.construct_memory_view %a, sizes: [4], strides: [1] {
-      coordinate_set = #set1db, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1db, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   %vb = ktdp.construct_memory_view %b, sizes: [4], strides: [1] {
-      coordinate_set = #set1db, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1db, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   %vc = ktdp.construct_memory_view %c, sizes: [4], strides: [1] {
-      coordinate_set = #set1db, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1db, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   %w = arith.addi %n, %n : i32
   return

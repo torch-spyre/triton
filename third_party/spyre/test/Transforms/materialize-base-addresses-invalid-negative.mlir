@@ -18,10 +18,10 @@
 // expected-error @below {{MaterializeBaseAddresses: base address 1 is negative (-8); addresses must be >= 0}}
 func.func @negative_address(%a: index, %b: index) {
   %va = ktdp.construct_memory_view %a, sizes: [4], strides: [1] {
-      coordinate_set = #set1d, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1d, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   %vb = ktdp.construct_memory_view %b, sizes: [4], strides: [1] {
-      coordinate_set = #set1d, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1d, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   return
 }

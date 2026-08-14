@@ -24,17 +24,17 @@ module {
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f32>, %[[VAL_1:.*]]: !tt.ptr<i32>, %[[VAL_2:.*]]: !tt.ptr<f32>) {
 // CHECK:           %[[VAL_3:.*]] = arith.constant 0 : i32
 // CHECK:           %[[VAL_4:.*]] = builtin.unrealized_conversion_cast %[[VAL_1]] : !tt.ptr<i32> to index
-// CHECK:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_4]], sizes: [32], strides: [1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<32xi32>
+// CHECK:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_4]], sizes: [32], strides: [1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.memory_space<global>} : memref<32xi32>
 // CHECK:           %[[VAL_6:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
 // CHECK:           %[[VAL_7:.*]] = builtin.unrealized_conversion_cast %[[VAL_0]] : !tt.ptr<f32> to index
-// CHECK:           %[[VAL_8:.*]] = ktdp.construct_memory_view %[[VAL_7]], sizes: [2, 512, 64], strides: [32768, 64, 1] {coordinate_set = #[[$ATTR_2]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<2x512x64xf32>
-// CHECK:           %[[VAL_9:.*]] = ktdp.construct_memory_view %[[VAL_7]], sizes: [512, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_3]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<512x128xf32>
+// CHECK:           %[[VAL_8:.*]] = ktdp.construct_memory_view %[[VAL_7]], sizes: [2, 512, 64], strides: [32768, 64, 1] {coordinate_set = #[[$ATTR_2]], memory_space = #ktdp.memory_space<global>} : memref<2x512x64xf32>
+// CHECK:           %[[VAL_9:.*]] = ktdp.construct_memory_view %[[VAL_7]], sizes: [512, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_3]], memory_space = #ktdp.memory_space<global>} : memref<512x128xf32>
 // CHECK:           %[[VAL_10:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
 // CHECK:           %[[VAL_11:.*]] = ktdp.construct_indirect_access_tile intermediate_variables(%[[VAL_12:.*]], %[[VAL_13:.*]], %[[VAL_14:.*]]) %[[VAL_8]][((%[[VAL_10]] + %[[VAL_12]] * 64 + %[[VAL_14]]) floordiv 64), ind(%[[VAL_5]]{{\[}}%[[VAL_6]] + %[[VAL_13]]]), ((%[[VAL_10]] + %[[VAL_12]] * 64 + %[[VAL_14]]) mod 64)] {variables_space_order = #[[$ATTR_0]], variables_space_set = #[[$ATTR_4]]} : memref<2x512x64xf32>, memref<32xi32> -> !ktdp.access_tile<2x32x64xindex>
 // CHECK:           %[[VAL_15:.*]] = ktdp.load %[[VAL_11]] : <2x32x64xindex> -> tensor<2x32x64xf32>
 // CHECK:           %[[VAL_16:.*]] = builtin.unrealized_conversion_cast %[[VAL_2]] : !tt.ptr<f32> to index
-// CHECK:           %[[VAL_17:.*]] = ktdp.construct_memory_view %[[VAL_16]], sizes: [2, 32, 64], strides: [2048, 64, 1] {coordinate_set = #[[$ATTR_4]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<2x32x64xf32>
-// CHECK:           %[[VAL_18:.*]] = ktdp.construct_memory_view %[[VAL_16]], sizes: [32, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_5]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<32x128xf32>
+// CHECK:           %[[VAL_17:.*]] = ktdp.construct_memory_view %[[VAL_16]], sizes: [2, 32, 64], strides: [2048, 64, 1] {coordinate_set = #[[$ATTR_4]], memory_space = #ktdp.memory_space<global>} : memref<2x32x64xf32>
+// CHECK:           %[[VAL_18:.*]] = ktdp.construct_memory_view %[[VAL_16]], sizes: [32, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_5]], memory_space = #ktdp.memory_space<global>} : memref<32x128xf32>
 // CHECK:           %[[VAL_19:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
 // CHECK:           %[[VAL_20:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
 // CHECK:           %[[VAL_21:.*]] = arith.constant 64 : index
@@ -95,15 +95,15 @@ module {
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f32>, %[[VAL_1:.*]]: !tt.ptr<i32>, %[[VAL_2:.*]]: !tt.ptr<f32>) {
 // CHECK:           %[[VAL_3:.*]] = arith.constant 0 : i32
 // CHECK:           %[[VAL_4:.*]] = builtin.unrealized_conversion_cast %[[VAL_1]] : !tt.ptr<i32> to index
-// CHECK:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_4]], sizes: [32], strides: [1] {coordinate_set = #[[$ATTR_7]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<32xi32>
+// CHECK:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_4]], sizes: [32], strides: [1] {coordinate_set = #[[$ATTR_7]], memory_space = #ktdp.memory_space<global>} : memref<32xi32>
 // CHECK:           %[[VAL_6:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
 // CHECK:           %[[VAL_7:.*]] = builtin.unrealized_conversion_cast %[[VAL_0]] : !tt.ptr<f32> to index
-// CHECK:           %[[VAL_8:.*]] = ktdp.construct_memory_view %[[VAL_7]], sizes: [512, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_8]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<512x128xf32>
+// CHECK:           %[[VAL_8:.*]] = ktdp.construct_memory_view %[[VAL_7]], sizes: [512, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_8]], memory_space = #ktdp.memory_space<global>} : memref<512x128xf32>
 // CHECK:           %[[VAL_9:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
 // CHECK:           %[[VAL_10:.*]] = ktdp.construct_indirect_access_tile intermediate_variables(%[[VAL_11:.*]], %[[VAL_12:.*]]) %[[VAL_8]][ind(%[[VAL_5]]{{\[}}%[[VAL_6]] + %[[VAL_11]]]), (%[[VAL_9]] + %[[VAL_12]])] {variables_space_order = #[[$ATTR_6]], variables_space_set = #[[$ATTR_9]]} : memref<512x128xf32>, memref<32xi32> -> !ktdp.access_tile<32x128xindex>
 // CHECK:           %[[VAL_13:.*]] = ktdp.load %[[VAL_10]] : <32x128xindex> -> tensor<32x128xf32>
 // CHECK:           %[[VAL_14:.*]] = builtin.unrealized_conversion_cast %[[VAL_2]] : !tt.ptr<f32> to index
-// CHECK:           %[[VAL_15:.*]] = ktdp.construct_memory_view %[[VAL_14]], sizes: [32, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_9]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<32x128xf32>
+// CHECK:           %[[VAL_15:.*]] = ktdp.construct_memory_view %[[VAL_14]], sizes: [32, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_9]], memory_space = #ktdp.memory_space<global>} : memref<32x128xf32>
 // CHECK:           %[[VAL_16:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
 // CHECK:           %[[VAL_17:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
 // CHECK:           %[[VAL_18:.*]] = ktdp.construct_access_tile %[[VAL_15]]{{\[}}%[[VAL_16]], %[[VAL_17]]] {access_tile_order = #[[$ATTR_6]], access_tile_set = #[[$ATTR_9]]} : memref<32x128xf32> -> !ktdp.access_tile<32x128xindex>

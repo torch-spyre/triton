@@ -21,7 +21,7 @@ module {
 // CHECK:           %[[VAL_7:.*]] = arith.index_cast %[[VAL_2]] : i32 to index
 // CHECK:           %[[VAL_8:.*]] = arith.index_cast %[[VAL_3]] : i64 to index
 // CHECK:           %[[VAL_9:.*]] = arith.index_cast %[[VAL_4]] : i64 to index
-// CHECK:           %[[VAL_10:.*]] = ktdp.construct_memory_view %[[VAL_5]], sizes: {{\[}}%[[VAL_6]], %[[VAL_7]]], strides: {{\[}}%[[VAL_8]], %[[VAL_9]]] {coordinate_set = #[[$ATTR_0]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<?x?xf16>
+// CHECK:           %[[VAL_10:.*]] = ktdp.construct_memory_view %[[VAL_5]], sizes: {{\[}}%[[VAL_6]], %[[VAL_7]]], strides: {{\[}}%[[VAL_8]], %[[VAL_9]]] {coordinate_set = #[[$ATTR_0]], memory_space = #ktdp.memory_space<global>} : memref<?x?xf16>
 // CHECK:           %[[VAL_11:.*]] = builtin.unrealized_conversion_cast %[[VAL_10]] : memref<?x?xf16> to !tt.tensordesc<128x64xf16>
 // CHECK:           tt.spyre_tensor_layout %[[VAL_11]] {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <128x64xf16>
 // CHECK:           tt.return
