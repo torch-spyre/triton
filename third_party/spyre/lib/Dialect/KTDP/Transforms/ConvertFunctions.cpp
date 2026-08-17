@@ -37,11 +37,23 @@ struct ConvertFunctionsPass
 
 private:
   /// tt.func -> func.func, preserving the body and the visibility marker.
+  ///
+  /// Reaches tt.func at any depth, not just the direct children of the
+  /// top-level module. tt.func is HasParent<"ModuleOp">, and a nested
+  /// builtin.module satisfies that, so a tt.func can legally sit deeper than
+  /// one level. Enumerating only direct children would skip it while
+  /// convertReturns below still rewrote its tt.return, leaving a tt.func whose
+  /// terminator is func.return — which fails verification, since tt.return is
+  /// HasParent<"FuncOp">. All three traversals in this pass must agree on which
+  /// functions they touch.
   void convertFunctions(ModuleOp module) {
-    // make_early_inc_range advances the iterator before the body runs, so
-    // erasing the current tt.func mid-iteration is safe.
-    for (auto ttFunc :
-         llvm::make_early_inc_range(module.getOps<triton::FuncOp>())) {
+    // Collect first, then rewrite. Erasing a tt.func inside the walk would
+    // invalidate the walker's cursor, because the erased op owns nested regions
+    // the walk is still traversing.
+    SmallVector<triton::FuncOp> ttFuncs;
+    module.walk([&](triton::FuncOp ttFunc) { ttFuncs.push_back(ttFunc); });
+
+    for (auto ttFunc : ttFuncs) {
       OpBuilder builder(ttFunc);
       auto funcOp =
           func::FuncOp::create(builder, ttFunc.getLoc(), ttFunc.getName(),
@@ -60,6 +72,7 @@ private:
       // setVisibility then *erases* the attribute on the result, because
       // SymbolTable::setSymbolVisibility drops it for Public. The round trip
       // collapsed private and nested to public.
+      //
       // "public" is the default and is left implicit, matching how MLIR prints
       // func.func: copying it verbatim would emit a redundant `public` marker
       // that no other func.func producer emits.

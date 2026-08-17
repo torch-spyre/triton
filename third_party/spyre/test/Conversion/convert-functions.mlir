@@ -248,3 +248,36 @@ tt.func public @multi_block_ptr_arg(%p: !tt.ptr<f32>) -> index {
 ^bb1:
   tt.return %i : index
 }
+
+// -----
+// A tt.func inside a nested builtin.module. tt.func is HasParent<"ModuleOp">,
+// which a nested module satisfies, so this is legal input. Every traversal in
+// the pass has to reach the same set of functions: converting only the direct
+// children of the top-level module while still rewriting tt.return everywhere
+// left a surviving tt.func whose terminator was func.return, which fails
+// verification because tt.return is HasParent<"FuncOp">.
+//
+// CHECK-NOT is hand-added, and pins that no tt.func or tt.return survives at
+// either depth. It is placed after the last positive check because it guards
+// the remainder of the output.
+
+// CHECK-LABEL:   func.func @outer_fn(
+// CHECK-SAME:  %[[VAL_0:.*]]: i32) -> i32 {
+// CHECK:           return %[[VAL_0]] : i32
+// CHECK:         }
+// CHECK:         module {
+// CHECK-LABEL:   func.func @inner_fn(
+// CHECK-SAME:  %[[VAL_0:.*]]: i32) -> i32 {
+// CHECK:           return %[[VAL_0]] : i32
+// CHECK:         }
+// CHECK-NOT:     tt.func
+// CHECK-NOT:     tt.return
+tt.func public @outer_fn(%arg0: i32) -> i32 {
+  tt.return %arg0 : i32
+}
+
+builtin.module {
+  tt.func public @inner_fn(%arg0: i32) -> i32 {
+    tt.return %arg0 : i32
+  }
+}
