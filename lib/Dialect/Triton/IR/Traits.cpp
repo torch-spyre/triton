@@ -80,6 +80,18 @@ OpTrait::impl::verifySameOperandsAndResultEncoding(Operation *op) {
 }
 
 LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
+  // --- START --- changed for spyre
+  // Both limits below are GPU artifacts, so the trait is gated as a unit: the
+  // element-count cap is a register / shared-memory budget, and the
+  // power-of-two requirement comes from LinearLayout / warp tiling. Spyre
+  // lowers tensors to KTIR/KTDP descriptors over HBM that the lowering re-tiles
+  // into access tiles, so a tensor's element count is not a resident footprint
+  // and neither limit applies. Mirrors the is_spyre() gating of the same two
+  // checks in validate_block_shape (python/triton/_utils.py).
+#ifdef TRITON_BUILD_TTIR_ONLY
+  (void)op;
+  return success();
+#else
   for (auto opType : op->getOperandTypes()) {
     if (auto tensorType = dyn_cast<RankedTensorType>(opType)) {
       int64_t numElements = 1;
@@ -89,16 +101,10 @@ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
         return op->emitError("Maximum allowed number of elements is ")
                << maxTensorNumElements << ", but " << *op
                << " has more than that";
-#ifndef TRITON_BUILD_TTIR_ONLY // --- added for spyre
-      // The power-of-two requirement is a GPU LinearLayout / warp-tiling
-      // artifact. Spyre (TTIR-only) lowers tensors to KTIR/KTDP descriptors that
-      // handle arbitrary sizes, so skip the pow2 check; the numel cap above
-      // still applies. Mirrors the is_spyre() frontend relaxations.
       if ((numElements & (numElements - 1)) != 0)
         return op->emitError("Number of elements must be power-of-two, but ")
                << *op << " doesn't follow the rule (" << numElements << ")"
                << " elements";
-#endif
     }
   }
   for (auto opType : op->getResultTypes()) {
@@ -110,19 +116,15 @@ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
         return op->emitError("Maximum allowed number of elements is ")
                << maxTensorNumElements << ", but " << *op
                << " has more than that";
-#ifndef TRITON_BUILD_TTIR_ONLY // --- added for spyre
-      // The power-of-two requirement is a GPU LinearLayout / warp-tiling
-      // artifact. Spyre (TTIR-only) lowers tensors to KTIR/KTDP descriptors that
-      // handle arbitrary sizes, so skip the pow2 check; the numel cap above
-      // still applies. Mirrors the is_spyre() frontend relaxations.
       if ((numElements & (numElements - 1)) != 0)
         return op->emitError("Number of elements must be power-of-two, but ")
                << *op << " doesn't follow the rule (" << numElements << ")"
                << " elements";
-#endif
     }
   }
   return success();
+#endif
+  // --- END --- changed for spyre
 }
 
 // Check that the Triton layouts on op's operands and return types are valid.

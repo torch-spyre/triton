@@ -9,11 +9,13 @@ in torch-spyre codegen and so has no ../triton test):
 
   * **Issue 1 — ``validate_block_shape`` (Python, ``triton/_utils.py``).**
     Per-element pow2 check reached via ``make_tensor_descriptor(block_shape=...)``.
-    Skipped when ``target_info.is_spyre()``; the numel cap still applies.
+    Skipped when ``target_info.is_spyre()``. The total-numel cap in the same
+    function is relaxed for Spyre as well, covered by ``test_max_numel.py``.
   * **Issue 2 — ``verifyTensorSize`` trait (C++, ``lib/Dialect/Triton/IR/Traits.cpp``).**
     Total-numel pow2 check on every op operand/result carrying ``TensorSizeTrait``.
-    Compiled out under ``TRITON_BUILD_TTIR_ONLY`` (the Spyre build), so a non-pow2
-    tensor op verifies. Exercised by parsing MLIR (parse runs the verifier).
+    The whole trait is compiled out under ``TRITON_BUILD_TTIR_ONLY`` (the Spyre
+    build) — its other limit, the element-count cap, is a GPU artifact too — so a
+    non-pow2 tensor op verifies. Exercised by parsing MLIR (parse runs the verifier).
   * Issue 3 — the reduction ``tl.arange`` range check (``semantic.py``) — is
     avoided in torch-spyre by not emitting the reduction preamble.
 
@@ -24,7 +26,7 @@ rejection is left intact (the relaxation must not leak to other backends).
 import tempfile
 
 import pytest
-from triton._utils import TRITON_MAX_TENSOR_NUMEL, validate_block_shape
+from triton._utils import validate_block_shape
 from triton.backends.compiler import GPUTarget
 from triton.language import target_info
 
@@ -93,12 +95,6 @@ class TestBlockShapePow2:
     def test_pow2_allowed_everywhere(self, as_backend, backend):
         as_backend(backend)
         assert validate_block_shape(self.POW2) == 4 * 128 * 64
-
-    def test_numel_cap_still_enforced_on_spyre(self, as_backend):
-        # Relaxing pow2 must not relax the maximum-numel cap.
-        as_backend("spyre")
-        with pytest.raises(ValueError, match="maximum tensor numel"):
-            validate_block_shape([TRITON_MAX_TENSOR_NUMEL + 1])
 
 
 # ---------------------------------------------------------------------------
