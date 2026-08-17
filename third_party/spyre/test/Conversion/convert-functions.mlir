@@ -216,7 +216,7 @@ tt.func public @mixed_signature(%p0: !tt.ptr<f32>, %n: i32, %p1: !tt.ptr<f16>) -
 
 // -----
 // No !tt.ptr argument at all: the signature is left exactly as it was. This is
-// the early-return path in finalizeFunctionSignatures.
+// the early-return path in retypePointerArgsToIndex.
 
 // CHECK-LABEL:   func.func @no_ptr_args(
 // CHECK-SAME:  %[[VAL_0:.*]]: i32, %[[VAL_1:.*]]: f32) -> i32 {

@@ -32,7 +32,7 @@ struct ConvertFunctionsPass
 
     convertFunctions(module);
     convertReturns(module);
-    finalizeFunctionSignatures(module);
+    retypePointerArgsToIndex(module);
   }
 
 private:
@@ -103,7 +103,10 @@ private:
     });
   }
 
-  void finalizeFunctionSignatures(ModuleOp module) {
+  /// Retype every !tt.ptr function parameter to index, and delete the
+  /// placeholder casts that stood between the parameter and its index-typed
+  /// uses.
+  void retypePointerArgsToIndex(ModuleOp module) {
     module.walk([&](func::FuncOp funcOp) {
       Block &entry = funcOp.getBody().front();
       OpBuilder builder(funcOp.getContext());
