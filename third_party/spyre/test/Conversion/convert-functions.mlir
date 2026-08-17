@@ -5,7 +5,7 @@
 // about what constitutes a good test! The CHECK should be
 // minimized and named to reflect the test intent.
 
-// RUN: spyre-triton-opt %s --convert-ttir-functions -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s -split-input-file --convert-ttir-functions | FileCheck %s
 
 // Tests for the --convert-ttir-functions pass: tt.func → func.func,
 // tt.return → func.return, and !tt.ptr function arguments → index.

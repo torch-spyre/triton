@@ -47,10 +47,25 @@ private:
           func::FuncOp::create(builder, ttFunc.getLoc(), ttFunc.getName(),
                                ttFunc.getFunctionType());
 
-      // func::FuncOp::create always produces a public function, so this must
-      // be unconditional: a private or nested tt.func would otherwise come out
-      // public, telling symbol-DCE and the inliner the opposite of the truth.
-      funcOp.setVisibility(ttFunc.getVisibility());
+      // func::FuncOp::create always produces a public function, so a non-public
+      // marker has to be copied deliberately: a private or nested tt.func would
+      // otherwise come out public, telling symbol-DCE and the inliner the
+      // opposite of the truth.
+      //
+      // The marker is copied as the raw sym_visibility attribute rather than
+      // via setVisibility(ttFunc.getVisibility()). tt.func declares
+      // sym_visibility as an ordinary OptionalAttr<StrAttr> and does not
+      // implement SymbolOpInterface, so getVisibility() does not read that
+      // attribute — it reports Public for every input. Passing that to
+      // setVisibility then *erases* the attribute on the result, because
+      // SymbolTable::setSymbolVisibility drops it for Public. The round trip
+      // collapsed private and nested to public.
+      // "public" is the default and is left implicit, matching how MLIR prints
+      // func.func: copying it verbatim would emit a redundant `public` marker
+      // that no other func.func producer emits.
+      if (auto visibility = ttFunc.getSymVisibilityAttr();
+          visibility && visibility.getValue() != "public")
+        funcOp.setSymVisibilityAttr(visibility);
 
       // Move the body rather than cloning it block by block. A move carries
       // every block, its arguments, and its successor references at once, so
