@@ -10,16 +10,16 @@
 //   runs first, while `%seqlen` is still an unconverted `tt.load`.
 //   `getConstantInt` can't see through it, so the descriptor's memory view
 //   is built with a dynamic size (`memref<?xf16>`). `LowerScalarLoad` then
-//   rewrites the scalar load to the rank-0 read chain and rewires the now-
-//   stale use of the old `tt.load` result (inside the memory view's
-//   dynamic-size operand) to the new `tensor.extract` result.
+//   rewrites the scalar load to the single-element 1-D read chain and
+//   rewires the now-stale use of the old `tt.load` result (inside the
+//   memory view's dynamic-size operand) to the new `tensor.extract` result.
 //
 // * The `--check-prefix=REVERSED` run uses the converse ordering —
 //   `LowerScalarLoad` runs alone, before `LowerDescriptorMemory` has seen
-//   the module. The scalar load is rewritten to the rank-0 read chain
-//   first, and the descriptor op -- not touched by this pass -- survives
-//   with its shape operand rewired from the (now-gone) `tt.load` result to
-//   the `tensor.extract` result.
+//   the module. The scalar load is rewritten to the single-element 1-D
+//   read chain first, and the descriptor op -- not touched by this pass --
+//   survives with its shape operand rewired from the (now-gone) `tt.load`
+//   result to the `tensor.extract` result.
 //
 // Together these pin that neither pass depends on the other having already
 // run. Companion Python test `test_dynamic_shape_from_scalar_load`
@@ -33,44 +33,45 @@
 // about what constitutes a good test! The CHECK should be
 // minimized and named to reflect the test intent.
 
-// REGULAR: #[[$ATTR_0:.+]] = affine_map<() -> ()>
-// REGULAR: #[[$ATTR_1:.+]] = affine_map<(d0) -> (d0)>
-// REGULAR: #[[$ATTR_2:.+]] = affine_set<() : (0 >= 0)>
-// REGULAR: #[[$ATTR_3:.+]] = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>
-// REGULAR: #[[$ATTR_4:.+]] = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+// REGULAR: #[[$ATTR_0:.+]] = affine_map<(d0) -> (d0)>
+// REGULAR: #[[$ATTR_1:.+]] = affine_set<(d0) : (d0 >= 0, -d0 >= 0)>
+// REGULAR: #[[$ATTR_2:.+]] = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>
+// REGULAR: #[[$ATTR_3:.+]] = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
 
-// REVERSED: #[[$ATTR_0:.+]] = affine_map<() -> ()>
-// REVERSED: #[[$ATTR_1:.+]] = affine_set<() : (0 >= 0)>
+// REVERSED: #[[$ATTR_0:.+]] = affine_map<(d0) -> (d0)>
+// REVERSED: #[[$ATTR_1:.+]] = affine_set<(d0) : (d0 >= 0, -d0 >= 0)>
 
 module {
 // REGULAR-LABEL:   tt.func @k(
 // REGULAR-SAME:  %[[VAL_0:.*]]: !tt.ptr<f16>, %[[VAL_1:.*]]: i32, %[[VAL_2:.*]]: !tt.ptr<i32>) {
 // REGULAR:           %[[VAL_3:.*]] = builtin.unrealized_conversion_cast %[[VAL_2]] : !tt.ptr<i32> to index
-// REGULAR:           %[[VAL_4:.*]] = ktdp.construct_memory_view %[[VAL_3]], sizes: [], strides: [] {coordinate_set = #[[$ATTR_2]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<i32>
-// REGULAR:           %[[VAL_5:.*]] = ktdp.construct_access_tile %[[VAL_4]][] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_2]]} : memref<i32> -> !ktdp.access_tile<index>
-// REGULAR:           %[[VAL_6:.*]] = ktdp.load %[[VAL_5]] : <index> -> tensor<i32>
-// REGULAR:           %[[VAL_7:.*]] = tensor.extract %[[VAL_6]][] : tensor<i32>
-// REGULAR:           %[[VAL_8:.*]] = arith.constant 1 : i64
-// REGULAR:           %[[VAL_9:.*]] = builtin.unrealized_conversion_cast %[[VAL_0]] : !tt.ptr<f16> to index
-// REGULAR:           %[[VAL_10:.*]] = arith.index_cast %[[VAL_7]] : i32 to index
-// REGULAR:           %[[VAL_11:.*]] = ktdp.construct_memory_view %[[VAL_9]], sizes: {{\[}}%[[VAL_10]]], strides: [1] {coordinate_set = #[[$ATTR_3]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<?xf16>
-// REGULAR:           %[[VAL_12:.*]] = builtin.unrealized_conversion_cast %[[VAL_11]] : memref<?xf16> to !tt.tensordesc<64xf16>
-// REGULAR:           %[[VAL_13:.*]] = arith.index_cast %[[VAL_1]] : i32 to index
-// REGULAR:           %[[VAL_14:.*]] = ktdp.construct_access_tile %[[VAL_11]]{{\[}}%[[VAL_13]]] {access_tile_order = #[[$ATTR_1]], access_tile_set = #[[$ATTR_4]]} : memref<?xf16> -> !ktdp.access_tile<64xindex>
-// REGULAR:           %[[VAL_15:.*]] = ktdp.load %[[VAL_14]] : <64xindex> -> tensor<64xf16>
+// REGULAR:           %[[VAL_4:.*]] = arith.constant 0 : index
+// REGULAR:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_3]], sizes: [1], strides: [1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1xi32>
+// REGULAR:           %[[VAL_6:.*]] = ktdp.construct_access_tile %[[VAL_5]]{{\[}}%[[VAL_4]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_1]]} : memref<1xi32> -> !ktdp.access_tile<1xindex>
+// REGULAR:           %[[VAL_7:.*]] = ktdp.load %[[VAL_6]] : <1xindex> -> tensor<1xi32>
+// REGULAR:           %[[VAL_8:.*]] = tensor.extract %[[VAL_7]]{{\[}}%[[VAL_4]]] : tensor<1xi32>
+// REGULAR:           %[[VAL_9:.*]] = arith.constant 1 : i64
+// REGULAR:           %[[VAL_10:.*]] = builtin.unrealized_conversion_cast %[[VAL_0]] : !tt.ptr<f16> to index
+// REGULAR:           %[[VAL_11:.*]] = arith.index_cast %[[VAL_8]] : i32 to index
+// REGULAR:           %[[VAL_12:.*]] = ktdp.construct_memory_view %[[VAL_10]], sizes: {{\[}}%[[VAL_11]]], strides: [1] {coordinate_set = #[[$ATTR_2]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<?xf16>
+// REGULAR:           %[[VAL_13:.*]] = builtin.unrealized_conversion_cast %[[VAL_12]] : memref<?xf16> to !tt.tensordesc<64xf16>
+// REGULAR:           %[[VAL_14:.*]] = arith.index_cast %[[VAL_1]] : i32 to index
+// REGULAR:           %[[VAL_15:.*]] = ktdp.construct_access_tile %[[VAL_12]]{{\[}}%[[VAL_14]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_3]]} : memref<?xf16> -> !ktdp.access_tile<64xindex>
+// REGULAR:           %[[VAL_16:.*]] = ktdp.load %[[VAL_15]] : <64xindex> -> tensor<64xf16>
 // REGULAR:           tt.return
 // REGULAR:         }
 
 // REVERSED-LABEL:   tt.func @k(
 // REVERSED-SAME:  %[[VAL_0:.*]]: !tt.ptr<f16>, %[[VAL_1:.*]]: i32, %[[VAL_2:.*]]: !tt.ptr<i32>) {
 // REVERSED:           %[[VAL_3:.*]] = builtin.unrealized_conversion_cast %[[VAL_2]] : !tt.ptr<i32> to index
-// REVERSED:           %[[VAL_4:.*]] = ktdp.construct_memory_view %[[VAL_3]], sizes: [], strides: [] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<i32>
-// REVERSED:           %[[VAL_5:.*]] = ktdp.construct_access_tile %[[VAL_4]][] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_1]]} : memref<i32> -> !ktdp.access_tile<index>
-// REVERSED:           %[[VAL_6:.*]] = ktdp.load %[[VAL_5]] : <index> -> tensor<i32>
-// REVERSED:           %[[VAL_7:.*]] = tensor.extract %[[VAL_6]][] : tensor<i32>
-// REVERSED:           %[[VAL_8:.*]] = arith.constant 1 : i64
-// REVERSED:           %[[VAL_9:.*]] = tt.make_tensor_descriptor %[[VAL_0]], {{\[}}%[[VAL_7]]], {{\[}}%[[VAL_8]]] : <f16>, <64xf16>
-// REVERSED:           %[[VAL_10:.*]] = tt.descriptor_load %[[VAL_9]]{{\[}}%[[VAL_1]]] : !tt.tensordesc<64xf16> -> tensor<64xf16>
+// REVERSED:           %[[VAL_4:.*]] = arith.constant 0 : index
+// REVERSED:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_3]], sizes: [1], strides: [1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1xi32>
+// REVERSED:           %[[VAL_6:.*]] = ktdp.construct_access_tile %[[VAL_5]]{{\[}}%[[VAL_4]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_1]]} : memref<1xi32> -> !ktdp.access_tile<1xindex>
+// REVERSED:           %[[VAL_7:.*]] = ktdp.load %[[VAL_6]] : <1xindex> -> tensor<1xi32>
+// REVERSED:           %[[VAL_8:.*]] = tensor.extract %[[VAL_7]]{{\[}}%[[VAL_4]]] : tensor<1xi32>
+// REVERSED:           %[[VAL_9:.*]] = arith.constant 1 : i64
+// REVERSED:           %[[VAL_10:.*]] = tt.make_tensor_descriptor %[[VAL_0]], {{\[}}%[[VAL_8]]], {{\[}}%[[VAL_9]]] : <f16>, <64xf16>
+// REVERSED:           %[[VAL_11:.*]] = tt.descriptor_load %[[VAL_10]]{{\[}}%[[VAL_1]]] : !tt.tensordesc<64xf16> -> tensor<64xf16>
 // REVERSED:           tt.return
 // REVERSED:         }
   tt.func @k(%ptr: !tt.ptr<f16>, %off: i32, %seqlen_ptr: !tt.ptr<i32>) {

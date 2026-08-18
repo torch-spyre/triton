@@ -7,7 +7,7 @@ lowering — pointer operand `!tt.ptr<ElemT>`, scalar result `ElemT`, as
 opposed to tensor-of-pointers `tt.load` (out of scope for this pass; see
 `[LowerPointerChainMemory]` in Passes.td).
 
-Each positive test asserts the rank-0 chain this pass emits:
+Each positive test asserts the single-element 1-D chain this pass emits:
     ktdp.construct_memory_view -> ktdp.construct_access_tile -> ktdp.load
     -> tensor.extract
 For masked loads, the mask must be a compile-time constant (a materialized
@@ -32,9 +32,9 @@ class LowerScalarLoadTester(SinglePassTester):
 # =========================================================================
 
 class TestScalarLoad(LowerScalarLoadTester):
-    # tt.load %ptr : !tt.ptr<ElemT> -> ElemT lowers to a rank-0 ktdp read.
-    # No tile/stride/shape logic — every intermediate op is rank 0, the
-    # structural floor of the ktdp.load contract.
+    # tt.load %ptr : !tt.ptr<ElemT> -> ElemT lowers to a single-element 1-D
+    # ktdp read: a single dim of extent 1, not rank 0 — rank-0 shaped types
+    # are not a supported interchange form downstream.
     #
     # test_bare_pointer                       — no addptr chain, no mask
     # test_addptr_chain_folded                — scalar tt.addptr offsets folded, no scaling
@@ -56,8 +56,8 @@ class TestScalarLoad(LowerScalarLoadTester):
 
         The pointer is cast straight to `index` (via `getBasePtrAsIndex`, an
         `unrealized_conversion_cast` that survives until `ConvertFunctions`)
-        and used directly as the rank-0 memory view's offset — no
-        `arith.addi` folding is needed since there's no `tt.addptr` chain.
+        and used directly as the single-element 1-D memory view's offset —
+        no `arith.addi` folding is needed since there's no `tt.addptr` chain.
 
         The loaded value is stored back out via `tt.store` (left untouched
         by this pass — raw scalar stores are out of scope), matching how a
@@ -76,17 +76,13 @@ class TestScalarLoad(LowerScalarLoadTester):
                              "ktdp.construct_access_tile",
                              "ktdp.load", "tensor.extract")
         self.assert_absent("tt.load")
-        # Rank 0: memref<f16> / tensor<f16>, no dims.
-        self.assert_result_type("ktdp.construct_memory_view", "memref<f16>")
-        self.assert_result("ktdp.load", shape=[], elem_type="f16")
-        # A rank-0 IntegerSet still needs one constraint to be constructible
-        # (IntegerSet::get derives its context from constraints[0], so a
-        # truly empty constraint list isn't valid) — the pass emits a
-        # trivially-true `0 >= 0` constraint as that placeholder.
+        # Single-element 1-D: memref<1xf16> / tensor<1xf16>, one dim of extent 1.
+        self.assert_result_type("ktdp.construct_memory_view", "memref<1xf16>")
+        self.assert_result("ktdp.load", shape=[1], elem_type="f16")
         self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
-                                num_dims=0, num_symbols=0, num_constraints=1)
+                                num_dims=1, num_symbols=0, num_constraints=2)
         self.assert_integer_set("ktdp.construct_access_tile", "access_tile_set",
-                                num_dims=0, num_symbols=0, num_constraints=1)
+                                num_dims=1, num_symbols=0, num_constraints=2)
         # Base pointer -> index via unrealized_conversion_cast, consumed
         # directly by construct_memory_view (no addptr chain to fold).
         self.assert_operand("ktdp.construct_memory_view", 0,
@@ -158,8 +154,8 @@ class TestScalarLoad(LowerScalarLoadTester):
     @pytest.mark.parametrize("elem", ["i32", "i16", "f16", "f32", "bf16"])
     def test_elem_type(self, elem):
         """The pass is not element-type-specific: integer and float types
-        of various widths all lower to the same rank-0 chain, just with a
-        different element type.
+        of various widths all lower to the same single-element 1-D chain,
+        just with a different element type.
         """
         self.run(f"""
         module {{
@@ -172,8 +168,8 @@ class TestScalarLoad(LowerScalarLoadTester):
         """)
         self.assert_present("ktdp.construct_memory_view", "ktdp.load")
         self.assert_absent("tt.load")
-        self.assert_result("ktdp.construct_memory_view", shape=[], elem_type=elem)
-        self.assert_result("ktdp.load", shape=[], elem_type=elem)
+        self.assert_result("ktdp.construct_memory_view", shape=[1], elem_type=elem)
+        self.assert_result("ktdp.load", shape=[1], elem_type=elem)
 
     @pattern("scalar-load-masked-constant-true", category="memory", example=[
         "x = tl.load(ptr, mask=True)  # compile-time-true guard, unconditional read",
@@ -330,8 +326,8 @@ class TestScalarLoad(LowerScalarLoadTester):
         Triton IR, since `PointerType::verify` only rejects tensor
         pointees, not pointer pointees) must be left legal/untouched, not
         matched by `isScalarPtr`. Only integer/float pointees are
-        lowerable: the rank-0 `memref`/`tensor` chain requires a
-        `MemRefElementTypeInterface` element type, and the zero-fallback
+        lowerable: the single-element 1-D `memref`/`tensor` chain requires
+        a `MemRefElementTypeInterface` element type, and the zero-fallback
         path requires `getZeroAttr` to have a case for it — neither holds
         for `PointerType`.
         """

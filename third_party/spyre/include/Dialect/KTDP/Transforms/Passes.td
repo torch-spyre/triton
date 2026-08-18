@@ -103,8 +103,9 @@ def LowerScalarLoad : Pass<"lower-scalar-load", "mlir::ModuleOp"> {
         Lowering:
         - scalar tt.addptr chain feeding the matched tt.load → folded into
           a single index offset (plain adds, no element-size scaling)
-        - scalar tt.load → rank-0 ktdp.construct_memory_view +
-          rank-0 ktdp.construct_access_tile + ktdp.load + tensor.extract
+        - scalar tt.load → single-element 1-D ktdp.construct_memory_view +
+          single-element 1-D ktdp.construct_access_tile + ktdp.load +
+          tensor.extract
         - masked scalar tt.load → the mask must be a compile-time constant
           (a materialized arith.constant i1); constant-true drops straight
           through to the unconditional read, constant-false skips the read

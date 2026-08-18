@@ -42,10 +42,11 @@ def _make_3d_checks(M, N, P, **_):
 
 def _make_1d_scalar_dim_checks(**_):
     def checks(t):
-        # Rank-0 scalar-read chain: construct_memory_view<memref<i32>> ->
-        # construct_access_tile<index> -> ktdp.load -> tensor.extract.
-        t.assert_result_type("ktdp.construct_memory_view", "memref<i32>")
-        t.assert_result_type("ktdp.construct_access_tile", "<index>")
+        # Single-element 1-D scalar-read chain: construct_memory_view
+        # <memref<1xi32>> -> construct_access_tile<1xindex> -> ktdp.load
+        # -> tensor.extract.
+        t.assert_result_type("ktdp.construct_memory_view", "memref<1xi32>")
+        t.assert_result_type("ktdp.construct_access_tile", "<1xindex>")
         t.assert_present("tensor.extract")
         # arith.index_cast bridges the extracted i32 to index before it
         # feeds the descriptor's dynamic size operand.
@@ -58,10 +59,11 @@ def _make_1d_scalar_dim_checks(**_):
 
 def _make_2d_scalar_dim_checks(N, **_):
     def checks(t):
-        # Rank-0 scalar-read chain: construct_memory_view<memref<i32>> ->
-        # construct_access_tile<index> -> ktdp.load -> tensor.extract.
-        t.assert_result_type("ktdp.construct_memory_view", "memref<i32>")
-        t.assert_result_type("ktdp.construct_access_tile", "<index>")
+        # Single-element 1-D scalar-read chain: construct_memory_view
+        # <memref<1xi32>> -> construct_access_tile<1xindex> -> ktdp.load
+        # -> tensor.extract.
+        t.assert_result_type("ktdp.construct_memory_view", "memref<1xi32>")
+        t.assert_result_type("ktdp.construct_access_tile", "<1xindex>")
         t.assert_present("tensor.extract")
         # arith.index_cast bridges the extracted i32 to index before it
         # feeds the descriptor's dynamic size operand.
@@ -345,19 +347,11 @@ VARIANTS = {
             "argument here; it is read from `seqlen_ptr` with a scalar "
             "`tl.load`. This is the 1D counterpart of "
             "`2d_dynamic_from_scalar_load` — the simplest form of the "
-            "rank-0 scalar-read chain (`construct_memory_view` / "
-            "`construct_access_tile` / `ktdp.load` / `tensor.extract`) "
+            "single-element 1-D scalar-read chain (`construct_memory_view` "
+            "/ `construct_access_tile` / `ktdp.load` / `tensor.extract`) "
             "feeding the dynamic-shape path via an `arith.index_cast` "
             "bridge, producing `memref<?xf32>`. Reuses the same oracle "
-            "as `dynamic` (via `make_inputs_scalar_dim`), but the "
-            "numerical check currently `xfail`s: `ktir_cpu`'s MLIR "
-            "frontend parser can't parse a rank-0 `memref<i32>` result "
-            "type."
-        ),
-        "xfail_numerical": (
-            "ktir_cpu's MLIRFrontendParser cannot parse a rank-0 "
-            "ktdp.construct_memory_view result type (memref<i32>): "
-            "ValueError: cannot parse dtype from 'memref<i32>'."
+            "as `dynamic` (via `make_inputs_scalar_dim`)."
         ),
         "extra_checks": _make_1d_scalar_dim_checks,
     },
@@ -483,19 +477,12 @@ VARIANTS = {
             "matching `add_kernel_2d_grid`'s naming and distribution "
             "pattern) so `N` is chunked across cores the same way the "
             "runtime `M` is, instead of walking a full row per core. "
-            "This exercises the rank-0 scalar-read chain "
+            "This exercises the single-element 1-D scalar-read chain "
             "(`construct_memory_view` / `construct_access_tile` / "
             "`ktdp.load` / `tensor.extract`) feeding the dynamic-shape "
             "path via an `arith.index_cast` bridge, producing "
             "`memref<?x32xf32>`. Reuses the same `x + y` oracle as `2d` "
-            "(via `make_inputs_2d_scalar_dim`), but the numerical check "
-            "currently `xfail`s: `ktir_cpu`'s MLIR frontend parser can't "
-            "parse a rank-0 `memref<i32>` result type."
-        ),
-        "xfail_numerical": (
-            "ktir_cpu's MLIRFrontendParser cannot parse a rank-0 "
-            "ktdp.construct_memory_view result type (memref<i32>): "
-            "ValueError: cannot parse dtype from 'memref<i32>'."
+            "(via `make_inputs_2d_scalar_dim`)."
         ),
         "extra_checks": _make_2d_scalar_dim_checks,
     },

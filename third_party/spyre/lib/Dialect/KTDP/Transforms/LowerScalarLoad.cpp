@@ -3,10 +3,13 @@
 // Lowers a *scalar* `tt.load` (pointer operand `!tt.ptr<ElemT>`, scalar
 // result `ElemT`) to the minimal legal KTDP read:
 //   tt.load %ptr [, %mask [, %other]]
-//     -> ktdp.construct_memory_view (rank 0)
-//     -> ktdp.construct_access_tile (rank 0)
-//     -> ktdp.load                  (-> tensor<ElemT>)
+//     -> ktdp.construct_memory_view (memref<1xElemT>)
+//     -> ktdp.construct_access_tile (!ktdp.access_tile<1xindex>)
+//     -> ktdp.load                  (-> tensor<1xElemT>)
 //     -> tensor.extract             (-> ElemT)
+// A single-element 1-D vector, not a rank-0 view/tile: rank-0 shaped types
+// are not a supported interchange form downstream, while a single-element
+// 1-D vector is.
 //
 // Spyre has no user-programmable control-flow divergence therefore
 // a data-dependent branch per lane is not expressible.
@@ -130,26 +133,30 @@ static Value resolveScalarAddress(OpBuilder &builder, Location loc,
   return baseIndex;
 }
 
-/// Emit the full rank-0 read: memory view -> access tile -> ktdp.load ->
-/// tensor.extract, returning the scalar `elemType` value. Built from the
-/// shared `buildMemoryView`/`buildAccessTile` helpers (also used by
-/// `LowerDescriptorMemory.cpp` and `RewriteDescriptorLayout.cpp`), with
-/// rank-0 arguments: no size/stride operands or attrs, no block indices.
+/// Emit the full single-element 1-D read: memory view -> access tile ->
+/// ktdp.load -> tensor.extract, returning the scalar `elemType` value.
+/// Built from the shared `buildMemoryView`/`buildAccessTile` helpers (also
+/// used by `LowerDescriptorMemory.cpp` and `RewriteDescriptorLayout.cpp`),
+/// with a single dim of extent 1 rather than rank 0 — rank-0 shaped types
+/// are not a supported interchange form downstream, while a single-element
+/// 1-D vector is. The one `arith.constant 0 : index` serves double duty, as
+/// both the tile's sole anchor index and the extract index.
 static Value emitScalarRead(OpBuilder &builder, Location loc,
                             Value baseIndex, Type elemType) {
   auto memSpaceAttr = mlir::ktdp::SpyreMemorySpaceAttr::get(
       builder.getContext(), mlir::ktdp::SpyreMemorySpaceKind::HBM,
       /*core=*/-1);
+  Value zero = arith::ConstantIndexOp::create(builder, loc, 0);
   Value memView = mlir::triton::ktdp::buildMemoryView(
-      builder, loc, baseIndex, /*staticSizes=*/{}, /*staticStrides=*/{},
+      builder, loc, baseIndex, /*staticSizes=*/{1}, /*staticStrides=*/{1},
       /*dynSizes=*/{}, /*dynStrides=*/{}, elemType, memSpaceAttr);
   Value accessTile = mlir::triton::ktdp::buildAccessTile(
-      builder, loc, memView, /*blockShape=*/{}, /*indices=*/{});
-  auto tensorType = RankedTensorType::get({}, elemType);
+      builder, loc, memView, /*blockShape=*/{1}, ValueRange{zero});
+  auto tensorType = RankedTensorType::get({1}, elemType);
   auto loadResult =
       mlir::ktdp::LoadOp::create(builder, loc, tensorType, accessTile);
   return tensor::ExtractOp::create(builder, loc, loadResult.getResult(),
-                                   ValueRange{})
+                                   ValueRange{zero})
       .getResult();
 }
 
