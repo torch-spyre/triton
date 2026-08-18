@@ -257,6 +257,12 @@ def ConvertFunctions : Pass<"convert-ttir-functions", "mlir::ModuleOp"> {
         Must run after all memory passes — they consume !tt.ptr args via
         getBasePtrAsIndex before this pass replaces them.
 
+        Precondition: every !tt.ptr function argument must be used only by
+        unrealized_conversion_cast ops. Replacing the argument with an index
+        fixes up those casts, but a user of any other kind would be left with a
+        wrongly typed operand, so the pass rejects that input with a diagnostic
+        instead of producing IR that fails verification.
+
         Lowering:
         - tt.func → func.func
         - tt.return → func.return

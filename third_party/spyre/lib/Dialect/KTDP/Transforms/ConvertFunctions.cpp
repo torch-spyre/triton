@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
 using namespace mlir;
@@ -30,12 +31,63 @@ struct ConvertFunctionsPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
+    // ---- Precondition check: every !tt.ptr function parameter must be
+    // consumed only by the placeholder casts the memory passes leave behind.
+    // Checked before anything is rewritten, so a rejected module is left
+    // untouched rather than partially converted.
+    if (failed(checkPointerArgsOnlyFeedCasts(module))) {
+      signalPassFailure();
+      return;
+    }
+
     convertFunctions(module);
     convertReturns(module);
     retypePointerArgsToIndex(module);
   }
 
 private:
+  /// Reject any !tt.ptr function parameter that is read by something other than
+  /// an unrealized_conversion_cast.
+  ///
+  /// retypePointerArgsToIndex below changes such a parameter's type to index and
+  /// folds away the casts that consumed it. It can only fix up the casts, so a
+  /// user of any other kind would be left holding an operand whose type changed
+  /// underneath it — the pass would report success and the verifier would then
+  /// fail on an op that did nothing wrong. Reaching this state means the memory
+  /// passes have not consumed the pointer via getBasePtrAsIndex, which is a pass
+  /// ordering error; the diagnostic says so rather than leaving the verifier to
+  /// blame the surviving op.
+  LogicalResult checkPointerArgsOnlyFeedCasts(ModuleOp module) {
+    // Both tt.func and func.func are checked: this pass accepts a module that
+    // already contains func.func (only tt.func is converted), and
+    // retypePointerArgsToIndex walks every func.func regardless of origin.
+    auto result = module.walk([](FunctionOpInterface fnOp) -> WalkResult {
+      if (fnOp.getFunctionBody().empty())
+        return WalkResult::advance();
+
+      for (BlockArgument arg : fnOp.getFunctionBody().front().getArguments()) {
+        if (!isa<triton::PointerType>(arg.getType()))
+          continue;
+
+        for (Operation *user : arg.getUsers()) {
+          if (isa<UnrealizedConversionCastOp>(user))
+            continue;
+          return user->emitError()
+                 << "cannot convert function signature: !tt.ptr argument #"
+                 << arg.getArgNumber() << " of '" << fnOp.getName()
+                 << "' is used by an op that is not an "
+                    "unrealized_conversion_cast, so replacing the argument "
+                    "with an index would leave this operand wrongly typed; the "
+                    "memory passes must consume every !tt.ptr use (via "
+                    "getBasePtrAsIndex) before this pass runs";
+        }
+      }
+      return WalkResult::advance();
+    });
+
+    return failure(result.wasInterrupted());
+  }
+
   /// tt.func -> func.func, preserving the body and the visibility marker.
   ///
   /// Reaches tt.func at any depth, not just the direct children of the
@@ -106,6 +158,10 @@ private:
   /// Retype every !tt.ptr function parameter to index, and delete the
   /// placeholder casts that stood between the parameter and its index-typed
   /// uses.
+  ///
+  /// Only the casts are fixed up, so this requires that a pointer parameter has
+  /// no other users. checkPointerArgsOnlyFeedCasts has already rejected the
+  /// module otherwise, which is what makes the unconditional setType below safe.
   void retypePointerArgsToIndex(ModuleOp module) {
     module.walk([&](func::FuncOp funcOp) {
       Block &entry = funcOp.getBody().front();
