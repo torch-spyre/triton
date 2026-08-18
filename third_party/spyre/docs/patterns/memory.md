@@ -614,9 +614,9 @@ desc = tl.make_tensor_descriptor(base, shape=[M, K], strides=[K, 1],
 
 Expected diagnostics:
 
-- `tt.addptr`
-- `must be ptr`
-- `got 'index'`
+- `cannot convert function signature`
+- `!tt.ptr argument #0`
+- `getBasePtrAsIndex`
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2490` (`TestAddptrIntoDescriptor.test_addptr_into_descriptor_fails`)</sup>
 
