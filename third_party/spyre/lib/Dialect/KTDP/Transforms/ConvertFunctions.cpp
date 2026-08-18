@@ -166,17 +166,14 @@ private:
   /// no other users. checkPointerArgsOnlyFeedCasts has already rejected the
   /// module otherwise, which is what makes the unconditional setType below safe.
   ///
-  /// An external function — a declaration with no body, which tt.func and
-  /// func.func both allow — is skipped. Its parameters live only in the
-  /// FunctionType, with no entry block to read them from, so there is nothing
-  /// here to retype. A !tt.ptr in a declaration's signature therefore survives
-  /// this pass; that is a separate gap from this function's contract, since
-  /// rewriting a declaration would also have to update every caller.
+  /// A declaration (a function with no body) is skipped: its parameters live
+  /// only in the FunctionType, so there is no entry block to retype. A !tt.ptr
+  /// in a declaration's signature therefore survives this pass — retyping one
+  /// would also mean updating every caller, which is out of scope here.
   void retypePointerArgsToIndex(ModuleOp module) {
     module.walk([&](func::FuncOp funcOp) {
-      // Guard before front(): front() on a region with no blocks is undefined
-      // behaviour, not a trapping error. Both walks in this pass must agree on
-      // skipping declarations.
+      // front() on a body with no blocks is undefined behaviour, not a
+      // trapping error, so guard before reading the entry block.
       if (funcOp.isExternal())
         return;
 

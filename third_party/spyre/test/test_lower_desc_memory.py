@@ -2467,10 +2467,10 @@ class TestAddptrIntoDescriptor(LowerDescMemoryTester):
     Current state: ``LowerDescriptorMemory`` lowers the descriptor ops
     via ``getBasePtrAsIndex``, which casts the base ``!tt.ptr`` operand
     to ``index``. The ``tt.addptr`` that computes that base is left
-    intact. When ``ConvertFunctions`` subsequently rewrites function
-    signatures (``!tt.ptr`` args → ``index``), ``tt.addptr``'s operand
-    becomes ``index`` but its verifier still demands ``!tt.ptr`` —
-    verification fails.
+    intact, still reading the ``!tt.ptr`` function argument.
+    ``ConvertFunctions`` can only fix up ``unrealized_conversion_cast``
+    users of that argument, so it rejects the module and the pipeline
+    fails.
 
     Fix plan: ``LowerDescriptorMemory`` should fold ``tt.addptr`` into
     the base/offset it passes to ``construct_memory_view`` (or
@@ -2526,11 +2526,11 @@ class TestAddptrIntoDescriptor(LowerDescMemoryTester):
               }
             }
             """)
-        # Pin the exact verifier diagnostic: tt.addptr's !tt.ptr operand
-        # was rewritten to index by ConvertFunctions, but the op's
-        # verifier still demands ptr. A drift in the error text or in
-        # which pass raises it will flag here.
+        # Pin ConvertFunctions' rejection, which names the real cause.
+        # The older behaviour let the pass succeed and left tt.addptr's own
+        # verifier to complain ("must be ptr ... got 'index'") about an op
+        # it never touched; that text must not come back.
         self.assert_stderr(capfd,
-                           "tt.addptr",
-                           "must be ptr",
-                           "got 'index'")
+                           "cannot convert function signature",
+                           "!tt.ptr argument #0",
+                           "getBasePtrAsIndex")
