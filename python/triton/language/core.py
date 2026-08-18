@@ -1896,15 +1896,10 @@ def arange(start, end, _semantic=None):
     return _semantic.arange(start, end)
 
 
-# --- START --- changed for spyre
 arange.__doc__ = f"""
     Returns contiguous values within the half-open interval :code:`[start,
     end)`.  :code:`end - start` must be less than or equal to
     :code:`TRITON_MAX_TENSOR_NUMEL = {TRITON_MAX_TENSOR_NUMEL}`
-
-    On the Spyre backend that bound is not enforced -- it is a GPU
-    register/shared-memory artifact. The power-of-two requirement on
-    :code:`end - start` still is.
 
     :param start: Start of the interval. Must be a power of two.
     :type start: int32
@@ -1912,7 +1907,6 @@ arange.__doc__ = f"""
         :code:`start`.
     :type end: int32
 """
-# --- END --- changed for spyre
 
 
 def _unwrap_shape(shape):

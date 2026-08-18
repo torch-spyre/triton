@@ -59,39 +59,36 @@ def is_power_of_two(x):
     return (x & (x - 1)) == 0
 
 
-def validate_block_shape(shape: List[int]):
-    # The per-element power-of-2 requirement is a GPU LinearLayout / warp-tiling
-    # artifact, not a Triton IR rule. Spyre lowers block shapes to KTIR/KTDP
-    # tensor descriptors that handle arbitrary sizes, so skip the pow2 check for
-    # Spyre (the numel cap below is relaxed for Spyre too -- see there). Mirrors
-    # the is_spyre() gating in semantic.py (descriptor relaxations, 16-byte
-    # contiguity). Both relaxations share this one is_spyre() call: it is a
-    # ConstexprFunction whose __call__ re-imports triton.language.core, and this
-    # function runs once per block_type construction. Imported locally to avoid
-    # a module-load import cycle (_utils <- language <- target_info).
-    from .language import target_info
-    on_spyre = target_info.is_spyre()
+# --- START --- changed for spyre
+def _validate_gpu_block_limits(shape: List[int], numel: int):
+    """Limits implied by a GPU tensor being register-resident: per-element
+    power-of-two (LinearLayout / warp tiling) and a total element-count cap
+    (register / shared-memory budget)."""
+    for i, d in enumerate(shape):
+        if not is_power_of_two(d):
+            raise ValueError(f"Shape element {i} must be a power of 2")
+    if numel > TRITON_MAX_TENSOR_NUMEL:
+        raise ValueError(f"numel ({numel}) exceeds triton maximum tensor numel ({TRITON_MAX_TENSOR_NUMEL})")
 
+
+# --- END --- changed for spyre
+
+
+def validate_block_shape(shape: List[int]):
     numel = 1
     for i, d in enumerate(shape):
         if not isinstance(d, int):
             raise TypeError(f"Shape element {i} must have type `constexpr[int]`, got `constexpr[{type(d)}]")
-        if not is_power_of_two(d) and not on_spyre:
-            raise ValueError(f"Shape element {i} must be a power of 2")
         numel *= d
 
     # --- START --- changed for spyre
-    # The numel cap is a GPU register / shared-memory budget: there a tensor is a
-    # register-resident distributed value, so its element count tracks physical
-    # capacity. On Spyre a block_shape describes an HBM region through a
-    # KTIR/KTDP descriptor that the lowering re-tiles into access tiles streaming
-    # through scratchpad, so it is not a resident footprint and this cap measures
-    # the wrong thing -- it rejected matmul's B operand in device stick layout
-    # ([N//64, K, 64], 8Mi elements at K=2048/N=4096) which Spyre can lower. The
-    # real limit is scratchpad bytes (dtype-dependent) and belongs to the
-    # backend; nothing enforces it there yet.
-    if not on_spyre and numel > TRITON_MAX_TENSOR_NUMEL:
-        raise ValueError(f"numel ({numel}) exceeds triton maximum tensor numel ({TRITON_MAX_TENSOR_NUMEL})")
+    # Gated as a unit: both limits assume a register-resident tensor, and Spyre
+    # lowers block shapes to KTIR/KTDP descriptors over HBM. Mirrors the
+    # TRITON_BUILD_TTIR_ONLY gating of verifyTensorSize (Traits.cpp). Local
+    # import avoids a cycle (_utils <- language <- target_info).
+    from .language import target_info
+    if not target_info.is_spyre():
+        _validate_gpu_block_limits(shape, numel)
     # --- END --- changed for spyre
     return numel
 
