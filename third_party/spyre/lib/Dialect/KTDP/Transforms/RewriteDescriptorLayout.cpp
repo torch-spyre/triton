@@ -294,7 +294,6 @@ struct RewriteDescriptorLayoutPass
                                   ArrayRef<int64_t> physArg) {
     OpBuilder b(tileOp);
     Location loc = tileOp.getLoc();
-    MLIRContext *ctx = b.getContext();
 
     auto logTileType = tileOp.getResult().getType();
     ArrayRef<int64_t> logBlock = logTileType.getShape();
@@ -402,22 +401,15 @@ struct RewriteDescriptorLayoutPass
       physIdx.push_back(applyCoordOp(b, loc, logI, op, arg));
     }
 
-    auto physTileType = mlir::ktdp::AccessTileType::get(physBlock,
-                                                         b.getIndexType());
-    auto identityMap = AffineMap::getMultiDimIdentityMap(physRank, ctx);
-    auto coordSet = buildRangeSetND(ctx, physBlock);
-
-    auto newTile = mlir::ktdp::ConstructAccessTilesOp::create(
-        b, loc, physTileType, newMemView,
-        identityMap, physIdx, /*symbol_operands=*/ValueRange{},
-        coordSet, identityMap);
+    Value newTileResult = mlir::triton::ktdp::buildAccessTile(
+        b, loc, newMemView, physBlock, physIdx);
 
     // Update consumers (ktdp.load / ktdp.store).
     for (auto *user : llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
       if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
-        retypeLoad(ld, newTile.getResult(), physBlock);
+        retypeLoad(ld, newTileResult, physBlock);
       } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
-        redirectStoreAccessTile(st, newTile.getResult());
+        redirectStoreAccessTile(st, newTileResult);
       } else {
         return user->emitError(
             "spyre_tensor_layout: unexpected user of access tile");
@@ -830,7 +822,6 @@ struct RewriteDescriptorLayoutPass
                                         triton::SpyreTensorLayoutOp marker) {
     OpBuilder b(plan.memViewOp);
     Location loc = plan.memViewOp.getLoc();
-    MLIRContext *ctx = b.getContext();
 
     // Build dynamic physical sizes.
     SmallVector<Value> physDynSizes;
@@ -869,19 +860,10 @@ struct RewriteDescriptorLayoutPass
 
     // Physical memref type.
     auto logMemrefType = cast<MemRefType>(plan.memViewOp.getResult().getType());
-    auto physMemrefType = MemRefType::get(plan.physStaticSizes,
-                                          logMemrefType.getElementType());
-    auto memSpaceAttr = plan.memViewOp.getMemorySpace();
-    auto coordSet = IntegerSetAttr::get(
-        buildRangeSetND(ctx, plan.physStaticSizes));
-
-    Value newMemView = mlir::ktdp::ConstructMemoryViewOp::create(
-                           b, loc, physMemrefType,
-                           plan.memViewOp.getOffset(),
-                           physDynSizes, physDynStrides,
-                           plan.physStaticSizes, physStaticStrides,
-                           memSpaceAttr, coordSet)
-                           .getResult();
+    Value newMemView = mlir::triton::ktdp::buildMemoryView(
+        b, loc, plan.memViewOp.getOffset(), plan.physStaticSizes,
+        physStaticStrides, physDynSizes, physDynStrides,
+        logMemrefType.getElementType(), plan.memViewOp.getMemorySpace());
 
     // Record the physical memView -> marker mapping for Phase 2.
     physMemViewToMarker[newMemView] = marker;

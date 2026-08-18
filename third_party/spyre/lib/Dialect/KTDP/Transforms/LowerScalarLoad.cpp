@@ -55,11 +55,8 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/IR/AffineExpr.h"
-#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -83,8 +80,8 @@ namespace {
 /// or a pointer-to-pointer (`!tt.ptr<!tt.ptr<ElemT>>` — valid Triton IR,
 /// since `PointerType::verify` only rejects tensor pointees, not pointer
 /// pointees). Only integer/float pointees are lowerable by this pass:
-/// `buildScalarMemoryView` requires a `MemRefElementTypeInterface` element
-/// type, and the constant-false-without-`other` fallback requires
+/// `emitScalarRead`'s memory view requires a `MemRefElementTypeInterface`
+/// element type, and the constant-false-without-`other` fallback requires
 /// `getZeroAttr` to have a case for the element type — neither holds for
 /// `PointerType`.
 static bool isScalarPtr(Value ptr) {
@@ -133,61 +130,21 @@ static Value resolveScalarAddress(OpBuilder &builder, Location loc,
   return baseIndex;
 }
 
-/// A rank-0 "trivially true" IntegerSet: 0 dims, 0 symbols, and a single
-/// `0 >= 0` constraint. `IntegerSet::get` derives its owning context from
-/// `constraints[0]`, so a genuinely empty constraint list (`{}`) is not
-/// constructible — it indexes past the end of an empty array and crashes.
-/// The single constant constraint is a no-op (always satisfied) and keeps
-/// the set a valid handle for the single point of a rank-0 space.
-static IntegerSet trivialIntegerSet(MLIRContext *ctx) {
-  return IntegerSet::get(/*dimCount=*/0, /*symbolCount=*/0,
-                         {getAffineConstantExpr(0, ctx)}, {false});
-}
-
-/// Build a rank-0 `ktdp.construct_memory_view` anchored at `baseIndex`,
-/// i.e. the memory view of a single scalar element. Mirrors
-/// `LowerDescriptorMemory.cpp`'s `buildBaseMemoryView`, specialized to
-/// rank 0: no size/stride operands or attrs, and a trivially-true
-/// coordinate set (see `trivialIntegerSet`) matching the single point of a
-/// rank-0 space.
-static Value buildScalarMemoryView(OpBuilder &builder, Location loc,
-                                    Value baseIndex, Type elemType) {
-  MLIRContext *ctx = builder.getContext();
-  auto memrefType = MemRefType::get({}, elemType);
-  auto memSpaceAttr = mlir::ktdp::MemorySpaceAttr::get(
-      ctx, mlir::ktdp::MemorySpaceKind::global, /*ct_id=*/-1);
-  auto coordinateSet = trivialIntegerSet(ctx);
-  auto memView = mlir::ktdp::ConstructMemoryViewOp::create(
-      builder, loc, memrefType, baseIndex,
-      /*sizes=*/ValueRange{}, /*strides=*/ValueRange{},
-      builder.getDenseI64ArrayAttr({}), builder.getDenseI64ArrayAttr({}),
-      memSpaceAttr, IntegerSetAttr::get(coordinateSet));
-  return memView.getResult();
-}
-
-/// Build a rank-0 `ktdp.construct_access_tile` over `memView`. Mirrors
-/// `LowerDescriptorMemory.cpp`'s `buildDirectAccessTile`, specialized to
-/// rank 0: no block indices, identity maps over zero dims.
-static Value buildScalarAccessTile(OpBuilder &builder, Location loc,
-                                    Value memView) {
-  MLIRContext *ctx = builder.getContext();
-  auto indexType = builder.getIndexType();
-  auto accessTileType = mlir::ktdp::AccessTileType::get({}, indexType);
-  auto identityMap = AffineMap::getMultiDimIdentityMap(0, ctx);
-  auto coordinateSet = trivialIntegerSet(ctx);
-  auto accessTile = mlir::ktdp::ConstructAccessTilesOp::create(
-      builder, loc, accessTileType, memView, identityMap,
-      /*indices=*/ValueRange{}, /*symbol_operands=*/ValueRange{},
-      coordinateSet, identityMap);
-  return accessTile.getResult();
-}
-
 /// Emit the full rank-0 read: memory view -> access tile -> ktdp.load ->
-/// tensor.extract, returning the scalar `elemType` value.
+/// tensor.extract, returning the scalar `elemType` value. Built from the
+/// shared `buildMemoryView`/`buildAccessTile` helpers (also used by
+/// `LowerDescriptorMemory.cpp` and `RewriteDescriptorLayout.cpp`), with
+/// rank-0 arguments: no size/stride operands or attrs, no block indices.
 static Value emitScalarRead(OpBuilder &builder, Location loc,
                             Value baseIndex, Type elemType) {
-  Value memView = buildScalarMemoryView(builder, loc, baseIndex, elemType);
-  Value accessTile = buildScalarAccessTile(builder, loc, memView);
+  auto memSpaceAttr = mlir::ktdp::SpyreMemorySpaceAttr::get(
+      builder.getContext(), mlir::ktdp::SpyreMemorySpaceKind::HBM,
+      /*core=*/-1);
+  Value memView = mlir::triton::ktdp::buildMemoryView(
+      builder, loc, baseIndex, /*staticSizes=*/{}, /*staticStrides=*/{},
+      /*dynSizes=*/{}, /*dynStrides=*/{}, elemType, memSpaceAttr);
+  Value accessTile = mlir::triton::ktdp::buildAccessTile(
+      builder, loc, memView, /*blockShape=*/{}, /*indices=*/{});
   auto tensorType = RankedTensorType::get({}, elemType);
   auto loadResult =
       mlir::ktdp::LoadOp::create(builder, loc, tensorType, accessTile);

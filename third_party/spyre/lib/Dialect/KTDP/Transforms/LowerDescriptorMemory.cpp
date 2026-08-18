@@ -38,7 +38,6 @@ namespace mlir::triton::ktdp {
 
 namespace {
 
-using mlir::triton::ktdp::buildRangeSetND;
 using mlir::triton::ktdp::getDescriptorMemView;
 using mlir::triton::ktdp::isLoweredDescriptor;
 
@@ -98,50 +97,12 @@ static Value buildBaseMemoryView(OpBuilder &builder, Location loc,
     }
   }
 
-  auto memrefType = MemRefType::get(shape, elemType);
-  auto memSpaceAttr = mlir::ktdp::MemorySpaceAttr::get(
-      ctx, mlir::ktdp::MemorySpaceKind::global, /*ct_id=*/-1);
+  auto memSpaceAttr = mlir::ktdp::SpyreMemorySpaceAttr::get(
+      ctx, mlir::ktdp::SpyreMemorySpaceKind::global, /*core=*/-1);
 
-  auto memView = mlir::ktdp::ConstructMemoryViewOp::create(
-      builder, loc, memrefType, baseIndex,
-      dynSizes, dynStrides,
-      builder.getDenseI64ArrayAttr(SmallVector<int64_t>(shape)),
-      builder.getDenseI64ArrayAttr(strides),
-      memSpaceAttr,
-      IntegerSetAttr::get(buildRangeSetND(ctx, shape)));
-
-  return memView.getResult();
-}
-
-//===----------------------------------------------------------------------===//
-// Direct access tile construction (load/store)
-//===----------------------------------------------------------------------===//
-
-/// Build ktdp.construct_access_tile for a direct (contiguous block) access.
-/// The memory view describes the full tensor; the block indices position the
-/// tile within it.  No manual offset computation needed.
-static Value buildDirectAccessTile(OpBuilder &builder, Location loc,
-                                   Value memView, ArrayRef<int64_t> blockShape,
-                                   ValueRange indices) {
-  MLIRContext *ctx = builder.getContext();
-  auto indexType = builder.getIndexType();
-
-  auto accessTileType = mlir::ktdp::AccessTileType::get(blockShape, indexType);
-  unsigned rank = blockShape.size();
-  auto identityMap = AffineMap::getMultiDimIdentityMap(rank, ctx);
-
-  // Cast index operands to index type (they arrive as i32 from Triton).
-  SmallVector<Value> indexOperands;
-  for (auto idx : indices)
-    indexOperands.push_back(
-        arith::IndexCastOp::create(builder, loc, indexType, idx));
-
-  auto accessTile = mlir::ktdp::ConstructAccessTilesOp::create(
-      builder, loc, accessTileType, memView,
-      identityMap, indexOperands, /*symbol_operands=*/ValueRange{},
-      buildRangeSetND(ctx, blockShape), identityMap);
-
-  return accessTile.getResult();
+  return mlir::triton::ktdp::buildMemoryView(builder, loc, baseIndex, shape,
+                                             strides, dynSizes, dynStrides,
+                                             elemType, memSpaceAttr);
 }
 
 //===----------------------------------------------------------------------===//
@@ -386,7 +347,7 @@ buildGatherSubscriptMaps(MLIRContext *ctx, unsigned indexRank,
 
 /// Build ktdp.construct_indirect_access_tile for gather/scatter.
 ///
-/// Mirrors :func:`buildDirectAccessTile` — caller pre-builds `memView`,
+/// Mirrors the shared `buildAccessTile` — caller pre-builds `memView`,
 /// helper constructs the access tile and returns it.  Indirect-only
 /// deviations:
 ///   - Takes a separately resolved `indexView` and its descriptor_load
@@ -461,7 +422,7 @@ struct ConvertDescriptorLoad
     // memory view, producing IR that passes verification here but is wrong.
     auto descType = cast<triton::TensorDescType>(op.getDesc().getType());
     ArrayRef<int64_t> blockShape = descType.getBlockType().getShape();
-    Value accessTile = buildDirectAccessTile(
+    Value accessTile = mlir::triton::ktdp::buildAccessTile(
         rewriter, loc, memView, blockShape, op.getIndices());
 
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
@@ -488,7 +449,7 @@ struct ConvertDescriptorStore
     // producing a tile/view rank mismatch.
     auto descType = cast<triton::TensorDescType>(op.getDesc().getType());
     ArrayRef<int64_t> blockShape = descType.getBlockType().getShape();
-    Value accessTile = buildDirectAccessTile(
+    Value accessTile = mlir::triton::ktdp::buildAccessTile(
         rewriter, loc, memView, blockShape, op.getIndices());
 
     mlir::ktdp::StoreOp::create(rewriter, loc, op.getSrc(), accessTile);
