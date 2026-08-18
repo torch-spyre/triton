@@ -250,6 +250,56 @@ tt.func public @multi_block_ptr_arg(%p: !tt.ptr<f32>) -> index {
 }
 
 // -----
+// An external tt.func — a declaration with no body, which the op explicitly
+// allows ("An external function declaration (used when referring to a function
+// declared in some other module) has no body", TritonOps.td). Its parameters
+// live only in the FunctionType; there is no entry block holding them.
+//
+// Both walks in the pass read the entry block, so both skip declarations via
+// isExternal(). Without that guard the retype walk calls front() on a region
+// with no blocks, which is undefined behaviour rather than a trapping error —
+// it read stale memory that reported zero arguments and returned early, so the
+// bug was invisible on this platform while remaining a real invalid read.
+//
+// The !tt.ptr in the signature survives, which is why this case is CHECKed
+// rather than CHECK-NOT'd: retyping a declaration would also have to update
+// every caller, so it is out of this pass's scope. The pass contract's "no
+// triton types remain" holds for definitions only.
+
+// CHECK-LABEL:   func.func private @external_decl(
+// CHECK-SAME:  !tt.ptr<f32>) -> f32
+tt.func private @external_decl(%p: !tt.ptr<f32>) -> f32
+
+// -----
+// A declaration that is already func.func on entry. The retype walk visits
+// every func.func regardless of origin, so it reaches this one without
+// convertFunctions having created it — the route that a guard placed only in
+// the tt.func conversion step would miss.
+
+// CHECK-LABEL:   func.func private @preexisting_decl(
+// CHECK-SAME:  !tt.ptr<f32>) -> f32
+func.func private @preexisting_decl(%p: !tt.ptr<f32>) -> f32
+
+// -----
+// A declaration and a definition in one module, sharing a pointer signature.
+// Pins that skipping the declaration does not cause the definition beside it to
+// be skipped too: %[[VAL_0]] must still come back as index.
+
+// CHECK-LABEL:   func.func private @decl_beside_def(
+// CHECK-SAME:  !tt.ptr<f32>) -> index
+// CHECK-LABEL:   func.func @def_beside_decl(
+// CHECK-SAME:  %[[VAL_0:.*]]: index) -> index {
+// CHECK-NOT:       unrealized_conversion_cast
+// CHECK:           return %[[VAL_0]] : index
+// CHECK:         }
+tt.func private @decl_beside_def(%p: !tt.ptr<f32>) -> index
+
+tt.func public @def_beside_decl(%p: !tt.ptr<f32>) -> index {
+  %i = builtin.unrealized_conversion_cast %p : !tt.ptr<f32> to index
+  tt.return %i : index
+}
+
+// -----
 // A tt.func inside a nested builtin.module. tt.func is HasParent<"ModuleOp">,
 // which a nested module satisfies, so this is legal input. Every traversal in
 // the pass has to reach the same set of functions: converting only the direct

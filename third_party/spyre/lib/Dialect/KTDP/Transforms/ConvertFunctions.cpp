@@ -62,7 +62,10 @@ private:
     // already contains func.func (only tt.func is converted), and
     // retypePointerArgsToIndex walks every func.func regardless of origin.
     auto result = module.walk([](FunctionOpInterface fnOp) -> WalkResult {
-      if (fnOp.getFunctionBody().empty())
+      // A declaration has no entry block to hold the arguments, so it has no
+      // argument users to inspect. Skipped for the same reason
+      // retypePointerArgsToIndex skips it.
+      if (fnOp.isExternal())
         return WalkResult::advance();
 
       for (BlockArgument arg : fnOp.getFunctionBody().front().getArguments()) {
@@ -162,8 +165,21 @@ private:
   /// Only the casts are fixed up, so this requires that a pointer parameter has
   /// no other users. checkPointerArgsOnlyFeedCasts has already rejected the
   /// module otherwise, which is what makes the unconditional setType below safe.
+  ///
+  /// An external function — a declaration with no body, which tt.func and
+  /// func.func both allow — is skipped. Its parameters live only in the
+  /// FunctionType, with no entry block to read them from, so there is nothing
+  /// here to retype. A !tt.ptr in a declaration's signature therefore survives
+  /// this pass; that is a separate gap from this function's contract, since
+  /// rewriting a declaration would also have to update every caller.
   void retypePointerArgsToIndex(ModuleOp module) {
     module.walk([&](func::FuncOp funcOp) {
+      // Guard before front(): front() on a region with no blocks is undefined
+      // behaviour, not a trapping error. Both walks in this pass must agree on
+      // skipping declarations.
+      if (funcOp.isExternal())
+        return;
+
       Block &entry = funcOp.getBody().front();
       OpBuilder builder(funcOp.getContext());
 
