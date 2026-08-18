@@ -2527,9 +2527,9 @@ class TestAddptrIntoDescriptor(LowerDescMemoryTester):
             }
             """)
         # Pin ConvertFunctions' rejection, which names the real cause.
-        # The older behaviour let the pass succeed and left tt.addptr's own
-        # verifier to complain ("must be ptr ... got 'index'") about an op
-        # it never touched; that text must not come back.
+        # Without its precondition check the pass succeeds and tt.addptr's own
+        # verifier complains ("must be ptr ... got 'index'") about an op that
+        # did nothing wrong; that text must not reappear here.
         self.assert_stderr(capfd,
                            "cannot convert function signature",
                            "!tt.ptr argument #0",

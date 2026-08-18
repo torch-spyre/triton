@@ -1,7 +1,7 @@
 //===- ConvertFunctions.cpp - Convert tt.func/return to func dialect ------===//
 //
-// Converts Triton function-level ops to standard func dialect and finalizes
-// !tt.ptr function arguments to index type.
+// Converts Triton function-level ops to the func dialect and retypes !tt.ptr
+// function arguments to index.
 //
 //===----------------------------------------------------------------------===//
 
@@ -31,10 +31,8 @@ struct ConvertFunctionsPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    // ---- Precondition check: every !tt.ptr function parameter must be
-    // consumed only by the placeholder casts the memory passes leave behind.
     // Checked before anything is rewritten, so a rejected module is left
-    // untouched rather than partially converted.
+    // untouched rather than half-converted.
     if (failed(checkPointerArgsOnlyFeedCasts(module))) {
       signalPassFailure();
       return;
@@ -49,22 +47,20 @@ private:
   /// Reject any !tt.ptr function parameter that is read by something other than
   /// an unrealized_conversion_cast.
   ///
-  /// retypePointerArgsToIndex below changes such a parameter's type to index and
-  /// folds away the casts that consumed it. It can only fix up the casts, so a
-  /// user of any other kind would be left holding an operand whose type changed
-  /// underneath it — the pass would report success and the verifier would then
-  /// fail on an op that did nothing wrong. Reaching this state means the memory
-  /// passes have not consumed the pointer via getBasePtrAsIndex, which is a pass
-  /// ordering error; the diagnostic says so rather than leaving the verifier to
-  /// blame the surviving op.
+  /// retypePointerArgsToIndex below retypes such a parameter to index and folds
+  /// away the casts. It fixes up only the casts, so any other user would be left
+  /// holding an operand whose type changed underneath it: the pass reports
+  /// success and the verifier then fails on an op that did nothing wrong.
+  ///
+  /// That state means a memory pass never consumed the pointer via
+  /// getBasePtrAsIndex — a pass ordering error. The diagnostic names that
+  /// instead of leaving the verifier to blame the surviving op.
   LogicalResult checkPointerArgsOnlyFeedCasts(ModuleOp module) {
-    // Both tt.func and func.func are checked: this pass accepts a module that
-    // already contains func.func (only tt.func is converted), and
-    // retypePointerArgsToIndex walks every func.func regardless of origin.
+    // FunctionOpInterface covers tt.func and func.func alike. Input may already
+    // contain func.func, and retypePointerArgsToIndex walks every one of them.
     auto result = module.walk([](FunctionOpInterface fnOp) -> WalkResult {
-      // A declaration has no entry block to hold the arguments, so it has no
-      // argument users to inspect. Skipped for the same reason
-      // retypePointerArgsToIndex skips it.
+      // A declaration has no entry block, so it has no argument users to
+      // inspect. retypePointerArgsToIndex skips it too.
       if (fnOp.isExternal())
         return WalkResult::advance();
 
@@ -93,14 +89,13 @@ private:
 
   /// tt.func -> func.func, preserving the body and the visibility marker.
   ///
-  /// Reaches tt.func at any depth, not just the direct children of the
-  /// top-level module. tt.func is HasParent<"ModuleOp">, and a nested
-  /// builtin.module satisfies that, so a tt.func can legally sit deeper than
-  /// one level. Enumerating only direct children would skip it while
-  /// convertReturns below still rewrote its tt.return, leaving a tt.func whose
-  /// terminator is func.return — which fails verification, since tt.return is
-  /// HasParent<"FuncOp">. All three traversals in this pass must agree on which
-  /// functions they touch.
+  /// Reaches tt.func at any depth, not just the top-level module's direct
+  /// children: tt.func only requires a ModuleOp parent, and a nested
+  /// builtin.module satisfies that. Enumerating direct children alone would skip
+  /// a nested one while convertReturns still rewrote its tt.return, leaving a
+  /// tt.func whose terminator is func.return — which fails verification, since
+  /// tt.return requires a func.func parent. All traversals in this pass must
+  /// agree on which functions they touch.
   void convertFunctions(ModuleOp module) {
     // Collect first, then rewrite. Erasing a tt.func inside the walk would
     // invalidate the walker's cursor, because the erased op owns nested regions
@@ -115,33 +110,29 @@ private:
                                ttFunc.getFunctionType());
 
       // func::FuncOp::create always produces a public function, so a non-public
-      // marker has to be copied deliberately: a private or nested tt.func would
-      // otherwise come out public, telling symbol-DCE and the inliner the
+      // marker has to be copied deliberately. Otherwise a private or nested
+      // tt.func comes out public, telling symbol-DCE and the inliner the
       // opposite of the truth.
       //
-      // The marker is copied as the raw sym_visibility attribute rather than
-      // via setVisibility(ttFunc.getVisibility()). tt.func declares
-      // sym_visibility as an ordinary OptionalAttr<StrAttr> and does not
-      // implement SymbolOpInterface, so getVisibility() does not read that
-      // attribute — it reports Public for every input. Passing that to
-      // setVisibility then *erases* the attribute on the result, because
-      // SymbolTable::setSymbolVisibility drops it for Public. The round trip
+      // Copy the raw sym_visibility attribute, not setVisibility(getVisibility()).
+      // tt.func declares sym_visibility as a plain OptionalAttr<StrAttr> and does
+      // not implement SymbolOpInterface, so getVisibility() ignores it and reports
+      // Public for every input; setVisibility then erases the attribute, since
+      // SymbolTable::setSymbolVisibility drops it for Public. That round trip
       // collapsed private and nested to public.
       //
-      // "public" is the default and is left implicit, matching how MLIR prints
-      // func.func: copying it verbatim would emit a redundant `public` marker
-      // that no other func.func producer emits.
+      // "public" is left implicit, matching how MLIR prints func.func — copying it
+      // would emit a redundant marker no other func.func producer emits.
       if (auto visibility = ttFunc.getSymVisibilityAttr();
           visibility && visibility.getValue() != "public")
         funcOp.setSymVisibilityAttr(visibility);
 
-      // Move the body rather than cloning it block by block. A move carries
-      // every block, its arguments, and its successor references at once, so
-      // there is no partial-copy state to get wrong on a multi-block body.
-      // Moving (not cloning) is valid because tt.func is IsolatedFromAbove —
-      // the body cannot reference a value defined outside it — and because the
-      // tt.func is erased immediately below. A future version that needs to
-      // keep the tt.func alive past this point must use cloneInto + IRMapping.
+      // Move the body rather than cloning it block by block: a move carries every
+      // block, its arguments, and its successor references at once, so there is no
+      // partial-copy state to get wrong on a multi-block body. Moving is safe
+      // because tt.func is IsolatedFromAbove — the body cannot reference a value
+      // defined outside it — and because the tt.func is erased just below. Keeping
+      // the tt.func alive past this point would require cloneInto + IRMapping.
       funcOp.getBody().takeBody(ttFunc.getBody());
 
       ttFunc.erase();
