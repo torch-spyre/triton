@@ -258,17 +258,32 @@ def ConvertFunctions : Pass<"convert-ttir-functions", "mlir::ModuleOp"> {
         getBasePtrAsIndex before this pass replaces them.
 
         Precondition: every !tt.ptr function argument must be used only by
-        unrealized_conversion_cast ops. Replacing the argument with an index
-        fixes up those casts, but a user of any other kind would be left with a
-        wrongly typed operand, so the pass rejects that input with a diagnostic
-        instead of producing IR that fails verification.
+        unrealized_conversion_cast ops, and each such cast must give that
+        argument at least one result of its own, every one of them index-typed.
+        Replacing the argument with an index fixes up those casts, but a user of
+        any other kind would be left with a wrongly typed operand, so the pass
+        rejects that input with a diagnostic instead of producing IR that fails
+        verification. Because the cast op is variadic on both sides, its arity
+        decides which results belong to a given argument: a 1-to-N cast gives
+        every result to its single operand, an N-to-N cast pairs result i with
+        operand i, and an N-to-1 cast gives no result to any one operand — the
+        last is rejected, as is a corresponding result typed anything but index.
 
         Lowering:
         - tt.func → func.func
         - tt.return → func.return
-        - !tt.ptr function arguments → index
+        - !tt.ptr function arguments → index (definitions only)
 
-        Output: no triton dialect ops or types remain.
+        Output: no tt.func or tt.return ops remain. Other triton ops are left
+        untouched — tt.get_program_id and tt.get_num_programs in particular
+        survive for DistributeWork, which runs after this pass.
+
+        !tt.ptr does not disappear from the module. A function argument is
+        retyped by rewriting the entry block's argument, so a declaration —
+        which has no body, and whose parameters live only in its FunctionType —
+        is skipped and keeps !tt.ptr in its signature. Retyping one would mean
+        rewriting every caller too, which is out of scope here. A downstream
+        pass must therefore not assume the type is gone.
     }];
 
     let dependentDialects = [
