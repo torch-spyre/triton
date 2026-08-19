@@ -2497,12 +2497,15 @@ class TestAddptrIntoDescriptor(LowerDescMemoryTester):
         """`tt.addptr` result feeding `tt.make_tensor_descriptor`.
 
         When a `tt.addptr` result is the base pointer for a tensor
-        descriptor, `ConvertFunctions` rewrites the `!tt.ptr` argument
-        to `index` before `LowerDescriptorMemory` can fold the pointer
-        arithmetic, and the op's verifier then rejects the now-illegal
-        operand type. This is the underlying reason batched matmul is
-        currently disabled: each batch step wants to offset the base
-        pointer before constructing the descriptor.
+        descriptor, `LowerDescriptorMemory` lowers the descriptor ops but
+        leaves the `tt.addptr` reading the `!tt.ptr` function argument
+        directly. `ConvertFunctions` only knows how to fold
+        `unrealized_conversion_cast` users of a pointer argument, so it
+        rejects the module up front — before any retype — and names the
+        missing `getBasePtrAsIndex` consumption as the cause. This is the
+        underlying reason batched matmul is currently disabled: each batch
+        step wants to offset the base pointer before constructing the
+        descriptor.
         """
         with pytest.raises(RuntimeError, match="PassManager::run failed"):
             self.run("""
