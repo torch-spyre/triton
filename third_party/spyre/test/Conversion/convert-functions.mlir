@@ -317,3 +317,50 @@ builtin.module {
     tt.return %arg0 : i32
   }
 }
+
+// -----
+// Fan-out cast: one !tt.ptr operand expanded to several index results.
+//
+// builtin.unrealized_conversion_cast is variadic on both sides. With a single
+// operand, every result carries that operand, so every result is the pointer's
+// correspond to it. Once the argument becomes an index each forward is an
+// identity, so all results are replaced by the argument and the cast is erased
+// outright.
+//
+// Both uses below must read %arg0 directly, and no cast may survive.
+
+// CHECK-LABEL:   func.func @fanout_cast(
+// CHECK-SAME:  %[[VAL_0:.*]]: index) -> (index, index) {
+// CHECK-NOT:       unrealized_conversion_cast
+// CHECK:           return %[[VAL_0]], %[[VAL_0]] : index, index
+// CHECK:         }
+tt.func public @fanout_cast(%p: !tt.ptr<f32>) -> (index, index) {
+  %a, %b = builtin.unrealized_conversion_cast %p : !tt.ptr<f32> to index, index
+  tt.return %a, %b : index, index
+}
+
+// -----
+// Pairwise cast: equal operand and result counts, so result i carries operand i.
+// This is the shape the PR review reported as a compiler crash.
+//
+// Only result #0 corresponds to the pointer, so only it is forwarded to %arg0.
+// Result #1 still carries %arg1 (an i32, whose type this pass does not change), so the
+// cast cannot be erased — it stays, with both operands intact, serving its one
+// remaining use. The pass rewrites uses and argument types, not the cast's
+// operand list, so the now-index %arg0 remains an operand even though nothing
+// reads its result any more. That is valid IR, and canonicalization drops the
+// dead operand later.
+//
+// Erasing the cast here is what crashed: the fold replaced result #0, dropped the
+// op, and left result #1's use dangling.
+
+// CHECK-LABEL:   func.func @pairwise_cast(
+// CHECK-SAME:  %[[VAL_0:.*]]: index,
+// CHECK-SAME:  %[[VAL_1:.*]]: i32) -> (index, index) {
+// CHECK:           %[[VAL_2:.*]]:2 = builtin.unrealized_conversion_cast %[[VAL_0]], %[[VAL_1]] : index, i32 to index, index
+// CHECK:           return %[[VAL_0]], %[[VAL_2]]#1 : index, index
+// CHECK:         }
+tt.func public @pairwise_cast(%p: !tt.ptr<f32>, %n: i32) -> (index, index) {
+  %a, %b = builtin.unrealized_conversion_cast %p, %n : !tt.ptr<f32>, i32 to index, index
+  tt.return %a, %b : index, index
+}

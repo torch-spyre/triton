@@ -93,3 +93,62 @@ tt.func public @non_ptr_arg_any_user(%a: i32) -> i32 {
   %b = arith.addi %a, %a : i32
   tt.return %b : i32
 }
+
+// -----
+// A cast that collapses several operands into fewer results.
+//
+// builtin.unrealized_conversion_cast is variadic on both sides, and its arity
+// decides how operands map to results. For a 1-to-N cast every result carries the
+// single operand; for an N-to-N cast result i carries operand i. Both give this
+// argument a result of its own to fold, and both are accepted — see
+// @fanout_cast and @pairwise_cast in convert-functions.mlir.
+//
+// An N-to-1 cast is different: the lone result is a joint function of every
+// operand (upstream's own example is a tuple built from several values), so no
+// operand owns it. Replacing it with the pointer argument alone would silently
+// discard %n's contribution, and there is no other local rewrite available.
+// Upstream agrees — its folder leaves a lone N-to-1 cast alone and only cancels
+// one against a matching 1-to-N partner.
+tt.func public @collapse_cast(%p: !tt.ptr<f32>, %n: i32) -> index {
+  // expected-error @below {{has no result belonging to this argument alone}}
+  %a = builtin.unrealized_conversion_cast %p, %n : !tt.ptr<f32>, i32 to index
+  tt.return %a : index
+}
+
+// -----
+// A corresponding result typed something other than index.
+//
+// The fold forwards the retyped (now index) argument into the result that
+// corresponds to it, which is only an identity if that result is index-typed.
+// Here it is i64, so forwarding would retype a value whose user still reads it
+// as i64 — the pass would report success and the verifier would then blame
+// tt.return, an op that did nothing wrong. This is the shape from the PR review:
+// name-checking the cast without checking its result type.
+tt.func public @ptr_to_i64(%p: !tt.ptr<f32>) -> i64 {
+  // expected-error @below {{result #0 has type 'i64', not index}}
+  %i = builtin.unrealized_conversion_cast %p : !tt.ptr<f32> to i64
+  tt.return %i : i64
+}
+
+// -----
+// A fan-out cast with one acceptable result and one unacceptable one. Every
+// result of a 1-to-N cast carries the single operand, so *all* of them must be
+// index — a check that stopped at result #0 would accept this and then leave %b
+// wrongly typed.
+tt.func public @fanout_mixed_result_types(%p: !tt.ptr<f32>) -> (index, i64) {
+  // expected-error @below {{result #1 has type 'i64', not index}}
+  %a, %b = builtin.unrealized_conversion_cast %p : !tt.ptr<f32> to index, i64
+  tt.return %a, %b : index, i64
+}
+
+// -----
+// A pairwise cast whose *pointer* result is wrongly typed while the other result
+// is fine. Result #1 corresponds to the pointer (it pairs with operand #1);
+// result #0 belongs to %n and is none of this pass's business. Pins that the
+// check follows the argument's own operand position rather than assuming
+// position 0.
+tt.func public @pairwise_bad_ptr_result(%n: i32, %p: !tt.ptr<f32>) -> (i32, i64) {
+  // expected-error @below {{result #1 has type 'i64', not index}}
+  %a, %b = builtin.unrealized_conversion_cast %n, %p : i32, !tt.ptr<f32> to i32, i64
+  tt.return %a, %b : i32, i64
+}

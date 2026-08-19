@@ -44,8 +44,92 @@ struct ConvertFunctionsPass
   }
 
 private:
+  /// The indices of the results of `cast` that carry operand `operandIdx`'s
+  /// value, or nullopt if the cast's shape gives that operand no result of its
+  /// own.
+  ///
+  /// builtin.unrealized_conversion_cast is variadic on both sides, and its arity
+  /// decides how operands correspond to results. Upstream MLIR's folder pairs
+  /// them by position, so this follows the same reading:
+  ///
+  ///   1 operand -> N results  ("fan-out": one value expanded, e.g. a tuple
+  ///                            split into its element types). Every result
+  ///                            carries the single operand, so all of them
+  ///                            correspond to it.
+  ///   N operands -> N results ("pairwise": result i carries operand i). Only
+  ///                            result `operandIdx` corresponds to this operand.
+  ///   N operands -> 1 result  ("collapse": the lone result is a joint function
+  ///                            of every operand, e.g. a tuple built from
+  ///                            several values). No single operand corresponds
+  ///                            to it, so nullopt is returned.
+  ///
+  /// A collapse has no correct per-operand rewrite: forwarding the result to one
+  /// operand would silently drop the others' contribution. Upstream agrees — it
+  /// leaves a lone N-to-1 cast alone and only cancels it against a matching
+  /// 1-to-N partner.
+  static std::optional<SmallVector<unsigned>>
+  getCorrespondingResultIndices(UnrealizedConversionCastOp cast,
+                                unsigned operandIdx) {
+    unsigned numResults = cast.getNumResults();
+    if (cast.getNumOperands() == 1) {
+      SmallVector<unsigned> allResults;
+      for (unsigned i = 0; i < numResults; ++i)
+        allResults.push_back(i);
+      return allResults;
+    }
+    if (cast.getNumOperands() == numResults)
+      return SmallVector<unsigned>{operandIdx};
+    return std::nullopt;
+  }
+
+  /// Reject a cast that this pass cannot fold once the argument becomes index.
+  ///
+  /// Two ways it can fail. The cast may collapse several operands into one
+  /// result, leaving no result that corresponds to this argument. Or a
+  /// corresponding result may be typed something other than index, in which case
+  /// forwarding the index-typed argument into it would retype a value its users
+  /// still read at the old type — the pass would report success and the verifier
+  /// would then blame an innocent op, which is the failure mode this precheck
+  /// exists to prevent.
+  LogicalResult checkCastResultsAreIndex(UnrealizedConversionCastOp cast,
+                                         BlockArgument arg,
+                                         FunctionOpInterface fnOp) {
+    unsigned operandIdx = 0;
+    for (OpOperand &operand : cast->getOpOperands())
+      if (operand.get() == arg) {
+        operandIdx = operand.getOperandNumber();
+        break;
+      }
+
+    auto resultIndices = getCorrespondingResultIndices(cast, operandIdx);
+    if (!resultIndices)
+      return cast.emitError()
+             << "cannot convert function signature: !tt.ptr argument #"
+             << arg.getArgNumber() << " of '" << fnOp.getName()
+             << "' feeds an unrealized_conversion_cast with "
+             << cast.getNumOperands() << " operands and "
+             << cast.getNumResults()
+             << " results; a cast that collapses several operands into fewer "
+                "results has no result belonging to this argument alone, so "
+                "there is no way to fold it away when the argument becomes an "
+                "index";
+
+    for (unsigned resultIdx : *resultIndices)
+      if (!cast.getResult(resultIdx).getType().isIndex())
+        return cast.emitError()
+               << "cannot convert function signature: !tt.ptr argument #"
+               << arg.getArgNumber() << " of '" << fnOp.getName()
+               << "' feeds an unrealized_conversion_cast whose result #"
+               << resultIdx << " has type "
+               << cast.getResult(resultIdx).getType()
+               << ", not index; replacing the argument with an index would "
+                  "leave that result wrongly typed for its users";
+
+    return success();
+  }
+
   /// Reject any !tt.ptr function parameter that is read by something other than
-  /// an unrealized_conversion_cast.
+  /// an unrealized_conversion_cast this pass can fold.
   ///
   /// retypePointerArgsToIndex below retypes such a parameter to index and folds
   /// away the casts. It fixes up only the casts, so any other user would be left
@@ -55,10 +139,14 @@ private:
   /// That state means a memory pass never consumed the pointer via
   /// getBasePtrAsIndex — a pass ordering error. The diagnostic names that
   /// instead of leaving the verifier to blame the surviving op.
+  ///
+  /// Being an unrealized_conversion_cast is necessary but not sufficient: the op
+  /// is variadic on both sides, so its arity decides whether any result even
+  /// corresponds to a given argument. checkCastResultsAreIndex screens that.
   LogicalResult checkPointerArgsOnlyFeedCasts(ModuleOp module) {
     // FunctionOpInterface covers tt.func and func.func alike. Input may already
     // contain func.func, and retypePointerArgsToIndex walks every one of them.
-    auto result = module.walk([](FunctionOpInterface fnOp) -> WalkResult {
+    auto result = module.walk([&](FunctionOpInterface fnOp) -> WalkResult {
       // A declaration has no entry block, so it has no argument users to
       // inspect. retypePointerArgsToIndex skips it too.
       if (fnOp.isExternal())
@@ -69,16 +157,19 @@ private:
           continue;
 
         for (Operation *user : arg.getUsers()) {
-          if (isa<UnrealizedConversionCastOp>(user))
-            continue;
-          return user->emitError()
-                 << "cannot convert function signature: !tt.ptr argument #"
-                 << arg.getArgNumber() << " of '" << fnOp.getName()
-                 << "' is used by an op that is not an "
-                    "unrealized_conversion_cast, so replacing the argument "
-                    "with an index would leave this operand wrongly typed; the "
-                    "memory passes must consume every !tt.ptr use (via "
-                    "getBasePtrAsIndex) before this pass runs";
+          auto cast = dyn_cast<UnrealizedConversionCastOp>(user);
+          if (!cast)
+            return user->emitError()
+                   << "cannot convert function signature: !tt.ptr argument #"
+                   << arg.getArgNumber() << " of '" << fnOp.getName()
+                   << "' is used by an op that is not an "
+                      "unrealized_conversion_cast, so replacing the argument "
+                      "with an index would leave this operand wrongly typed; "
+                      "the memory passes must consume every !tt.ptr use (via "
+                      "getBasePtrAsIndex) before this pass runs";
+
+          if (failed(checkCastResultsAreIndex(cast, arg, fnOp)))
+            return WalkResult::interrupt();
         }
       }
       return WalkResult::advance();
@@ -154,8 +245,10 @@ private:
   /// uses.
   ///
   /// Only the casts are fixed up, so this requires that a pointer parameter has
-  /// no other users. checkPointerArgsOnlyFeedCasts has already rejected the
-  /// module otherwise, which is what makes the unconditional setType below safe.
+  /// no other users, and that every cast reading it has an index-typed result
+  /// corresponding to that parameter. checkPointerArgsOnlyFeedCasts has already
+  /// rejected the module otherwise, which is what makes the unconditional setType
+  /// and result forwarding below safe.
   ///
   /// A declaration (a function with no body) is skipped: its parameters live
   /// only in the FunctionType, so there is no entry block to retype. A !tt.ptr
@@ -192,6 +285,13 @@ private:
         if (!isa<triton::PointerType>(arg.getType()))
           continue;
 
+        // Collect before rewriting: the loop below erases casts, which would
+        // invalidate this use list mid-iteration.
+        //
+        // getUsers iterates uses rather than unique owners, so a cast holding the
+        // argument in two operand positions is listed twice. A repeat visit is
+        // harmless — the forwarding below is idempotent, and the erase only fires
+        // once nothing reads the cast, so an already-erased op is never re-entered.
         SmallVector<UnrealizedConversionCastOp> casts;
         for (auto *user : arg.getUsers())
           if (auto cast = dyn_cast<UnrealizedConversionCastOp>(user))
@@ -200,8 +300,27 @@ private:
         arg.setType(builder.getIndexType());
 
         for (auto cast : casts) {
-          cast.getResult(0).replaceAllUsesWith(arg);
-          cast.erase();
+          // Forward the results this argument owns. checkCastResultsAreIndex has
+          // already established that at least one result corresponds to this
+          // argument and that every such result is index-typed, so each forward
+          // is an identity now that the argument is an index.
+          unsigned operandIdx = 0;
+          for (OpOperand &operand : cast->getOpOperands())
+            if (operand.get() == arg) {
+              operandIdx = operand.getOperandNumber();
+              break;
+            }
+
+          auto resultIndices = getCorrespondingResultIndices(cast, operandIdx);
+          for (unsigned resultIdx : *resultIndices)
+            cast.getResult(resultIdx).replaceAllUsesWith(arg);
+
+          // A pairwise cast's other results still carry other operands, so the
+          // cast has to stay. Erase only once nothing reads it — which is the
+          // whole cast for the one-operand shapes, and for a pairwise cast only
+          // after every pointer argument feeding it has been folded.
+          if (cast->use_empty())
+            cast.erase();
         }
       }
 
