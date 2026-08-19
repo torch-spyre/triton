@@ -84,7 +84,7 @@ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
   // Gated as a unit: both limits assume a register-resident tensor (a
   // register / shared-memory budget, and LinearLayout warp tiling), and Spyre
   // lowers tensors to KTIR/KTDP descriptors over HBM. Mirrors the is_spyre()
-  // gating of the same two checks in validate_block_shape (triton/_utils.py).
+  // early return in validate_block_shape (triton/_utils.py).
 #ifdef TRITON_BUILD_TTIR_ONLY
   (void)op;
   return success();

@@ -59,21 +59,6 @@ def is_power_of_two(x):
     return (x & (x - 1)) == 0
 
 
-# --- START --- changed for spyre
-def _validate_gpu_block_limits(shape: List[int], numel: int):
-    """Limits implied by a GPU tensor being register-resident: per-element
-    power-of-two (LinearLayout / warp tiling) and a total element-count cap
-    (register / shared-memory budget)."""
-    for i, d in enumerate(shape):
-        if not is_power_of_two(d):
-            raise ValueError(f"Shape element {i} must be a power of 2")
-    if numel > TRITON_MAX_TENSOR_NUMEL:
-        raise ValueError(f"numel ({numel}) exceeds triton maximum tensor numel ({TRITON_MAX_TENSOR_NUMEL})")
-
-
-# --- END --- changed for spyre
-
-
 def validate_block_shape(shape: List[int]):
     numel = 1
     for i, d in enumerate(shape):
@@ -82,14 +67,20 @@ def validate_block_shape(shape: List[int]):
         numel *= d
 
     # --- START --- changed for spyre
-    # Gated as a unit: both limits assume a register-resident tensor, and Spyre
-    # lowers block shapes to KTIR/KTDP descriptors over HBM. Mirrors the
-    # TRITON_BUILD_TTIR_ONLY gating of verifyTensorSize (Traits.cpp). Local
-    # import avoids a cycle (_utils <- language <- target_info).
+    # Both limits below assume a register-resident tensor, and Spyre lowers block
+    # shapes to KTIR/KTDP descriptors over HBM. Mirrors the TRITON_BUILD_TTIR_ONLY
+    # early return in verifyTensorSize (Traits.cpp). Local import avoids a cycle
+    # (_utils <- language <- target_info).
     from .language import target_info
-    if not target_info.is_spyre():
-        _validate_gpu_block_limits(shape, numel)
+    if target_info.is_spyre():
+        return numel
     # --- END --- changed for spyre
+
+    for i, d in enumerate(shape):
+        if not is_power_of_two(d):
+            raise ValueError(f"Shape element {i} must be a power of 2")
+    if numel > TRITON_MAX_TENSOR_NUMEL:
+        raise ValueError(f"numel ({numel}) exceeds triton maximum tensor numel ({TRITON_MAX_TENSOR_NUMEL})")
     return numel
 
 
