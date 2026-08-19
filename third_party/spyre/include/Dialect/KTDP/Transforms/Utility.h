@@ -3,7 +3,7 @@
 #ifndef KTDP_TRANSFORMS_UTILITY_H
 #define KTDP_TRANSFORMS_UTILITY_H
 
-#include "Ktdp/KtdpAttrs.hpp"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IntegerSet.h"
@@ -34,7 +34,7 @@ Value buildMemoryView(OpBuilder &builder, Location loc, Value baseIndex,
                       ArrayRef<int64_t> staticSizes,
                       ArrayRef<int64_t> staticStrides, ValueRange dynSizes,
                       ValueRange dynStrides, Type elemType,
-                      mlir::ktdp::KtdpMemorySpaceAttr memorySpace);
+                      mlir::ktdp::MemorySpaceAttr memorySpace);
 
 /// Build a `ktdp.construct_access_tile` of `blockShape` over `memView`,
 /// anchored at `indices` (one per view dim, per the op's `base_map`

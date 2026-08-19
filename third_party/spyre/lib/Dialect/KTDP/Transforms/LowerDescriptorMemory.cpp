@@ -97,8 +97,8 @@ static Value buildBaseMemoryView(OpBuilder &builder, Location loc,
     }
   }
 
-  auto memSpaceAttr = mlir::ktdp::SpyreMemorySpaceAttr::get(
-      ctx, mlir::ktdp::SpyreMemorySpaceKind::global, /*core=*/-1);
+  auto memSpaceAttr = mlir::ktdp::MemorySpaceAttr::get(
+      ctx, mlir::ktdp::MemorySpaceKind::global, /*ct_id=*/-1);
 
   return mlir::triton::ktdp::buildMemoryView(builder, loc, baseIndex, shape,
                                              strides, dynSizes, dynStrides,

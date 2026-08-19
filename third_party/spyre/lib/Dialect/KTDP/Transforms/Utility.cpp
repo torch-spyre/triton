@@ -1,8 +1,8 @@
 //===- Utility.cpp - Shared transform utilities for KTDP passes -----------===//
 
 #include "Dialect/KTDP/Transforms/Utility.h"
-#include "Ktdp/KtdpOps.hpp"
-#include "Ktdp/KtdpTypes.hpp"
+#include "ktir/Dialect/KTDP/KTDP.h"
+#include "ktir/Dialect/KTDP/KTDPTypes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineExpr.h"
@@ -126,7 +126,7 @@ Value buildMemoryView(OpBuilder &builder, Location loc, Value baseIndex,
                       ArrayRef<int64_t> staticSizes,
                       ArrayRef<int64_t> staticStrides, ValueRange dynSizes,
                       ValueRange dynStrides, Type elemType,
-                      mlir::ktdp::KtdpMemorySpaceAttr memorySpace) {
+                      mlir::ktdp::MemorySpaceAttr memorySpace) {
   MLIRContext *ctx = builder.getContext();
   auto memrefType = MemRefType::get(staticSizes, elemType);
   auto memView = mlir::ktdp::ConstructMemoryViewOp::create(

@@ -46,14 +46,14 @@ module {
 // REGULAR-SAME:  %[[VAL_0:.*]]: !tt.ptr<f16>, %[[VAL_1:.*]]: i32, %[[VAL_2:.*]]: !tt.ptr<i32>) {
 // REGULAR:           %[[VAL_3:.*]] = builtin.unrealized_conversion_cast %[[VAL_2]] : !tt.ptr<i32> to index
 // REGULAR:           %[[VAL_4:.*]] = arith.constant 0 : index
-// REGULAR:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_3]], sizes: [1], strides: [1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1xi32>
+// REGULAR:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_3]], sizes: [1], strides: [1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.memory_space<global>} : memref<1xi32>
 // REGULAR:           %[[VAL_6:.*]] = ktdp.construct_access_tile %[[VAL_5]]{{\[}}%[[VAL_4]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_1]]} : memref<1xi32> -> !ktdp.access_tile<1xindex>
 // REGULAR:           %[[VAL_7:.*]] = ktdp.load %[[VAL_6]] : <1xindex> -> tensor<1xi32>
 // REGULAR:           %[[VAL_8:.*]] = tensor.extract %[[VAL_7]]{{\[}}%[[VAL_4]]] : tensor<1xi32>
 // REGULAR:           %[[VAL_9:.*]] = arith.constant 1 : i64
 // REGULAR:           %[[VAL_10:.*]] = builtin.unrealized_conversion_cast %[[VAL_0]] : !tt.ptr<f16> to index
 // REGULAR:           %[[VAL_11:.*]] = arith.index_cast %[[VAL_8]] : i32 to index
-// REGULAR:           %[[VAL_12:.*]] = ktdp.construct_memory_view %[[VAL_10]], sizes: {{\[}}%[[VAL_11]]], strides: [1] {coordinate_set = #[[$ATTR_2]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<?xf16>
+// REGULAR:           %[[VAL_12:.*]] = ktdp.construct_memory_view %[[VAL_10]], sizes: {{\[}}%[[VAL_11]]], strides: [1] {coordinate_set = #[[$ATTR_2]], memory_space = #ktdp.memory_space<global>} : memref<?xf16>
 // REGULAR:           %[[VAL_13:.*]] = builtin.unrealized_conversion_cast %[[VAL_12]] : memref<?xf16> to !tt.tensordesc<64xf16>
 // REGULAR:           %[[VAL_14:.*]] = arith.index_cast %[[VAL_1]] : i32 to index
 // REGULAR:           %[[VAL_15:.*]] = ktdp.construct_access_tile %[[VAL_12]]{{\[}}%[[VAL_14]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_3]]} : memref<?xf16> -> !ktdp.access_tile<64xindex>
@@ -65,7 +65,7 @@ module {
 // REVERSED-SAME:  %[[VAL_0:.*]]: !tt.ptr<f16>, %[[VAL_1:.*]]: i32, %[[VAL_2:.*]]: !tt.ptr<i32>) {
 // REVERSED:           %[[VAL_3:.*]] = builtin.unrealized_conversion_cast %[[VAL_2]] : !tt.ptr<i32> to index
 // REVERSED:           %[[VAL_4:.*]] = arith.constant 0 : index
-// REVERSED:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_3]], sizes: [1], strides: [1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1xi32>
+// REVERSED:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_3]], sizes: [1], strides: [1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.memory_space<global>} : memref<1xi32>
 // REVERSED:           %[[VAL_6:.*]] = ktdp.construct_access_tile %[[VAL_5]]{{\[}}%[[VAL_4]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_1]]} : memref<1xi32> -> !ktdp.access_tile<1xindex>
 // REVERSED:           %[[VAL_7:.*]] = ktdp.load %[[VAL_6]] : <1xindex> -> tensor<1xi32>
 // REVERSED:           %[[VAL_8:.*]] = tensor.extract %[[VAL_7]]{{\[}}%[[VAL_4]]] : tensor<1xi32>

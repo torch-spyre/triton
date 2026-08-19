@@ -143,9 +143,9 @@ static Value resolveScalarAddress(OpBuilder &builder, Location loc,
 /// both the tile's sole anchor index and the extract index.
 static Value emitScalarRead(OpBuilder &builder, Location loc,
                             Value baseIndex, Type elemType) {
-  auto memSpaceAttr = mlir::ktdp::SpyreMemorySpaceAttr::get(
-      builder.getContext(), mlir::ktdp::SpyreMemorySpaceKind::HBM,
-      /*core=*/-1);
+  auto memSpaceAttr = mlir::ktdp::MemorySpaceAttr::get(
+      builder.getContext(), mlir::ktdp::MemorySpaceKind::global,
+      /*ct_id=*/-1);
   Value zero = arith::ConstantIndexOp::create(builder, loc, 0);
   Value memView = mlir::triton::ktdp::buildMemoryView(
       builder, loc, baseIndex, /*staticSizes=*/{1}, /*staticStrides=*/{1},
