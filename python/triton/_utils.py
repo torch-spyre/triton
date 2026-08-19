@@ -67,10 +67,8 @@ def validate_block_shape(shape: List[int]):
         numel *= d
 
     # --- START --- changed for spyre
-    # Both limits below assume a register-resident tensor, and Spyre lowers block
-    # shapes to KTIR/KTDP descriptors over HBM. Mirrors the TRITON_BUILD_TTIR_ONLY
-    # early return in verifyTensorSize (Traits.cpp). Local import avoids a cycle
-    # (_utils <- language <- target_info).
+    # Mirrors the TRITON_BUILD_TTIR_ONLY early return in verifyTensorSize (Traits.cpp).
+    # Local import avoids a cycle (_utils <- language <- target_info).
     from .language import target_info
     if target_info.is_spyre():
         return numel

@@ -81,10 +81,8 @@ OpTrait::impl::verifySameOperandsAndResultEncoding(Operation *op) {
 
 LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
   // --- START --- changed for spyre
-  // Gated as a unit: both limits assume a register-resident tensor (a
-  // register / shared-memory budget, and LinearLayout warp tiling), and Spyre
-  // lowers tensors to KTIR/KTDP descriptors over HBM. Mirrors the is_spyre()
-  // early return in validate_block_shape (triton/_utils.py).
+  // Gated as a unit: the pow2 limit below is a GPU artifact too. Mirrors the
+  // is_spyre() early return in validate_block_shape (triton/_utils.py).
 #ifdef TRITON_BUILD_TTIR_ONLY
   (void)op;
   return success();
