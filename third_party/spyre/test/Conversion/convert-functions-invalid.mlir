@@ -152,3 +152,16 @@ tt.func public @pairwise_bad_ptr_result(%n: i32, %p: !tt.ptr<f32>) -> (i32, i64)
   %a, %b = builtin.unrealized_conversion_cast %n, %p : i32, !tt.ptr<f32> to i32, i64
   tt.return %a, %b : i32, i64
 }
+
+// -----
+// A repeated-operand cast whose second result is wrongly typed. The argument sits
+// at both operand positions of a pairwise cast, so it owns result #0 *and* result
+// #1; a check that stopped at the first matching operand position would only ever
+// type-check result #0 and accept this. Benign in today's IR only because the
+// mistyped result happens to be the one nothing forwards — the precheck exists so
+// that stays a rejection rather than depending on use patterns.
+tt.func public @repeated_operand_bad_second_result(%p: !tt.ptr<f32>) -> i64 {
+  // expected-error @below {{result #1 has type 'i64', not index}}
+  %a, %b = builtin.unrealized_conversion_cast %p, %p : !tt.ptr<f32>, !tt.ptr<f32> to index, i64
+  tt.return %b : i64
+}

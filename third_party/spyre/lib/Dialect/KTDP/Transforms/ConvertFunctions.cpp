@@ -82,6 +82,35 @@ private:
     return std::nullopt;
   }
 
+  /// The indices of every result of `cast` that carries `arg`, or nullopt if any
+  /// operand position holding `arg` has no result of its own.
+  ///
+  /// An argument may occupy more than one operand position of the same cast
+  /// (`cast %p, %p`), so this unions the correspondences of all of them.
+  /// Duplicates are dropped: the fan-out shape maps every operand position to the
+  /// same full result list, and forwarding one result twice would be wasted work.
+  /// Indices come out in ascending order, since getCorrespondingResultIndices
+  /// yields them that way per position and positions are visited in order.
+  ///
+  /// Both the precheck and the rewrite read this one function, so what gets
+  /// type-checked is exactly what gets forwarded.
+  static std::optional<SmallVector<unsigned>>
+  getResultIndicesForArg(UnrealizedConversionCastOp cast, Value arg) {
+    SmallVector<unsigned> indices;
+    for (OpOperand &operand : cast->getOpOperands()) {
+      if (operand.get() != arg)
+        continue;
+      auto perOperand =
+          getCorrespondingResultIndices(cast, operand.getOperandNumber());
+      if (!perOperand)
+        return std::nullopt;
+      for (unsigned resultIdx : *perOperand)
+        if (!llvm::is_contained(indices, resultIdx))
+          indices.push_back(resultIdx);
+    }
+    return indices;
+  }
+
   /// Reject a cast that this pass cannot fold once the argument becomes index.
   ///
   /// Two ways it can fail. The cast may collapse several operands into one
@@ -91,17 +120,14 @@ private:
   /// still read at the old type — the pass would report success and the verifier
   /// would then blame an innocent op, which is the failure mode this precheck
   /// exists to prevent.
+  ///
+  /// Every result belonging to the argument is checked, not just the first. An
+  /// argument repeated across operand positions owns a result per position, and a
+  /// mistype in any of them is equally unfoldable.
   LogicalResult checkCastResultsAreIndex(UnrealizedConversionCastOp cast,
                                          BlockArgument arg,
                                          FunctionOpInterface fnOp) {
-    unsigned operandIdx = 0;
-    for (OpOperand &operand : cast->getOpOperands())
-      if (operand.get() == arg) {
-        operandIdx = operand.getOperandNumber();
-        break;
-      }
-
-    auto resultIndices = getCorrespondingResultIndices(cast, operandIdx);
+    auto resultIndices = getResultIndicesForArg(cast, arg);
     if (!resultIndices)
       return cast.emitError()
              << "cannot convert function signature: !tt.ptr argument #"
@@ -280,18 +306,22 @@ private:
       if (!changed)
         return;
 
+      // Every cast reached while forwarding, kept so the erase sweep below can
+      // run after all forwarding is done. Nothing is erased inside the loops:
+      // erasing there would invalidate a cast that a later iteration still has
+      // to visit, and a cast can be reached more than once — once per operand
+      // position holding the same argument, and once per pointer argument
+      // feeding it. Deferring the erase makes a repeat visit genuinely harmless,
+      // because forwarding an already-forwarded result is a no-op.
+      SmallVector<UnrealizedConversionCastOp> reachedCasts;
+
       for (unsigned i = 0; i < entry.getNumArguments(); ++i) {
         BlockArgument arg = entry.getArgument(i);
         if (!isa<triton::PointerType>(arg.getType()))
           continue;
 
-        // Collect before rewriting: the loop below erases casts, which would
-        // invalidate this use list mid-iteration.
-        //
-        // getUsers iterates uses rather than unique owners, so a cast holding the
-        // argument in two operand positions is listed twice. A repeat visit is
-        // harmless — the forwarding below is idempotent, and the erase only fires
-        // once nothing reads the cast, so an already-erased op is never re-entered.
+        // Collect before retyping: replaceAllUsesWith below mutates the use list
+        // this range walks.
         SmallVector<UnrealizedConversionCastOp> casts;
         for (auto *user : arg.getUsers())
           if (auto cast = dyn_cast<UnrealizedConversionCastOp>(user))
@@ -300,29 +330,33 @@ private:
         arg.setType(builder.getIndexType());
 
         for (auto cast : casts) {
-          // Forward the results this argument owns. checkCastResultsAreIndex has
-          // already established that at least one result corresponds to this
-          // argument and that every such result is index-typed, so each forward
-          // is an identity now that the argument is an index.
-          unsigned operandIdx = 0;
-          for (OpOperand &operand : cast->getOpOperands())
-            if (operand.get() == arg) {
-              operandIdx = operand.getOperandNumber();
-              break;
-            }
-
-          auto resultIndices = getCorrespondingResultIndices(cast, operandIdx);
+          // Forward every result this argument owns — all of them, not just the
+          // first, since the argument may sit in several operand positions and
+          // owns a result per position. checkCastResultsAreIndex has already
+          // established that at least one result corresponds to this argument and
+          // that every such result is index-typed, so each forward is an identity
+          // now that the argument is an index.
+          auto resultIndices = getResultIndicesForArg(cast, arg);
           for (unsigned resultIdx : *resultIndices)
             cast.getResult(resultIdx).replaceAllUsesWith(arg);
 
-          // A pairwise cast's other results still carry other operands, so the
-          // cast has to stay. Erase only once nothing reads it — which is the
-          // whole cast for the one-operand shapes, and for a pairwise cast only
-          // after every pointer argument feeding it has been folded.
-          if (cast->use_empty())
-            cast.erase();
+          reachedCasts.push_back(cast);
         }
       }
+
+      // A pairwise cast's other results still carry other operands, so a cast is
+      // erased only once nothing reads it: the whole cast for the one-operand
+      // shapes, and for a pairwise cast only after every pointer argument feeding
+      // it has been folded. use_empty() is only a reliable test for that here,
+      // after the forwarding above has finished.
+      //
+      // The sweep must visit each cast once: reachedCasts records one entry per
+      // forwarding visit, so the same op can appear several times, and erasing one
+      // op twice is a double free.
+      SmallPtrSet<Operation *, 8> seen;
+      for (auto cast : reachedCasts)
+        if (seen.insert(cast).second && cast->use_empty())
+          cast.erase();
 
       auto newFuncType = FunctionType::get(
           funcOp.getContext(), newArgTypes,

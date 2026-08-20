@@ -364,3 +364,76 @@ tt.func public @pairwise_cast(%p: !tt.ptr<f32>, %n: i32) -> (index, index) {
   %a, %b = builtin.unrealized_conversion_cast %p, %n : !tt.ptr<f32>, i32 to index, index
   tt.return %a, %b : index, index
 }
+
+// A cast holding the same pointer argument at both operand positions.
+//
+// The argument owns a result per operand position, so both must be forwarded and
+// the cast then becomes fully dead. Two hazards meet here. arg.getUsers() lists
+// uses rather than unique owners, so this cast is reached twice for one argument;
+// and forwarding result #0 moves the return's use off the cast, which makes it
+// look dead on the *first* visit. Erasing inside that loop freed the op while the
+// second visit still held it. Forwarding now happens for every owned result in
+// one visit, and erasing is deferred to a single deduplicated sweep afterwards.
+// CHECK-LABEL:   func.func @repeated_operand_cast(
+// CHECK-NOT:       builtin.unrealized_conversion_cast
+// CHECK:           return %[[VAL_0:.*]] : index
+tt.func public @repeated_operand_cast(%p: !tt.ptr<f32>) -> index {
+  %a, %b = builtin.unrealized_conversion_cast %p, %p : !tt.ptr<f32>, !tt.ptr<f32> to index, index
+  tt.return %a : index
+}
+
+// The same shape returning result #1 instead of #0.
+//
+// A control for @repeated_operand_cast: identical IR but for which result the
+// return reads. It never crashed, because leaving result #0 unforwarded kept a
+// live use on the cast and so never triggered the erase. Both variants must now
+// converge on the same output.
+// CHECK-LABEL:   func.func @repeated_operand_cast_second_result(
+// CHECK-NOT:       builtin.unrealized_conversion_cast
+// CHECK:           return %[[VAL_0:.*]] : index
+tt.func public @repeated_operand_cast_second_result(%p: !tt.ptr<f32>) -> index {
+  %a, %b = builtin.unrealized_conversion_cast %p, %p : !tt.ptr<f32>, !tt.ptr<f32> to index, index
+  tt.return %b : index
+}
+
+// Three operand positions, all holding the same pointer argument.
+//
+// Extends the two-position case: a rewrite that handled only the first match
+// would forward result #0 and leave #1 and #2 reading a cast that the repeat
+// visits then erased underneath them.
+// CHECK-LABEL:   func.func @all_three_repeat(
+// CHECK-NOT:       builtin.unrealized_conversion_cast
+// CHECK:           return %[[A:.*]], %[[A]], %[[A]] : index, index, index
+tt.func public @all_three_repeat(%p: !tt.ptr<f32>) -> (index, index, index) {
+  %a, %b, %c = builtin.unrealized_conversion_cast %p, %p, %p : !tt.ptr<f32>, !tt.ptr<f32>, !tt.ptr<f32> to index, index, index
+  tt.return %a, %b, %c : index, index, index
+}
+
+// A repeated pointer argument interleaved with a non-pointer operand.
+//
+// %p sits at positions #0 and #2, so it owns results #0 and #2 — but not #1,
+// which pairs with %n. Pins that the forwarded set is exactly the positions
+// holding the argument, neither truncated to the first nor widened to every
+// result. The cast stays because result #1 is still read; it is an identity cast
+// by then, which canonicalization removes later, not this pass.
+// CHECK-LABEL:   func.func @partial_repeat(
+// CHECK:           %[[C:.*]]:3 = builtin.unrealized_conversion_cast
+// CHECK:           return %[[P:.*]], %[[C]]#1, %[[P]] : index, i32, index
+tt.func public @partial_repeat(%p: !tt.ptr<f32>, %n: i32) -> (index, i32, index) {
+  %a, %b, %c = builtin.unrealized_conversion_cast %p, %n, %p : !tt.ptr<f32>, i32, !tt.ptr<f32> to index, i32, index
+  tt.return %a, %b, %c : index, i32, index
+}
+
+// Two different pointer arguments feeding one cast.
+//
+// Each owns its own paired result, and the cast must outlive the first argument's
+// forwarding to still be there for the second. This is why the erase sweep sits
+// outside the per-argument loop rather than inside it. Retained here because
+// result #2 (%n's) is still read.
+// CHECK-LABEL:   func.func @two_distinct_ptrs(
+// CHECK:           %[[C:.*]]:3 = builtin.unrealized_conversion_cast
+// CHECK:           return %[[P:.*]], %[[Q:.*]], %[[C]]#2 : index, index, i32
+tt.func public @two_distinct_ptrs(%p: !tt.ptr<f32>, %q: !tt.ptr<f32>, %n: i32) -> (index, index, i32) {
+  %a, %b, %c = builtin.unrealized_conversion_cast %p, %q, %n : !tt.ptr<f32>, !tt.ptr<f32>, i32 to index, index, i32
+  tt.return %a, %b, %c : index, index, i32
+}
