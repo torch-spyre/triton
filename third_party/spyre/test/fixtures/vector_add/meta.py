@@ -40,6 +40,40 @@ def _make_3d_checks(M, N, P, **_):
     return checks
 
 
+def _make_1d_scalar_dim_checks(**_):
+    def checks(t):
+        # Single-element 1-D scalar-read chain: construct_memory_view
+        # <memref<1xi32>> -> construct_access_tile<1xindex> -> ktdp.load
+        # -> tensor.extract.
+        t.assert_result_type("ktdp.construct_memory_view", "memref<1xi32>")
+        t.assert_result_type("ktdp.construct_access_tile", "<1xindex>")
+        t.assert_present("tensor.extract")
+        # arith.index_cast bridges the extracted i32 to index before it
+        # feeds the descriptor's dynamic size operand.
+        t.assert_operand("ktdp.construct_memory_view", 1,
+                         defined_by="arith.index_cast", type_substr="index")
+        # The descriptor shape lowers to a dynamic memref.
+        t.assert_result_type("ktdp.construct_memory_view", "memref<?xf32>")
+    return checks
+
+
+def _make_2d_scalar_dim_checks(N, **_):
+    def checks(t):
+        # Single-element 1-D scalar-read chain: construct_memory_view
+        # <memref<1xi32>> -> construct_access_tile<1xindex> -> ktdp.load
+        # -> tensor.extract.
+        t.assert_result_type("ktdp.construct_memory_view", "memref<1xi32>")
+        t.assert_result_type("ktdp.construct_access_tile", "<1xindex>")
+        t.assert_present("tensor.extract")
+        # arith.index_cast bridges the extracted i32 to index before it
+        # feeds the descriptor's dynamic size operand.
+        t.assert_operand("ktdp.construct_memory_view", 1,
+                         defined_by="arith.index_cast", type_substr="index")
+        # The descriptor shape lowers to a dynamic memref.
+        t.assert_result_type("ktdp.construct_memory_view", f"memref<?x{N}xf32>")
+    return checks
+
+
 # ---------------------------------------------------------------------------
 # Reference (NumPy oracle) + input maker
 # ---------------------------------------------------------------------------
@@ -71,6 +105,21 @@ def run(inputs: dict) -> np.ndarray:
     return inputs["x_ptr"] + inputs["y_ptr"]
 
 
+def make_inputs_scalar_dim(BLOCK_SIZE: int, dtype: str = "f32", n_elements: int = 4096) -> dict:
+    """1D inputs for add_kernel_scalar_dim.
+
+    `n_elements` is not part of the kernel's SIGNATURE (it is read from
+    `seqlen_ptr`, not passed as an arg), so it is a keyword default here
+    rather than a `params` entry — same reasoning as
+    `make_inputs_2d_scalar_dim`. Delegates to ``make_inputs`` for the
+    x/y/output buffers and adds the scalar read as a rank-1 buffer of
+    length 1.
+    """
+    inputs = make_inputs(n_elements, BLOCK_SIZE, dtype)
+    inputs["seqlen_ptr"] = np.array([n_elements], dtype=np.int32)
+    return inputs
+
+
 def make_inputs_2d(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
                    *, dtype=np.float32, **_unused) -> dict:
     """Build 2D pointer-tensor inputs for add_kernel_2d."""
@@ -81,6 +130,22 @@ def make_inputs_2d(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
     y = np.cos(t * 2.0 * np.pi / total).astype(dtype).reshape(M, N)
     output = np.zeros((M, N), dtype=dtype)
     return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
+
+
+def make_inputs_2d_scalar_dim(N: int, BLOCK_M: int, BLOCK_N: int, M: int = 32) -> dict:
+    """2D inputs for add_kernel_2d_scalar_dim.
+
+    `M` is not part of the kernel's SIGNATURE (it is read from
+    `seqlen_ptr`, not passed as an arg), so it is a keyword default here
+    rather than a `params` entry — a `params` entry would otherwise leak
+    into ``run_cpu``'s kwargs and fail its "unknown kwarg" check, since
+    `add_kernel_2d_scalar_dim` has no `M` parameter. Delegates to
+    ``make_inputs_2d`` for the x/y/output buffers and adds the scalar
+    read as a rank-1 buffer of length 1.
+    """
+    inputs = make_inputs_2d(M, N, BLOCK_M, BLOCK_N)
+    inputs["seqlen_ptr"] = np.array([M], dtype=np.int32)
+    return inputs
 
 
 def make_inputs_3d(
@@ -171,6 +236,24 @@ _SIG_3D = {
     "BLOCK_P":    "i32",
 }
 
+_SIG_1D_SCALAR = {
+    "x_ptr":      "*fp32",
+    "y_ptr":      "*fp32",
+    "output_ptr": "*fp32",
+    "seqlen_ptr": "*i32",
+    "BLOCK_SIZE": "i32",
+}
+
+_SIG_2D_SCALAR = {
+    "x_ptr":      "*fp32",
+    "y_ptr":      "*fp32",
+    "output_ptr": "*fp32",
+    "seqlen_ptr": "*i32",
+    "N":          "i32",
+    "BLOCK_M":    "i32",
+    "BLOCK_N":    "i32",
+}
+
 VARIANTS = {
     # --- 1D variants ---
     "default": {
@@ -240,6 +323,37 @@ VARIANTS = {
         # smaller n_elements than the static default.
         "base":   "dynamic",
         "params": {"n_elements": [4096], "BLOCK_SIZE": [1024]},
+    },
+    "dynamic_from_scalar_load": {
+        "base":         "dynamic",
+        "kernel_fn":    kernel.add_kernel_scalar_dim,
+        "SIGNATURE":    _SIG_1D_SCALAR,
+        "constexpr":    ["BLOCK_SIZE"],
+        "params":       {"BLOCK_SIZE": [1024]},
+        "inputs":       make_inputs_scalar_dim,
+        "tags": [
+            "descriptor-load-dynamic-from-scalar-load",
+            "descriptor-store-dynamic", "program-id-1d", "num-programs-fold",
+        ],
+        "summary": (
+            "1D elementwise add where `n_elements` is read from memory "
+            "via a scalar `tl.load`, then used as a tensor descriptor's "
+            "dynamic shape."
+        ),
+        "doc": (
+            "not yet wired into any dataflow-scheduler/DFIR "
+            "flow (`kDynamic` has no `AddressAssignment` / "
+            "`NormalizeGridTo1D` path yet). `n_elements` is not a kernel "
+            "argument here; it is read from `seqlen_ptr` with a scalar "
+            "`tl.load`. This is the 1D counterpart of "
+            "`2d_dynamic_from_scalar_load` — the simplest form of the "
+            "single-element 1-D scalar-read chain (`construct_memory_view` "
+            "/ `construct_access_tile` / `ktdp.load` / `tensor.extract`) "
+            "feeding the dynamic-shape path via an `arith.index_cast` "
+            "bridge, producing `memref<?xf32>`. Reuses the same oracle "
+            "as `dynamic` (via `make_inputs_scalar_dim`)."
+        ),
+        "extra_checks": _make_1d_scalar_dim_checks,
     },
     # --- 2D variants ---
     "2d": {
@@ -333,6 +447,44 @@ VARIANTS = {
             # All three operands share the rank-3 physical view [2, 64, 64].
             t.assert_result_type("ktdp.construct_memory_view", "2x64x64xf16"),
         ),
+    },
+    "2d_dynamic_from_scalar_load": {
+        "base":         "2d",
+        "kernel_fn":    kernel.add_kernel_2d_scalar_dim,
+        "SIGNATURE":    _SIG_2D_SCALAR,
+        "constexpr":    ["N", "BLOCK_M", "BLOCK_N"],
+        "params":       {"N": [32], "BLOCK_M": [16], "BLOCK_N": [16]},
+        "inputs":       make_inputs_2d_scalar_dim,
+        # 2D grid: [4, 8] = 32 cores. N is chunked across grid_n the same
+        # way the runtime M is chunked across grid_m (add_kernel_2d_grid's
+        # distribution pattern), rather than walking a full row per core.
+        "grid":         [4, 8],
+        "tags": [
+            "descriptor-load-dynamic-from-scalar-load",
+            "descriptor-store-dynamic", "program-id-2d", "num-programs-fold",
+        ],
+        "summary": (
+            "2D elementwise add over a 2D grid where `M` is read from "
+            "memory via a scalar `tl.load`, then used as a tensor "
+            "descriptor's dynamic shape; `N` is chunked the same way."
+        ),
+        "doc": (
+            "not yet wired into any dataflow-scheduler/DFIR "
+            "flow (`kDynamic` has no `AddressAssignment` / "
+            "`NormalizeGridTo1D` path yet). `M` is not a kernel argument "
+            "here; it is read from `seqlen_ptr` with a scalar `tl.load`. "
+            "Uses a genuine 2D grid (`pid_m`/`pid_n`, `grid_m`/`grid_n`, "
+            "matching `add_kernel_2d_grid`'s naming and distribution "
+            "pattern) so `N` is chunked across cores the same way the "
+            "runtime `M` is, instead of walking a full row per core. "
+            "This exercises the single-element 1-D scalar-read chain "
+            "(`construct_memory_view` / `construct_access_tile` / "
+            "`ktdp.load` / `tensor.extract`) feeding the dynamic-shape "
+            "path via an `arith.index_cast` bridge, producing "
+            "`memref<?x32xf32>`. Reuses the same `x + y` oracle as `2d` "
+            "(via `make_inputs_2d_scalar_dim`)."
+        ),
+        "extra_checks": _make_2d_scalar_dim_checks,
     },
     # --- 3D variants ---
     "3d": {

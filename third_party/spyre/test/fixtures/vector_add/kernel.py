@@ -1,6 +1,6 @@
 """Vector-add kernels: 1D, 2D, and 3D elementwise add.
 
-Five ``@triton.jit`` functions exercising tensor descriptors at increasing
+Seven ``@triton.jit`` functions exercising tensor descriptors at increasing
 dimensionality. Two grid styles:
 
 1D-grid kernels (``tl.program_id(0)`` only) — each core loops over its
@@ -14,6 +14,13 @@ Multi-axis grid kernels — each axis of the grid maps to one tensor
 - :func:`add_kernel_2d_grid` — 2D grid: pid_0 → M-tile, pid_1 → N-tile
 - :func:`add_kernel_3d_grid` — 3D grid: pid_0 → M-tile, pid_1 → N-tile,
                                          pid_2 → P-tile
+- :func:`add_kernel_2d_scalar_dim` — 2D grid, but `M` is a scalar read
+  from memory rather than a kernel argument; `N` is still chunked the
+  same way as `M`. KTIR-structural only for now.
+
+Scalar-load variant of the 1D kernel — same idea, one axis:
+- :func:`add_kernel_scalar_dim` — 1D, but `n_elements` is a scalar read
+  from memory rather than a kernel argument. KTIR-structural only for now.
 """
 
 import triton
@@ -63,6 +70,51 @@ def add_kernel(
         y = y_desc.load([offset])
         out_desc.store([offset], x + y)
 
+
+@triton.jit
+def add_kernel_scalar_dim(
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    seqlen_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """1D add where `n_elements` is read from memory instead of passed directly.
+
+    for now: KTIR-structural only, do not wire this into any end-to-end/DFIR test.
+    """
+    pid = tl.program_id(0)
+    n_elements = tl.load(seqlen_ptr)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr,
+        shape=[n_elements],
+        strides=[1],
+        block_shape=[BLOCK_SIZE],
+    )
+    y_desc = tl.make_tensor_descriptor(
+        y_ptr,
+        shape=[n_elements],
+        strides=[1],
+        block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr,
+        shape=[n_elements],
+        strides=[1],
+        block_shape=[BLOCK_SIZE],
+    )
+
+    num_cores = tl.num_programs(0)
+    num_blocks = tl.cdiv(n_elements, BLOCK_SIZE)
+    blocks_per_core = tl.cdiv(num_blocks, num_cores)
+    start = pid * blocks_per_core
+    end = tl.minimum(start + blocks_per_core, num_blocks)
+    for i in range(start, end):
+        offset = i * BLOCK_SIZE
+        x = x_desc.load([offset])
+        y = y_desc.load([offset])
+        out_desc.store([offset], x + y)
 
 
 @triton.jit
@@ -153,6 +205,52 @@ def add_kernel_2d_grid(
     n_blocks = tl.cdiv(N, BLOCK_N)
     m_blocks_per_core = tl.cdiv(m_blocks, num_cores_m)
     n_blocks_per_core = tl.cdiv(n_blocks, num_cores_n)
+    m_start = pid_m * m_blocks_per_core
+    m_end   = tl.minimum(m_start + m_blocks_per_core, m_blocks)
+    n_start = pid_n * n_blocks_per_core
+    n_end   = tl.minimum(n_start + n_blocks_per_core, n_blocks)
+
+    for m in range(m_start, m_end):
+        for n in range(n_start, n_end):
+            x = x_desc.load([m * BLOCK_M, n * BLOCK_N])
+            y = y_desc.load([m * BLOCK_M, n * BLOCK_N])
+            out_desc.store([m * BLOCK_M, n * BLOCK_N], x + y)
+
+
+@triton.jit
+def add_kernel_2d_scalar_dim(
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    seqlen_ptr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """2D add where `M` is read from memory instead of passed directly.
+
+    for now: KTIR-structural only, do not wire this into any end-to-end/DFIR test.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    grid_m = tl.num_programs(0)
+    grid_n = tl.num_programs(1)
+    M = tl.load(seqlen_ptr)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+    )
+    y_desc = tl.make_tensor_descriptor(
+        y_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+    )
+
+    m_blocks = tl.cdiv(M, BLOCK_M)
+    n_blocks = tl.cdiv(N, BLOCK_N)
+    m_blocks_per_core = tl.cdiv(m_blocks, grid_m)
+    n_blocks_per_core = tl.cdiv(n_blocks, grid_n)
     m_start = pid_m * m_blocks_per_core
     m_end   = tl.minimum(m_start + m_blocks_per_core, m_blocks)
     n_start = pid_n * n_blocks_per_core

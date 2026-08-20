@@ -7,7 +7,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
-#include "Ktdp/KtdpDialect.hpp"
+#include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
 
 int main(int argc, char **argv) {

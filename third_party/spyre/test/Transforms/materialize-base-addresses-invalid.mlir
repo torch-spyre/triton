@@ -20,10 +20,10 @@
 // expected-error @below {{MaterializeBaseAddresses: 3 base addresses supplied but the function has only 2 index argument(s) to materialize them into}}
 func.func @too_many_addresses(%a: index, %b: index) {
   %va = ktdp.construct_memory_view %a, sizes: [4], strides: [1] {
-      coordinate_set = #set1d, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1d, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   %vb = ktdp.construct_memory_view %b, sizes: [4], strides: [1] {
-      coordinate_set = #set1d, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1d, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   return
 }
@@ -39,10 +39,10 @@ func.func @too_many_addresses(%a: index, %b: index) {
 // expected-error @below {{MaterializeBaseAddresses: 3 base addresses supplied but the function has only 2 index argument(s) to materialize them into}}
 func.func @too_many_interleaved(%a: index, %n: i32, %b: index) {
   %va = ktdp.construct_memory_view %a, sizes: [4], strides: [1] {
-      coordinate_set = #set1db, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1db, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   %vb = ktdp.construct_memory_view %b, sizes: [4], strides: [1] {
-      coordinate_set = #set1db, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1db, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   %w = arith.addi %n, %n : i32
   return

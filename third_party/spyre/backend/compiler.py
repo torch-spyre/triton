@@ -182,7 +182,8 @@ class SpyreBackend(BaseBackend):
         _CORE_PIPELINE_PASSES, each optionally followed by fixes anchored to it via
         options.required_fixes:
           - LowerDescriptorMemory: tt.descriptor_load/store/gather/scatter -> ktdp.*
-          - LowerScalarLoad: scalar tt.load (+ addptr chain) -> ktdp.* rank-0 read
+          - LowerScalarLoad: scalar tt.load (+ addptr chain) -> ktdp.* single-
+            element 1-D read
           - LowerComputeOps: tt.reduce/broadcast/expand_dims -> linalg/tensor
             + dead op sweep
           - RewriteDescriptorLayout: logical tensor descriptors -> physical

@@ -33,8 +33,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/KTDP/Transforms/Passes.h"
-#include "Ktdp/KtdpDialect.hpp"
-#include "Ktdp/KtdpOps.hpp"
+#include "ktir/Dialect/KTDP/KTDP.h"
+#include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"

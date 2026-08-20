@@ -25,8 +25,8 @@ module {
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f32>) {
 // CHECK:           %[[VAL_1:.*]] = arith.constant 0 : index
 // CHECK:           %[[VAL_2:.*]] = builtin.unrealized_conversion_cast %[[VAL_0]] : !tt.ptr<f32> to index
-// CHECK:           %[[VAL_3:.*]] = ktdp.construct_memory_view %[[VAL_2]], sizes: [2, 128, 64], strides: [8192, 64, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<2x128x64xf32>
-// CHECK:           %[[VAL_4:.*]] = ktdp.construct_memory_view %[[VAL_2]], sizes: [128, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_2]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<128x128xf32>
+// CHECK:           %[[VAL_3:.*]] = ktdp.construct_memory_view %[[VAL_2]], sizes: [2, 128, 64], strides: [8192, 64, 1] {coordinate_set = #[[$ATTR_1]], memory_space = #ktdp.memory_space<global>} : memref<2x128x64xf32>
+// CHECK:           %[[VAL_4:.*]] = ktdp.construct_memory_view %[[VAL_2]], sizes: [128, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_2]], memory_space = #ktdp.memory_space<global>} : memref<128x128xf32>
 // CHECK:           %[[VAL_5:.*]] = arith.constant 64 : index
 // CHECK:           %[[VAL_6:.*]] = arith.divsi %[[VAL_1]], %[[VAL_5]] : index
 // CHECK:           %[[VAL_7:.*]] = arith.constant 64 : index
@@ -39,7 +39,7 @@ tt.func @shared_index_value(%arg0: !tt.ptr<f32>) {
   // Use the SAME value for both logical indices.
   %idx = arith.constant 0 : index
   %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
-  %1 = ktdp.construct_memory_view %0, sizes: [128, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<128x128xf32>
+  %1 = ktdp.construct_memory_view %0, sizes: [128, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<128x128xf32>
   %2 = builtin.unrealized_conversion_cast %1 : memref<128x128xf32> to !tt.tensordesc<128x128xf32>
   // phys_src=[1, 0, 1] phys_op=[1, 0, 2] phys_arg=[64, 0, 64]
   // Physical dim 0: logical dim 1, floordiv 64

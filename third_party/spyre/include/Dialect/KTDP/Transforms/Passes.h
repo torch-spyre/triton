@@ -20,6 +20,7 @@ std::unique_ptr<OperationPass<ModuleOp>> createLowerDescriptorMemoryPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerScalarLoadPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerComputeOpsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createUnaliasLinalgOutsPass();
+std::unique_ptr<OperationPass<ModuleOp>> createDropReductionInitFillPass();
 std::unique_ptr<OperationPass<ModuleOp>> createDistributeWorkPass(
     llvm::ArrayRef<int64_t> grid = {});
 std::unique_ptr<OperationPass<ModuleOp>> createMaterializeBaseAddressesPass(

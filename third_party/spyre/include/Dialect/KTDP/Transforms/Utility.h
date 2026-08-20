@@ -3,6 +3,7 @@
 #ifndef KTDP_TRANSFORMS_UTILITY_H
 #define KTDP_TRANSFORMS_UTILITY_H
 
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IntegerSet.h"
@@ -22,6 +23,26 @@ Value getDescriptorMemView(Value desc);
 /// Build a range-set constraint for an N-D coordinate space.
 /// Static dims use arith constants; dynamic dims use IntegerSet symbols.
 IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape);
+
+/// Build a `ktdp.construct_memory_view` of `staticSizes`/`staticStrides`
+/// anchored at `baseIndex`. `staticSizes`/`staticStrides` may be empty for a
+/// rank-0 view; entries equal to `ShapedType::kDynamic` draw their runtime
+/// value from `dynSizes`/`dynStrides` in order, one per sentinel — the same
+/// convention `ktdp.construct_memory_view`'s ODS builder and verifier use.
+/// The coordinate set is derived from `staticSizes` via `buildRangeSetND`.
+Value buildMemoryView(OpBuilder &builder, Location loc, Value baseIndex,
+                      ArrayRef<int64_t> staticSizes,
+                      ArrayRef<int64_t> staticStrides, ValueRange dynSizes,
+                      ValueRange dynStrides, Type elemType,
+                      mlir::ktdp::MemorySpaceAttr memorySpace);
+
+/// Build a `ktdp.construct_access_tile` of `blockShape` over `memView`,
+/// anchored at `indices` (one per view dim, per the op's `base_map`
+/// contract — an empty `blockShape`/`indices` pair builds a rank-0 tile).
+/// Indices not already `index`-typed are cast to `index` first, since
+/// Triton hands block/loop indices over as `i32`.
+Value buildAccessTile(OpBuilder &builder, Location loc, Value memView,
+                      ArrayRef<int64_t> blockShape, ValueRange indices);
 
 /// Erase trivially dead ops in reverse walk order.
 /// An op is erased only if BOTH conditions hold:

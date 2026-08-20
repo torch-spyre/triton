@@ -15,13 +15,13 @@
 
 // CHECK-LABEL:   func.func @large_address() {
 // CHECK:           %[[VAL_0:.*]] = arith.constant 8589934592 : index
-// CHECK:           %[[VAL_1:.*]] = ktdp.construct_memory_view %[[VAL_0]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4xf16>
+// CHECK:           %[[VAL_1:.*]] = ktdp.construct_memory_view %[[VAL_0]], sizes: [4], strides: [1] {coordinate_set = #{{.*}}, memory_space = #ktdp.memory_space<global>} : memref<4xf16>
 // CHECK:           return
 // CHECK:         }
 #set1d = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>
 func.func @large_address(%a: index) {
   %va = ktdp.construct_memory_view %a, sizes: [4], strides: [1] {
-      coordinate_set = #set1d, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set1d, memory_space = #ktdp.memory_space<global>
   } : memref<4xf16>
   return
 }

@@ -103,8 +103,9 @@ def LowerScalarLoad : Pass<"lower-scalar-load", "mlir::ModuleOp"> {
         Lowering:
         - scalar tt.addptr chain feeding the matched tt.load → folded into
           a single index offset (plain adds, no element-size scaling)
-        - scalar tt.load → rank-0 ktdp.construct_memory_view +
-          rank-0 ktdp.construct_access_tile + ktdp.load + tensor.extract
+        - scalar tt.load → single-element 1-D ktdp.construct_memory_view +
+          single-element 1-D ktdp.construct_access_tile + ktdp.load +
+          tensor.extract
         - masked scalar tt.load → the mask must be a compile-time constant
           (a materialized arith.constant i1); constant-true drops straight
           through to the unconditional read, constant-false skips the read
@@ -388,6 +389,64 @@ def MaterializeBaseAddresses
     let dependentDialects = [
         "mlir::func::FuncDialect",
         "mlir::arith::ArithDialect"
+    ];
+}
+
+def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
+    let summary = "Drop a zero linalg.fill that initialises a reduction's outs.";
+    let description = [{
+        Input: any IR containing linalg ops on ranked tensors. Matches the
+        LinalgOp interface but only ops with at least one reduction iterator, so
+        linalg.reduce and a linalg.generic carrying a reduction iterator are both
+        covered while an elementwise op's fill is out of scope — which is what
+        keeps this pass away from the other producer of linalg.fill in this
+        pipeline, tt.splat.
+
+        Lowering:
+        - reduction whose outs[i] is defined by a linalg.fill of a constant zero
+          (float or integer, +0.0 and -0.0 alike) writing into a tensor.empty
+          → outs[i] repointed at that tensor.empty, and the fill erased once
+          dead.
+        - Same shape, but the fill value is not zero → rejected with a
+          diagnostic.
+        - A fill writing into anything other than tensor.empty → left alone;
+          repointing outs at it would substitute live contents for the stated
+          initial value.
+
+        A reduction's payload reads its outs operand, so dropping the init is
+        sound only because the scheduler emits its own accumulator reset ahead of
+        the reduction loop. That reset is hardcoded to zero, which is why the
+        gate is the literal value zero rather than the combiner's neutral
+        element: a mulf reduction initialised to 1.0 would be reset to zero by
+        the scheduler whatever this pass does, so it is reported instead of
+        silently lowered.
+
+        That makes this a deliberate, narrow exception to the rule
+        UnaliasLinalgOuts enforces. That pass refuses exactly this rewrite,
+        because a payload reading its init makes tensor.empty observable; the
+        exception is justified here by the reset guarantee, which the IR does not
+        express.
+
+        Motivation: LowerComputeOps gives every tt.reduce an outs of
+        tensor.empty + linalg.fill, per upstream linalg semantics. The
+        dataflow-scheduler's KTIRLegalityCheck allowlist is add/mul/sub/reduce
+        and rejects the fill; widening that allowlist alone turns the rejection
+        into an assertion failure in ConstructThreeStagePipeline, which admits
+        one compute op per group and cannot fuse a producer feeding an init
+        operand.
+
+        Ordering: must run after LowerComputeOps, the pass that creates the fill;
+        anchored earlier it is a silent no-op. Independent of
+        RewriteDescriptorLayout — running before it simply means the layout pass
+        physicalizes a tensor.empty rather than a fill.
+
+        Output: reductions whose outs is a bare tensor.empty, as hand-written
+        reference KTIR states directly.
+    }];
+
+    let dependentDialects = [
+        "mlir::linalg::LinalgDialect",
+        "mlir::tensor::TensorDialect"
     ];
 }
 

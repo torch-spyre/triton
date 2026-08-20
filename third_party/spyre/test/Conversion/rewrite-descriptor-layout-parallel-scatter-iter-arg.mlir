@@ -43,12 +43,12 @@ module {
 // CHECK:           %[[VAL_5:.*]] = arith.constant 2 : i32
 // CHECK:           %[[VAL_6:.*]] = arith.constant dense<0.000000e+00> : tensor<1x64x128xf16>
 // CHECK:           %[[VAL_7:.*]] = builtin.unrealized_conversion_cast %[[VAL_0]] : !tt.ptr<f16> to index
-// CHECK:           %[[VAL_8:.*]] = ktdp.construct_memory_view %[[VAL_7]], sizes: [1, 64, 64], strides: [1, 64, 1] {coordinate_set = #[[$ATTR_2]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x64x64xf16>
+// CHECK:           %[[VAL_8:.*]] = ktdp.construct_memory_view %[[VAL_7]], sizes: [1, 64, 64], strides: [1, 64, 1] {coordinate_set = #[[$ATTR_2]], memory_space = #ktdp.memory_space<global>} : memref<1x64x64xf16>
 // CHECK:           %[[VAL_9:.*]] = builtin.unrealized_conversion_cast %[[VAL_1]] : !tt.ptr<f16> to index
-// CHECK:           %[[VAL_10:.*]] = ktdp.construct_memory_view %[[VAL_9]], sizes: [1, 2, 64, 64], strides: [8192, 4096, 64, 1] {coordinate_set = #[[$ATTR_3]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x2x64x64xf16>
-// CHECK:           %[[VAL_11:.*]] = ktdp.construct_memory_view %[[VAL_9]], sizes: [1, 64, 128], strides: [8192, 128, 1] {coordinate_set = #[[$ATTR_4]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x64x128xf16>
+// CHECK:           %[[VAL_10:.*]] = ktdp.construct_memory_view %[[VAL_9]], sizes: [1, 2, 64, 64], strides: [8192, 4096, 64, 1] {coordinate_set = #[[$ATTR_3]], memory_space = #ktdp.memory_space<global>} : memref<1x2x64x64xf16>
+// CHECK:           %[[VAL_11:.*]] = ktdp.construct_memory_view %[[VAL_9]], sizes: [1, 64, 128], strides: [8192, 128, 1] {coordinate_set = #[[$ATTR_4]], memory_space = #ktdp.memory_space<global>} : memref<1x64x128xf16>
 // CHECK:           %[[VAL_12:.*]] = builtin.unrealized_conversion_cast %[[VAL_2]] : !tt.ptr<f16> to index
-// CHECK:           %[[VAL_13:.*]] = ktdp.construct_memory_view %[[VAL_12]], sizes: [1, 64, 128], strides: [8192, 128, 1] {coordinate_set = #[[$ATTR_4]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x64x128xf16>
+// CHECK:           %[[VAL_13:.*]] = ktdp.construct_memory_view %[[VAL_12]], sizes: [1, 64, 128], strides: [8192, 128, 1] {coordinate_set = #[[$ATTR_4]], memory_space = #ktdp.memory_space<global>} : memref<1x64x128xf16>
 // CHECK:           %[[VAL_14:.*]] = scf.for %[[VAL_15:.*]] = %[[VAL_3]] to %[[VAL_5]] step %[[VAL_4]] iter_args(%[[VAL_16:.*]] = %[[VAL_6]]) -> (tensor<1x64x128xf16>)  : i32 {
 // CHECK:             %[[VAL_17:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
 // CHECK:             %[[VAL_18:.*]] = arith.index_cast %[[VAL_3]] : i32 to index

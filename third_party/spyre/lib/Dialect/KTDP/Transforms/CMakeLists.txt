@@ -8,6 +8,7 @@ add_triton_library(KTDPTransforms
   RewriteDescriptorLayout/Classify.cpp
   RewriteDescriptorLayout/ContractionSynthesis.cpp
   UnaliasLinalgOuts.cpp
+  DropReductionInitFill.cpp
   DistributeWork.cpp
   MaterializeBaseAddresses.cpp
   Utility.cpp
