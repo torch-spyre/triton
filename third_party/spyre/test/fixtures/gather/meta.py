@@ -9,26 +9,40 @@ Vocabulary (matches ``kernel.py``):
   - ``M``, ``N``         — source matrix dims (rows, cols)
   - ``K_INDICES``        — number of rows to gather
   - ``BLOCK_COLS``       — column slice width per gathered row
-  - ``BLOCK_ROWS``       — row-tile size, 2D variants only (single-program
-                           variants gather all ``K_INDICES`` rows in one
-                           shot, so they have no row-tile size)
-  - ``y_offset``         — starting column of the slice, single-program
-                           variants only; the kernel reads
+  - ``BLOCK_ROWS``       — row-tile size; every variant except the
+                           single-program ``1core``/``large_k``
+                           pair gathers in ``BLOCK_ROWS``-sized row tiles
+                           rather than all ``K_INDICES`` rows at once
+  - ``y_offset``         — starting column of the slice, kernels that
+                           take a fixed column slice only (not
+                           ``gather_2d_kernel``); the kernel reads
                            ``source[idx[i], y_offset : y_offset + BLOCK_COLS]``
 
-Two kernel families share this fixture:
+Three kernel families share this fixture:
 
-  - **single-program** (``gather_kernel``) — one kernel invocation
-    consumes the whole index array. No ``tl.program_id``, so
-    DistributeWork is a no-op. Variants:
-      - ``default`` — sanity case with non-zero ``y_offset``.
-      - **edge-case set** — six variants that each pin a specific
-        edge-case bug class (zero offset, full row, minimum legal sizes,
-        slice ending at row edge, wider slice, larger K_INDICES).
+  - **distributed** (``gather_kernel``) — the ``default``. Fixed
+    column slice via ``y_offset``, rows tiled by ``BLOCK_ROWS`` and
+    distributed across a 1D core grid via ``tl.program_id(0)``. Variants:
+      - ``default``       — sanity case with non-zero ``y_offset``.
+      - **edge-case set** — six variants rebased onto this kernel, each
+        pinning a specific bug class (zero offset, full row, minimum
+        legal sizes, slice ending at row edge, wider slice).
+
+  - **single-program** (``gather_kernel_1core``) — one kernel invocation
+    consumes the whole index array in one ``descriptor_gather`` call, no
+    row tiling. No ``tl.program_id``, so DistributeWork is a no-op.
+    Variants:
+      - ``1core``   — the ``gather_kernel_1core`` sanity case itself
+                      (formerly ``default``).
+      - ``large_k`` — larger ``K_INDICES`` fan-out in one shot;
+                      kept single-program because row-tiling would
+                      change what it tests (the fan-out size).
 
   - **2D-tiled** (``gather_2d_kernel``) — tiled across a 2D core grid.
     ``tl.program_id(0)`` and ``tl.program_id(1)`` both active; each
-    core runs an inner ``scf.for`` over its row-tile chunk. Variants:
+    core runs an inner ``scf.for`` over its row-tile chunk. No
+    ``y_offset`` — gathers the full row width by column-tiling instead.
+    Variants:
       - ``2d``             — small source matrix (M=1024, N=128).
       - ``2d_large_table`` — same distribution at larger source dims
                               (M=4096, N=256), per-core tile count
@@ -693,6 +707,21 @@ SIGNATURE = {
     "M":          "i32",
     "N":          "i32",
     "K_INDICES":  "i32",
+    "BLOCK_ROWS": "i32",
+    "BLOCK_COLS": "i32",
+}
+
+# gather_kernel_1core has no BLOCK_ROWS (no row tiling) — otherwise
+# identical to the module-level SIGNATURE, including y_offset as a fixed
+# column slice.
+_SIG_1CORE = {
+    "in_ptr":     "*fp32",
+    "out_ptr":    "*fp32",
+    "idx_ptr":    "*i32",
+    "y_offset":   "i32",
+    "M":          "i32",
+    "N":          "i32",
+    "K_INDICES":  "i32",
     "BLOCK_COLS": "i32",
 }
 
@@ -858,23 +887,29 @@ _SIG_1D = {
 
 VARIANTS = {
     "default": {
-        # Sanity case: small source matrix, unique indices, non-zero
-        # y_offset to exercise the column-slicing path.  Non-zero
-        # y_offset matters because the lowered indirect access tile
-        # uses y_offset as a captured variable in the direct-dimension
-        # subscript map (``col = y_offset + d1``); a y_offset=0 test
-        # would mask any bug in that subscript.
+        # Basic, representative gather fixture: plain rank-2 source, plain
+        # 1D grid, no shape exotica — and distributed across the core grid.
+        # Small source matrix, unique indices, non-zero y_offset to
+        # exercise the column-slicing path.  Non-zero y_offset matters
+        # because the lowered indirect access tile uses y_offset as a
+        # captured variable in the direct-dimension subscript map
+        # (``col = y_offset + d1``); a y_offset=0 test would mask any bug
+        # in that subscript.
         #
         # ``BLOCK_COLS`` must be a power of two (Triton frontend
         # constraint on descriptor block shapes).  With BLOCK_COLS=32
         # and y_offset=16 we read columns [16, 48) of each gathered
         # row — strictly inside [0, N=64).
+        #
+        # K_INDICES=256 with BLOCK_ROWS=8 gives 32 row tiles, filling
+        # the 32-core grid with exactly one gather per core.
         "kernel_fn":  kernel.gather_kernel,
-        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS"],
+        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_ROWS", "BLOCK_COLS"],
         "params": {
             "M":          [1024],
             "N":          [64],
-            "K_INDICES":  [32],
+            "K_INDICES":  [256],
+            "BLOCK_ROWS": [8],
             "BLOCK_COLS": [32],
             "y_offset":   [16],
         },
@@ -884,13 +919,59 @@ VARIANTS = {
         "inputs":     make_inputs,
         "output_key": "out_ptr",
     },
+    "1core": {
+        # gather_kernel_1core: the one variant in this fixture that pins
+        # the no-scf.for shape — a single descriptor_gather call consumes
+        # the whole index array in one shot, no tl.program_id, no row
+        # tiling. Formerly the ``default`` variant; demoted because
+        # "default" plays two roles at once (conftest._resolve_base's
+        # implicit merge base for every "base"-less sibling, and
+        # conftest._load_examples's bare test key ``gather``), and the
+        # single-program shape is the exotic one here — every sibling
+        # inheriting it meant no rank-2 variant ever exercised the
+        # distributed gather path. Key spelled "1core" to match the
+        # kernel name.
+        #
+        # "base": None opts out of the implicit default-fallback merge
+        # (conftest._resolve_base) instead of inheriting the new
+        # default's SIGNATURE (which adds BLOCK_ROWS) — this variant
+        # has no BLOCK_ROWS of its own and needs its own SIGNATURE.
+        "base":       None,
+        "kernel_fn":  kernel.gather_kernel_1core,
+        "SIGNATURE":  _SIG_1CORE,
+        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS"],
+        "params": {
+            "M":          [1024],
+            "N":          [64],
+            "K_INDICES":  [32],
+            "BLOCK_COLS": [32],
+            "y_offset":   [16],
+        },
+        "tags":       ["descriptor-gather", "1core"],
+        "summary": (
+            "Single-program gather: one descriptor_gather consumes the whole "
+            "index array, with no tl.program_id and so no distribution "
+            "scf.for. Spyre's fixed core count makes that a legitimate, "
+            "representative class of kernel rather than a gap to close — it "
+            "is the shape ``default`` deliberately does not have."
+        ),
+        "grid":       [32],
+        "reference":  run,
+        "inputs":     make_inputs,
+        "output_key": "out_ptr",
+    },
     # ------------------------------------------------------------------
     # Edge-case variants.  Each pins one specific bug class that the
-    # default+embedding pair does not cover.  See README.md (the
-    # "Variants" and "Preconditions" sections) for the rules these have
-    # to obey:
+    # default+embedding pair does not cover.  Based on the distributed
+    # ``default`` (gather_kernel), so each exercises the column-slice
+    # machinery on the row-tiled path —
+    # see README.md (the "Variants" and "Preconditions" sections) for
+    # the rules these have to obey:
     #   * BLOCK_COLS is a power of two (validate_block_shape)
-    #   * K_INDICES >= 8 (descriptor_gather verifier)
+    #   * BLOCK_ROWS >= 8 (descriptor_gather verifier) — under
+    #     row-tiling the verifier's minimum binds on the gathered index
+    #     tile's leading dim, i.e. BLOCK_ROWS, not K_INDICES; K_INDICES
+    #     only needs to be a multiple of BLOCK_ROWS (no masking)
     #   * y_offset + BLOCK_COLS <= N (slice fits in the source row)
     # The TMA-only ``BLOCK_COLS >= 32 / bitwidth * 8`` minimum does not
     # apply on Spyre (see kernel.py docstring), but every rank-2
@@ -908,6 +989,7 @@ VARIANTS = {
             "M":          [256],
             "N":          [32],
             "K_INDICES":  [16],
+            "BLOCK_ROWS": [8],
             "BLOCK_COLS": [16],
             "y_offset":   [0],
         },
@@ -925,6 +1007,7 @@ VARIANTS = {
             "M":          [128],
             "N":          [16],
             "K_INDICES":  [16],
+            "BLOCK_ROWS": [8],
             "BLOCK_COLS": [16],
             "y_offset":   [0],
         },
@@ -939,25 +1022,34 @@ VARIANTS = {
             "M":          [128],
             "N":          [256],
             "K_INDICES":  [16],
+            "BLOCK_ROWS": [8],
             "BLOCK_COLS": [256],
             "y_offset":   [0],
         },
         "inputs": make_inputs_full_row,
     },
     "min_block_cols": {
-        # Smallest legal sizes per the verifier: K_INDICES=8 (verifier
-        # minimum) and BLOCK_COLS=8 (verifier minimum for f32, since
-        # 32/bitwidth*8 = 8 when bitwidth=32).  Probes the lower
-        # boundary of the legal region.  Per the test rule "test
-        # endpoints of a range, not just the interior" — interior cases
-        # alone wouldn't catch a bug that triggers only at the
-        # smallest legal block.  Allows duplicates so an aliasing bug
-        # at the minimum size shows up.
+        # Smallest legal sizes per the verifier: BLOCK_ROWS=8 (verifier
+        # minimum on the gathered index tile) and BLOCK_COLS=8 (verifier
+        # minimum for f32, since 32/bitwidth*8 = 8 when bitwidth=32).
+        # Probes the lower boundary of the legal region.  Per the test
+        # rule "test endpoints of a range, not just the interior" —
+        # interior cases alone wouldn't catch a bug that triggers only
+        # at the smallest legal block.  Allows duplicates so an
+        # aliasing bug at the minimum size shows up.
+        #
+        # K_INDICES=8 == BLOCK_ROWS reduces this variant to a single
+        # row tile — one busy core, 31 idle. That degenerate fan-out is
+        # deliberate: it is the smallest legal shape the row-tiled kernel
+        # accepts, and the clamp in gather_kernel (m_end = min(m_start +
+        # rows_per_core, m_blocks)) is what keeps the 31 idle cores from
+        # walking off the end of the index array.
         "base":   "default",
         "params": {
             "M":          [64],
             "N":          [64],
             "K_INDICES":  [8],
+            "BLOCK_ROWS": [8],
             "BLOCK_COLS": [8],
             "y_offset":   [32],
         },
@@ -975,6 +1067,7 @@ VARIANTS = {
             "M":          [256],
             "N":          [64],
             "K_INDICES":  [16],
+            "BLOCK_ROWS": [8],
             "BLOCK_COLS": [16],
             "y_offset":   [48],
         },
@@ -992,18 +1085,26 @@ VARIANTS = {
             "M":          [128],
             "N":          [256],
             "K_INDICES":  [16],
+            "BLOCK_ROWS": [8],
             "BLOCK_COLS": [128],
             "y_offset":   [64],
         },
         "inputs": make_inputs_wide_slice,
     },
     "large_k": {
-        # Larger K_INDICES (128) than any other variant.  The kernel
-        # is single-program, so this stresses the descriptor_load on
-        # the index buffer + the descriptor_gather fan-out at higher
-        # row count, without changing the lowering path.  Duplicates
-        # allowed so the larger fan-out also exercises aliasing.
-        "base":   "default",
+        # Largest single-shot fan-out in the fixture: K_INDICES=128 rows
+        # in one descriptor_gather.  (``default`` carries a larger
+        # K_INDICES=256, but tiled 8 rows at a time, so its per-gather
+        # fan-out is 8.)  Stresses the descriptor_load on the index
+        # buffer + the descriptor_gather fan-out at higher row count,
+        # without changing the lowering path.  Duplicates allowed so the
+        # larger fan-out also exercises aliasing.
+        #
+        # Kept on "1core" (not moved onto the distributed default):
+        # under row-tiling the per-gather fan-out would become
+        # BLOCK_ROWS instead of the full K_INDICES, silently changing
+        # what this variant tests.
+        "base":   "1core",
         "params": {
             "M":          [512],
             "N":          [64],
@@ -1042,10 +1143,11 @@ VARIANTS = {
         # the ``x_offsets.shape[0] >= 8`` assertion), so BLOCK_ROWS >= 8
         # here.
         #
-        # Unlike ``default``, this kernel is multi-program: it reads
-        # ``tl.program_id`` on both axes, so DistributeWork lowers it to
-        # ``ktdp.get_compute_tile_id`` plus a distribution loop. That
-        # lowering is pinned by ``Conversion/distribute-work-multi-axis.mlir``.
+        # ``default`` distributes too, but only on axis 0; this kernel
+        # reads ``tl.program_id`` on both axes, so DistributeWork lowers it
+        # to ``ktdp.get_compute_tile_id`` plus a distribution loop over a
+        # 2D tile space. That lowering is pinned by
+        # ``Conversion/distribute-work-multi-axis.mlir``.
         "kernel_fn":    kernel.gather_2d_kernel,
         "SIGNATURE":    _SIG_2D,
         "constexpr":    [
@@ -1127,7 +1229,7 @@ VARIANTS = {
     "2d_large_table_serial": {
         # ``2d_large_table`` data shape on a 1-core grid. Same intent
         # as ``2d_serial``: pin the degenerate tiling path numerically
-        # at the larger source dims, no work-distribution check.
+        # at the larger source dims.
         "base":     "2d_large_table",
         "tags":     ["descriptor-gather"],
         "grid":     [1, 1],
