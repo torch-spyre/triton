@@ -938,15 +938,39 @@ struct RewriteDescriptorLayoutPass
     // Phase 2: synthesize contractions via greedy pattern rewrite.
     {
       PassContext ctx{physMemViewToMarker, physicalLoadToTransposePerm};
+      ctx.emitGenericBody = emitGeneric;
       RewritePatternSet patterns(module.getContext());
       populateContractionPatterns(patterns, ctx);
-      // Collect candidate ops (only op types our patterns target).
+      // Collect candidate ops (only op types our patterns target), and reject
+      // any pre-existing linalg.generic.
+      //
+      // The rejection belongs here rather than in a pattern: the greedy driver
+      // below runs with GreedyRewriteStrictness::ExistingAndNewOps, so it
+      // reprocesses ops the patterns themselves create. A pattern-based check
+      // would therefore fire on this pass's own linalg.generic output under
+      // emit-generic.
       SmallVector<Operation *> candidates;
+      bool sawGeneric = false;
       module.walk([&](Operation *op) {
+        if (auto generic = dyn_cast<linalg::GenericOp>(op)) {
+          // Phase 2 recognizes a contraction by its concrete op type and reads
+          // the operand layouts; it never interprets indexing_maps. Admitting a
+          // generic would mean ignoring the attribute that defines its
+          // semantics, so refuse instead of silently mislowering.
+          generic.emitError(
+              "rewrite-descriptor-layout: input contains a linalg.generic; "
+              "this pass matches concrete contraction ops "
+              "(linalg.matmul/batch_matmul/reduce) and does not interpret "
+              "indexing_maps, so generalize after it rather than before");
+          sawGeneric = true;
+          return;
+        }
         if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, linalg::ReduceOp,
                 mlir::ktdp::StoreOp>(op))
           candidates.push_back(op);
       });
+      if (sawGeneric)
+        return signalPassFailure();
       GreedyRewriteConfig config;
       config.enableFolding(false);
       config.enableConstantCSE(false);

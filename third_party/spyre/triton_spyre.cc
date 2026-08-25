@@ -57,16 +57,19 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // ConvertFunctions would rewrite).
   m.def(
       "add_convert_ttir_to_ktdp",
-      [](mlir::PassManager &pm, const std::string &data_layout) {
+      [](mlir::PassManager &pm, const std::string &data_layout,
+         bool emit_generic) {
         pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
         pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
         pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
         pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
-            mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
+            mlir::triton::ktdp::RewriteDescriptorLayoutOptions{
+                .dataLayout = data_layout, .emitGeneric = emit_generic}));
         pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
         pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
       },
-      py::arg("pm"), py::arg("data_layout") = "device");
+      py::arg("pm"), py::arg("data_layout") = "device",
+      py::arg("emit_generic") = false);
   // Individual pass bindings. add_convert_ttir_to_ktdp above is the default
   // order, but a caller that needs a different one — a subset of the passes,
   // a repeat, or an extra pass slotted between two of them — builds the
@@ -81,11 +84,14 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   });
   m.def(
       "add_rewrite_descriptor_layout",
-      [](mlir::PassManager &pm, const std::string &data_layout) {
+      [](mlir::PassManager &pm, const std::string &data_layout,
+         bool emit_generic) {
         pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
-            mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
+            mlir::triton::ktdp::RewriteDescriptorLayoutOptions{
+                .dataLayout = data_layout, .emitGeneric = emit_generic}));
       },
-      py::arg("pm"), py::arg("data_layout") = "device");
+      py::arg("pm"), py::arg("data_layout") = "device",
+      py::arg("emit_generic") = false);
   // Not in add_convert_ttir_to_ktdp above: this is a fix pass, spliced into the
   // pipeline from Python via SpyreOptions.required_fixes. It must be anchored on
   // convert_elementwise_to_linalg, which is the pass that creates the ins/outs

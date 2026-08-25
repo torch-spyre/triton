@@ -53,12 +53,31 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
         no tt.spyre_tensor_layout ops remain. Descriptors without an
         annotation are left untouched. A pure pointwise kernel exercises only
         Phase 1.
+
+        Rejects an incoming linalg.generic. Phase 2 reasons about a contraction
+        by matching a concrete op (linalg.matmul, batch_matmul, reduce) and
+        reading its operand layouts; it never interprets indexing_maps. A
+        generic carries its iteration space in those maps, so admitting one
+        would mean silently ignoring the very attribute that defines its
+        semantics. Generalize before this pass and the contraction is no longer
+        recognizable; generalize after and the maps are already physical.
+
+        The emit-generic option selects how a stick-split walk is expressed:
+        false (default) synthesizes an scf.for nest plus tensor.insert_slice,
+        true expresses the same walk as one linalg.generic. Only the loop form
+        is consumed by the dataflow-scheduler today, which is why the generic
+        form is opt-in rather than the default.
     }];
 
     let options = [
         Option<"dataLayout", "data-layout", "std::string",
                /*default=*/"\"device\"",
-               "Format of tensors: \"device\" (stickified) or \"host\" (row-major)">
+               "Format of tensors: \"device\" (stickified) or \"host\" (row-major)">,
+        Option<"emitGeneric", "emit-generic", "bool",
+               /*default=*/"false",
+               "Express a stick-split walk as a single linalg.generic instead "
+               "of an scf.for nest. Opt-in: the loop form is what the "
+               "dataflow-scheduler consumes today.">
     ];
 
     let dependentDialects = [

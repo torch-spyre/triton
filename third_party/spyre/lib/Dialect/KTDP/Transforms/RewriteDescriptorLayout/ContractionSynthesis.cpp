@@ -23,11 +23,13 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -205,16 +207,37 @@ Value extractOpSlice(OpBuilder &b, Location loc,
 // Source stage (matmul / reduce operands)
 //===----------------------------------------------------------------------===//
 
+// Defined below, next to the map-building helpers it depends on. Returns a null
+// Value when the shape has no generic form, in which case the caller falls back
+// to the loop path.
+static Value tryEmitGeneric(linalg::LinalgOp op, OpBuilder &b,
+                            const SourceOpSpec &spec,
+                            llvm::ArrayRef<OperandPlan> plans,
+                            const PassContext &ctx);
+
 // Source stage emission: extract slices, optional transpose, call emitOp.
 // Returns the replacement value for the original op's result.
 Value emitSourceStage(
     linalg::LinalgOp op,
     OpBuilder &b,
-    llvm::function_ref<Value(OpBuilder &, Location, llvm::ArrayRef<Value>, Value,
-                             RankedTensorType)>
-        emitOp,
-    llvm::ArrayRef<OperandPlan> plans) {
+    const SourceOpSpec &spec,
+    llvm::ArrayRef<OperandPlan> plans,
+    const PassContext &ctx) {
   Location loc = op.getLoc();
+  auto emitOp = spec.emitOp;
+
+  // Both paths consume the same OperandPlans and return a canonical LOGICAL
+  // tensor of the same type, which the sink stage physicalizes — so the choice
+  // is invisible to every later stage. A null return means this shape has no
+  // generic form yet, and the loop path below runs unchanged.
+  if (ctx.emitGenericBody) {
+    if (Value v = tryEmitGeneric(op, b, spec, plans, ctx))
+      return v;
+    if (ctx.hadError)
+      return Value{};
+    LLVM_DEBUG(llvm::dbgs()
+               << "  emit-generic: no generic form, falling back to loop nest\n");
+  }
 
   Value cVal = op.getDpsInits()[0];
   auto accElemTy = cast<RankedTensorType>(cVal.getType()).getElementType();
@@ -267,8 +290,32 @@ Value emitSourceStage(
         f = plan.coords.physBlock[p];
       if (f <= 1)
         continue;
-      if (stickFactor != 1 && stickFactor != f)
-        llvm_unreachable("emitSourceStage: plans disagree on stickFactor");
+      if (stickFactor != 1 && stickFactor != f) {
+        // Two annotated operands disagree on how many sticks the *reduction*
+        // axis spans. Distinct from the parallel-scatter disagreement below,
+        // which dispatchSource reports: that one concerns a parallel floor dim
+        // and can also differ on the output axis. Reported here so the message
+        // names the right axis kind.
+        //
+        // No lit test reaches this branch. Both operands must contribute a
+        // reduction-axis floor dim with differing trip counts, but a
+        // contraction's reduction extent is shared, and every attempt to make
+        // the trip counts differ either changes a per-stick block shape — which
+        // linalg's own verifier rejects first — or stops producing a reduction
+        // floor dim at all. It was previously an llvm_unreachable, so this may
+        // be genuinely unreachable; it is a diagnostic rather than a crash
+        // because "probably unreachable" is not a safe reason to abort the
+        // compiler.
+        ctx.hadError = true;
+        op->emitError(
+            "spyre_tensor_layout: operands disagree on the reduction "
+            "stick factor — two annotated operands carry reduction floor "
+            "dims with different trip counts (")
+            << stickFactor << " vs " << f
+            << "); a contraction's reduction axis must span the same number "
+               "of sticks in every operand";
+        return Value{};
+      }
       stickFactor = f;
     }
   }
@@ -375,6 +422,297 @@ static LogicalResult emitFatalError(Operation *op, const PassContext &ctx,
   return op->emitError(msg);
 }
 
+// Helper: reject an indexing map this pipeline cannot express.
+//
+// A *projected permutation* is an affine map whose every result is a bare
+// dimension name — `(d0, d1) -> (d1, d0)` qualifies, `(d0, d1) -> (d0 * 32 + d1)`
+// does not. A constant result is also admitted here: the downstream
+// dataflow-scheduler gates map results on "bare dim or constant", so a
+// constant-indexed access is legal even though it is not a permutation.
+//
+// AffineMap::isProjectedPermutation() is deliberately not used. It rejects a
+// constant result unless passed allowZeroInResults=true, and even then admits
+// only literal zero, which is stricter than the scheduler's own rule.
+//
+// A stick split is a rank change and can only be written as `d0 * 32 + d1`, so
+// a map failing this check is exactly the shape that would be mislowered.
+// True when every result of `map` is a bare dimension or a constant, i.e. the
+// map is one the dataflow-scheduler's pipeline-construction gate accepts. Shared
+// by the diagnostic below and by the generic emitter, which uses it to decline a
+// shape rather than to report an error.
+static bool isProjectedOrConstantMap(AffineMap map) {
+  return llvm::all_of(map.getResults(), [](AffineExpr result) {
+    return isa<AffineDimExpr, AffineConstantExpr>(result);
+  });
+}
+
+static LogicalResult
+verifyProjectedIndexingMap(Operation *op, const PassContext &ctx, AffineMap map,
+                           llvm::StringRef what) {
+  for (AffineExpr result : map.getResults()) {
+    if (isa<AffineDimExpr, AffineConstantExpr>(result))
+      continue;
+    // An AffineExpr has no Diagnostic operator<<, so stringify it first. Bind
+    // the buffer to a named std::string — streaming into a temporary and
+    // handing the result to a Twine would dangle.
+    std::string exprBuf;
+    llvm::raw_string_ostream exprOs(exprBuf);
+    exprOs << result;
+    std::string mapBuf;
+    llvm::raw_string_ostream mapOs(mapBuf);
+    mapOs << map;
+    return emitFatalError(
+        op, ctx,
+        "spyre_tensor_layout: " + what + " indexing map " + mapBuf +
+            " is not a projected permutation — result '" + exprBuf +
+            "' is neither a bare dimension nor a constant, which the "
+            "dataflow-scheduler cannot consume");
+  }
+  return success();
+}
+
+
+//===----------------------------------------------------------------------===//
+// Generic emission (emit-generic option)
+//===----------------------------------------------------------------------===//
+
+// One physical dim's contribution to an operand's indexing map, before the
+// iteration space is known. `kind` mirrors OperandPlan::dims.sliceKind[p]; the
+// two dimension ids index the shared iteration space being built.
+//
+// The mapping from a slice offset to an affine expression is the whole idea of
+// the generic form. Each SliceKind reads its element position from the loop
+// counters instead of computing a slice offset from an induction variable:
+//
+//   StickIndex      offset = IV,               size 1        -> d_stick
+//   StickifiedBlock offset = IV * stickSize,    size stick    -> d_stick * stickSize + d_lane
+//   WholeBlock      offset = 0,                 size whole    -> d_lane
+//
+// The middle row is the one that is not a projected permutation, and so the one
+// verifyProjectedIndexingMap rejects. See the file-level note there.
+struct MapDimContribution {
+  SliceKind kind;
+  int64_t stickDim = -1;   // iteration dim selecting which stick
+  int64_t laneDim = -1;    // iteration dim walking within a stick / block
+  int64_t stickSize = 1;   // element count per stick; from plan.dims.stickSize
+};
+
+// Build one operand's indexing map from its per-dim contributions.
+//
+// `domainRank` is the size of the shared iteration space. Results are emitted in
+// physical dim order, matching the operand's own shape, because a
+// linalg.generic's map is indexed by the operand's dimensions.
+static AffineMap
+buildOperandIndexingMap(MLIRContext *mlirCtx, unsigned domainRank,
+                        llvm::ArrayRef<MapDimContribution> contributions) {
+  llvm::SmallVector<AffineExpr> results;
+  for (const MapDimContribution &c : contributions) {
+    switch (c.kind) {
+    case SliceKind::StickIndex:
+      results.push_back(getAffineDimExpr(c.stickDim, mlirCtx));
+      break;
+    case SliceKind::StickifiedBlock:
+      // A rank change: one logical axis re-expressed as stick * width + lane.
+      // Deliberately arithmetic — no bare-dim form exists for a split.
+      results.push_back(
+          getAffineDimExpr(c.stickDim, mlirCtx) * c.stickSize +
+          getAffineDimExpr(c.laneDim, mlirCtx));
+      break;
+    case SliceKind::WholeBlock:
+      results.push_back(getAffineDimExpr(c.laneDim, mlirCtx));
+      break;
+    }
+  }
+  return AffineMap::get(domainRank, /*symbolCount=*/0, results, mlirCtx);
+}
+
+
+// Try to express the whole stick-split walk as one linalg.generic.
+//
+// Returns a canonical LOGICAL tensor of the same type the scf.for path returns,
+// which the sink stage then physicalizes — the invariant emitSourceStage's
+// contract rests on, so both paths are interchangeable to every later stage.
+//
+// Returns a null Value when this shape has no generic form yet. That is a
+// *fallback*, not an error: the caller re-runs the loop path, so turning the
+// option on never converts a working compile into a failure. A map the
+// downstream consumer cannot take is reported by verifyProjectedIndexingMap,
+// which sets ctx.hadError and fails the pass rather than falling back — a
+// silently-different lowering would be worse than a diagnostic.
+//
+// Iteration space. One counter per *logical* coordinate, then one per reduced
+// extent:
+//
+//   [ 0 .. nParallel )   one per accumulator axis            -> parallel
+//   [ nParallel .. R )   one per reduced or split extent     -> reduction
+//
+// A parallel counter and its accumulator axis share an index, so the output map
+// is the identity over that prefix. A reduced axis never appears in the output
+// map, which is what makes its counter a reduction.
+//
+// The subtlety is that `dimRoles` is keyed by the LOGICAL dim a physical dim
+// derives from, and a stick split turns one logical dim into two physical dims
+// (a floordiv dim and a mod dim). Both therefore report the *same* role. Writing
+// that role into both map results would name one counter twice — an invalid map,
+// and not what the layout means. A split axis instead reconstructs its single
+// logical coordinate from the two physical dims as `stick * stickSize + lane`,
+// exactly as the reduction case does.
+static Value tryEmitGeneric(linalg::LinalgOp op, OpBuilder &b,
+                            const SourceOpSpec &spec,
+                            llvm::ArrayRef<OperandPlan> plans,
+                            const PassContext &ctx) {
+  if (!spec.emitGenericBody)
+    return Value{}; // op kind has no generic form; caller falls back
+  MLIRContext *mlirCtx = b.getContext();
+  Location loc = op.getLoc();
+
+  Value cVal = op.getDpsInits()[0];
+  auto accTy = dyn_cast<RankedTensorType>(cVal.getType());
+  if (!accTy)
+    return Value{};
+
+  unsigned nParallel = accTy.getRank();
+  unsigned nextDim = nParallel;
+
+  // A reduced extent is private to the operand carrying it, except for the stick
+  // counter of a split axis: that index is what two operands walk in lockstep,
+  // so it is shared and keyed by the axis's slot in reduceDims — a position
+  // counted from the right, stable across operands where a physical dim index is
+  // not.
+  llvm::DenseMap<int64_t, int64_t> reduceSlotToStickDim;
+  auto sharedStickDim = [&](int64_t slot) -> int64_t {
+    auto it = reduceSlotToStickDim.find(slot);
+    if (it != reduceSlotToStickDim.end())
+      return it->second;
+    return reduceSlotToStickDim[slot] = nextDim++;
+  };
+
+  llvm::SmallVector<AffineMap> indexingMaps;
+  llvm::SmallVector<Value> inputs;
+
+  for (const OperandPlan &plan : plans) {
+    unsigned rank = plan.coords.physBlock.size();
+    if (plan.dims.sliceKind.size() != rank || plan.dimRoles.size() != rank)
+      return Value{};
+
+    // Detect a *split parallel* axis: two physical dims sharing one role, one of
+    // them the floordiv (stick-index) dim and the other the lane. Its two map
+    // results must combine into one logical coordinate rather than each naming
+    // the shared role counter.
+    llvm::DenseMap<int64_t, int> roleCount;
+    for (unsigned p = 0; p < rank; ++p)
+      if (plan.dimRoles[p] >= 0)
+        ++roleCount[plan.dimRoles[p]];
+
+    llvm::SmallVector<MapDimContribution> contributions;
+    for (unsigned p = 0; p < rank; ++p) {
+      MapDimContribution c;
+      c.kind = plan.dims.sliceKind[p];
+      c.stickSize = plan.dims.stickSize;
+      int64_t role = plan.dimRoles[p];
+
+      if (role >= (int64_t)nParallel)
+        return Value{}; // role outside the accumulator: unhandled
+
+      if (role >= 0 && roleCount[role] > 1) {
+        // Split parallel axis. Reconstruct `role`'s coordinate from this
+        // operand's stick and lane dims. Both physical dims produce the same
+        // pair of expressions, so the map result is well-defined either way:
+        // the floordiv dim contributes the stick term, the mod dim the lane.
+        //
+        // No generic form is claimed for this shape yet: the reconstruction is
+        // arithmetic on two counters that the output map would also have to
+        // agree with, and getting that wrong silently reorders elements. Decline
+        // and let the loop path handle it.
+        return Value{};
+      }
+
+      switch (c.kind) {
+      case SliceKind::StickIndex:
+        // Selects one stick, size 1. Parallel: names its output axis. Reduced: a
+        // private counter, since a size-1 walk is not shared across operands.
+        if (role >= 0) {
+          c.stickDim = role;
+        } else {
+          c.stickDim = nextDim++;
+        }
+        break;
+      case SliceKind::StickifiedBlock: {
+        // The split: stick * width + lane. Shared stick counter, private lane.
+        // This is the non-projected map the guard below reports.
+        auto it = llvm::find(plan.dims.reduceDims, (int)p);
+        if (it == plan.dims.reduceDims.end())
+          return Value{}; // split on a non-reduced axis: unhandled
+        c.stickDim = sharedStickDim(
+            std::distance(plan.dims.reduceDims.begin(), it));
+        c.laneDim = nextDim++;
+        break;
+      }
+      case SliceKind::WholeBlock:
+        // Taken whole: a parallel axis names its output axis, a reduced one
+        // walks its own counter over the full extent.
+        c.laneDim = (role >= 0) ? role : (int64_t)(nextDim++);
+        break;
+      }
+      contributions.push_back(c);
+    }
+
+    indexingMaps.push_back(
+        buildOperandIndexingMap(mlirCtx, /*domainRank=*/nextDim, contributions));
+    inputs.push_back(plan.value);
+  }
+
+  unsigned domainRank = nextDim;
+  // Maps were built as counters were allocated, so earlier ones were created
+  // against a smaller domain. Re-anchor every map to the final rank; the
+  // expressions are unchanged, only the declared domain size grows.
+  for (AffineMap &map : indexingMaps)
+    map = AffineMap::get(domainRank, /*symbolCount=*/0, map.getResults(),
+                         mlirCtx);
+
+  // The output reads the parallel prefix in accumulator-axis order.
+  llvm::SmallVector<AffineExpr> outResults;
+  for (unsigned a = 0; a < nParallel; ++a)
+    outResults.push_back(getAffineDimExpr(a, mlirCtx));
+  indexingMaps.push_back(
+      AffineMap::get(domainRank, /*symbolCount=*/0, outResults, mlirCtx));
+
+  // A stick split is a rank change and can only be written as `stick * width +
+  // lane`, so a K-split matmul legitimately produces a non-projected map. The
+  // dataflow-scheduler cannot consume one (see verifyProjectedIndexingMap), so
+  // decline the shape and let the loop path run. This is a fallback, not an
+  // error: the loop form is what the scheduler takes today, and it is what the
+  // default path would have emitted anyway.
+  for (AffineMap map : indexingMaps)
+    if (!isProjectedOrConstantMap(map)) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "  emit-generic: map " << map
+                 << " is not consumable downstream, falling back\n");
+      return Value{};
+    }
+
+  llvm::SmallVector<utils::IteratorType> iteratorTypes(
+      domainRank, utils::IteratorType::reduction);
+  for (unsigned a = 0; a < nParallel; ++a)
+    iteratorTypes[a] = utils::IteratorType::parallel;
+
+  auto generic = linalg::GenericOp::create(
+      b, loc, TypeRange{accTy}, ValueRange(inputs), ValueRange{cVal},
+      indexingMaps, iteratorTypes,
+      [&](OpBuilder &inner, Location iloc, ValueRange args) {
+        spec.emitGenericBody(inner, iloc, args);
+      });
+
+  // linalg checks that the domain extents implied by the operand shapes agree.
+  // A disagreement means the plans were inconsistent; drop the op and let the
+  // loop path run rather than leaving invalid IR behind.
+  if (failed(generic.verify())) {
+    generic.erase();
+    return Value{};
+  }
+  return generic.getResult(0);
+}
+
 // Classify one operand and populate plans[i].
 LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
                              const PassContext &ctx, PatternRewriter &rewriter) {
@@ -458,7 +796,11 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
   }
 
   OpBuilder b(op.getOperation());
-  Value result = emitSourceStage(op, b, spec.emitOp, plans);
+  Value result = emitSourceStage(op, b, spec, plans, ctx);
+  if (!result && ctx.hadError)
+    // emitSourceStage already emitted a specific diagnostic; do not overwrite
+    // it with the generic parallel-scatter message below.
+    return failure();
   if (!result)
     return emitFatalError(op, ctx,
         "spyre_tensor_layout: operands disagree on the parallel multi-stick "
@@ -619,6 +961,38 @@ LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
 // Shared matmul-like pattern helper
 //===----------------------------------------------------------------------===//
 
+// Variant 2 (design doc section 4.4): the region body of a matmul expressed as a
+// linalg.generic. linalg.matmul accumulates implicitly through its `outs`
+// operand, so nothing in its body says "reduce"; a generic has to name the
+// multiply and the accumulate explicitly.
+//
+// args holds one scalar per operand in ins-then-outs order: A, B, then the
+// running accumulator C.
+//
+// Integer and float are separate op sets in arith, so the element type selects
+// which pair to emit. An unsupported element type yields nothing, which would
+// leave the region without its required terminator — so callers must screen the
+// type first; matmulGenericBodySupported is that screen.
+static bool matmulGenericBodySupported(Type elemTy) {
+  return isa<FloatType>(elemTy) || elemTy.isSignlessInteger();
+}
+
+static void emitMatmulGenericBody(OpBuilder &inner, Location iloc,
+                                  ValueRange args) {
+  assert(args.size() == 3 && "matmul generic body expects A, B, and C scalars");
+  Value a = args[0], bArg = args[1], acc = args[2];
+  Type elemTy = acc.getType();
+  Value prod, sum;
+  if (isa<FloatType>(elemTy)) {
+    prod = arith::MulFOp::create(inner, iloc, a, bArg).getResult();
+    sum = arith::AddFOp::create(inner, iloc, prod, acc).getResult();
+  } else {
+    prod = arith::MulIOp::create(inner, iloc, a, bArg).getResult();
+    sum = arith::AddIOp::create(inner, iloc, prod, acc).getResult();
+  }
+  linalg::YieldOp::create(inner, iloc, ValueRange{sum});
+}
+
 // Shared implementation for matmul-like contractions (matmul, batch_matmul).
 // Parameterized by the op type, logical rank, canonical axes, and op emitter.
 template <typename OpTy>
@@ -648,6 +1022,12 @@ static LogicalResult rewriteMatmulLike(
   spec.operands.assign(operandSpecs.begin(), operandSpecs.end());
   spec.logicalRank = logicalRank;
   spec.emitOp = emitOp;
+  // Leave emitGenericBody null for an element type arith has no mul/add pair
+  // for, so the generic path declines the shape and the loop path runs.
+  auto accTy = dyn_cast<RankedTensorType>(
+      cast<linalg::LinalgOp>(op.getOperation()).getDpsInits()[0].getType());
+  if (accTy && matmulGenericBodySupported(accTy.getElementType()))
+    spec.emitGenericBody = emitMatmulGenericBody;
   return dispatchSource(op, spec, ctx, rewriter);
 }
 
@@ -755,21 +1135,53 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
       targetOrder.push_back((int64_t)r);
     targetOrder.append(logicalRank - outAxis, -1);
 
-    Block &combinerBlock = rd.getOperation()->getRegion(0).front();
-    llvm::SmallVector<Operation *> combinerOps;
-    for (Operation &op : combinerBlock.without_terminator())
-      combinerOps.push_back(&op);
-    auto combinerYield = cast<linalg::YieldOp>(combinerBlock.getTerminator());
-    llvm::SmallVector<Value> yieldVals(combinerYield.getValues().begin(),
-                                       combinerYield.getValues().end());
-    llvm::SmallVector<Value> origBlockArgs(combinerBlock.getArguments().begin(),
-                                           combinerBlock.getArguments().end());
+    // Capture the source reduce's combiner region — the small block stating how
+    // to merge two partial results — so both emitters can replay it. Shared by
+    // pointer because the two lambdas below outlive this scope and must not each
+    // consume the vectors.
+    //
+    // Replaying rather than reconstructing is what makes the path
+    // operator-agnostic: a sum arrives as arith.addf and stays arith.addf, a
+    // max-reduction stays arith.maximumf, and a combiner holding several ops or
+    // an operator this code has never seen is carried through unchanged. Nothing
+    // here matches on the combiner's contents.
+    struct Combiner {
+      llvm::SmallVector<Operation *> ops;   // every op except the terminator
+      llvm::SmallVector<Value> yieldVals;   // what its linalg.yield returns
+      llvm::SmallVector<Value> blockArgs;   // its own block arguments
+    };
+    auto combiner = std::make_shared<Combiner>();
+    {
+      Block &combinerBlock = rd.getOperation()->getRegion(0).front();
+      for (Operation &op : combinerBlock.without_terminator())
+        combiner->ops.push_back(&op);
+      auto combinerYield = cast<linalg::YieldOp>(combinerBlock.getTerminator());
+      combiner->yieldVals.assign(combinerYield.getValues().begin(),
+                                 combinerYield.getValues().end());
+      combiner->blockArgs.assign(combinerBlock.getArguments().begin(),
+                                 combinerBlock.getArguments().end());
+    }
+
+    // Clone the combiner into whatever region `args` belongs to, binding its
+    // original block arguments to `args` positionally. Used at slice granularity
+    // by the loop path and at element granularity by the generic path — the same
+    // arithmetic, the same order, only the operand types differ.
+    auto replayCombiner = [combiner](OpBuilder &inner, Location iloc,
+                                     ValueRange args) {
+      IRMapping mapping;
+      for (unsigned i = 0;
+           i < combiner->blockArgs.size() && i < args.size(); ++i)
+        mapping.map(combiner->blockArgs[i], args[i]);
+      for (Operation *op : combiner->ops)
+        inner.clone(*op, mapping);
+      llvm::SmallVector<Value> mapped;
+      for (Value v : combiner->yieldVals)
+        mapped.push_back(mapping.lookupOrDefault(v));
+      linalg::YieldOp::create(inner, iloc, mapped);
+    };
 
     unsigned outputRank = logicalRank - (unsigned)rd.getDimensions().size();
-    auto emitReduceOp = [outputRank,
-                         combinerOps = std::move(combinerOps),
-                         yieldVals = std::move(yieldVals),
-                         origBlockArgs = std::move(origBlockArgs)](
+    auto emitReduceOp = [outputRank, replayCombiner](
                             OpBuilder &b, Location loc,
                             llvm::ArrayRef<Value> slices, Value acc,
                             RankedTensorType accTy) -> Value {
@@ -779,22 +1191,25 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
         dims.push_back((int64_t)d);
       return linalg::ReduceOp::create(
           b, loc, ValueRange{slices[0]}, ValueRange{acc}, dims,
-          [&](OpBuilder &inner, Location iloc, ValueRange args) {
-            IRMapping mapping;
-            for (unsigned i = 0; i < origBlockArgs.size(); ++i)
-              mapping.map(origBlockArgs[i], args[i]);
-            for (Operation *op : combinerOps)
-              inner.clone(*op, mapping);
-            llvm::SmallVector<Value> mapped;
-            for (Value v : yieldVals)
-              mapped.push_back(mapping.lookupOrDefault(v));
-            linalg::YieldOp::create(inner, iloc, mapped);
-          }).getResult(0);
+          replayCombiner).getResult(0);
     };
+
+    // Variant 1 (design doc section 4.4): the generic form of a reduce. The
+    // region is the same combiner, replayed on scalars — one element from the
+    // input and the running accumulator — instead of on slices. Which axes are
+    // reduced is carried by iterator_types rather than by a `dims` list, and a
+    // transpose folds into the indexing maps instead of becoming its own op.
+    auto emitReduceGenericBody = [replayCombiner](OpBuilder &inner,
+                                                 Location iloc,
+                                                 ValueRange args) {
+      replayCombiner(inner, iloc, args);
+    };
+
     SourceOpSpec spec;
     spec.operands = {SourceOperandSpec{canonicalAxes, targetOrder}};
     spec.logicalRank = logicalRank;
     spec.emitOp = emitReduceOp;
+    spec.emitGenericBody = emitReduceGenericBody;
     return dispatchSource(rd, spec, ctx, rewriter);
   }
 };

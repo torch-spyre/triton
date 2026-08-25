@@ -23,8 +23,8 @@ _CORE_PIPELINE_PASSES = (
 _PASS_OPTIONS = {
     "distribute_work": ("grid",),
     "materialize_base_addresses": ("base_addresses",),
-    "rewrite_descriptor_layout": ("data_layout",),
-    "convert_ttir_to_ktdp": ("data_layout",),
+    "rewrite_descriptor_layout": ("data_layout", "emit_generic"),
+    "convert_ttir_to_ktdp": ("data_layout", "emit_generic"),
 }
 
 
@@ -69,6 +69,13 @@ class SpyreOptions:
     # HBM data layout: "device" (stickified row-major physical strides) or
     # "host" (strides derived from logical strides via the coordinate map).
     data_layout: str = "device"
+    # How RewriteDescriptorLayout expresses a stick-split walk: False emits an
+    # scf.for nest plus tensor.insert_slice, True emits one linalg.generic.
+    # Opt-in because only the loop form is consumed downstream today. Needs no
+    # __post_init__ validation — unlike data_layout, which is a string that
+    # would otherwise fall through to "host" on a typo, a bool is validated by
+    # the pybind11/llvm::cl parser.
+    emit_generic: bool = False
     # Required by Triton code generator
     sanitize_overflow: bool = False
     debug: bool = False

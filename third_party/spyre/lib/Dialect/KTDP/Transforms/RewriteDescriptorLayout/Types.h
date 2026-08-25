@@ -16,6 +16,10 @@ struct PassContext {
   const llvm::DenseMap<mlir::Value, llvm::SmallVector<int64_t>> &physicalLoadToTransposePerm;
   /// Set by patterns to indicate a fatal error that should abort the pass.
   mutable bool hadError = false;
+  /// Mirrors the emit-generic pass option: when true, a stick-split walk is
+  /// expressed as a single linalg.generic rather than an scf.for nest. Read by
+  /// the emission helpers in ContractionSynthesis.cpp.
+  bool emitGenericBody = false;
 };
 
 /// Per-operand coord-map info read from a still-live marker.
@@ -113,9 +117,29 @@ struct SourceOperandSpec {
 struct SourceOpSpec {
   llvm::SmallVector<SourceOperandSpec> operands;
   unsigned logicalRank;
+
+  /// Per-slice emitter. Receives operands already sliced for one iteration of
+  /// the synthesized loop nest, plus the incoming accumulator and its type, and
+  /// returns the value to accumulate. Drives the scf.for path, which is the
+  /// default and the only form consumed downstream today. Always populated.
   llvm::function_ref<Value(OpBuilder &, Location, llvm::ArrayRef<Value>,
                            Value, RankedTensorType)>
       emitOp;
+
+  /// Region-body builder for the linalg.generic form, used when the
+  /// emit-generic pass option is on. Builds the *entire* body: every arithmetic
+  /// op plus the closing linalg.yield.
+  ///
+  /// The ValueRange holds block arguments the linalg.generic builder has
+  /// already created — one scalar per `ins` operand, then one per `outs`
+  /// accumulator — so this callback reads them rather than declaring them. A
+  /// two-input, one-output generic therefore sees args[0], args[1], args[2].
+  ///
+  /// Null when the op kind has no generic form, in which case the caller falls
+  /// back to `emitOp`. Both emitters describe the same arithmetic at different
+  /// granularity: per-slice versus per-element.
+  llvm::function_ref<void(OpBuilder &, Location, mlir::ValueRange)>
+      emitGenericBody = nullptr;
 };
 
 } // namespace mlir::triton::ktdp
