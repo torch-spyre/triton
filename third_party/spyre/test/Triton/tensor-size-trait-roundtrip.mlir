@@ -10,9 +10,6 @@
 // verifier -- "printed back" means "the trait let it through". Which is also why
 // the ops here have to be tt.*: func.func and func.return do not carry the trait,
 // so writing this with them would pass without reaching what it checks.
-//
-// On its own this cannot tell a relaxed trait from a verifier that never ran.
-// tensor-size-trait-invalid.mlir is the control for that.
 
 // 192 elements: not a power of two. tt.splat carries the trait on its result.
 // CHECK-LABEL: tt.func @non_pow2_splat
