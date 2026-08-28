@@ -378,16 +378,15 @@ def add_kernel_3d_grid(
 
 
 @triton.jit
-def add_kernel_1core(
+def add_kernel_device(
     x_ptr,
     y_ptr,
     output_ptr,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
 ):
-    """2D elementwise add over exactly one tile, with no distribution loop.
+    """Elementwise add over exactly one tile, with no distribution loop.
 
     The odd one out in this file: no ``tl.program_id``, no ``tl.num_programs``,
     no loop -- one ``BLOCK_M x BLOCK_N`` tile that is the whole tensor. Every
@@ -395,19 +394,22 @@ def add_kernel_1core(
     program id, and dbo-opt rejects the loop it outlines from that, so this is
     the only variant in the suite that reaches a Spyre *binary* rather than
     stopping at KTIR.
-
-    Elementwise on purpose: a reduction would additionally need the
-    DropReductionInitFill fix pass.
     """
+    pid = tl.program_id(0)
+
     x_desc = tl.make_tensor_descriptor(
-        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
     )
     y_desc = tl.make_tensor_descriptor(
-        y_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+        y_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
     )
     out_desc = tl.make_tensor_descriptor(
-        output_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
     )
-    x = x_desc.load([0, 0])
-    y = y_desc.load([0, 0])
-    out_desc.store([0, 0], x + y)
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(y_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+    offset = pid * BLOCK_SIZE
+    x = x_desc.load([offset])
+    y = y_desc.load([offset])
+    out_desc.store([offset], x + y)

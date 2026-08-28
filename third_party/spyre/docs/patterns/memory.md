@@ -592,7 +592,7 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>
 - `matmul::bmm_3d_grid` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-3d)
 - `matmul::spyre_stick_k_reduction` — M=64, K=128, N=256, BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, A_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-store-static, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 16 more variants_
+_+ 17 more variants_
 
 ## descriptor-offset-base
 
@@ -839,7 +839,7 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
 - `matmul::bmm_3d_grid` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-3d)
 - `matmul::spyre_stick_k_reduction` — M=64, K=128, N=256, BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, A_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 16 more variants_
+_+ 17 more variants_
 
 
 ---

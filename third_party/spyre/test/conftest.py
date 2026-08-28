@@ -56,9 +56,7 @@ Fixes, in order of preference:
 
 import importlib.util
 import itertools
-import os
 import re
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -757,22 +755,13 @@ def compilable_example(request):
 def spyrecode_options(compilable_example):
     """Compile options for the variant under test.
 
-    The two fixes are required, not optional: the scheduler inside dbo-opt wants
-    the compute to be a ``linalg`` op whose ``outs`` is a fresh ``tensor.empty``.
-    Tensor-level ``arith`` leaves the memref as ``strided<..., offset: ?>`` and
-    dbo-opt rejects the ``ktdp.load`` operand; an aliased ``outs`` fails later the
-    same way. Both must anchor on a *core* pass -- ``_make_ktir`` silently ignores
-    any other anchor -- and dict order decides which runs first, so
-    unalias_linalg_outs is second.
+    The grid alone. The fix passes the scheduler inside dbo-opt requires
+    (``convert_elementwise_to_linalg`` and ``unalias_linalg_outs``, anchored on
+    ``rewrite_descriptor_layout``) are now injected by ``parse_options`` so no
+    caller has to name them.
     """
     entry = EXAMPLES[compilable_example]
-    return {
-        "grid": tuple(entry["grid"]),
-        "required_fixes": {
-            "convert_elementwise_to_linalg": "lower_compute_ops",
-            "unalias_linalg_outs": "lower_compute_ops",
-        },
-    }
+    return {"grid": tuple(entry["grid"])}
 
 
 @pytest.fixture(scope="module")
@@ -799,17 +788,3 @@ def compiled(dbo_opt, spyrecode_options, binary_source):
     return triton_compile(binary_source, target=spyre_target(),
                           options=spyrecode_options)
 
-
-@pytest.fixture(scope="module")
-def compiled_baked(dbo_opt, spyrecode_options, binary_source):
-    """The same variant with addresses baked in rather than symbolic.
-
-    The non-default mode, and the only one in which the backend derives anything
-    from the pointer types -- so it is what a test asserting a derived address has
-    to compile. A fixture rather than a compile written inside the test, so that
-    class takes its binary the same way throughout.
-    """
-    from triton.compiler.compiler import compile as triton_compile
-    from utils import spyre_target
-    return triton_compile(binary_source, target=spyre_target(),
-                          options={**spyrecode_options, "symbolic_args": False})

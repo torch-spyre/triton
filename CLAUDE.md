@@ -144,14 +144,20 @@ PYTHONPATH=python:third_party/spyre uv run python $T | ./python/triton/FileCheck
 Numerical coverage is a work in progress; known gaps are strict-xfail'd and
 missing oracles skip, so the suite stays green while catching regressions.
 
+`test_device_launch.py` launches on hardware, in the pytest process itself, and a
+Spyre device admits one opener for that process's whole lifetime. It is in the
+pytest suite rather than under lit precisely because pytest runs one process
+sequentially — that is what serializes device access. 
+
 ### Lit tests and `spyre-triton-opt`
 
 `spyre-triton-opt` registers both Triton (TTIR) and KTDP dialects/passes.
 It lives in `third_party/spyre/bin/` and is built by default. Lit tests
 live in `third_party/spyre/test/` alongside the pytest suite: `.mlir` for IR, and
 `.py` under `test/python/` for what is Python rather than IR (the address policy,
-the option surface, the `spyrecode` stage). `test/python/lit.local.cfg` adds the
-suffix and sets the `PYTHONPATH` those need, since lit does not load `conftest.py`.
+the option surface, the `spyrecode` stage, the driver surface).
+`test/python/lit.local.cfg` adds the suffix and sets the `PYTHONPATH` those need,
+since lit does not load `conftest.py`.
 
 **Tests needing `dbo-opt`.** `test/lit.cfg.py` forwards `TRITON_SPYRE_DBO_OPT` and
 `TRITON_SPYRE_DEVICE` (they are not in lit's default whitelist) and defines a

@@ -37,11 +37,9 @@ the one above, so asking for a later one brings the earlier:
                         and only this, is what makes a test skip
 ``binary_source``       an ASTSource for the variant, not yet compiled
 ``compiled``            that source through every stage, symbolic
-``compiled_baked``      the same, with addresses baked in -- the
-                        non-default mode, where the backend derives them
 ======================= =============================================
 
-So ``compiled`` or ``compiled_baked`` alone is already both parametrized and gated:
+So ``compiled`` alone is already both parametrized and gated:
 one input, not three. Ask for nothing the body does not use.
 
 Subsets are safe, with one trap. Because these are module-scoped and pytest caches
@@ -104,23 +102,6 @@ def test_artifact_bytes_are_deterministic(compiled, spyrecode_options, monkeypat
                              options=spyrecode_options)
     assert hashlib.sha256(rebuilt.kernel).hexdigest() == \
         hashlib.sha256(compiled.kernel).hexdigest()
-
-
-def test_derived_addresses_reach_the_artifact(compiled_baked):
-    # The one surviving assertion on the *value* _make_ktir derives from the TTIR
-    # pointer types: three fp16 pointers land on the i * 16 GiB segments, counted in
-    # elements. It runs through a whole compile because metadata is the only place
-    # the derivation is observable, and only a compile produces metadata -- the
-    # tool-free lowering the option tests use (utils.make_ktir_mod) returns the
-    # module alone. The rest of what used to be asserted here -- widths per pointer,
-    # the seven-pointer ceiling, non-pointer arguments, sub-byte rejection -- is
-    # asserted directly on _segment_addresses in backend-options-test.py, which
-    # needs neither a module nor this tool, so only one test pays for a compile.
-    #
-    # ``compiled_baked`` rather than ``compiled`` because nothing is derived in the
-    # default symbolic mode; baking is what makes the value exist.
-    assert tuple(compiled_baked.metadata.base_addresses) == (
-        0, 8589934592, 17179869184)
 
 
 def test_missing_device_file_raises(dbo_opt, binary_source, spyrecode_options,

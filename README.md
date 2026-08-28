@@ -188,6 +188,38 @@ passing them silently. If instead you see a failure naming an unknown `ktdp`
 attribute, an older `dbo-opt` was found on `PATH` — the error says which binary ran
 and how it was chosen.
 
+## Device Launch Dependency
+
+`kernel[grid](x, y, out, ...)` runs on hardware in the calling process:
+`SpyreLauncher` calls torch-spyre's `prepare_kernel` and `launch_jobplan`
+directly, and inputs reach the device with `.to("spyre")` the way CUDA's reach it
+with `.cuda()`.
+
+torch-spyre is therefore required for a launch, and it is **not** declared as a
+dependency — not in `install_requires` and not in the `spyre-test` extra. That is
+deliberate rather than an omission: it is a machine-level install (a compiled
+`_C.so` bound to one Spyre runtime tree, plus that runtime itself), and there is no
+canonical index or repository URL this file can name. Importing the
+Triton backend does not import it — the import happens inside the launcher — so
+every machine without one keeps working, and a launch without one fails with an
+ordinary `ImportError`.
+
+Point the test suite at an existing install with `PYTHONPATH`, and at the runtime
+libraries its `_C.so` dlopens with `LD_LIBRARY_PATH` — `ld.so` reads the latter at
+`exec`, so it must be set before the interpreter starts, in the environment
+`pytest` is launched from.
+
+The test that launches is `third_party/spyre/test/test_device_launch.py`, part of
+the ordinary pytest suite.  It is a **pytest** test rather than a `lit` one because of how the device is held: a
+Spyre device admits exactly one opener, the launch is in-process, and the hold
+starts at the first `.to("spyre")` and lasts the process's lifetime. pytest runs one
+process, sequentially, so that runner *is* the serialization, for any number of
+device tests in any number of files. `lit` runs one process per file in parallel, so
+there the same safety rested on a convention — exactly one file carrying the feature
+— that nothing enforced. The accepted consequence: on a machine with a device, a
+plain `pytest third_party/spyre/test` opens it and holds it for the session, the
+same posture upstream Triton has with a GPU.
+
 ## KTIR CPU Dependency
 
 The optional `spyre-test` extra installs `ktir-cpu` from

@@ -800,6 +800,22 @@ setup(
             "numpy>=1.24,<2",
             "lit>=18,<20",
         ],
+        # Device execution. torch-spyre supplies prepare_kernel/launch_jobplan,
+        # which SpyreLauncher calls, and registers the "spyre" device with torch so
+        # a kernel's arguments can reach it via .to("spyre").
+        #
+        # Deliberately separate from spyre-test rather than folded into it, because
+        # either of these would break that install on a machine that only wants the
+        # structural tests:
+        #   * torch-spyre builds a C++ extension (its own build-system requires
+        #     cmake) against a Spyre runtime tree this repo knows nothing about;
+        #   * it wants torch~=2.13, while spyre-test pins numpy<2 for ktir-cpu's
+        #     MLIR ABI — a joint constraint neither side asked for.
+        #
+        "spyre-device": [
+            "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre"
+            "@00de1235a0063faf8f535d868bbbcd9928b9e0b8",
+        ],
     },
     # --- END --- added for spyre
     packages=list(get_packages()),

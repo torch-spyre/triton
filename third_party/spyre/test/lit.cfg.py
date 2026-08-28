@@ -12,8 +12,16 @@ config.suffixes = [".mlir"]
 config.test_source_root = os.path.dirname(__file__)
 config.test_exec_root = os.path.join(config.spyre_obj_root, "test")
 
-llvm_config.with_system_environment(["HOME", "INCLUDE", "LIB", "TMP", "TEMP",
-                                     "TRITON_SPYRE_DBO_OPT", "TRITON_SPYRE_DEVICE"])
+llvm_config.with_system_environment([
+    "HOME", "INCLUDE", "LIB", "TMP", "TEMP",
+    "TRITON_SPYRE_DBO_OPT", "TRITON_SPYRE_DEVICE",
+    # Where dbo-opt finds its own default device when TRITON_SPYRE_DEVICE is
+    # unset, which resolve_device() treats as a legitimate configuration rather
+    # than an error. So this belongs to the ``dbo-opt`` compile test, not to any
+    # device launch: drop it and that test compiles against no device on a machine
+    # that was relying on the fallback.
+    "DEEPTOOLS_PATH",
+])
 
 # A ``dbo-opt`` feature, so a test needing the backend compiler says
 # ``REQUIRES: dbo-opt`` and lit reports Unsupported when there is none.
