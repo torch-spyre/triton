@@ -59,6 +59,7 @@ import itertools
 import re
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -118,6 +119,8 @@ from utils import (  # noqa: E402
 #   output_key    : which inputs key holds the output buffer
 #   func_name     : KTIR function name (defaults to kernel_fn.__name__)
 #   extra_checks  : optional (tester) -> None for variant-specific asserts
+#   factory       : optional VariantFactory supplying the fields that vary
+#                   with the swept combination
 #   xfail_numerical : optional str | dict for the numerical-test xfail mark
 #
 # The ``constexprs`` grammar supports only ``dict[str, scalar]`` — each entry
@@ -305,6 +308,82 @@ def _sweep_suffix(merged_params: dict, combo: dict, always_suffixed: set = froze
     return "[" + ", ".join(f"{k}={combo[k][0]}" for k in swept) + "]"
 
 
+@dataclass(frozen=True)
+class VariantFactory:
+    """Produces the variant fields that depend on the swept combination.
+
+    Subclass, override the hooks you need, and put it on a variant's
+    ``"factory"`` key. Each hook is called per combination with the combination
+    as kwargs (declare ``**_`` for axes it ignores) and returns the field's
+    value, or ``None`` to leave it unset. Configuration goes in dataclass fields
+    (``Elementwise(rank=2)``) so hooks can share derivations.
+
+    Hooks are ordinary methods, found by name. Nothing here inspects a
+    callable's parameters to guess whether it is a factory — the way
+    ``extra_checks`` does, which is why that rule could not be reused: an oracle
+    may legitimately declare ``**kwargs`` (``inter_tile_reduce``'s
+    ``run_element_sum``), and inspection would call it with no ``inputs``.
+    """
+
+    def signature(self, **combo):
+        """-> the variant's ``SIGNATURE``, ``{arg_name: dtype_str}``."""
+        return None
+
+    def reference(self, **combo):
+        """-> the ``reference`` oracle, ``(inputs) -> np.ndarray``."""
+        return None
+
+    def inputs(self, **combo):
+        """-> the ``inputs`` generator, ``(**param_values) -> {name: array}``."""
+        return None
+
+    def declares(self, hook: str) -> bool:
+        """Whether *hook* is overridden here rather than inherited."""
+        return getattr(type(self), hook) is not getattr(VariantFactory, hook)
+
+
+# Hook name → the field it produces. A table because ``SIGNATURE`` is uppercase
+# by fixture convention, and ``def SIGNATURE(self, ...)`` would read worse.
+_FACTORY_HOOKS = {
+    "signature": "SIGNATURE",
+    "reference": "reference",
+    "inputs":    "inputs",
+}
+
+
+def _apply_factory(entry: dict, combo: dict, *, kernel_name: str) -> None:
+    """Resolve *entry*'s ``factory`` hooks for one combination, in place.
+
+    Hooks get plain values out of *combo*'s ``(label, value)`` pairs — the label
+    only names the combination in a registry key.
+    """
+    factory = entry.get("factory")
+    if factory is None:
+        return
+    if not isinstance(factory, VariantFactory):
+        raise TypeError(
+            f"{kernel_name}: 'factory' must be a VariantFactory instance, got "
+            f"{type(factory).__name__}. Hooks are looked up as methods on the "
+            f"class, so a bare callable cannot supply them."
+        )
+
+    combo_values = {k: v[1] for k, v in combo.items()}
+    for hook, field in _FACTORY_HOOKS.items():
+        # Refused rather than resolved by precedence: which one wins would be a
+        # fact about statement order here. Checked on the merged entry, so a
+        # literal inherited from a base collides too — the base must drop it,
+        # since the merge grammar cannot delete a key.
+        if factory.declares(hook) and field in entry:
+            raise ValueError(
+                f"{kernel_name}: declares both the literal field {field!r} and "
+                f"the factory hook {hook}() that produces it. Keep one: remove "
+                f"the field, or remove the hook."
+            )
+        value = getattr(factory, hook)(**combo_values)
+        if value is not None:
+            entry[field] = value
+
+
 def _load_examples():
     registry: dict = {}
     if not _FIXTURES_DIR.exists():
@@ -379,6 +458,11 @@ def _load_examples():
                            for p in sig.parameters.values()):
                         combo_values = {k: v[1] for k, v in combo.items()}
                         entry["extra_checks"] = ec(**combo_values)
+
+                # Before _resolve_variant, which reads SIGNATURE and needs a
+                # plain dict by then. 'factory' needs no merge handling: it is a
+                # single value, so _resolve_base replaces it wholesale.
+                _apply_factory(entry, combo, kernel_name=f"{name}::{vname}{suffix}")
 
                 if module_sig:
                     runtime, constexprs, param_values = _resolve_variant(
