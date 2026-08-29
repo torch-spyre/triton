@@ -295,7 +295,7 @@ def gather_2d_kernel(
     rows_per_core = tl.cdiv(m_blocks, grid_m)
     cols_per_core = tl.cdiv(n_blocks, grid_n)
 
-    # Descriptors built once outside the loop (vector_add_2d pattern).
+    # Descriptors built once outside the loop (elementwise_2d pattern).
     idx_desc = tl.make_tensor_descriptor(
         idx_ptr,
         shape=[K_INDICES],

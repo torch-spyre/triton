@@ -95,7 +95,7 @@ block sizes, slice ending at `N`, wider slice, larger fan-out).
    across the full row width, using each tile's `offset_n` as the
    gather's column offset.
 3. **Multi-tile per core.** Each core runs an inner `scf.for` over
-   its row-tile chunk, matching the per-core-loop idiom of `vector_add`
+   its row-tile chunk, matching the per-core-loop idiom of `elementwise`
    and `softmax`.
 
 Both 2D variants are also paired with a `_serial` flavour on a

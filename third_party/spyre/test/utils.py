@@ -29,6 +29,7 @@ import numpy as np
 DTYPE_MAP = {
     "fp32": np.float32,
     "fp16": np.float16,
+    "i32":  np.int32,
 }
 
 #: Spyre stick width in bytes. A "stick" is the hardware's contiguous

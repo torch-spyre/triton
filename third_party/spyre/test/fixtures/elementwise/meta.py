@@ -1,18 +1,20 @@
-"""SIGNATURE + VARIANTS + reference oracle + input generators for vector_add.
+"""SIGNATURE + VARIANTS + reference oracle + input generators for elementwise.
 
-Six variants — 1D static/dynamic, 2D static/dynamic, 3D static/dynamic —
-share the same NumPy oracle (``x + y``). They exercise tensor descriptors
-at increasing dimensionality and static-vs-dynamic shape lowering.
+Variants cover 1D/2D/3D shapes (Level A, OP pinned to "add") and
+op × dtype correctness on ktir_cpu (Level B, 1d_compute sweeps 3×4=12 combos).
 
 See ``fixtures/README.md`` for the field reference and discovery rules.
 """
 
 import functools
+import operator
 
 import numpy as np
+from dataclasses import dataclass
 
+import conftest
 from . import kernel
-from utils import sticksize
+from utils import sticksize, DTYPE_MAP
 
 
 # ---------------------------------------------------------------------------
@@ -73,10 +75,10 @@ def _make_2d_scalar_dim_checks(N, **_):
 
 
 # ---------------------------------------------------------------------------
-# Reference (NumPy oracle) + input maker
+# Reference (NumPy oracle) + input makers
 # ---------------------------------------------------------------------------
 
-def make_inputs(n_elements: int, BLOCK_SIZE: int, 
+def make_inputs(n_elements: int, BLOCK_SIZE: int,
                 *, dtype="f32", **_unused) -> dict:
     """Build pointer-tensor inputs for the kernel.
 
@@ -104,8 +106,8 @@ def run(inputs: dict) -> np.ndarray:
     return inputs["x_ptr"] + inputs["y_ptr"]
 
 
-def make_inputs_scalar_dim(BLOCK_SIZE: int, dtype: str = "f32", n_elements: int = 4096) -> dict:
-    """1D inputs for add_kernel_scalar_dim.
+def make_inputs_scalar_dim(BLOCK_SIZE: int, dtype: str = "f32", n_elements: int = 4096, **_unused) -> dict:
+    """1D inputs for elementwise_1d_scalar_dim.
 
     `n_elements` is not part of the kernel's SIGNATURE (it is read from
     `seqlen_ptr`, not passed as an arg), so it is a keyword default here
@@ -121,7 +123,7 @@ def make_inputs_scalar_dim(BLOCK_SIZE: int, dtype: str = "f32", n_elements: int 
 
 def make_inputs_2d(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
                    *, dtype=np.float32, **_unused) -> dict:
-    """Build 2D pointer-tensor inputs for add_kernel_2d."""
+    """Build 2D pointer-tensor inputs for elementwise_2d."""
     del BLOCK_M, BLOCK_N
     total = M * N
     t = np.arange(total, dtype=np.float32)
@@ -131,14 +133,14 @@ def make_inputs_2d(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
     return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
 
 
-def make_inputs_2d_scalar_dim(N: int, BLOCK_M: int, BLOCK_N: int, M: int = 32) -> dict:
-    """2D inputs for add_kernel_2d_scalar_dim.
+def make_inputs_2d_scalar_dim(N: int, BLOCK_M: int, BLOCK_N: int, M: int = 32, **_unused) -> dict:
+    """2D inputs for elementwise_2d_scalar_dim.
 
     `M` is not part of the kernel's SIGNATURE (it is read from
     `seqlen_ptr`, not passed as an arg), so it is a keyword default here
     rather than a `params` entry — a `params` entry would otherwise leak
     into ``run_cpu``'s kwargs and fail its "unknown kwarg" check, since
-    `add_kernel_2d_scalar_dim` has no `M` parameter. Delegates to
+    `elementwise_2d_scalar_dim` has no `M` parameter. Delegates to
     ``make_inputs_2d`` for the x/y/output buffers and adds the scalar
     read as a rank-1 buffer of length 1.
     """
@@ -150,8 +152,9 @@ def make_inputs_2d_scalar_dim(N: int, BLOCK_M: int, BLOCK_N: int, M: int = 32) -
 def make_inputs_3d(
     M: int, N: int, P: int,
     BLOCK_M: int, BLOCK_N: int, BLOCK_P: int,
+    **_unused,
 ) -> dict:
-    """Build 3D pointer-tensor inputs for add_kernel_3d."""
+    """Build 3D pointer-tensor inputs for elementwise_3d."""
     del BLOCK_M, BLOCK_N, BLOCK_P
     total = M * N * P
     t = np.arange(total, dtype=np.float32)
@@ -160,6 +163,74 @@ def make_inputs_3d(
     output = np.zeros((M, N, P), dtype=np.float32)
     return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
 
+
+# ---------------------------------------------------------------------------
+# Level B factory — Elementwise(VariantFactory)
+# ---------------------------------------------------------------------------
+
+# Shape-arg dicts for each rank's runtime signature (no pointer types — those
+# come from DTYPE). These are the non-constexpr, non-pointer runtime args.
+_SHAPE_ARGS = {
+    1: {"n_elements": "i32"},      # elementwise_1d
+    # 2D and 3D are not used by Level B (1d_compute), kept for Stage 3
+}
+
+# NumPy oracles indexed by op name.
+_NUMPY_OPS = {
+    "add": operator.add,
+    "sub": operator.sub,
+    "mul": operator.mul,
+    "div": operator.truediv,
+}
+
+# Pointer type strings for each DTYPE.
+_PTR = {"fp16": "*fp16", "fp32": "*fp32", "i32": "*i32"}
+
+
+def _make_inputs_compute(n_elements: int, BLOCK_SIZE: int,
+                         *, dtype: str, op: str, **_unused) -> dict:
+    """Input generator for 1d_compute: dtype/op-aware.
+
+    Floats: x = sin, y = cos + 2 (keeps div away from zero and gives
+    interesting values). i32: small positive integers so mul stays in range
+    and floordiv is exact.
+    """
+    np_dtype = DTYPE_MAP[dtype]
+    n = n_elements
+    if dtype == "i32":
+        x = np.arange(1, n + 1, dtype=np_dtype)
+        y = np.full(n, 3, dtype=np_dtype)
+    else:
+        t = np.arange(n, dtype=np.float32)
+        x = np.sin(t * 2.0 * np.pi / n).astype(np_dtype)
+        y = (np.cos(t * 2.0 * np.pi / n) + 2.0).astype(np_dtype)
+    output = np.zeros(n, dtype=np_dtype)
+    return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
+
+
+@dataclass(frozen=True)
+class Elementwise(conftest.VariantFactory):
+    """Factory for elementwise variants that sweep OP and/or DTYPE.
+
+    ``rank`` selects which _SHAPE_ARGS entry to use for the runtime signature.
+    Only rank=1 is used in Stage 2 (1d_compute); rank=2 is for Stage 3 (2d_device).
+    """
+    rank: int = 1
+
+    def signature(self, DTYPE, **_):
+        ptrs = {n: _PTR[DTYPE] for n in ("x_ptr", "y_ptr", "output_ptr")}
+        return {**ptrs, **_SHAPE_ARGS[self.rank]}
+
+    def reference(self, OP, **_):
+        def oracle(inputs):
+            x, y = inputs["x_ptr"], inputs["y_ptr"]
+            if OP == "div" and x.dtype == np.int32:
+                return (x.astype(np.float32) / y.astype(np.float32)).astype(np.int32)
+            return _NUMPY_OPS[OP](x, y).astype(x.dtype)
+        return oracle
+
+    def inputs(self, OP, DTYPE, **_):
+        return functools.partial(_make_inputs_compute, dtype=DTYPE, op=OP)
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +269,7 @@ _SIG_2D = {
     "BLOCK_N":    "i32",
 }
 
-# add_kernel_2d carries the optional layout constexprs; add_kernel_2d_grid
+# elementwise_2d carries the optional layout constexprs; elementwise_2d_grid
 # (which shares _SIG_2D) does not.
 _SIG_2D_LAYOUT = {
     **_SIG_2D,
@@ -276,12 +347,13 @@ VARIANTS = {
             "the set — one axis, no inner reduction, no cross-core "
             "communication."
         ),
-        "kernel_fn":    kernel.add_kernel,
-        "constexpr":    ["n_elements", "BLOCK_SIZE"],
+        "kernel_fn":    kernel.elementwise_1d,
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "OP"],
         "params":       {
             # n_elements=[1024,2097152,2097153]: absorbs single_block (1024)
             # and nonaligned (2097153).
             "n_elements": [1024, 2097152, 2097153], "BLOCK_SIZE": [1024],
+            "DTYPE": ["fp32"], "OP": ["add"],
         },
         # 1D kernel (only tl.program_id(0)) on the 32-core Spyre grid.
         "grid":         [32],
@@ -308,7 +380,7 @@ VARIANTS = {
             "computes its own per-tile work based on the runtime "
             "value."
         ),
-        "constexpr":    ["BLOCK_SIZE"],
+        "constexpr":    ["BLOCK_SIZE", "DTYPE", "OP"],
         "extra_checks": lambda t: (
             # Dynamic path: construct_memory_view must carry a dynamic
             # dimension (memref<?x...>) — the whole point of this variant
@@ -321,14 +393,14 @@ VARIANTS = {
         # Different shape: verifies the compiled dynamic kernel runs at a
         # smaller n_elements than the static default.
         "base":   "dynamic",
-        "params": {"n_elements": [4096], "BLOCK_SIZE": [1024]},
+        "params": {"n_elements": [4096], "BLOCK_SIZE": [1024], "DTYPE": ["fp32"], "OP": ["add"]},
     },
     "dynamic_from_scalar_load": {
         "base":         "dynamic",
-        "kernel_fn":    kernel.add_kernel_scalar_dim,
+        "kernel_fn":    kernel.elementwise_1d_scalar_dim,
         "SIGNATURE":    _SIG_1D_SCALAR,
-        "constexpr":    ["BLOCK_SIZE"],
-        "params":       {"BLOCK_SIZE": [1024]},
+        "constexpr":    ["BLOCK_SIZE", "OP"],
+        "params":       {"BLOCK_SIZE": [1024], "OP": ["add"]},
         "inputs":       make_inputs_scalar_dim,
         "tags": [
             "descriptor-load-dynamic-from-scalar-load",
@@ -354,6 +426,34 @@ VARIANTS = {
         ),
         "extra_checks": _make_1d_scalar_dim_checks,
     },
+    # --- Level B: compute correctness (op × dtype, ktir_cpu only) ---
+    "1d_compute": {
+        # No base: prevent inheriting `reference` and `inputs` from `default`
+        # (factory hooks produce them; a literal field + hook on the same
+        # variant is a collection-time error).
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static",
+                 "program-id-1d", "elementwise-compute"],
+        "summary": (
+            "1D elementwise op across fp16/fp32/i32 and add/sub/mul/div. "
+            "Sweeps the OP × DTYPE product to cover ktir_cpu correctness; "
+            "div and i32 stop here pending #107."
+        ),
+        "kernel_fn":    kernel.elementwise_1d,
+        "factory":      Elementwise(rank=1),
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "OP"],
+        "params": {
+            "DTYPE":      ["fp16", "fp32", "i32"],
+            "OP":         ["add", "sub", "mul", "div"],
+            "n_elements": [128],
+            "BLOCK_SIZE": [128],
+        },
+        "grid":         [1],
+        "parallel":     False,
+        "output_key":   "output_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+    },
     # --- 2D variants ---
     "2d": {
         # M=[512,520]: absorbs 2d_nonaligned (M=520, m_blocks=33 → clamp fires).
@@ -372,14 +472,15 @@ VARIANTS = {
             "`M` and `N` are compile-time constants here, so the "
             "descriptor shape is fully static (`memref<512x32xf32>`)."
         ),
-        "kernel_fn":    kernel.add_kernel_2d,
+        "kernel_fn":    kernel.elementwise_2d,
         "SIGNATURE":    _SIG_2D_LAYOUT,
         "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
         "params":       {
             # M=[512,520]: absorbs 2d_nonaligned (M=520).
             "M": [512, 520], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16],
             "X_LAYOUT": [None], "Y_LAYOUT": [None], "OUT_LAYOUT": [None],
+            "OP": ["add"],
         },
         "inputs":       make_inputs_2d,
         "extra_checks": _make_2d_checks,
@@ -398,7 +499,7 @@ VARIANTS = {
             "unchanged across a range of matrix shapes."
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?xf32>"),
@@ -411,6 +512,7 @@ VARIANTS = {
         "params": {
             "M": [256], "N": [64], "BLOCK_M": [16], "BLOCK_N": [16],
             "X_LAYOUT": [None], "Y_LAYOUT": [None], "OUT_LAYOUT": [None],
+            "OP": ["add"],
         },
     },
     "1d_device": {
@@ -430,13 +532,13 @@ VARIANTS = {
             "loop -- the one variant dbo-opt can lower to a binary."
         ),
         "doc": (
-            "Takes two `M` fp16 inputs in spyre tensor 2D layouts " 
+            "Takes two `M` fp16 inputs in spyre tensor 2D layouts "
             "and writes `C = A + B` in one "
             "`tl.program_id`, no `tl.num_programs`, no loop."
         ),
-        "kernel_fn":    kernel.add_kernel_device,
+        "kernel_fn":    kernel.elementwise_1d_device,
         "SIGNATURE":    _SIG_TENSORS_FP16,
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT"],
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "OP"],
         "params":       {
             "n_elements": [128],
             "BLOCK_SIZE": [128],
@@ -446,9 +548,10 @@ VARIANTS = {
             # tuple-detection sees any tuple element in the values list and
             # would misread the raw inner tuple as a (label, value) pair. The
             # label also becomes the suffix when sweeping: adding a second
-            # layout produces vector_add__1d_device[LAYOUT=stick] and
-            # vector_add__1d_device[LAYOUT=other].
+            # layout produces elementwise__1d_device[LAYOUT=stick] and
+            # elementwise__1d_device[LAYOUT=other].
             "LAYOUT":   [("stick", ((0, "floordiv", _S2("x_ptr")), (0, "mod", _S2("x_ptr"))))],
+            "OP": ["add"],
         },
         "grid":         [1],
         "parallel":     False,
@@ -457,7 +560,7 @@ VARIANTS = {
         # conftest so the property travels with the variant, like `parallel`.
         "compiles_to_binary": True,
         "reference":    run,
-        # BLOCK_SIZE is actually not useds, stub it out
+        # BLOCK_SIZE is actually not used, stub it out
         "inputs":       functools.partial(make_inputs, dtype="f16"),
         "output_key":   "output_ptr",
         "rtol":         1e-2,
@@ -490,6 +593,7 @@ VARIANTS = {
             "n_elements": [128],
             "BLOCK_SIZE": [64],
             "LAYOUT":   [("stick", ((0, "floordiv", _S2("x_ptr")), (0, "mod", _S2("x_ptr"))))],
+            "OP": ["add"],
         },
     },
     "2d_spyre_stick": {
@@ -514,6 +618,7 @@ VARIANTS = {
                             (1, "mod", _S2("y_ptr"))]],
             "OUT_LAYOUT": [[(1, "floordiv", _S2("output_ptr")), 0,
                             (1, "mod", _S2("output_ptr"))]],
+            "OP": ["add"],
         },
         "grid":        [1],
         "data_layout": "host",
@@ -528,13 +633,13 @@ VARIANTS = {
     },
     "2d_dynamic_from_scalar_load": {
         "base":         "2d",
-        "kernel_fn":    kernel.add_kernel_2d_scalar_dim,
+        "kernel_fn":    kernel.elementwise_2d_scalar_dim,
         "SIGNATURE":    _SIG_2D_SCALAR,
-        "constexpr":    ["N", "BLOCK_M", "BLOCK_N"],
-        "params":       {"N": [32], "BLOCK_M": [16], "BLOCK_N": [16]},
+        "constexpr":    ["N", "BLOCK_M", "BLOCK_N", "OP"],
+        "params":       {"N": [32], "BLOCK_M": [16], "BLOCK_N": [16], "OP": ["add"]},
         "inputs":       make_inputs_2d_scalar_dim,
         # 2D grid: [4, 8] = 32 cores. N is chunked across grid_n the same
-        # way the runtime M is chunked across grid_m (add_kernel_2d_grid's
+        # way the runtime M is chunked across grid_m (elementwise_2d_grid's
         # distribution pattern), rather than walking a full row per core.
         "grid":         [4, 8],
         "tags": [
@@ -552,7 +657,7 @@ VARIANTS = {
             "`NormalizeGridTo1D` path yet). `M` is not a kernel argument "
             "here; it is read from `seqlen_ptr` with a scalar `tl.load`. "
             "Uses a genuine 2D grid (`pid_m`/`pid_n`, `grid_m`/`grid_n`, "
-            "matching `add_kernel_2d_grid`'s naming and distribution "
+            "matching `elementwise_2d_grid`'s naming and distribution "
             "pattern) so `N` is chunked across cores the same way the "
             "runtime `M` is, instead of walking a full row per core. "
             "This exercises the single-element 1-D scalar-read chain "
@@ -580,13 +685,14 @@ VARIANTS = {
             "compile-time constants, producing a fully-static "
             "descriptor (`memref<64x32x16xf32>`)."
         ),
-        "kernel_fn":    kernel.add_kernel_3d,
+        "kernel_fn":    kernel.elementwise_3d,
         "SIGNATURE":    _SIG_3D,
-        "constexpr":    ["M", "N", "P", "BLOCK_M", "BLOCK_N", "BLOCK_P"],
+        "constexpr":    ["M", "N", "P", "BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
         "params":       {
             # M=[64,65,256]: absorbs 3d_nonaligned (M=65) and 3d_active_cores (M=256).
             "M": [64, 65, 256], "N": [32], "P": [16],
             "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
+            "OP": ["add"],
         },
         "inputs":       make_inputs_3d,
         "extra_checks": _make_3d_checks,
@@ -603,7 +709,7 @@ VARIANTS = {
             "dimensions arrive as runtime `i32` arguments. The "
             "descriptor lowers to `memref<?x?x?xf32>`."
         ),
-        "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P"],
+        "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?x?xf32>"),
@@ -621,11 +727,11 @@ VARIANTS = {
             "axis distributes its tiles via a loop: `pid_0` covers M, `pid_1` "
             "covers N. The 2D grid replaces the 1D-grid outer loops."
         ),
-        "kernel_fn":    kernel.add_kernel_2d_grid,
+        "kernel_fn":    kernel.elementwise_2d_grid,
         "SIGNATURE":    _SIG_2D,
-        "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N"],
+        "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N", "OP"],
         # 2D grid: [4, 8] = 32 cores
-        "params":       {"M": [256], "N": [128], "BLOCK_M": [16], "BLOCK_N": [16]},
+        "params":       {"M": [256], "N": [128], "BLOCK_M": [16], "BLOCK_N": [16], "OP": ["add"]},
         "grid":         [4, 8],
         "inputs":       make_inputs_2d,
         "extra_checks": lambda t: (
@@ -644,7 +750,7 @@ VARIANTS = {
             "Same as `2d_grid` but `M` and `N` are runtime `i32` arguments. "
             "Descriptors lower to `memref<?x?xf32>`."
         ),
-        "constexpr":    ["BLOCK_M", "BLOCK_N"],
+        "constexpr":    ["BLOCK_M", "BLOCK_N", "OP"],
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?xf32>"),
@@ -662,13 +768,14 @@ VARIANTS = {
             "axis distributes its tiles via a loop: `pid_0` covers M, `pid_1` "
             "covers N, `pid_2` covers P."
         ),
-        "kernel_fn":    kernel.add_kernel_3d_grid,
+        "kernel_fn":    kernel.elementwise_3d_grid,
         "SIGNATURE":    _SIG_3D,
-        "constexpr":    ["M", "N", "P", "BLOCK_M", "BLOCK_N", "BLOCK_P"],
+        "constexpr":    ["M", "N", "P", "BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
         # 3D grid: [2, 4, 4] = 32 cores
         "params":       {
             "M": [64], "N": [32], "P": [16],
             "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
+            "OP": ["add"],
         },
         "grid":         [2, 4, 4],
         "inputs":       make_inputs_3d,
@@ -688,7 +795,7 @@ VARIANTS = {
             "Same as `3d_grid` but `M`, `N`, `P` are runtime `i32` arguments. "
             "Descriptors lower to `memref<?x?x?xf32>`."
         ),
-        "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P"],
+        "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?x?xf32>"),
