@@ -1,29 +1,30 @@
-"""Vector-add kernels: 1D, 2D, and 3D elementwise add.
+"""Elementwise kernels: 1D, 2D, and 3D shapes with OP dispatch.
 
 Seven ``@triton.jit`` functions exercising tensor descriptors at increasing
-dimensionality. Two grid styles:
+dimensionality. Each takes ``OP: tl.constexpr`` and dispatches add/sub/mul/div.
+Two grid styles:
 
 1D-grid kernels (``tl.program_id(0)`` only) — each core loops over its
   share of tiles in the outermost dimension:
-- :func:`add_kernel`    — 1D: ``shape=[n_elements]``
-- :func:`add_kernel_2d` — 2D: ``shape=[M, N]``
-- :func:`add_kernel_3d` — 3D: ``shape=[M, N, P]``
+- :func:`elementwise_1d`    — 1D: ``shape=[n_elements]``
+- :func:`elementwise_2d` — 2D: ``shape=[M, N]``
+- :func:`elementwise_3d` — 3D: ``shape=[M, N, P]``
 
 Multi-axis grid kernels — each axis of the grid maps to one tensor
   dimension; no manual distribution loop is needed for those axes:
-- :func:`add_kernel_2d_grid` — 2D grid: pid_0 → M-tile, pid_1 → N-tile
-- :func:`add_kernel_3d_grid` — 3D grid: pid_0 → M-tile, pid_1 → N-tile,
+- :func:`elementwise_2d_grid` — 2D grid: pid_0 → M-tile, pid_1 → N-tile
+- :func:`elementwise_3d_grid` — 3D grid: pid_0 → M-tile, pid_1 → N-tile,
                                          pid_2 → P-tile
-- :func:`add_kernel_2d_scalar_dim` — 2D grid, but `M` is a scalar read
+- :func:`elementwise_2d_scalar_dim` — 2D grid, but `M` is a scalar read
   from memory rather than a kernel argument; `N` is still chunked the
   same way as `M`. KTIR-structural only for now.
 
 No-grid kernel — one tile, no distribution loop at all:
-- :func:`add_kernel_1core` — 2D, single tile; the only variant here that
-  dbo-opt can lower all the way to a binary.
+- :func:`elementwise_1d_device` — 1D, single tile; the only variant here
+  that dbo-opt can lower all the way to a binary.
 
 Scalar-load variant of the 1D kernel — same idea, one axis:
-- :func:`add_kernel_scalar_dim` — 1D, but `n_elements` is a scalar read
+- :func:`elementwise_1d_scalar_dim` — 1D, but `n_elements` is a scalar read
   from memory rather than a kernel argument. KTIR-structural only for now.
 """
 
@@ -32,12 +33,14 @@ import triton.language as tl
 
 
 @triton.jit
-def add_kernel(
+def elementwise_1d(
     x_ptr,
     y_ptr,
     output_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
+    DTYPE: tl.constexpr,
+    OP: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -72,18 +75,27 @@ def add_kernel(
         offset = i * BLOCK_SIZE
         x = x_desc.load([offset])
         y = y_desc.load([offset])
-        out_desc.store([offset], x + y)
+        if OP == "add":
+            result = x + y
+        elif OP == "sub":
+            result = x - y
+        elif OP == "mul":
+            result = x * y
+        else:
+            result = x / y
+        out_desc.store([offset], result)
 
 
 @triton.jit
-def add_kernel_scalar_dim(
+def elementwise_1d_scalar_dim(
     x_ptr,
     y_ptr,
     output_ptr,
     seqlen_ptr,
     BLOCK_SIZE: tl.constexpr,
+    OP: tl.constexpr,
 ):
-    """1D add where `n_elements` is read from memory instead of passed directly.
+    """1D elementwise where `n_elements` is read from memory instead of passed directly.
 
     for now: KTIR-structural only, do not wire this into any end-to-end/DFIR test.
     """
@@ -118,11 +130,19 @@ def add_kernel_scalar_dim(
         offset = i * BLOCK_SIZE
         x = x_desc.load([offset])
         y = y_desc.load([offset])
-        out_desc.store([offset], x + y)
+        if OP == "add":
+            result = x + y
+        elif OP == "sub":
+            result = x - y
+        elif OP == "mul":
+            result = x * y
+        else:
+            result = x / y
+        out_desc.store([offset], result)
 
 
 @triton.jit
-def add_kernel_2d(
+def elementwise_2d(
     x_ptr,
     y_ptr,
     output_ptr,
@@ -133,8 +153,9 @@ def add_kernel_2d(
     X_LAYOUT: tl.constexpr,
     Y_LAYOUT: tl.constexpr,
     OUT_LAYOUT: tl.constexpr,
+    OP: tl.constexpr,
 ):
-    """2D elementwise add: out[M, N] = x[M, N] + y[M, N].
+    """2D elementwise op: out[M, N] = x[M, N] OP y[M, N].
 
     ``X_LAYOUT`` / ``Y_LAYOUT`` / ``OUT_LAYOUT`` are optional Spyre stick-tiling
     layouts for the matching descriptor; pass None to lower logically.
@@ -172,11 +193,19 @@ def add_kernel_2d(
             offset_n = n * BLOCK_N
             x = x_desc.load([offset_m, offset_n])
             y = y_desc.load([offset_m, offset_n])
-            out_desc.store([offset_m, offset_n], x + y)
+            if OP == "add":
+                result = x + y
+            elif OP == "sub":
+                result = x - y
+            elif OP == "mul":
+                result = x * y
+            else:
+                result = x / y
+            out_desc.store([offset_m, offset_n], result)
 
 
 @triton.jit
-def add_kernel_2d_grid(
+def elementwise_2d_grid(
     x_ptr,
     y_ptr,
     output_ptr,
@@ -184,11 +213,12 @@ def add_kernel_2d_grid(
     N,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    OP: tl.constexpr,
 ):
     """2D grid: pid_0 distributes M-tiles, pid_1 distributes N-tiles.
 
     Each grid axis loops over its assigned tiles via a distribution loop,
-    replacing the 1D-grid outer loops from :func:`add_kernel_2d`.
+    replacing the 1D-grid outer loops from :func:`elementwise_2d`.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -218,11 +248,19 @@ def add_kernel_2d_grid(
         for n in range(n_start, n_end):
             x = x_desc.load([m * BLOCK_M, n * BLOCK_N])
             y = y_desc.load([m * BLOCK_M, n * BLOCK_N])
-            out_desc.store([m * BLOCK_M, n * BLOCK_N], x + y)
+            if OP == "add":
+                result = x + y
+            elif OP == "sub":
+                result = x - y
+            elif OP == "mul":
+                result = x * y
+            else:
+                result = x / y
+            out_desc.store([m * BLOCK_M, n * BLOCK_N], result)
 
 
 @triton.jit
-def add_kernel_2d_scalar_dim(
+def elementwise_2d_scalar_dim(
     x_ptr,
     y_ptr,
     output_ptr,
@@ -230,8 +268,9 @@ def add_kernel_2d_scalar_dim(
     N: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    OP: tl.constexpr,
 ):
-    """2D add where `M` is read from memory instead of passed directly.
+    """2D elementwise where `M` is read from memory instead of passed directly.
 
     for now: KTIR-structural only, do not wire this into any end-to-end/DFIR test.
     """
@@ -264,11 +303,19 @@ def add_kernel_2d_scalar_dim(
         for n in range(n_start, n_end):
             x = x_desc.load([m * BLOCK_M, n * BLOCK_N])
             y = y_desc.load([m * BLOCK_M, n * BLOCK_N])
-            out_desc.store([m * BLOCK_M, n * BLOCK_N], x + y)
+            if OP == "add":
+                result = x + y
+            elif OP == "sub":
+                result = x - y
+            elif OP == "mul":
+                result = x * y
+            else:
+                result = x / y
+            out_desc.store([m * BLOCK_M, n * BLOCK_N], result)
 
 
 @triton.jit
-def add_kernel_3d(
+def elementwise_3d(
     x_ptr,
     y_ptr,
     output_ptr,
@@ -278,6 +325,7 @@ def add_kernel_3d(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_P: tl.constexpr,
+    OP: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -313,11 +361,19 @@ def add_kernel_3d(
                 offset_p = p * BLOCK_P
                 x = x_desc.load([offset_m, offset_n, offset_p])
                 y = y_desc.load([offset_m, offset_n, offset_p])
-                out_desc.store([offset_m, offset_n, offset_p], x + y)
+                if OP == "add":
+                    result = x + y
+                elif OP == "sub":
+                    result = x - y
+                elif OP == "mul":
+                    result = x * y
+                else:
+                    result = x / y
+                out_desc.store([offset_m, offset_n, offset_p], result)
 
 
 @triton.jit
-def add_kernel_3d_grid(
+def elementwise_3d_grid(
     x_ptr,
     y_ptr,
     output_ptr,
@@ -327,11 +383,12 @@ def add_kernel_3d_grid(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_P: tl.constexpr,
+    OP: tl.constexpr,
 ):
     """3D grid: pid_0 distributes M-tiles, pid_1 N-tiles, pid_2 P-tiles.
 
     Each grid axis loops over its assigned tiles via a distribution loop,
-    replacing the 1D-grid outer loops from :func:`add_kernel_3d`.
+    replacing the 1D-grid outer loops from :func:`elementwise_3d`.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -374,22 +431,31 @@ def add_kernel_3d_grid(
             for p in range(p_start, p_end):
                 x = x_desc.load([m * BLOCK_M, n * BLOCK_N, p * BLOCK_P])
                 y = y_desc.load([m * BLOCK_M, n * BLOCK_N, p * BLOCK_P])
-                out_desc.store([m * BLOCK_M, n * BLOCK_N, p * BLOCK_P], x + y)
+                if OP == "add":
+                    result = x + y
+                elif OP == "sub":
+                    result = x - y
+                elif OP == "mul":
+                    result = x * y
+                else:
+                    result = x / y
+                out_desc.store([m * BLOCK_M, n * BLOCK_N, p * BLOCK_P], result)
 
 
 @triton.jit
-def add_kernel_device(
+def elementwise_1d_device(
     x_ptr,
     y_ptr,
     output_ptr,
     n_elements: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     LAYOUT: tl.constexpr,
+    OP: tl.constexpr,
 ):
-    """Elementwise add over exactly one tile, with no distribution loop.
+    """Elementwise op over exactly one tile, with no distribution loop.
 
     The odd one out in this file: no ``tl.program_id``, no ``tl.num_programs``,
-    no loop -- one ``BLOCK_M x BLOCK_N`` tile that is the whole tensor. Every
+    no loop -- one ``BLOCK_SIZE``-wide tile that is the whole tensor. Every
     other kernel here carves work across the grid with an ``scf.for`` over the
     program id, and dbo-opt rejects the loop it outlines from that, so this is
     the only variant in the suite that reaches a Spyre *binary* rather than
@@ -412,4 +478,12 @@ def add_kernel_device(
     offset = pid * BLOCK_SIZE
     x = x_desc.load([offset])
     y = y_desc.load([offset])
-    out_desc.store([offset], x + y)
+    if OP == "add":
+        result = x + y
+    elif OP == "sub":
+        result = x - y
+    elif OP == "mul":
+        result = x * y
+    else:
+        result = x / y
+    out_desc.store([offset], result)

@@ -44,7 +44,7 @@ SHAPES = [
 # arguments having to follow. A static variant would describe a block larger than
 # its own tensor. No registered variant is over-cap on its own -- the largest
 # tensor across all 106 is 131,072, an eighth of the cap.
-_EXAMPLE = EXAMPLES["vector_add__2d_dynamic[M=520]"]
+_EXAMPLE = EXAMPLES["elementwise__2d_dynamic[M=520]"]
 
 
 def assert_over_cap_block_survives_lowering(block_m, block_n):

@@ -497,7 +497,7 @@ class KTIRStructuralTester(StructuralAssertions):
     Example::
 
         class TestVectorAdd(KTIRStructuralTester):
-            EXAMPLE = "vector_add"
+            EXAMPLE = "elementwise"
 
             def test_ktdp_ops(self):
                 self.assert_present("ktdp.load", "ktdp.store")
@@ -634,7 +634,7 @@ class KTIRCpuTester:
     Designed for multiple inheritance with :class:`KTIRStructuralTester`::
 
         class TestVectorAdd(KTIRCpuTester, KTIRStructuralTester):
-            EXAMPLE = "vector_add"
+            EXAMPLE = "elementwise"
 
             def test_numerical(self):
                 out = self.run_cpu("add_kernel", arg0=x, arg1=y, arg2=output)

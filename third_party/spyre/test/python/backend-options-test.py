@@ -39,7 +39,7 @@ from backend.compiler import (
 # ``*fp32`` pointers and nothing else — the pointer-argument assertions here care
 # only about the count, and the element widths they would otherwise pin are
 # covered by ``TestBaseAddresses`` on ``_segment_addresses`` directly.
-_EXAMPLE = EXAMPLES["vector_add__2d[M=512]"]
+_EXAMPLE = EXAMPLES["elementwise__2d[M=512]"]
 
 # ---------------------------------------------------------------------------
 # base_addresses — the fixed segment policy
