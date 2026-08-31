@@ -26,6 +26,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -482,6 +483,21 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
       // transpose fires.
       if (chainBlockedByPendingTranspose(operand))
         return failure();
+      // A reshape/broadcast producing this operand is not a deferred
+      // physicalization (it is not a linalg.transpose, so
+      // chainBlockedByPendingTranspose does not catch it) and is not a
+      // legitimate logical scratchpad either: its element-to-index mapping
+      // does not match a plain logical tensor's, so classifying it as one
+      // would silently compute the wrong slice. Hard-error rather than
+      // guess (case 3's scope is the transpose path only — see #91/#92).
+      if (auto *defOp = operand.getDefiningOp()) {
+        if (isa<tensor::ReshapeOp, tensor::ExpandShapeOp,
+                tensor::CollapseShapeOp, linalg::BroadcastOp>(defOp))
+          return emitFatalError(op, ctx,
+              "spyre_tensor_layout: source op operand is produced by a "
+              "reshape/broadcast, which cannot be treated as a physical "
+              "load or a plain logical scratchpad");
+      }
       auto tensorTy = dyn_cast<RankedTensorType>(operand.getType());
       if (!tensorTy ||
           tensorTy.getRank() != (int64_t)spec.operands[i].canonicalAxes.size())
@@ -489,6 +505,22 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
             "spyre_tensor_layout: source op operand is neither a physical "
             "load nor a logical (scratchpad) tensor of the expected rank");
       plans[i] = classifyScratchpad(operand, spec.operands[i]);
+    }
+  }
+
+  // A reduce absorbs its whole reduce axis set directly (opInnerReduceDims),
+  // so its loopDims never need a stick loop: move them into opTileDims (as
+  // WholeBlock slices spanning the full physical extent) before
+  // reconcileOperandSet folds loopDims into a trip count. Matmul never sets
+  // this flag, so its classification/dispatch is untouched.
+  if (spec.absorbLoopDimsIntoReduce) {
+    for (auto &plan : plans) {
+      for (int p : plan.dims.loopDims) {
+        plan.dims.opTileDims.push_back(p);
+        plan.dims.sliceKind[p] = SliceKind::WholeBlock;
+      }
+      plan.dims.loopDims.clear();
+      llvm::sort(plan.dims.opTileDims);
     }
   }
 
@@ -777,20 +809,70 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
       if ((unsigned)(src + 1) > logicalRank)
         logicalRank = (unsigned)(src + 1);
 
+    // Guard against re-matching an already-rewritten case-1 reduce. A case-1
+    // reduce keeps its physical extract_slice as input; when every dim on
+    // that slice is a WholeBlock (no narrowing at all -- e.g. a fully
+    // absorbed reduce with no residual stick loop), RewriteElementwisePattern
+    // sees identical operand/result shapes and copies the *same* marker
+    // forward onto the slice, making it look like a fresh physical operand to
+    // needsDispatch above. Once rewritten, rd.getDimensions() holds
+    // slice-local physical positions (e.g. [0, 2]), not logical dims -- so if
+    // any entry is already >= logicalRank, this op's `dimensions` cannot be
+    // logical dims of the *current* marker and this is a re-visit of an
+    // already-final reduce: reinterpreting it as logical again would silently
+    // compute nonsense (see emitReduceOp/targetOrder below, which assume
+    // rd.getDimensions() are logical). Fail rather than risk that.
+    if (llvm::any_of(rd.getDimensions(),
+                     [&](int64_t d) { return d >= (int64_t)logicalRank; }))
+      return failure();
+
     llvm::SmallVector<int64_t> canonicalAxes(logicalRank, -1);
     unsigned outAxis = 0;
     for (unsigned d = 0; d < logicalRank; ++d)
       if (!llvm::is_contained(rd.getDimensions(), (int64_t)d))
         canonicalAxes[d] = outAxis++;
 
-    // emitReduceOp always reduces the trailing axes (dims = [outputRank,
-    // rank)), so the surviving roles must come first, in order, and the
-    // reduced slots last — regardless of where the reduced axis sits
-    // logically.
+    // targetOrder: build it in *physical* dim order (via phys_src), not
+    // trailing-forced. linalg.reduce's `dimensions` is DenseArrayStrictlySorted
+    // -- sorted, but with no contiguity or trailing-position requirement -- so
+    // a reduced axis no longer needs to be moved to the end. resolveOperand's
+    // computeTransposePerm (PermutationUtils.h, not touched here) matches
+    // targetOrder's role sequence against the operand's physical roles by
+    // stable left-to-right scan; feeding it the *current* physical role
+    // sequence (survivors renumbered to canonical ascending order, reduced
+    // slots left as -1 in their own physical slot) makes it a no-op whenever
+    // the survivors are already in ascending order -- the transpose is then
+    // only emitted when they are not (Step 3, item 3/5: the transpose path is
+    // now scoped to reordering survivors, never to relocating reduced dims).
+    //
+    // This mirrors classify()'s own floor-dim test (role >= 0 && FloorDiv is a
+    // floorDim, excluded from opTileDims) so targetOrder's entries line up
+    // 1:1 with opTileDims in physical order, which is what dispatchSource's
+    // absorbLoopDimsIntoReduce fold produces (all reduce dims folded into
+    // opTileDims, sorted ascending == physical order).
     llvm::SmallVector<int64_t> targetOrder;
-    for (unsigned r = 0; r < outAxis; ++r)
-      targetOrder.push_back((int64_t)r);
-    targetOrder.append(logicalRank - outAxis, -1);
+    {
+      auto physOp = marker.getPhysOp();
+      for (unsigned p = 0; p < physOp.size(); ++p) {
+        int64_t logDim = marker.getPhysSrc()[p];
+        int64_t role = (logDim < (int64_t)canonicalAxes.size())
+                            ? canonicalAxes[logDim]
+                            : -1;
+        bool isFloor = role >= 0 &&
+                       static_cast<CoordOp>(physOp[p]) == CoordOp::FloorDiv;
+        if (!isFloor)
+          targetOrder.push_back(role);
+      }
+    }
+
+    // The reduced slice-local axis positions are exactly the -1 slots of
+    // targetOrder: resolveOperand's transpose (if any) reorders the operand
+    // into targetOrder's order, so slot t ends up holding a reduced axis iff
+    // targetOrder[t] == -1, regardless of where it sat before.
+    llvm::SmallVector<int64_t> reducedSlicePositions;
+    for (unsigned t = 0; t < targetOrder.size(); ++t)
+      if (targetOrder[t] == -1)
+        reducedSlicePositions.push_back((int64_t)t);
 
     Block &combinerBlock = rd.getOperation()->getRegion(0).front();
     llvm::SmallVector<Operation *> combinerOps;
@@ -802,18 +884,13 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
     llvm::SmallVector<Value> origBlockArgs(combinerBlock.getArguments().begin(),
                                            combinerBlock.getArguments().end());
 
-    unsigned outputRank = logicalRank - (unsigned)rd.getDimensions().size();
-    auto emitReduceOp = [outputRank,
+    auto emitReduceOp = [dims = reducedSlicePositions,
                          combinerOps = std::move(combinerOps),
                          yieldVals = std::move(yieldVals),
                          origBlockArgs = std::move(origBlockArgs)](
                             OpBuilder &b, Location loc,
                             llvm::ArrayRef<Value> slices, Value acc,
                             RankedTensorType accTy) -> Value {
-      auto sliceTy = cast<RankedTensorType>(slices[0].getType());
-      llvm::SmallVector<int64_t> dims;
-      for (unsigned d = outputRank; d < (unsigned)sliceTy.getRank(); ++d)
-        dims.push_back((int64_t)d);
       return linalg::ReduceOp::create(
           b, loc, ValueRange{slices[0]}, ValueRange{acc}, dims,
           [&](OpBuilder &inner, Location iloc, ValueRange args) {
@@ -832,6 +909,7 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
     spec.operands = {SourceOperandSpec{canonicalAxes, targetOrder}};
     spec.logicalRank = logicalRank;
     spec.emitOp = emitReduceOp;
+    spec.absorbLoopDimsIntoReduce = true;
     return dispatchSource(rd, spec, ctx, rewriter);
   }
 };

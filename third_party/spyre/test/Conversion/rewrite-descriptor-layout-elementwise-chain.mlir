@@ -111,8 +111,7 @@ module {
 // CHECK-LABEL: tt.func @elementwise_expand_dims_unannotated
 // CHECK:       ktdp.load {{.*}} : <2x64x64xindex> -> tensor<2x64x64xf32>
 // CHECK:       arith.negf {{.*}} : tensor<2x64x64xf32>
-// CHECK:       scf.for
-// CHECK:       linalg.reduce
+// CHECK:       linalg.reduce{{.*}}dimensions = [0, 2]
 // CHECK:       tensor.expand_shape %{{.*}} {{.*}} output_shape [64, 1] : tensor<64xf32> into tensor<64x1xf32>
 // CHECK:       tensor.collapse_shape %{{.*}} : tensor<64x1xf32> into tensor<64xf32>
 // CHECK:       linalg.broadcast ins(%{{.*}} : tensor<64xf32>) outs(%{{.*}} : tensor<64x128xf32>)

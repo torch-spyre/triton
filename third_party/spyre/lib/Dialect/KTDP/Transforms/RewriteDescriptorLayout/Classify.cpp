@@ -8,6 +8,7 @@
 #include "RewriteDescriptorLayout/Classify.h"
 
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -71,6 +72,13 @@ OperandPlan classify(Value val, const OperandCoords &coords,
   std::reverse(d.floorDims.begin(), d.floorDims.end());
   std::reverse(d.loopDims.begin(), d.loopDims.end());
   std::reverse(d.opTileDims.begin(), d.opTileDims.end());
+
+  // opInnerReduceDims: every reduceDim, sorted ascending -- the real reduce
+  // axis set (see ClassifiedDims comment). d.reduceDims is built right-to-left
+  // and never reversed, so it comes out descending; sort rather than reverse
+  // in case a future caller mutates it out of strict right-to-left order.
+  d.opInnerReduceDims.assign(d.reduceDims.begin(), d.reduceDims.end());
+  llvm::sort(d.opInnerReduceDims);
 
   d.sliceKind.assign(rank, SliceKind::WholeBlock);
   auto markList = [&](llvm::ArrayRef<int> dims) {
