@@ -6,29 +6,45 @@
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 namespace mlir::triton::ktdp {
 
+/// What is known about one physical value (a physicalized ktdp.load result,
+/// or a value retyped to physical by Phase 2's elementwise pattern).
+struct PhysicalValueInfo {
+  /// The layout marker for the descriptor this value ultimately derives
+  /// from. Always set when a PhysicalValueInfo exists at all: Phase 1 seeds
+  /// every entry from a ktdp.load whose access tile resolves to a marker via
+  /// physMemViewToMarker, and Phase 2 only ever grows the map by copying an
+  /// existing entry from an operand to that operand's op result.
+  triton::SpyreTensorLayoutOp marker;
+  /// The logical permutation of a linalg.transpose erased on this value's
+  /// chain, empty if none. Populated by Phase 2's transpose pattern
+  /// (RewriteTransposePattern) as it erases transposes, and read by
+  /// dispatchSource to fold the erased permutation into canonicalAxes.
+  llvm::SmallVector<int64_t> transposePerm;
+};
+
 struct PassContext {
   const llvm::DenseMap<mlir::Value, triton::SpyreTensorLayoutOp> &physMemViewToMarker;
-  /// Maps a physical ktdp.load result -> the logical permutation of a
-  /// linalg.transpose erased on its consuming chain. Populated by Phase 2's
-  /// transpose pattern (RewriteTransposePattern) as it erases transposes, and
-  /// read by dispatchSource to fold the erased permutation into canonicalAxes.
-  llvm::DenseMap<mlir::Value, llvm::SmallVector<int64_t>> &physicalLoadToTransposePerm;
-  /// Seeded by Phase 1 with every physical ktdp.load result, and grown by
-  /// Phase 2's RewriteElementwisePattern with the result of each op it
-  /// retypes (a value it just made physical). Membership answers "is this
-  /// value reachable from a physicalized load" without re-walking the chain:
-  /// an op on a path that was never physicalized (no marker anywhere upstream)
-  /// is simply never in this set. This is what keeps the elementwise pattern's
-  /// local shape rule from mis-firing on ops like tt.expand_dims that happen
-  /// to have one tensor operand and a differently-shaped result but are not
-  /// reachable from any physicalized load.
-  llvm::DenseSet<mlir::Value> &physicalValues;
+  /// Maps a physical value (a ktdp.load result, or a value Phase 2 has
+  /// retyped to physical) to what is known about it -- see PhysicalValueInfo.
+  /// Seeded by Phase 1 with every physical ktdp.load result (the root of
+  /// every chain Phase 2 will retype), and grown by Phase 2's
+  /// RewriteElementwisePattern with the result of each op it retypes (a
+  /// value it just made physical, carrying forward its operand's info) and
+  /// by RewriteTransposePattern as it erases transposes (recording the
+  /// permutation against the transpose's input, which is already an entry).
+  /// Presence answers "is this value reachable from a physicalized load"
+  /// without re-walking the chain: an op on a path that was never
+  /// physicalized (no marker anywhere upstream) is simply never in this map.
+  /// This is what keeps the elementwise pattern's local shape rule from
+  /// mis-firing on ops like tt.expand_dims that happen to have one tensor
+  /// operand and a differently-shaped result but are not reachable from any
+  /// physicalized load.
+  llvm::DenseMap<mlir::Value, PhysicalValueInfo> &physicalValues;
   /// Set by patterns to indicate a fatal error that should abort the pass.
   mutable bool hadError = false;
 };

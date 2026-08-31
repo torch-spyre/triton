@@ -107,14 +107,11 @@ struct RewriteDescriptorLayoutPass
   // Loops already rescaled to stick granularity.
   DenseSet<scf::ForOp> rescaledLoops;
 
-  // Maps a physical ktdp.load result -> the logical permutation of a
-  // linalg.transpose that was erased in Phase 1.
-  llvm::DenseMap<mlir::Value, SmallVector<int64_t>> physicalLoadToTransposePerm;
-
-  // Every physical ktdp.load result, seeded here in Phase 1 (retypeLoad) and
-  // grown by Phase 2 as it retypes elementwise ops -- see PassContext's
-  // physicalValues for why this replaces a backward traceback.
-  llvm::DenseSet<mlir::Value> physicalValues;
+  // Maps a physical value (a ktdp.load result, or a value Phase 2 has
+  // retyped to physical) to what is known about it -- see PassContext's
+  // physicalValues in Types.h. Seeded here in Phase 1 (retypeLoad) and grown
+  // by Phase 2 as it retypes elementwise ops and erases transposes.
+  llvm::DenseMap<mlir::Value, mlir::triton::ktdp::PhysicalValueInfo> physicalValues;
 
   // Resolved from the pass option: true = "device" (physical row-major strides),
   // false = "host" (derive strides from logical strides via coord map).
@@ -275,7 +272,8 @@ struct RewriteDescriptorLayoutPass
                                   Value newMemView,
                                   ArrayRef<int64_t> physSrc,
                                   ArrayRef<int64_t> physOp,
-                                  ArrayRef<int64_t> physArg) {
+                                  ArrayRef<int64_t> physArg,
+                                  triton::SpyreTensorLayoutOp marker) {
     OpBuilder b(tileOp);
     Location loc = tileOp.getLoc();
 
@@ -395,7 +393,7 @@ struct RewriteDescriptorLayoutPass
     // Update consumers (ktdp.load / ktdp.store).
     for (auto *user : llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
       if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
-        retypeLoad(ld, newTileResult, physBlock);
+        retypeLoad(ld, newTileResult, physBlock, marker);
       } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
         redirectStoreAccessTile(st, newTileResult);
       } else {
@@ -412,7 +410,7 @@ struct RewriteDescriptorLayoutPass
   LogicalResult rewriteIndirectAccessTile(
       mlir::ktdp::ConstructIndirectAccessTilesOp tileOp, Value newMemView,
       ArrayRef<int64_t> physSrc, ArrayRef<int64_t> physOp,
-      ArrayRef<int64_t> physArg) {
+      ArrayRef<int64_t> physArg, triton::SpyreTensorLayoutOp marker) {
     OpBuilder b(tileOp);
     Location loc = tileOp.getLoc();
     MLIRContext *ctx = b.getContext();
@@ -535,7 +533,7 @@ struct RewriteDescriptorLayoutPass
     // Update consumers.
     for (auto *user : llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
       if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
-        retypeLoad(ld, newTile.getResult(), physBlock);
+        retypeLoad(ld, newTile.getResult(), physBlock, marker);
       } else {
         return user->emitError(
             "spyre_tensor_layout: unexpected user of indirect access tile");
@@ -552,7 +550,8 @@ struct RewriteDescriptorLayoutPass
   // Phase 1 stops here — it no longer forward-retypes the consuming chain;
   // Phase 2 decides each consuming op individually (see ContractionSynthesis.cpp).
   void retypeLoad(mlir::ktdp::LoadOp ld, Value newTile,
-                  ArrayRef<int64_t> physBlock) {
+                  ArrayRef<int64_t> physBlock,
+                  triton::SpyreTensorLayoutOp marker) {
     OpBuilder b(ld);
     auto elemTy = cast<RankedTensorType>(ld.getResult().getType())
                       .getElementType();
@@ -560,9 +559,12 @@ struct RewriteDescriptorLayoutPass
     auto newLd = mlir::ktdp::LoadOp::create(b, ld.getLoc(), physResTy, newTile);
     ld.getResult().replaceAllUsesWith(newLd.getResult());
     ld.erase();
-    // Seed Phase 2's reachability set: this is a physicalized load result,
-    // the root of every forward elementwise chain Phase 2 will retype.
-    physicalValues.insert(newLd.getResult());
+    // Seed Phase 2's reachability map: this is a physicalized load result,
+    // the root of every forward elementwise chain Phase 2 will retype, and
+    // carries this descriptor's marker for dispatchSource/findMarkerForStore
+    // to read directly (no backward walk needed).
+    physicalValues[newLd.getResult()] =
+        mlir::triton::ktdp::PhysicalValueInfo{marker, {}};
   }
 
   // Redirect ktdp.store's access tile operand to the new physical tile.
@@ -815,12 +817,12 @@ struct RewriteDescriptorLayoutPass
     // Rebuild each access tile that uses the old memView.
     for (auto tileOp : plan.directTiles) {
       if (failed(rewriteAccessTile(tileOp, newMemView, plan.physSrc, plan.physOp,
-                                   plan.physArg)))
+                                   plan.physArg, marker)))
         return failure();
     }
     for (auto tileOp : plan.indirectTiles) {
       if (failed(rewriteIndirectAccessTile(tileOp, newMemView, plan.physSrc,
-                                           plan.physOp, plan.physArg)))
+                                           plan.physOp, plan.physArg, marker)))
         return failure();
     }
 
@@ -881,8 +883,7 @@ struct RewriteDescriptorLayoutPass
 
     // Phase 2: synthesize contractions via greedy pattern rewrite.
     {
-      PassContext ctx{physMemViewToMarker, physicalLoadToTransposePerm,
-                      physicalValues};
+      PassContext ctx{physMemViewToMarker, physicalValues};
       RewritePatternSet patterns(module.getContext());
       populateContractionPatterns(patterns, ctx);
       // Collect candidate ops: the four contraction-family ops, plus every

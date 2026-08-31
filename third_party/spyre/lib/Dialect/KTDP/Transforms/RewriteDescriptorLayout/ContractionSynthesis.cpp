@@ -44,13 +44,14 @@ namespace mlir::triton::ktdp {
 // RankedTensor operand.
 //
 // This single-tensor-operand restriction is specific to the BACKWARD walk in
-// walkToLoad: with two or more tensor operands there is no single producer to
-// follow, and the restriction is exactly what keeps that walk from crossing a
-// matmul (3 tensor operands) or reduce (2). It is not a general elementwise
-// predicate. Forward retyping (deciding an op's own result type in Phase 2)
-// must NOT reuse this — see RewriteElementwisePattern, which uses a separate,
-// purely local shape rule that also covers multi-tensor-operand elementwise
-// ops (arith.addf, select, ...).
+// chainBlockedByPendingTranspose: with two or more tensor operands there is
+// no single producer to follow, and the restriction is exactly what keeps
+// that walk from crossing a matmul (3 tensor operands) or reduce (2). It is
+// not a general elementwise predicate. Forward retyping (deciding an op's
+// own result type in Phase 2) must NOT reuse this — see
+// RewriteElementwisePattern, which uses a separate, purely local shape rule
+// that also covers multi-tensor-operand elementwise ops (arith.addf, select,
+// ...).
 bool isSingleTensorElementwiseOp(Operation *op) {
   if (op->getNumResults() != 1 || op->getNumOperands() == 0)
     return false;
@@ -87,29 +88,17 @@ Value emitTranspose(OpBuilder &b, Location loc, Value src,
       b.getDenseI64ArrayAttr(mlirPerm)).getResult()[0];
 }
 
-// Walk backward from `val` through single-tensor elementwise ops to the
-// ktdp.load that produced it. Returns null if not found.
-mlir::ktdp::LoadOp walkToLoad(Value val) {
-  Value v = val;
-  while (true) {
-    auto *defOp = v.getDefiningOp();
-    if (!defOp)
-      return mlir::ktdp::LoadOp{};
-    if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(defOp))
-      return ld;
-    if (!isSingleTensorElementwiseOp(defOp))
-      return mlir::ktdp::LoadOp{};
-    for (auto operand : defOp->getOperands())
-      if (isa<RankedTensorType>(operand.getType())) { v = operand; break; }
-  }
-}
-
 // True if a not-yet-erased linalg.transpose sits between `val` and a
-// ktdp.load, i.e. `walkToLoad(val)` returning null is because a transpose
-// pattern (RewriteTransposePattern) has not fired here yet, rather than `val`
-// genuinely not deriving from a physical load. Matmul/reduce/store dispatch
-// must distinguish these two null cases: the former means "not ready, defer
-// to a later greedy iteration" (return failure()), the latter means
+// ktdp.load, i.e. a lookup of `val` in ctx.physicalValues missing is because
+// a transpose pattern (RewriteTransposePattern) has not fired here yet,
+// rather than `val` genuinely not deriving from a physical load. This is an
+// IR-structural question -- "is there a live linalg.TransposeOp on this
+// chain" -- not a "is this value already known-physical" question, so it
+// cannot be answered by a map lookup: a transpose's own input is not itself
+// recorded in ctx.physicalValues until after RewriteTransposePattern erases
+// the transpose (see that pattern). Matmul/reduce/store dispatch must
+// distinguish these two "not found" cases: the former means "not ready,
+// defer to a later greedy iteration" (return failure()), the latter means
 // "genuinely logical, treat as a scratchpad operand."
 bool chainBlockedByPendingTranspose(Value val) {
   Value v = val;
@@ -143,14 +132,15 @@ lookupMarkerFromTile(Value accessTile, const PassContext &ctx) {
                                              : triton::SpyreTensorLayoutOp{};
 }
 
-// Walk back from an operand through the elementwise chain to the
-// ktdp.load, then look up the physical memView -> marker map.
+// Look up the originating marker for an operand directly from
+// ctx.physicalValues: every physical value (a ktdp.load result, or a value
+// Phase 2 has already retyped) carries its marker forward in the map, so no
+// backward walk is needed.
 triton::SpyreTensorLayoutOp
 findMarkerForOperand(Value operand, const PassContext &ctx) {
-  auto ld = walkToLoad(operand);
-  if (!ld)
-    return {};
-  return lookupMarkerFromTile(ld.getAccessTile(), ctx);
+  auto it = ctx.physicalValues.find(operand);
+  return it != ctx.physicalValues.end() ? it->second.marker
+                                       : triton::SpyreTensorLayoutOp{};
 }
 
 // True if `val`'s defining op is an elementwise op RewriteElementwisePattern
@@ -194,6 +184,7 @@ bool pendingElementwiseRetype(Value val, const PassContext &ctx) {
   });
   return reachesPhysicalLoad;
 }
+
 
 // Emit a stick loop (scf.for) or inline for trip <= 1.
 Value emitStickLoop(OpBuilder &b, Location loc, int64_t tripCount,
@@ -418,10 +409,10 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
 
   for (unsigned i = 0; i < nOps; ++i) {
     Value operand = op.getDpsInputs()[i];
-    auto ld = walkToLoad(operand);
+    auto physIt = ctx.physicalValues.find(operand);
 
-    if (ld) {
-      auto marker = findMarkerForOperand(operand, ctx);
+    if (physIt != ctx.physicalValues.end()) {
+      auto marker = physIt->second.marker;
       if (!marker) {
         auto tensorTy = dyn_cast<RankedTensorType>(operand.getType());
         if (!tensorTy ||
@@ -437,9 +428,8 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
       // Compose erased transpose perm into canonicalAxes.
       llvm::SmallVector<int64_t> effectiveCanonicalAxes = spec.operands[i].canonicalAxes;
       {
-        auto it = ctx.physicalLoadToTransposePerm.find(ld.getResult());
-        if (it != ctx.physicalLoadToTransposePerm.end()) {
-          const auto &tau = it->second;
+        const auto &tau = physIt->second.transposePerm;
+        if (!tau.empty()) {
           assert(tau.size() == effectiveCanonicalAxes.size() &&
                  "transpose perm size must match canonicalAxes size");
           llvm::SmallVector<int64_t> reordered(effectiveCanonicalAxes.size());
@@ -459,9 +449,9 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
         llvm::dbgs() << "]\n";
       });
     } else {
-      // walkToLoad found nothing: either this operand is genuinely logical
-      // (scratchpad), or a linalg.transpose sitting on its chain has not
-      // been erased yet by RewriteTransposePattern. The latter is not a
+      // Not (yet) in ctx.physicalValues: either this operand is genuinely
+      // logical (scratchpad), or a linalg.transpose sitting on its chain has
+      // not been erased yet by RewriteTransposePattern. The latter is not a
       // fatal condition — defer to a later greedy iteration once the
       // transpose fires.
       if (chainBlockedByPendingTranspose(operand))
@@ -895,14 +885,21 @@ struct RewriteElementwisePattern : RewritePattern {
       return failure();
 
     // Reachability scoping (see comment above): require at least one tensor
-    // operand to already be in the physicalized-value set. Without this, the
+    // operand to already be in the physicalized-value map. Without this, the
     // pattern would retype ops on paths that were never physicalized at all
     // (e.g. tt.expand_dims in an unannotated function).
-    bool reachesPhysicalLoad = llvm::any_of(op->getOperands(), [&](Value o) {
+    auto physOperandIt = llvm::find_if(op->getOperands(), [&](Value o) {
       return ctx.physicalValues.contains(o);
     });
-    if (!reachesPhysicalLoad)
+    if (physOperandIt == op->getOperands().end())
       return failure();
+
+    // Carry the originating operand's info (marker + any transpose perm)
+    // forward to this op's result -- if several operands are already
+    // physical (e.g. both sides of arith.addf), they were reconciled onto
+    // the same physical shape by the operand-shape-agreement check above, so
+    // any one of their PhysicalValueInfo entries is representative.
+    PhysicalValueInfo info = ctx.physicalValues.find(*physOperandIt)->second;
 
     rewriter.modifyOpInPlace(op, [&]() {
       op->getResult(0).setType(
@@ -910,7 +907,7 @@ struct RewriteElementwisePattern : RewritePattern {
     });
     // Propagate forward: this op's result is now itself a physicalized
     // value, so a downstream elementwise op reading it must see it as such.
-    ctx.physicalValues.insert(op->getResult(0));
+    ctx.physicalValues[op->getResult(0)] = info;
     // The greedy driver re-enqueues an in-place-modified op itself, but not
     // its users — yet a user (e.g. a downstream linalg.transpose or another
     // elementwise op) may only become dispatchable now that this op's result
@@ -925,11 +922,12 @@ struct RewriteElementwisePattern : RewritePattern {
 // Pattern: linalg.transpose (erase and record permutation)
 //===----------------------------------------------------------------------===//
 
-// physicalLoadToTransposePerm exists only because this erase happens before
-// dispatchSource can see the transpose: erasing it here (Phase 2, per-op,
-// same as before but no longer forced by Phase 1's forward walk) still
-// requires the downstream matmul/reduce to recover the permutation from
-// somewhere once the transpose is gone.
+// The transpose permutation is recorded in ctx.physicalValues (against
+// `input`, which must already be an entry -- see PhysicalValueInfo) because
+// this erase happens before dispatchSource can see the transpose: erasing it
+// here (Phase 2, per-op, same as before but no longer forced by Phase 1's
+// forward walk) still requires the downstream matmul/reduce to recover the
+// permutation from somewhere once the transpose is gone.
 struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
   const PassContext &ctx;
   RewriteTransposePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
@@ -938,8 +936,8 @@ struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
   LogicalResult matchAndRewrite(linalg::TransposeOp tr,
                                 PatternRewriter &rewriter) const override {
     Value input = tr.getInput();
-    auto ld = walkToLoad(input);
-    if (!ld)
+    auto it = ctx.physicalValues.find(input);
+    if (it == ctx.physicalValues.end())
       return failure();
 
     auto perm = SmallVector<int64_t>(tr.getPermutation());
@@ -948,7 +946,7 @@ struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
       llvm::interleaveComma(perm, llvm::dbgs());
       llvm::dbgs() << "\n";
     });
-    auto &slot = ctx.physicalLoadToTransposePerm[ld.getResult()];
+    auto &slot = it->second.transposePerm;
     slot = slot.empty() ? perm : composePerm(slot, perm);
     // Capture users before replaceOp() moves them onto `input`'s use-list:
     // the greedy driver does not automatically re-enqueue users of a
