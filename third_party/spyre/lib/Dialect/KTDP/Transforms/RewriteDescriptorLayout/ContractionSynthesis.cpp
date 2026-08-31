@@ -100,6 +100,32 @@ Value emitTranspose(OpBuilder &b, Location loc, Value src,
 // distinguish these two "not found" cases: the former means "not ready,
 // defer to a later greedy iteration" (return failure()), the latter means
 // "genuinely logical, treat as a scratchpad operand."
+// Why this survives the physicalValues consolidation, and why raising
+// RewriteTransposePattern's benefit does not remove it.
+//
+// A transpose is erased by RewriteTransposePattern, which records its
+// permutation against its input. dispatchSource then reads that entry. Running
+// the producer first is necessary but not sufficient: chained transposes with an
+// elementwise op between them need the two patterns to alternate.
+//
+//     load(physical) -> trans1 -> negf -> trans2 -> dot
+//
+//     erase trans1     input is the load, ready immediately
+//     retype negf      only once trans1 is erased
+//     erase trans2     only once negf is retyped
+//     dispatch dot     only once trans2 is erased
+//
+// Three alternating rounds between two patterns, so no benefit ordering lets the
+// matmul see a fully resolved chain on first visit -- whichever pattern runs
+// first, the other must run before it can proceed again. The matmul is therefore
+// visited while a transpose is still live, and must defer rather than conclude
+// its operand is logical. Measured: with the transpose pattern at benefit 3 this
+// still fires once, on chained_transpose_matmul.
+//
+// The traversal duplicates the backward walk that walkToLoad used to perform.
+// Removing it needs physicalValues to carry a pending state, so "not resolved
+// yet" is a lookup rather than a re-derivation -- a convergence change, not a
+// consolidation.
 bool chainBlockedByPendingTranspose(Value val) {
   Value v = val;
   while (true) {
@@ -930,8 +956,11 @@ struct RewriteElementwisePattern : RewritePattern {
 // permutation from somewhere once the transpose is gone.
 struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
   const PassContext &ctx;
+  // Benefit 3, above every consumer of the permutation it records. A transpose
+  // must be erased before dispatchSource reads physicalValues, or the entry is
+  // absent when asked and a miss cannot be told from "genuinely logical".
   RewriteTransposePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
-      : OpRewritePattern(mlirCtx, /*benefit=*/1), ctx(layoutCtx) {}
+      : OpRewritePattern(mlirCtx, /*benefit=*/3), ctx(layoutCtx) {}
 
   LogicalResult matchAndRewrite(linalg::TransposeOp tr,
                                 PatternRewriter &rewriter) const override {
