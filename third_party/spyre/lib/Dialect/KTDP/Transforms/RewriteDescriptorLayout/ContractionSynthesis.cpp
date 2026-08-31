@@ -38,16 +38,19 @@
 
 using namespace mlir;
 
-namespace {
-
-using namespace mlir::triton::ktdp;
-
-//===----------------------------------------------------------------------===//
-// Shared helpers
-//===----------------------------------------------------------------------===//
+namespace mlir::triton::ktdp {
 
 // True iff op is a single-result elementwise op with exactly one
 // RankedTensor operand.
+//
+// This single-tensor-operand restriction is specific to the BACKWARD walk in
+// walkToLoad: with two or more tensor operands there is no single producer to
+// follow, and the restriction is exactly what keeps that walk from crossing a
+// matmul (3 tensor operands) or reduce (2). It is not a general elementwise
+// predicate. Forward retyping (deciding an op's own result type in Phase 2)
+// must NOT reuse this — see RewriteElementwisePattern, which uses a separate,
+// purely local shape rule that also covers multi-tensor-operand elementwise
+// ops (arith.addf, select, ...).
 bool isSingleTensorElementwiseOp(Operation *op) {
   if (op->getNumResults() != 1 || op->getNumOperands() == 0)
     return false;
@@ -57,6 +60,16 @@ bool isSingleTensorElementwiseOp(Operation *op) {
       ++tensorOps;
   return tensorOps == 1;
 }
+
+} // namespace mlir::triton::ktdp
+
+namespace {
+
+using namespace mlir::triton::ktdp;
+
+//===----------------------------------------------------------------------===//
+// Shared helpers
+//===----------------------------------------------------------------------===//
 
 // Emit linalg.transpose with the given permutation (input->output form).
 // linalg.transpose uses "output<-input" form, so we invert here.
@@ -91,6 +104,34 @@ mlir::ktdp::LoadOp walkToLoad(Value val) {
   }
 }
 
+// True if a not-yet-erased linalg.transpose sits between `val` and a
+// ktdp.load, i.e. `walkToLoad(val)` returning null is because a transpose
+// pattern (RewriteTransposePattern) has not fired here yet, rather than `val`
+// genuinely not deriving from a physical load. Matmul/reduce/store dispatch
+// must distinguish these two null cases: the former means "not ready, defer
+// to a later greedy iteration" (return failure()), the latter means
+// "genuinely logical, treat as a scratchpad operand."
+bool chainBlockedByPendingTranspose(Value val) {
+  Value v = val;
+  while (true) {
+    auto *defOp = v.getDefiningOp();
+    if (!defOp)
+      return false;
+    if (isa<mlir::ktdp::LoadOp>(defOp))
+      return false;
+    if (isa<linalg::TransposeOp>(defOp))
+      return true;
+    if (!isSingleTensorElementwiseOp(defOp))
+      return false;
+    Value next;
+    for (auto operand : defOp->getOperands())
+      if (isa<RankedTensorType>(operand.getType())) { next = operand; break; }
+    if (!next)
+      return false;
+    v = next;
+  }
+}
+
 // Look up the marker for an access tile's base memView in the pass context.
 triton::SpyreTensorLayoutOp
 lookupMarkerFromTile(Value accessTile, const PassContext &ctx) {
@@ -110,6 +151,48 @@ findMarkerForOperand(Value operand, const PassContext &ctx) {
   if (!ld)
     return {};
   return lookupMarkerFromTile(ld.getAccessTile(), ctx);
+}
+
+// True if `val`'s defining op is an elementwise op RewriteElementwisePattern
+// has not yet retyped to its final shape: at least one tensor operand, a
+// single tensor result, the operand/result shapes not yet uniform, and (the
+// same reachability scoping RewriteElementwisePattern itself requires -- see
+// its comment) at least one tensor operand already in ctx.physicalValues. A
+// consumer (e.g. RewriteStorePattern) seeing such a value must defer --
+// return failure() -- rather than read dataTy.getRank() now, since that rank
+// is about to change out from under it once the elementwise op is retyped.
+// Without this, a store whose data tile is produced by e.g. arith.addf can
+// fire while addf is still logically shaped, misclassify the store as
+// needing a sink/bridge stage, and lock in a decision building on a value
+// that is not in its final form.
+bool pendingElementwiseRetype(Value val, const PassContext &ctx) {
+  auto *defOp = val.getDefiningOp();
+  if (!defOp || defOp->getNumResults() != 1)
+    return false;
+  auto resTy = dyn_cast<RankedTensorType>(defOp->getResult(0).getType());
+  if (!resTy)
+    return false;
+  ArrayRef<int64_t> commonShape;
+  bool sawTensorOperand = false;
+  for (Value o : defOp->getOperands()) {
+    auto opndTy = dyn_cast<RankedTensorType>(o.getType());
+    if (!opndTy)
+      continue;
+    if (!sawTensorOperand) {
+      commonShape = opndTy.getShape();
+      sawTensorOperand = true;
+    } else if (opndTy.getShape() != commonShape) {
+      // Operands themselves disagree -- not (yet) a case
+      // RewriteElementwisePattern will touch; do not report pending.
+      return false;
+    }
+  }
+  if (!sawTensorOperand || resTy.getShape() == commonShape)
+    return false;
+  bool reachesPhysicalLoad = llvm::any_of(defOp->getOperands(), [&](Value o) {
+    return ctx.physicalValues.contains(o);
+  });
+  return reachesPhysicalLoad;
 }
 
 // Emit a stick loop (scf.for) or inline for trip <= 1.
@@ -376,6 +459,13 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
         llvm::dbgs() << "]\n";
       });
     } else {
+      // walkToLoad found nothing: either this operand is genuinely logical
+      // (scratchpad), or a linalg.transpose sitting on its chain has not
+      // been erased yet by RewriteTransposePattern. The latter is not a
+      // fatal condition — defer to a later greedy iteration once the
+      // transpose fires.
+      if (chainBlockedByPendingTranspose(operand))
+        return failure();
       auto tensorTy = dyn_cast<RankedTensorType>(operand.getType());
       if (!tensorTy ||
           tensorTy.getRank() != (int64_t)spec.operands[i].canonicalAxes.size())
@@ -731,6 +821,249 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// Pattern: single-tensor elementwise op (retype in place)
+//===----------------------------------------------------------------------===//
+
+// An elementwise op's output can always be physicalized: it is rank-agnostic,
+// so the physical type of its tensor operand(s) propagates unchanged (the
+// work retypeChain used to do forward, in passing, over the whole chain).
+//
+// Deliberately local, and deliberately not isSingleTensorElementwiseOp (see
+// the comment there): by the time Phase 2 runs, Phase 1 has already made
+// every load's result physical, so the decision for an elementwise op is
+// local to that op's own operand/result shapes, not a backward walk. This
+// also means the rule covers multi-tensor-operand elementwise ops (addf,
+// mulf, select, ...) for free -- it just requires every tensor operand to
+// already agree on a shape before retyping the result to match.
+//
+// The shape-mismatch test alone is not sufficient to scope this pattern: it
+// also matches ops that are not elementwise at all but happen to have one
+// tensor operand and a differently-shaped result, e.g. tt.expand_dims
+// (tensor<1xf32> -> tensor<1x1xf32> in softmax's row-max reduction). Base
+// retypeChain never touched such ops because it only ever walked values
+// reachable from a physicalized load's users -- an unannotated function
+// (softmax has zero tt.spyre_tensor_layout markers) never seeded that walk
+// at all.
+//
+// ctx.physicalValues restores that same reachability scoping, as a seeded
+// worklist rather than a backward traceback: Phase 1 seeds it with every
+// physical ktdp.load result (the root of every chain Phase 2 will retype),
+// and this pattern grows it with the result of each op it retypes -- so
+// membership IS the "reachable from a physicalized load" answer, propagated
+// forward exactly the way base retypeChain did, just now living in Phase 2
+// where the per-op decision belongs. An op on an unannotated path is simply
+// never in the set, so tt.expand_dims in softmax is never retyped.
+struct RewriteElementwisePattern : RewritePattern {
+  const PassContext &ctx;
+  RewriteElementwisePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
+      : RewritePattern(Pattern::MatchAnyOpTypeTag(), /*benefit=*/1, mlirCtx),
+        ctx(layoutCtx) {}
+
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    if (op->getNumResults() != 1)
+      return failure();
+    auto resTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (!resTy)
+      return failure();
+
+    // Every tensor operand must be a RankedTensorType, and they must all
+    // agree on shape -- that agreement is the safety condition: if one
+    // operand is still logical and another already physical, decline rather
+    // than retype to a guess.
+    ArrayRef<int64_t> commonShape;
+    bool sawTensorOperand = false;
+    for (Value o : op->getOperands()) {
+      auto opndTy = dyn_cast<RankedTensorType>(o.getType());
+      if (!isa<RankedTensorType>(o.getType()))
+        continue;
+      if (!opndTy)
+        return failure();
+      if (!sawTensorOperand) {
+        commonShape = opndTy.getShape();
+        sawTensorOperand = true;
+      } else if (opndTy.getShape() != commonShape) {
+        return failure();
+      }
+    }
+    if (!sawTensorOperand)
+      return failure();
+
+    // Idempotence: once the result already matches, stop matching, so the
+    // greedy driver's repeated re-enqueue cannot re-fire this.
+    if (resTy.getShape() == commonShape)
+      return failure();
+
+    // Reachability scoping (see comment above): require at least one tensor
+    // operand to already be in the physicalized-value set. Without this, the
+    // pattern would retype ops on paths that were never physicalized at all
+    // (e.g. tt.expand_dims in an unannotated function).
+    bool reachesPhysicalLoad = llvm::any_of(op->getOperands(), [&](Value o) {
+      return ctx.physicalValues.contains(o);
+    });
+    if (!reachesPhysicalLoad)
+      return failure();
+
+    rewriter.modifyOpInPlace(op, [&]() {
+      op->getResult(0).setType(
+          RankedTensorType::get(commonShape, resTy.getElementType()));
+    });
+    // Propagate forward: this op's result is now itself a physicalized
+    // value, so a downstream elementwise op reading it must see it as such.
+    ctx.physicalValues.insert(op->getResult(0));
+    // The greedy driver re-enqueues an in-place-modified op itself, but not
+    // its users — yet a user (e.g. a downstream linalg.transpose or another
+    // elementwise op) may only become dispatchable now that this op's result
+    // type has changed. Force those users back onto the worklist.
+    for (Operation *user : llvm::make_early_inc_range(op->getResult(0).getUsers()))
+      rewriter.modifyOpInPlace(user, [] {});
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Pattern: linalg.transpose (erase and record permutation)
+//===----------------------------------------------------------------------===//
+
+// physicalLoadToTransposePerm exists only because this erase happens before
+// dispatchSource can see the transpose: erasing it here (Phase 2, per-op,
+// same as before but no longer forced by Phase 1's forward walk) still
+// requires the downstream matmul/reduce to recover the permutation from
+// somewhere once the transpose is gone.
+struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
+  const PassContext &ctx;
+  RewriteTransposePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
+      : OpRewritePattern(mlirCtx, /*benefit=*/1), ctx(layoutCtx) {}
+
+  LogicalResult matchAndRewrite(linalg::TransposeOp tr,
+                                PatternRewriter &rewriter) const override {
+    Value input = tr.getInput();
+    auto ld = walkToLoad(input);
+    if (!ld)
+      return failure();
+
+    auto perm = SmallVector<int64_t>(tr.getPermutation());
+    LLVM_DEBUG({
+      llvm::dbgs() << "  erasing transpose, perm: ";
+      llvm::interleaveComma(perm, llvm::dbgs());
+      llvm::dbgs() << "\n";
+    });
+    auto &slot = ctx.physicalLoadToTransposePerm[ld.getResult()];
+    slot = slot.empty() ? perm : composePerm(slot, perm);
+    // Capture users before replaceOp() moves them onto `input`'s use-list:
+    // the greedy driver does not automatically re-enqueue users of a
+    // replaced value, but a downstream elementwise/transpose/contraction op
+    // may only become dispatchable now that this transpose is gone.
+    SmallVector<Operation *> formerUsers(tr.getResult()[0].getUsers().begin(),
+                                         tr.getResult()[0].getUsers().end());
+    rewriter.replaceOp(tr, input);
+    for (Operation *user : formerUsers)
+      rewriter.modifyOpInPlace(user, [] {});
+    return success();
+  }
+};
+
+// Bridging stage: the mirror image of emitSinkStage. The store's access tile
+// is logical (no marker to physicalize into), but its data tile is physical
+// (the source-side marker, from the load that produced it, is known). Gather
+// the physical stick slices of the data tile into a logical-shaped
+// accumulator via tensor.insert_slice, one stick loop per floor dim, then
+// swap the store's data tile operand to that logical value — the access tile
+// is left untouched, exactly as emitSinkStage leaves it untouched on the
+// other side.
+LogicalResult emitBridgeToLogical(mlir::ktdp::StoreOp st,
+                                  const OperandPlan &sPlan,
+                                  PatternRewriter &rewriter) {
+  Value physTile = st.getDataTile();
+  OpBuilder b(st.getOperation());
+  Location loc = st.getLoc();
+
+  Type elemTy = cast<RankedTensorType>(physTile.getType()).getElementType();
+  llvm::ArrayRef<int64_t> physBlock = sPlan.coords.physBlock;
+  int physRank = (int)physBlock.size();
+  int64_t stickSize = physBlock[sPlan.dims.lane];
+  unsigned logRank = sPlan.coords.logicalRank;
+
+  auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
+
+  llvm::SmallVector<int64_t> logShape(logRank, 0);
+  for (int p : sPlan.dims.opTileDims) {
+    int64_t logDim = sPlan.dimRoles[p];
+    if (logDim >= 0 && (unsigned)logDim < logRank)
+      logShape[logDim] = physBlock[p];
+  }
+  for (int p : sPlan.dims.floorDims) {
+    int64_t logDim = sPlan.dimRoles[p];
+    if (logDim >= 0 && (unsigned)logDim < logRank)
+      logShape[logDim] = stickSize * physBlock[p];
+  }
+  Value logicalAcc = tensor::EmptyOp::create(b, loc, logShape, elemTy);
+
+  llvm::SmallVector<OpFoldResult> physOffsetsBase(physRank, idx(0));
+  llvm::SmallVector<OpFoldResult> physSizes(physRank);
+  llvm::SmallVector<OpFoldResult> physStrides(physRank, idx(1));
+  for (int p = 0; p < physRank; ++p)
+    physSizes[p] = llvm::is_contained(sPlan.dims.floorDims, p)
+                       ? idx(1) : idx(physBlock[p]);
+
+  llvm::SmallVector<OpFoldResult> logOffsetsBase(logRank, idx(0));
+  llvm::SmallVector<OpFoldResult> logSizesBase(logRank);
+  llvm::SmallVector<OpFoldResult> logStrides(logRank, idx(1));
+  for (int p : sPlan.dims.opTileDims) {
+    int64_t logDim = sPlan.dimRoles[p];
+    if (logDim >= 0 && (unsigned)logDim < logRank)
+      logSizesBase[logDim] = idx(physBlock[p]);
+  }
+  for (int p : sPlan.dims.floorDims) {
+    int64_t logDim = sPlan.dimRoles[p];
+    if (logDim >= 0 && (unsigned)logDim < logRank)
+      logSizesBase[logDim] = idx(stickSize);
+  }
+
+  Value acc = logicalAcc;
+  for (int p : sPlan.dims.floorDims) {
+    int64_t logDim = sPlan.dimRoles[p];
+    if (logDim < 0 || (unsigned)logDim >= logRank) continue;
+
+    int64_t tripCount = physBlock[p];
+    Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
+
+    // The extracted slice must be logical-rank shaped (matching logAccumulator,
+    // which insert_slice requires for a non-rank-reducing insert): the floor
+    // dim being iterated collapses away entirely (it is not a logical axis of
+    // its own — it and the lane dim share logDim), while every other physical
+    // dim maps 1:1 onto a logical dim per dimRoles.
+    llvm::SmallVector<int64_t> slShape(logRank);
+    for (int p2 : sPlan.dims.opTileDims) {
+      int64_t ld = sPlan.dimRoles[p2];
+      if (ld >= 0 && (unsigned)ld < logRank)
+        slShape[ld] = physBlock[p2];
+    }
+    slShape[logDim] = stickSize;
+    auto slTy = RankedTensorType::get(slShape, elemTy);
+
+    acc = emitStickLoop(b, loc, tripCount, acc,
+        [&](OpBuilder &bb, Value s, Value logAccumulator) -> Value {
+          llvm::SmallVector<OpFoldResult> physOff = physOffsetsBase;
+          physOff[p] = s;
+          Value physSlice = tensor::ExtractSliceOp::create(
+              bb, loc, slTy, physTile, physOff, physSizes, physStrides);
+
+          llvm::SmallVector<OpFoldResult> logOff = logOffsetsBase;
+          logOff[logDim] =
+              arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
+          return tensor::InsertSliceOp::create(
+              bb, loc, physSlice, logAccumulator, logOff, logSizesBase, logStrides);
+        });
+  }
+
+  rewriter.modifyOpInPlace(st, [&]() {
+    st.getDataTileMutable().set(acc);
+  });
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Pattern: ktdp.store (sink)
 //===----------------------------------------------------------------------===//
 
@@ -744,12 +1077,51 @@ struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
     auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
     auto tileTy = dyn_cast<mlir::ktdp::AccessTileType>(
         st.getAccessTile().getType());
-    if (!dataTy || !tileTy ||
-        dataTy.getRank() == (int)tileTy.getShape().size())
+    if (!dataTy || !tileTy)
+      return failure();
+    // Defer if the data tile's producer is an elementwise op that has not
+    // yet been retyped: dataTy.getRank() below is about to change once it
+    // is, and deciding sink-vs-bridge on the stale rank would lock in the
+    // wrong answer (see pendingElementwiseRetype).
+    if (pendingElementwiseRetype(st.getDataTile(), ctx))
+      return failure();
+    if (dataTy.getRank() == (int)tileTy.getShape().size())
       return failure();
     auto marker = findMarkerForStore(st.getDataTile(), ctx);
-    if (!marker)
-      return failure();
+    if (!marker) {
+      // No destination marker to physicalize into: the access tile stays
+      // logical. If the data tile is physical (source-side marker known),
+      // this is the case the store output-decision table calls "the output
+      // cannot be physicalized" — bridge with a loop that reassembles the
+      // logical shape from the physical data tile's stick slices.
+      auto srcMarker = findMarkerForOperand(st.getDataTile(), ctx);
+      if (!srcMarker)
+        return failure();
+
+      LLVM_DEBUG(llvm::dbgs() << "  dispatching store bridge-to-logical at "
+                              << st.getLoc() << "\n");
+
+      auto physShape = dataTy.getShape();
+      OperandCoords sC = OperandCoords::fromMarker(srcMarker,
+                                                    tileTy.getShape().size(),
+                                                    physShape);
+      int physRank = (int)physShape.size();
+      llvm::SmallVector<int64_t> dimRoleS(physRank);
+      for (int p = 0; p < physRank; ++p)
+        dimRoleS[p] = srcMarker.getPhysSrc()[p];
+      OperandPlan sPlan = classify(st.getDataTile(), sC, dimRoleS);
+
+      if (sPlan.dims.floorDims.empty())
+        return failure();
+      if (!sPlan.dims.loopDims.empty()) {
+        ctx.hadError = true;
+        return st.emitError(
+            "spyre_tensor_layout: store bridge stage: unexpected reduction "
+            "dim");
+      }
+
+      return emitBridgeToLogical(st, sPlan, rewriter);
+    }
 
     LLVM_DEBUG(llvm::dbgs() << "  dispatching store sink at " << st.getLoc() << "\n");
 
@@ -807,6 +1179,8 @@ void populateContractionPatterns(RewritePatternSet &patterns,
   MLIRContext *mlirCtx = patterns.getContext();
   patterns.add<RewriteMatmulPattern, RewriteBatchMatmulPattern,
                RewriteReducePattern>(mlirCtx, ctx);
+  patterns.add<RewriteTransposePattern>(mlirCtx, ctx);
+  patterns.add<RewriteElementwisePattern>(mlirCtx, ctx);
   patterns.add<RewriteStorePattern>(mlirCtx, ctx);
 }
 

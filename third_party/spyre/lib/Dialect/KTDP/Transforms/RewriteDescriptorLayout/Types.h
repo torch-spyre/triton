@@ -6,6 +6,7 @@
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -13,7 +14,21 @@ namespace mlir::triton::ktdp {
 
 struct PassContext {
   const llvm::DenseMap<mlir::Value, triton::SpyreTensorLayoutOp> &physMemViewToMarker;
-  const llvm::DenseMap<mlir::Value, llvm::SmallVector<int64_t>> &physicalLoadToTransposePerm;
+  /// Maps a physical ktdp.load result -> the logical permutation of a
+  /// linalg.transpose erased on its consuming chain. Populated by Phase 2's
+  /// transpose pattern (RewriteTransposePattern) as it erases transposes, and
+  /// read by dispatchSource to fold the erased permutation into canonicalAxes.
+  llvm::DenseMap<mlir::Value, llvm::SmallVector<int64_t>> &physicalLoadToTransposePerm;
+  /// Seeded by Phase 1 with every physical ktdp.load result, and grown by
+  /// Phase 2's RewriteElementwisePattern with the result of each op it
+  /// retypes (a value it just made physical). Membership answers "is this
+  /// value reachable from a physicalized load" without re-walking the chain:
+  /// an op on a path that was never physicalized (no marker anywhere upstream)
+  /// is simply never in this set. This is what keeps the elementwise pattern's
+  /// local shape rule from mis-firing on ops like tt.expand_dims that happen
+  /// to have one tensor operand and a differently-shaped result but are not
+  /// reachable from any physicalized load.
+  llvm::DenseSet<mlir::Value> &physicalValues;
   /// Set by patterns to indicate a fatal error that should abort the pass.
   mutable bool hadError = false;
 };

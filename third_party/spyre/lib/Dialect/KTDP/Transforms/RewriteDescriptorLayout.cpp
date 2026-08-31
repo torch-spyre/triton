@@ -111,6 +111,11 @@ struct RewriteDescriptorLayoutPass
   // linalg.transpose that was erased in Phase 1.
   llvm::DenseMap<mlir::Value, SmallVector<int64_t>> physicalLoadToTransposePerm;
 
+  // Every physical ktdp.load result, seeded here in Phase 1 (retypeLoad) and
+  // grown by Phase 2 as it retypes elementwise ops -- see PassContext's
+  // physicalValues for why this replaces a backward traceback.
+  llvm::DenseSet<mlir::Value> physicalValues;
+
   // Resolved from the pass option: true = "device" (physical row-major strides),
   // false = "host" (derive strides from logical strides via coord map).
   bool hwDataLayout = false;
@@ -543,14 +548,9 @@ struct RewriteDescriptorLayoutPass
 
   // --- Load/store consumer updates ---
 
-  // True if the op is a shape-constraining op whose result shape is NOT
-  // inherited from a single physical input.
-  static bool isContractionOp(Operation *op) {
-    return isa<linalg::ContractionOpInterface>(op) ||
-           isa<linalg::ReduceOp>(op);
-  }
-
   // Retype ktdp.load: replace with a new load of the physical tensor type.
+  // Phase 1 stops here — it no longer forward-retypes the consuming chain;
+  // Phase 2 decides each consuming op individually (see ContractionSynthesis.cpp).
   void retypeLoad(mlir::ktdp::LoadOp ld, Value newTile,
                   ArrayRef<int64_t> physBlock) {
     OpBuilder b(ld);
@@ -558,55 +558,16 @@ struct RewriteDescriptorLayoutPass
                       .getElementType();
     auto physResTy = RankedTensorType::get(physBlock, elemTy);
     auto newLd = mlir::ktdp::LoadOp::create(b, ld.getLoc(), physResTy, newTile);
-    retypeChain(ld.getResult(), newLd.getResult());
+    ld.getResult().replaceAllUsesWith(newLd.getResult());
     ld.erase();
+    // Seed Phase 2's reachability set: this is a physicalized load result,
+    // the root of every forward elementwise chain Phase 2 will retype.
+    physicalValues.insert(newLd.getResult());
   }
 
   // Redirect ktdp.store's access tile operand to the new physical tile.
   void redirectStoreAccessTile(mlir::ktdp::StoreOp st, Value newTile) {
     st.getAccessTileMutable().set(newTile);
-  }
-
-  // Forward-retype the elementwise op chain.
-  void retypeChain(Value oldVal, Value newVal) {
-    Value physLoadResult = newVal;
-    oldVal.replaceAllUsesWith(newVal);
-    SmallVector<Operation *> worklist(newVal.getUsers().begin(),
-                                      newVal.getUsers().end());
-    while (!worklist.empty()) {
-      Operation *op = worklist.pop_back_val();
-      if (op->getNumResults() != 1)
-        continue;
-      if (isContractionOp(op))
-        continue;
-      if (auto tr = dyn_cast<linalg::TransposeOp>(op)) {
-        auto perm = SmallVector<int64_t>(tr.getPermutation());
-        LLVM_DEBUG({
-          llvm::dbgs() << "  erasing transpose, perm: ";
-          llvm::interleaveComma(perm, llvm::dbgs());
-          llvm::dbgs() << "\n";
-        });
-        auto &slot = physicalLoadToTransposePerm[physLoadResult];
-        slot = slot.empty() ? perm : composePerm(slot, perm);
-        Value physInput = tr.getInput();
-        SmallVector<Operation *> fmrConsumers(tr.getResult()[0].getUsers().begin(),
-                                              tr.getResult()[0].getUsers().end());
-        tr.getResult()[0].replaceAllUsesWith(physInput);
-        worklist.append(fmrConsumers.begin(), fmrConsumers.end());
-        tr.erase();
-        continue;
-      }
-      auto resTy  = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-      auto opndTy = op->getNumOperands() > 0
-                        ? dyn_cast<RankedTensorType>(op->getOperand(0).getType())
-                        : nullptr;
-      if (!resTy || !opndTy || resTy.getShape() == opndTy.getShape())
-        continue;
-      op->getResult(0).setType(
-          RankedTensorType::get(opndTy.getShape(), resTy.getElementType()));
-      worklist.append(op->getResult(0).getUsers().begin(),
-                      op->getResult(0).getUsers().end());
-    }
   }
 
   // --- Phase 1: physicalize one descriptor ---
@@ -920,14 +881,36 @@ struct RewriteDescriptorLayoutPass
 
     // Phase 2: synthesize contractions via greedy pattern rewrite.
     {
-      PassContext ctx{physMemViewToMarker, physicalLoadToTransposePerm};
+      PassContext ctx{physMemViewToMarker, physicalLoadToTransposePerm,
+                      physicalValues};
       RewritePatternSet patterns(module.getContext());
       populateContractionPatterns(patterns, ctx);
-      // Collect candidate ops (only op types our patterns target).
+      // Collect candidate ops: the four contraction-family ops, plus every
+      // other op that consumes a physical value (elementwise ops and
+      // linalg.transpose) so Phase 2 decides them too, rather than Phase 1
+      // retyping/erasing them in passing.
+      //
+      // The elementwise membership test here is deliberately not
+      // isSingleTensorElementwiseOp -- that predicate is scoped to the
+      // backward walk in walkToLoad (see its comment) and would silently
+      // exclude multi-tensor-operand elementwise ops like arith.addf from
+      // ever being retyped by RewriteElementwisePattern. This test only
+      // needs to be a superset of what that pattern's own local rule
+      // matches: any single-result op with at least one tensor operand.
       SmallVector<Operation *> candidates;
       module.walk([&](Operation *op) {
         if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, linalg::ReduceOp,
-                mlir::ktdp::StoreOp>(op))
+                mlir::ktdp::StoreOp, linalg::TransposeOp>(op)) {
+          candidates.push_back(op);
+          return;
+        }
+        if (op->getNumResults() != 1 ||
+            !isa<RankedTensorType>(op->getResult(0).getType()))
+          return;
+        bool hasTensorOperand = llvm::any_of(op->getOperands(), [](Value v) {
+          return isa<RankedTensorType>(v.getType());
+        });
+        if (hasTensorOperand)
           candidates.push_back(op);
       });
       GreedyRewriteConfig config;
