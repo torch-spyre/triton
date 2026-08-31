@@ -189,46 +189,26 @@ bool pendingElementwiseRetype(Value val, const PassContext &ctx) {
 }
 
 
-// Emit a stick loop (scf.for) or inline for trip <= 1.
-Value emitStickLoop(OpBuilder &b, Location loc, int64_t tripCount,
-                    Value acc,
-                    llvm::function_ref<Value(OpBuilder &, Value, Value)> body) {
+// Emit a counted loop (scf.for) over a single iter_arg, or inline for trip <=
+// 1. Used both for a reduction's stick loop (iter_arg is the accumulator) and
+// for a parallel-scatter loop (iter_arg is the container being filled via
+// tensor.insert_slice) -- the two calling contexts differ only in what `body`
+// does with its iter_arg, not in the loop skeleton itself.
+Value emitCountedLoop(OpBuilder &b, Location loc, int64_t tripCount,
+                     Value iterArg,
+                     llvm::function_ref<Value(OpBuilder &, Value, Value)> body) {
   if (tripCount <= 1) {
     Value s0 = arith::ConstantIndexOp::create(b, loc, 0);
-    return body(b, s0, acc);
+    return body(b, s0, iterArg);
   }
   Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
   Value c1 = arith::ConstantIndexOp::create(b, loc, 1);
   Value ub = arith::ConstantIndexOp::create(b, loc, tripCount);
-  auto forOp = scf::ForOp::create(b, loc, c0, ub, c1, ValueRange{acc});
+  auto forOp = scf::ForOp::create(b, loc, c0, ub, c1, ValueRange{iterArg});
   OpBuilder ib = OpBuilder::atBlockBegin(forOp.getBody());
   Value stepped =
       body(ib, forOp.getInductionVar(), forOp.getRegionIterArgs()[0]);
   scf::YieldOp::create(ib, loc, ValueRange{stepped});
-  b.setInsertionPointAfter(forOp);
-  return forOp.getResult(0);
-}
-
-// Outer parallel-scatter loop: iterates parallelIV = 0..tripCount, filling
-// disjoint slabs of `container` via tensor.insert_slice returned by `body`.
-// Inlines for tripCount <= 1 (passes a const-0 IV and returns the body result
-// directly), so the extent-1 case emits exactly what the plain reduction path
-// would.
-Value emitParallelScatterLoop(
-    OpBuilder &b, Location loc, int64_t tripCount, Value container,
-    llvm::function_ref<Value(OpBuilder &, Value, Value)> body) {
-  if (tripCount <= 1) {
-    Value s0 = arith::ConstantIndexOp::create(b, loc, 0);
-    return body(b, s0, container);
-  }
-  Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
-  Value c1 = arith::ConstantIndexOp::create(b, loc, 1);
-  Value ub = arith::ConstantIndexOp::create(b, loc, tripCount);
-  auto forOp = scf::ForOp::create(b, loc, c0, ub, c1, ValueRange{container});
-  OpBuilder ib = OpBuilder::atBlockBegin(forOp.getBody());
-  Value updated =
-      body(ib, forOp.getInductionVar(), forOp.getRegionIterArgs()[0]);
-  scf::YieldOp::create(ib, loc, ValueRange{updated});
   b.setInsertionPointAfter(forOp);
   return forOp.getResult(0);
 }
@@ -279,12 +259,18 @@ Value extractOpSlice(OpBuilder &b, Location loc,
 }
 
 //===----------------------------------------------------------------------===//
-// Source stage (matmul / reduce operands)
+// Conversion stage: narrow N physical operands into one op-tile (a source op
+// feeding matmul/reduce), or widen one op-tile into physical (a store's data
+// tile). One direction parameter, not two emitters: both narrow N physical
+// operands into one op-tile, or widen one op-tile into physical -- they
+// transpose, drive a counted loop, slice, and insert, differing only in which
+// side of the loop is the physical container and whether an op fires inside
+// it (narrow) or the loop body is a plain gather/scatter (widen).
 //===----------------------------------------------------------------------===//
 
-// Source stage emission: extract slices, optional transpose, call emitOp.
+// Narrow stage emission: extract slices, optional transpose, call emitOp.
 // Returns the replacement value for the original op's result.
-Value emitSourceStage(
+Value emitNarrowStage(
     linalg::LinalgOp op,
     OpBuilder &b,
     llvm::function_ref<Value(OpBuilder &, Location, llvm::ArrayRef<Value>, Value,
@@ -341,7 +327,7 @@ Value emitSourceStage(
   // per-slab accumulator (shape `accTy`); `pIV` selects the parallel stick.
   Value stickIV;
   auto emitReductionLoop = [&](OpBuilder &bb, Value acc, Value pIV) -> Value {
-    return emitStickLoop(bb, loc, stickFactor, acc,
+    return emitCountedLoop(bb, loc, stickFactor, acc,
         [&](OpBuilder &bbb, Value s, Value innerAcc) {
       stickIV = s;
       OpBuilder saved = b;
@@ -379,7 +365,7 @@ Value emitSourceStage(
   llvm::SmallVector<OpFoldResult> slabStrides(accDims.size(),
                                               b.getIndexAttr(1));
 
-  return emitParallelScatterLoop(b, loc, parallelFactor, cVal,
+  return emitCountedLoop(b, loc, parallelFactor, cVal,
       [&](OpBuilder &bb, Value pIV, Value container) -> Value {
         Value stickSizeV =
             arith::ConstantIndexOp::create(bb, loc, parallelStickSize);
@@ -536,7 +522,7 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
         "two independent scatter loops (not supported)");
 
   OpBuilder b(op.getOperation());
-  Value result = emitSourceStage(op, b, spec.emitOp, plans, tripCounts);
+  Value result = emitNarrowStage(op, b, spec.emitOp, plans, tripCounts);
   rewriter.replaceOp(op, result);
   return success();
 }
@@ -566,92 +552,159 @@ triton::SpyreTensorLayoutOp findMarkerForStore(Value value,
   return {};
 }
 
-// Sink stage: scatter a logical data tile into the physical D tensor shape.
-// Preconditions (non-empty floorDims, empty loopDims) are checked by the
-// caller before `dPlan` is even built for resolution; see
-// RewriteStorePattern.
-LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
-                            const OperandPlan &dPlan,
-                            const PassContext &ctx,
-                            PatternRewriter &rewriter) {
-  LLVM_DEBUG(llvm::dbgs() << "  sink stage: stickSize=" << dPlan.dims.stickSize
-                          << ", floorDims=" << dPlan.dims.floorDims.size() << "\n");
-  Value inputTile = st.getDataTile();
+// Which side of a store's widening conversion is the physical one. The other
+// side is always logical -- one op-tile, one physical container -- so naming
+// the physical side's role also names the logical side's by elimination.
+enum class WidenTarget {
+  Physical, // op-tile (logical) -> physical D tensor shape: the sink case.
+  Logical,  // physical data tile -> logical (no output marker): the bridge
+            // case, gathering stick slices back into a logical accumulator.
+};
+
+// Widen stage: the shared conversion path's Widen direction. One op-tile
+// side and one physical-block side; the loop scatters (Physical target) or
+// gathers (Logical target) stick slices between them, one floor dim at a
+// time, then repoints the store's data tile operand to the assembled result.
+//
+// Whichever side is logical always carries the multiply-by-stickSize offset
+// (it is the wide side being addressed one stick at a time); whichever side
+// is physical always carries the raw stick index `p` (it already has one
+// slot per stick). That invariant holds regardless of which side plays
+// source vs. destination, which is what lets the two original emitters
+// (emitSinkStage, emitBridgeToLogical) collapse into this one, selected by
+// `target`.
+//
+// Only the Physical target ever transposes: `plan.transposePerm` is filled by
+// resolveOperand(), which the sink caller runs and the bridge caller does
+// not (see RewriteStorePattern) -- so for a Logical target `plan.transposePerm`
+// is always empty and the guard below is simply never taken, matching
+// emitBridgeToLogical's behavior of never transposing.
+LogicalResult emitWidenStage(mlir::ktdp::StoreOp st,
+                             const OperandPlan &plan,
+                             WidenTarget target,
+                             PatternRewriter &rewriter) {
+  LLVM_DEBUG(llvm::dbgs() << "  widen stage: stickSize=" << plan.dims.stickSize
+                          << ", floorDims=" << plan.dims.floorDims.size()
+                          << ", target=" << (target == WidenTarget::Physical
+                                                  ? "physical" : "logical")
+                          << "\n");
+  Value opTileSide = st.getDataTile();
   OpBuilder b(st.getOperation());
   Location loc = st.getLoc();
 
-  Type elemTy = cast<RankedTensorType>(inputTile.getType()).getElementType();
+  Type elemTy = cast<RankedTensorType>(opTileSide.getType()).getElementType();
 
-  llvm::ArrayRef<int64_t> physBlock = dPlan.coords.physBlock;
+  llvm::ArrayRef<int64_t> physBlock = plan.coords.physBlock;
   int physRank = (int)physBlock.size();
-  int64_t stickSize = physBlock[dPlan.dims.lane];
+  int64_t stickSize = physBlock[plan.dims.lane];
 
-  unsigned logRank = dPlan.coords.logicalRank;
-  llvm::ArrayRef<int64_t> sinkPerm = dPlan.transposePerm;
+  unsigned logRank = plan.coords.logicalRank;
+  llvm::ArrayRef<int64_t> perm = plan.transposePerm;
 
   auto logDimToPos = [&](int64_t d) -> unsigned {
-    return sinkPerm.empty() ? (unsigned)d : (unsigned)sinkPerm[d];
+    return perm.empty() ? (unsigned)d : (unsigned)perm[d];
   };
 
-  if (!sinkPerm.empty())
-    inputTile = emitTranspose(b, loc, inputTile, sinkPerm);
+  if (target == WidenTarget::Physical && !perm.empty())
+    opTileSide = emitTranspose(b, loc, opTileSide, perm);
 
   auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
 
-  llvm::SmallVector<int64_t> sinkShape(physBlock.begin(), physBlock.end());
-  Value physicalSink = tensor::EmptyOp::create(b, loc, sinkShape, elemTy);
-
-  llvm::SmallVector<OpFoldResult> inputOffsetsBase(logRank, idx(0));
-  llvm::SmallVector<OpFoldResult> inputSizesBase(logRank);
-  llvm::SmallVector<OpFoldResult> inputStrides(logRank, idx(1));
-  for (int p : dPlan.dims.opTileDims) {
-    int64_t logDim = dPlan.dimRoles[p];
+  // The op-tile-side offsets/sizes (rank logRank) and the physical-side
+  // offsets/sizes (rank physRank) are the same two arrays regardless of
+  // target; only which one is the extract_slice source vs. the insert_slice
+  // destination (and which one is the freshly created container) flips.
+  llvm::SmallVector<OpFoldResult> logOffsetsBase(logRank, idx(0));
+  llvm::SmallVector<OpFoldResult> logSizesBase(logRank);
+  llvm::SmallVector<OpFoldResult> logStrides(logRank, idx(1));
+  for (int p : plan.dims.opTileDims) {
+    int64_t logDim = plan.dimRoles[p];
     if (logDim >= 0 && (unsigned)logDim < logRank)
-      inputSizesBase[logDimToPos(logDim)] = idx(physBlock[p]);
+      logSizesBase[logDimToPos(logDim)] = idx(physBlock[p]);
   }
-  for (int p : dPlan.dims.floorDims) {
-    int64_t logDim = dPlan.dimRoles[p];
+  for (int p : plan.dims.floorDims) {
+    int64_t logDim = plan.dimRoles[p];
     if (logDim >= 0 && (unsigned)logDim < logRank)
-      inputSizesBase[logDimToPos(logDim)] = idx(stickSize);
+      logSizesBase[logDimToPos(logDim)] = idx(stickSize);
   }
 
-  llvm::SmallVector<OpFoldResult> sinkOffsetsBase(physRank, idx(0));
-  llvm::SmallVector<OpFoldResult> sinkSizes(physRank);
-  llvm::SmallVector<OpFoldResult> sinkStrides(physRank, idx(1));
+  llvm::SmallVector<OpFoldResult> physOffsetsBase(physRank, idx(0));
+  llvm::SmallVector<OpFoldResult> physSizes(physRank);
+  llvm::SmallVector<OpFoldResult> physStrides(physRank, idx(1));
   for (int p = 0; p < physRank; ++p)
-    sinkSizes[p] = llvm::is_contained(dPlan.dims.floorDims, p)
+    physSizes[p] = llvm::is_contained(plan.dims.floorDims, p)
                        ? idx(1) : idx(physBlock[p]);
 
-  Value acc = physicalSink;
-  for (int p : dPlan.dims.floorDims) {
-    int64_t logDim = dPlan.dimRoles[p];
+  // The container is the physical block for a Physical target, or the
+  // logical (opTileDims/floorDims-derived) shape for a Logical target.
+  Value container;
+  if (target == WidenTarget::Physical) {
+    llvm::SmallVector<int64_t> physShape(physBlock.begin(), physBlock.end());
+    container = tensor::EmptyOp::create(b, loc, physShape, elemTy);
+  } else {
+    llvm::SmallVector<int64_t> logShape(logRank, 0);
+    for (int p : plan.dims.opTileDims) {
+      int64_t logDim = plan.dimRoles[p];
+      if (logDim >= 0 && (unsigned)logDim < logRank)
+        logShape[logDim] = physBlock[p];
+    }
+    for (int p : plan.dims.floorDims) {
+      int64_t logDim = plan.dimRoles[p];
+      if (logDim >= 0 && (unsigned)logDim < logRank)
+        logShape[logDim] = stickSize * physBlock[p];
+    }
+    container = tensor::EmptyOp::create(b, loc, logShape, elemTy);
+  }
+
+  Value acc = container;
+  for (int p : plan.dims.floorDims) {
+    int64_t logDim = plan.dimRoles[p];
     if (logDim < 0 || (unsigned)logDim >= logRank) continue;
 
     unsigned tileDim = logDimToPos(logDim);
     int64_t tripCount = physBlock[p];
     Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
 
+    // The op-tile-rank slice type: for a Physical target this is the input
+    // slice cut from the logical op-tile side; for a Logical target this is
+    // the (rank-reducing) result type of the slice cut from the physical
+    // side, forced to logical rank so it matches the logical accumulator for
+    // insert_slice.
     llvm::SmallVector<int64_t> slShape(logRank);
-    for (int p2 : dPlan.dims.opTileDims) {
-      int64_t ld = dPlan.dimRoles[p2];
+    for (int p2 : plan.dims.opTileDims) {
+      int64_t ld = plan.dimRoles[p2];
       if (ld >= 0 && (unsigned)ld < logRank)
         slShape[logDimToPos(ld)] = physBlock[p2];
     }
     slShape[tileDim] = stickSize;
     auto slTy = RankedTensorType::get(slShape, elemTy);
 
-    acc = emitStickLoop(b, loc, tripCount, acc,
-        [&](OpBuilder &bb, Value s, Value sinkAccumulator) -> Value {
-          llvm::SmallVector<OpFoldResult> inOff = inputOffsetsBase;
-          inOff[tileDim] =
-              arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
-          Value inputSlice = tensor::ExtractSliceOp::create(
-              bb, loc, slTy, inputTile, inOff, inputSizesBase, inputStrides);
+    acc = emitCountedLoop(b, loc, tripCount, acc,
+        [&](OpBuilder &bb, Value s, Value iterAcc) -> Value {
+          if (target == WidenTarget::Physical) {
+            llvm::SmallVector<OpFoldResult> inOff = logOffsetsBase;
+            inOff[tileDim] =
+                arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
+            Value inputSlice = tensor::ExtractSliceOp::create(
+                bb, loc, slTy, opTileSide, inOff, logSizesBase, logStrides);
 
-          llvm::SmallVector<OpFoldResult> sinkOff = sinkOffsetsBase;
-          sinkOff[p] = s;
+            llvm::SmallVector<OpFoldResult> containerOff = physOffsetsBase;
+            containerOff[p] = s;
+            return tensor::InsertSliceOp::create(
+                bb, loc, inputSlice, iterAcc, containerOff, physSizes,
+                physStrides);
+          }
+
+          llvm::SmallVector<OpFoldResult> physOff = physOffsetsBase;
+          physOff[p] = s;
+          Value physSlice = tensor::ExtractSliceOp::create(
+              bb, loc, slTy, opTileSide, physOff, physSizes, physStrides);
+
+          llvm::SmallVector<OpFoldResult> logOff = logOffsetsBase;
+          logOff[tileDim] =
+              arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
           return tensor::InsertSliceOp::create(
-              bb, loc, inputSlice, sinkAccumulator, sinkOff, sinkSizes, sinkStrides);
+              bb, loc, physSlice, iterAcc, logOff, logSizesBase, logStrides);
         });
   }
 
@@ -1033,106 +1086,6 @@ struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
   }
 };
 
-// Bridging stage: the mirror image of emitSinkStage. The store's access tile
-// is logical (no marker to physicalize into), but its data tile is physical
-// (the source-side marker, from the load that produced it, is known). Gather
-// the physical stick slices of the data tile into a logical-shaped
-// accumulator via tensor.insert_slice, one stick loop per floor dim, then
-// swap the store's data tile operand to that logical value — the access tile
-// is left untouched, exactly as emitSinkStage leaves it untouched on the
-// other side.
-LogicalResult emitBridgeToLogical(mlir::ktdp::StoreOp st,
-                                  const OperandPlan &sPlan,
-                                  PatternRewriter &rewriter) {
-  Value physTile = st.getDataTile();
-  OpBuilder b(st.getOperation());
-  Location loc = st.getLoc();
-
-  Type elemTy = cast<RankedTensorType>(physTile.getType()).getElementType();
-  llvm::ArrayRef<int64_t> physBlock = sPlan.coords.physBlock;
-  int physRank = (int)physBlock.size();
-  int64_t stickSize = physBlock[sPlan.dims.lane];
-  unsigned logRank = sPlan.coords.logicalRank;
-
-  auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
-
-  llvm::SmallVector<int64_t> logShape(logRank, 0);
-  for (int p : sPlan.dims.opTileDims) {
-    int64_t logDim = sPlan.dimRoles[p];
-    if (logDim >= 0 && (unsigned)logDim < logRank)
-      logShape[logDim] = physBlock[p];
-  }
-  for (int p : sPlan.dims.floorDims) {
-    int64_t logDim = sPlan.dimRoles[p];
-    if (logDim >= 0 && (unsigned)logDim < logRank)
-      logShape[logDim] = stickSize * physBlock[p];
-  }
-  Value logicalAcc = tensor::EmptyOp::create(b, loc, logShape, elemTy);
-
-  llvm::SmallVector<OpFoldResult> physOffsetsBase(physRank, idx(0));
-  llvm::SmallVector<OpFoldResult> physSizes(physRank);
-  llvm::SmallVector<OpFoldResult> physStrides(physRank, idx(1));
-  for (int p = 0; p < physRank; ++p)
-    physSizes[p] = llvm::is_contained(sPlan.dims.floorDims, p)
-                       ? idx(1) : idx(physBlock[p]);
-
-  llvm::SmallVector<OpFoldResult> logOffsetsBase(logRank, idx(0));
-  llvm::SmallVector<OpFoldResult> logSizesBase(logRank);
-  llvm::SmallVector<OpFoldResult> logStrides(logRank, idx(1));
-  for (int p : sPlan.dims.opTileDims) {
-    int64_t logDim = sPlan.dimRoles[p];
-    if (logDim >= 0 && (unsigned)logDim < logRank)
-      logSizesBase[logDim] = idx(physBlock[p]);
-  }
-  for (int p : sPlan.dims.floorDims) {
-    int64_t logDim = sPlan.dimRoles[p];
-    if (logDim >= 0 && (unsigned)logDim < logRank)
-      logSizesBase[logDim] = idx(stickSize);
-  }
-
-  Value acc = logicalAcc;
-  for (int p : sPlan.dims.floorDims) {
-    int64_t logDim = sPlan.dimRoles[p];
-    if (logDim < 0 || (unsigned)logDim >= logRank) continue;
-
-    int64_t tripCount = physBlock[p];
-    Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
-
-    // The extracted slice must be logical-rank shaped (matching logAccumulator,
-    // which insert_slice requires for a non-rank-reducing insert): the floor
-    // dim being iterated collapses away entirely (it is not a logical axis of
-    // its own — it and the lane dim share logDim), while every other physical
-    // dim maps 1:1 onto a logical dim per dimRoles.
-    llvm::SmallVector<int64_t> slShape(logRank);
-    for (int p2 : sPlan.dims.opTileDims) {
-      int64_t ld = sPlan.dimRoles[p2];
-      if (ld >= 0 && (unsigned)ld < logRank)
-        slShape[ld] = physBlock[p2];
-    }
-    slShape[logDim] = stickSize;
-    auto slTy = RankedTensorType::get(slShape, elemTy);
-
-    acc = emitStickLoop(b, loc, tripCount, acc,
-        [&](OpBuilder &bb, Value s, Value logAccumulator) -> Value {
-          llvm::SmallVector<OpFoldResult> physOff = physOffsetsBase;
-          physOff[p] = s;
-          Value physSlice = tensor::ExtractSliceOp::create(
-              bb, loc, slTy, physTile, physOff, physSizes, physStrides);
-
-          llvm::SmallVector<OpFoldResult> logOff = logOffsetsBase;
-          logOff[logDim] =
-              arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
-          return tensor::InsertSliceOp::create(
-              bb, loc, physSlice, logAccumulator, logOff, logSizesBase, logStrides);
-        });
-  }
-
-  rewriter.modifyOpInPlace(st, [&]() {
-    st.getDataTileMutable().set(acc);
-  });
-  return success();
-}
-
 //===----------------------------------------------------------------------===//
 // Pattern: ktdp.store (sink)
 //===----------------------------------------------------------------------===//
@@ -1190,7 +1143,7 @@ struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
             "dim");
       }
 
-      return emitBridgeToLogical(st, sPlan, rewriter);
+      return emitWidenStage(st, sPlan, WidenTarget::Logical, rewriter);
     }
 
     LLVM_DEBUG(llvm::dbgs() << "  dispatching store sink at " << st.getLoc() << "\n");
@@ -1199,10 +1152,14 @@ struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
     unsigned logRank = dataTy.getRank();
     OperandCoords dC = OperandCoords::fromMarker(marker, logRank, physBlock);
 
-    int physRank = (int)physBlock.size();
-    llvm::SmallVector<int64_t> dimRoleD(physRank);
-    for (int p = 0; p < physRank; ++p)
-      dimRoleD[p] = marker.getPhysSrc()[p];
+    // A store contracts nothing, so its canonicalAxes is the dense identity
+    // (logical dim d carries role d) -- buildDimRoles against that identity
+    // reduces to dimRoles[p] = coords.src[p] = marker.getPhysSrc()[p], the
+    // same classification dispatchSource runs for a source operand.
+    llvm::SmallVector<int64_t> identityAxes(logRank);
+    std::iota(identityAxes.begin(), identityAxes.end(), 0);
+    llvm::SmallVector<int64_t> dimRoleD;
+    buildDimRoles(dC, identityAxes, dimRoleD);
 
     OperandPlan dPlan = classify(st.getDataTile(), dC, dimRoleD);
 
@@ -1232,7 +1189,7 @@ struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
     std::iota(targetOrderD.begin(), targetOrderD.end(), 0);
     resolveOperand(dPlan, targetOrderD, TransposeDirection::Widen);
 
-    return emitSinkStage(st, dPlan, ctx, rewriter);
+    return emitWidenStage(st, dPlan, WidenTarget::Physical, rewriter);
   }
 };
 
