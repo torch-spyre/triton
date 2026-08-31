@@ -524,11 +524,11 @@ tile = tl.descriptor_load(desc, [pid_m * BLOCK_M, pid_k * BLOCK_K])
 
 **Round-trip evidence**
 
-- `matmul::dynamic` — M=128, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-store-dynamic, dot, program-id-2d, num-programs-fold)
-- `matmul::bmm_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-1d, num-programs-fold)
-- `matmul::2d_grid_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-2d)
-- `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-3d)
-- `matmul::spyre_stick_parallel_dynamic` (also demonstrates: descriptor-store-dynamic, dot, program-id-1d, spyre-tensor-layout)
+- `elementwise::dynamic` (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
+- `elementwise::2d_dynamic` (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
+- `elementwise::3d_dynamic` (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
+- `elementwise::2d_grid_dynamic` (also demonstrates: descriptor-store-dynamic, program-id-2d, num-programs-fold)
+- `elementwise::3d_grid_dynamic` (also demonstrates: descriptor-store-dynamic, program-id-3d, num-programs-fold)
 
 _+ 6 more variants_
 
@@ -560,8 +560,8 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])
 
 **Round-trip evidence**
 
-- `vector_add::dynamic_from_scalar_load` — BLOCK_SIZE=1024 (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
-- `vector_add::2d_dynamic_from_scalar_load` — N=32, BLOCK_M=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, program-id-2d, num-programs-fold)
+- `elementwise::dynamic_from_scalar_load` — BLOCK_SIZE=1024, OP='add' (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
+- `elementwise::2d_dynamic_from_scalar_load` — N=32, BLOCK_M=16, BLOCK_N=16, OP='add' (also demonstrates: descriptor-store-dynamic, program-id-2d, num-programs-fold)
 
 ## descriptor-load-static
 
@@ -586,13 +586,13 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>
 
 **Round-trip evidence**
 
-- `matmul::default` — M=16, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-store-static, dot, program-id-2d, num-programs-fold)
-- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-store-static, dot, program-id-1d, num-programs-fold)
-- `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-2d)
-- `matmul::bmm_3d_grid` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-store-static, dot, program-id-3d)
-- `matmul::spyre_stick_k_reduction` — M=64, K=128, N=256, BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, A_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-store-static, dot, program-id-1d, spyre-tensor-layout)
+- `elementwise::default` — n_elements=1024, BLOCK_SIZE=1024, DTYPE='fp32', OP='add' (also demonstrates: descriptor-store-static, program-id-1d, num-programs-fold)
+- `elementwise::1d_compute` — DTYPE='fp16', OP='add', n_elements=128, BLOCK_SIZE=128 (also demonstrates: descriptor-store-static, program-id-1d, elementwise-compute)
+- `elementwise::2d` — M=512, N=32, BLOCK_M=16, BLOCK_N=16, X_LAYOUT=None, Y_LAYOUT=None, OUT_LAYOUT=None, OP='add' (also demonstrates: descriptor-store-static, program-id-1d, num-programs-fold)
+- `elementwise::1d_device` — n_elements=128, BLOCK_SIZE=128, LAYOUT=('stick', ((0, 'floordiv', 64), (0, 'mod', 64))), OP='add' (also demonstrates: descriptor-store-static, simplified:no-loop, spyre-tensor-layout)
+- `elementwise::1d_device_grid2` — n_elements=128, BLOCK_SIZE=64, LAYOUT=('stick', ((0, 'floordiv', 64), (0, 'mod', 64))), OP='add' (also demonstrates: descriptor-store-static, program-id-1d, simplified:no-loop, spyre-tensor-layout)
 
-_+ 17 more variants_
+_+ 18 more variants_
 
 ## descriptor-offset-base
 
@@ -810,11 +810,11 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])
 
 **Round-trip evidence**
 
-- `matmul::dynamic` — M=128, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-dynamic, dot, program-id-2d, num-programs-fold)
-- `matmul::bmm_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-1d, num-programs-fold)
-- `matmul::2d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-2d)
-- `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-3d)
-- `matmul::spyre_stick_parallel_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-1d, spyre-tensor-layout)
+- `elementwise::dynamic` (also demonstrates: descriptor-load-dynamic, program-id-1d, num-programs-fold)
+- `elementwise::dynamic_from_scalar_load` — BLOCK_SIZE=1024, OP='add' (also demonstrates: descriptor-load-dynamic-from-scalar-load, program-id-1d, num-programs-fold)
+- `elementwise::2d_dynamic` (also demonstrates: descriptor-load-dynamic, program-id-1d, num-programs-fold)
+- `elementwise::2d_dynamic_from_scalar_load` — N=32, BLOCK_M=16, BLOCK_N=16, OP='add' (also demonstrates: descriptor-load-dynamic-from-scalar-load, program-id-2d, num-programs-fold)
+- `elementwise::3d_dynamic` (also demonstrates: descriptor-load-dynamic, program-id-1d, num-programs-fold)
 
 _+ 8 more variants_
 
@@ -833,13 +833,13 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
 
 **Round-trip evidence**
 
-- `matmul::default` — M=16, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-static, dot, program-id-2d, num-programs-fold)
-- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-static, dot, program-id-1d, num-programs-fold)
-- `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-2d)
-- `matmul::bmm_3d_grid` — B=4, M=64, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, dot, program-id-3d)
-- `matmul::spyre_stick_k_reduction` — M=64, K=128, N=256, BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, A_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, dot, program-id-1d, spyre-tensor-layout)
+- `elementwise::default` — n_elements=1024, BLOCK_SIZE=1024, DTYPE='fp32', OP='add' (also demonstrates: descriptor-load-static, program-id-1d, num-programs-fold)
+- `elementwise::1d_compute` — DTYPE='fp16', OP='add', n_elements=128, BLOCK_SIZE=128 (also demonstrates: descriptor-load-static, program-id-1d, elementwise-compute)
+- `elementwise::2d` — M=512, N=32, BLOCK_M=16, BLOCK_N=16, X_LAYOUT=None, Y_LAYOUT=None, OUT_LAYOUT=None, OP='add' (also demonstrates: descriptor-load-static, program-id-1d, num-programs-fold)
+- `elementwise::1d_device` — n_elements=128, BLOCK_SIZE=128, LAYOUT=('stick', ((0, 'floordiv', 64), (0, 'mod', 64))), OP='add' (also demonstrates: descriptor-load-static, simplified:no-loop, spyre-tensor-layout)
+- `elementwise::1d_device_grid2` — n_elements=128, BLOCK_SIZE=64, LAYOUT=('stick', ((0, 'floordiv', 64), (0, 'mod', 64))), OP='add' (also demonstrates: descriptor-load-static, program-id-1d, simplified:no-loop, spyre-tensor-layout)
 
-_+ 17 more variants_
+_+ 18 more variants_
 
 
 ---

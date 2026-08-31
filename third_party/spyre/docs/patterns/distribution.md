@@ -52,11 +52,11 @@ Expected diagnostics:
 
 **Round-trip evidence**
 
-- `gather::2d` — M=1024, N=128, K_INDICES=64, BLOCK_ROWS=8, BLOCK_COLS=16 (also demonstrates: descriptor-gather, program-id-2d)
-- `matmul::default` — M=16, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-static, descriptor-store-static, dot, program-id-2d)
-- `matmul::dynamic` — M=128, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, program-id-2d)
-- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-static, descriptor-store-static, dot, program-id-1d)
-- `matmul::bmm_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, program-id-1d)
+- `elementwise::default` — n_elements=1024, BLOCK_SIZE=1024, DTYPE='fp32', OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d)
+- `elementwise::dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, program-id-1d)
+- `elementwise::dynamic_from_scalar_load` — BLOCK_SIZE=1024, OP='add' (also demonstrates: descriptor-load-dynamic-from-scalar-load, descriptor-store-dynamic, program-id-1d)
+- `elementwise::2d` — M=512, N=32, BLOCK_M=16, BLOCK_N=16, X_LAYOUT=None, Y_LAYOUT=None, OUT_LAYOUT=None, OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d)
+- `elementwise::2d_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, program-id-1d)
 
 _+ 16 more variants_
 
@@ -83,13 +83,13 @@ offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
 **Round-trip evidence**
 
-- `matmul::bmm` — B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-static, descriptor-store-static, dot, num-programs-fold)
-- `matmul::bmm_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, num-programs-fold)
-- `matmul::spyre_stick_k_reduction` — M=64, K=128, N=256, BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, A_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-static, descriptor-store-static, dot, spyre-tensor-layout)
-- `matmul::spyre_stick_parallel_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, spyre-tensor-layout)
-- `matmul::spyre_stick_k_dynamic` — M=64, K=128, N=64, BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, A_LAYOUT=[(0, 'floordiv', 64), 1, (0, 'mod', 64)], B_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)], C_LAYOUT=[(1, 'floordiv', 64), 0, (1, 'mod', 64)] (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, spyre-tensor-layout)
+- `elementwise::default` — n_elements=1024, BLOCK_SIZE=1024, DTYPE='fp32', OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, num-programs-fold)
+- `elementwise::dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, num-programs-fold)
+- `elementwise::dynamic_from_scalar_load` — BLOCK_SIZE=1024, OP='add' (also demonstrates: descriptor-load-dynamic-from-scalar-load, descriptor-store-dynamic, num-programs-fold)
+- `elementwise::1d_compute` — DTYPE='fp16', OP='add', n_elements=128, BLOCK_SIZE=128 (also demonstrates: descriptor-load-static, descriptor-store-static, elementwise-compute)
+- `elementwise::2d` — M=512, N=32, BLOCK_M=16, BLOCK_N=16, X_LAYOUT=None, Y_LAYOUT=None, OUT_LAYOUT=None, OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, num-programs-fold)
 
-_+ 16 more variants_
+_+ 17 more variants_
 
 ## program-id-2d
 
@@ -116,10 +116,10 @@ col_offset = pid_y * BLOCK_N
 
 **Round-trip evidence**
 
+- `elementwise::2d_dynamic_from_scalar_load` — N=32, BLOCK_M=16, BLOCK_N=16, OP='add' (also demonstrates: descriptor-load-dynamic-from-scalar-load, descriptor-store-dynamic, num-programs-fold)
+- `elementwise::2d_grid` — M=256, N=128, BLOCK_M=16, BLOCK_N=16, OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, num-programs-fold)
+- `elementwise::2d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, num-programs-fold)
 - `gather::2d` — M=1024, N=128, K_INDICES=64, BLOCK_ROWS=8, BLOCK_COLS=16 (also demonstrates: descriptor-gather, num-programs-fold)
 - `matmul::default` — M=16, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-static, descriptor-store-static, dot, num-programs-fold)
-- `matmul::dynamic` — M=128, K=64, N=256, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16, A_LAYOUT=None, B_LAYOUT=None, C_LAYOUT=None (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot, num-programs-fold)
-- `matmul::2d_grid` — M=256, K=64, N=128, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16 (also demonstrates: descriptor-load-static, descriptor-store-static, dot)
-- `matmul::2d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, dot)
 
 _+ 3 more variants_
