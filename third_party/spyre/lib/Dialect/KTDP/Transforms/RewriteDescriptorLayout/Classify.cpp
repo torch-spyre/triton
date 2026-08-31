@@ -53,8 +53,7 @@ OperandPlan classify(Value val, const OperandCoords &coords,
 
   for (int p = rank - 1; p >= 0; --p) {
     int64_t role = dimRoles[p];
-    bool isFloor = (role >= 0 &&
-                    static_cast<CoordOp>(coords.op[p]) == CoordOp::FloorDiv);
+    bool isFloor = isFloorDim(role, static_cast<CoordOp>(coords.op[p]));
     if (role == -1) {
       d.reduceDims.push_back(p);
       if (d.opInnerDim == -1) {
@@ -72,13 +71,7 @@ OperandPlan classify(Value val, const OperandCoords &coords,
   std::reverse(d.floorDims.begin(), d.floorDims.end());
   std::reverse(d.loopDims.begin(), d.loopDims.end());
   std::reverse(d.opTileDims.begin(), d.opTileDims.end());
-
-  // opInnerReduceDims: every reduceDim, sorted ascending -- the real reduce
-  // axis set (see ClassifiedDims comment). d.reduceDims is built right-to-left
-  // and never reversed, so it comes out descending; sort rather than reverse
-  // in case a future caller mutates it out of strict right-to-left order.
-  d.opInnerReduceDims.assign(d.reduceDims.begin(), d.reduceDims.end());
-  llvm::sort(d.opInnerReduceDims);
+  std::reverse(d.reduceDims.begin(), d.reduceDims.end());
 
   d.sliceKind.assign(rank, SliceKind::WholeBlock);
   auto markList = [&](llvm::ArrayRef<int> dims) {

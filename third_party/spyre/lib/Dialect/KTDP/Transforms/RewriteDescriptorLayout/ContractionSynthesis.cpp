@@ -90,43 +90,14 @@ Value emitTranspose(OpBuilder &b, Location loc, Value src,
 }
 
 // True if a not-yet-erased linalg.transpose sits between `val` and a
-// ktdp.load, i.e. a lookup of `val` in ctx.physicalValues missing is because
-// a transpose pattern (RewriteTransposePattern) has not fired here yet,
-// rather than `val` genuinely not deriving from a physical load. This is an
-// IR-structural question -- "is there a live linalg.TransposeOp on this
-// chain" -- not a "is this value already known-physical" question, so it
-// cannot be answered by a map lookup: a transpose's own input is not itself
-// recorded in ctx.physicalValues until after RewriteTransposePattern erases
-// the transpose (see that pattern). Matmul/reduce/store dispatch must
-// distinguish these two "not found" cases: the former means "not ready,
-// defer to a later greedy iteration" (return failure()), the latter means
-// "genuinely logical, treat as a scratchpad operand."
-// Why this survives the physicalValues consolidation, and why raising
-// RewriteTransposePattern's benefit does not remove it.
-//
-// A transpose is erased by RewriteTransposePattern, which records its
-// permutation against its input. dispatchSource then reads that entry. Running
-// the producer first is necessary but not sufficient: chained transposes with an
-// elementwise op between them need the two patterns to alternate.
-//
-//     load(physical) -> trans1 -> negf -> trans2 -> dot
-//
-//     erase trans1     input is the load, ready immediately
-//     retype negf      only once trans1 is erased
-//     erase trans2     only once negf is retyped
-//     dispatch dot     only once trans2 is erased
-//
-// Three alternating rounds between two patterns, so no benefit ordering lets the
-// matmul see a fully resolved chain on first visit -- whichever pattern runs
-// first, the other must run before it can proceed again. The matmul is therefore
-// visited while a transpose is still live, and must defer rather than conclude
-// its operand is logical. Measured: with the transpose pattern at benefit 3 this
-// still fires once, on chained_transpose_matmul.
-//
-// The traversal duplicates the backward walk that walkToLoad used to perform.
-// Removing it needs physicalValues to carry a pending state, so "not resolved
-// yet" is a lookup rather than a re-derivation -- a convergence change, not a
-// consolidation.
+// ktdp.load: a missing ctx.physicalValues entry is then "not ready yet" (the
+// caller must defer, returning failure()) rather than "genuinely logical"
+// (treat as a scratchpad operand) — a transpose's input is not recorded in
+// ctx.physicalValues until RewriteTransposePattern erases it, so a plain map
+// lookup cannot distinguish the two. No pattern-benefit ordering avoids this:
+// a chain with an elementwise op between two transposes needs the transpose
+// and elementwise patterns to alternate across several greedy iterations
+// before a downstream matmul/reduce/store sees a fully resolved operand.
 bool chainBlockedByPendingTranspose(Value val) {
   Value v = val;
   while (true) {
@@ -428,9 +399,13 @@ static LogicalResult emitFatalError(Operation *op, const PassContext &ctx,
   return op->emitError(msg);
 }
 
-// Classify one operand and populate plans[i].
+// Classify one operand and populate plans[i]. `absorbLoopDims` is declared
+// by the calling pattern: true iff its op can take its whole reduce axis set
+// directly (e.g. linalg.reduce's `dimensions`), false if a second reduce axis
+// must become a real cross-stick accumulation loop (matmul).
 LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
-                             const PassContext &ctx, PatternRewriter &rewriter) {
+                             const PassContext &ctx, PatternRewriter &rewriter,
+                             bool absorbLoopDims = false) {
   unsigned nOps = spec.operands.size();
   llvm::SmallVector<OperandPlan, 2> plans(nOps);
 
@@ -508,12 +483,10 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
     }
   }
 
-  // A reduce absorbs its whole reduce axis set directly (opInnerReduceDims),
-  // so its loopDims never need a stick loop: move them into opTileDims (as
-  // WholeBlock slices spanning the full physical extent) before
-  // reconcileOperandSet folds loopDims into a trip count. Matmul never sets
-  // this flag, so its classification/dispatch is untouched.
-  if (spec.absorbLoopDimsIntoReduce) {
+  // When the op can absorb its whole reduce axis set directly, fold loopDims
+  // into opTileDims (as WholeBlock slices spanning the full physical extent)
+  // before reconcileOperandSet folds loopDims into a trip count.
+  if (absorbLoopDims) {
     for (auto &plan : plans) {
       for (int p : plan.dims.loopDims) {
         plan.dims.opTileDims.push_back(p);
@@ -832,24 +805,12 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
       if (!llvm::is_contained(rd.getDimensions(), (int64_t)d))
         canonicalAxes[d] = outAxis++;
 
-    // targetOrder: build it in *physical* dim order (via phys_src), not
-    // trailing-forced. linalg.reduce's `dimensions` is DenseArrayStrictlySorted
-    // -- sorted, but with no contiguity or trailing-position requirement -- so
-    // a reduced axis no longer needs to be moved to the end. resolveOperand's
-    // computeTransposePerm (PermutationUtils.h, not touched here) matches
-    // targetOrder's role sequence against the operand's physical roles by
-    // stable left-to-right scan; feeding it the *current* physical role
-    // sequence (survivors renumbered to canonical ascending order, reduced
-    // slots left as -1 in their own physical slot) makes it a no-op whenever
-    // the survivors are already in ascending order -- the transpose is then
-    // only emitted when they are not (Step 3, item 3/5: the transpose path is
-    // now scoped to reordering survivors, never to relocating reduced dims).
-    //
-    // This mirrors classify()'s own floor-dim test (role >= 0 && FloorDiv is a
-    // floorDim, excluded from opTileDims) so targetOrder's entries line up
-    // 1:1 with opTileDims in physical order, which is what dispatchSource's
-    // absorbLoopDimsIntoReduce fold produces (all reduce dims folded into
-    // opTileDims, sorted ascending == physical order).
+    // targetOrder holds one entry per non-floor physical dim, in physical
+    // order, role or -1 for a reduced dim. linalg.reduce's `dimensions` is
+    // DenseArrayStrictlySorted with no trailing-position requirement, so
+    // reduced dims need not be moved to the end. Floor-dim exclusion uses
+    // isFloorDim, matching classify()'s own test, so entries line up 1:1
+    // with opTileDims in physical order.
     llvm::SmallVector<int64_t> targetOrder;
     {
       auto physOp = marker.getPhysOp();
@@ -858,9 +819,7 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
         int64_t role = (logDim < (int64_t)canonicalAxes.size())
                             ? canonicalAxes[logDim]
                             : -1;
-        bool isFloor = role >= 0 &&
-                       static_cast<CoordOp>(physOp[p]) == CoordOp::FloorDiv;
-        if (!isFloor)
+        if (!isFloorDim(role, static_cast<CoordOp>(physOp[p])))
           targetOrder.push_back(role);
       }
     }
@@ -909,8 +868,9 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
     spec.operands = {SourceOperandSpec{canonicalAxes, targetOrder}};
     spec.logicalRank = logicalRank;
     spec.emitOp = emitReduceOp;
-    spec.absorbLoopDimsIntoReduce = true;
-    return dispatchSource(rd, spec, ctx, rewriter);
+    // linalg.reduce can absorb its whole reduce axis set directly via
+    // `dimensions`, unlike matmul, which can only ever contract one axis.
+    return dispatchSource(rd, spec, ctx, rewriter, /*absorbLoopDims=*/true);
   }
 };
 

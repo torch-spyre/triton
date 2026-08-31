@@ -85,19 +85,11 @@ struct ClassifiedDims {
   int                lane;        // innermost phys dim = rank-1
   int64_t            stickSize;   // stick/lane width = physBlock[lane]
   llvm::SmallVector<int>   floorDims;   // parallel stick-index dims
-  llvm::SmallVector<int>   reduceDims;  // all -1 dims in right-to-left order
+  llvm::SmallVector<int>   reduceDims;  // all -1 dims, ascending
   int                opInnerDim;  // rightmost reduceDim; -1 if none
   llvm::SmallVector<int>   loopDims;    // reduceDims minus opInnerDim
   llvm::SmallVector<int>   opTileDims;  // residual >= 0 non-floor dims
   llvm::SmallVector<SliceKind> sliceKind; // per-phys-dim slice behavior
-  // All reduceDims, sorted ascending -- the full in-op reduce axis set a
-  // linalg.reduce can express directly via `dimensions` (which requires
-  // DenseArrayStrictlySorted, not contiguity or a trailing position). Added
-  // alongside opInnerDim/loopDims rather than replacing them: matmul still
-  // consumes those two fields exactly as before (it can only ever absorb one
-  // reduce axis per operand; a second becomes a real cross-stick
-  // accumulation loop). Only the reduce dispatch path reads this field.
-  llvm::SmallVector<int>   opInnerReduceDims;
 };
 
 /// One operand's full plan: classification + resolution results.
@@ -160,12 +152,6 @@ struct SourceOpSpec {
   llvm::function_ref<Value(OpBuilder &, Location, llvm::ArrayRef<Value>,
                            Value, RankedTensorType)>
       emitOp;
-  /// True only for linalg.reduce: unlike matmul, a reduce op can absorb its
-  /// entire reduce axis set (ClassifiedDims::opInnerReduceDims) directly via
-  /// `dimensions`, so dispatchSource folds every plan's loopDims into
-  /// opTileDims before resolving/slicing rather than driving a stick loop
-  /// over them (see Step 3 of the layout refactor plan).
-  bool absorbLoopDimsIntoReduce = false;
 };
 
 } // namespace mlir::triton::ktdp
