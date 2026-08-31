@@ -172,7 +172,7 @@ def make_inputs_3d(
 # come from DTYPE). These are the non-constexpr, non-pointer runtime args.
 _SHAPE_ARGS = {
     1: {"n_elements": "i32"},      # elementwise_1d
-    # 2D and 3D are not used by Level B (1d_compute), kept for Stage 3
+    2: {},                         # 2d_device: M/N are constexprs, no runtime shape args
 }
 
 # NumPy oracles indexed by op name.
@@ -208,6 +208,21 @@ def _make_inputs_compute(n_elements: int, BLOCK_SIZE: int,
     return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
 
 
+def _make_inputs_2d_device(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
+                            *, dtype: str, op: str, **_unused) -> dict:
+    """2D input generator for device variants: dtype/op-aware.
+
+    Floats: x = sin, y = cos + 2 (keeps div away from zero). Reshaped to [M, N].
+    """
+    np_dtype = DTYPE_MAP[dtype]
+    total = M * N
+    t = np.arange(total, dtype=np.float32)
+    x = np.sin(t * 2.0 * np.pi / total).astype(np_dtype).reshape(M, N)
+    y = (np.cos(t * 2.0 * np.pi / total) + 2.0).astype(np_dtype).reshape(M, N)
+    output = np.zeros((M, N), dtype=np_dtype)
+    return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
+
+
 @dataclass(frozen=True)
 class Elementwise(conftest.VariantFactory):
     """Factory for elementwise variants that sweep OP and/or DTYPE.
@@ -230,7 +245,10 @@ class Elementwise(conftest.VariantFactory):
         return oracle
 
     def inputs(self, OP, DTYPE, **_):
-        return functools.partial(_make_inputs_compute, dtype=DTYPE, op=OP)
+        if self.rank == 1:
+            return functools.partial(_make_inputs_compute, dtype=DTYPE, op=OP)
+        elif self.rank == 2:
+            return functools.partial(_make_inputs_2d_device, dtype=DTYPE, op=OP)
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +311,27 @@ _SIG_TENSORS_FP16 = {
 _SIG_2D_SPYRE = {**_SIG_2D_LAYOUT, **_SIG_TENSORS_FP16}
 
 _S2 = functools.partial(sticksize, _SIG_TENSORS_FP16)
+
+
+def _stick_layout_1d(dtype_str: str) -> tuple:
+    """1D stick layout for a given dtype, as a hashable tuple-of-tuples.
+
+    stick=64 for fp16, stick=32 for fp32. The 1D layout maps:
+      physical dim 0 = logical_idx[0] // stick  (which stick)
+      physical dim 1 = logical_idx[0] % stick   (lane within stick)
+    """
+    stick = sticksize({"x_ptr": f"*{dtype_str}"}, "x_ptr")
+    return ((0, "floordiv", stick), (0, "mod", stick))
+
+
+def _stick_layout_2d_on_n(dtype_str: str) -> tuple:
+    """2D stick-on-N layout for a given dtype, as a hashable tuple.
+
+    Physicalizes [M, N] -> [N//stick, M, stick]:
+      (1, "floordiv", stick), 0, (1, "mod", stick)
+    """
+    stick = sticksize({"x_ptr": f"*{dtype_str}"}, "x_ptr")
+    return ((1, "floordiv", stick), 0, (1, "mod", stick))
 
 _SIG_3D = {
     "x_ptr":      "*fp32",
@@ -516,56 +555,54 @@ VARIANTS = {
         },
     },
     "1d_device": {
-        # The only variant in the suite that reaches a Spyre binary. Everything
+        # The device variants in the suite that reach a Spyre binary. Everything
         # else distributes tiles with an scf.for over the program id, and dbo-opt
-        # rejects the loop it outlines from that; this kernel has no loop and no
-        # program id -- one tile that is the whole tensor.
+        # rejects the loop it outlines from that; this kernel has no loop --
+        # one tile that is the whole tensor.
         #
         # That makes it the fixture the spyrecode-stage tests compile, which is
         # why it lives here rather than inline in a test module.
+        # Stage 3: sweep {fp16} x {add, sub, mul}. fp32 is in 1d_device_fp32.
+        "base": None,   # prevent inheriting reference/inputs from default
         "tags": [
             "descriptor-load-static", "descriptor-store-static",
-            "simplified:no-loop", "spyre-tensor-layout"
+            "simplified:no-loop", "spyre-tensor-layout",
         ],
         "summary": (
-            "Elementwise add over a single tile, with no grid distribution "
-            "loop -- the one variant dbo-opt can lower to a binary."
-        ),
-        "doc": (
-            "Takes two `M` fp16 inputs in spyre tensor 2D layouts "
-            "and writes `C = A + B` in one "
-            "`tl.program_id`, no `tl.num_programs`, no loop."
+            "1D fp16 elementwise over a single tile, no distribution loop. "
+            "Sweeps add/sub/mul -- the three ops dbo-opt accepts at fp16."
         ),
         "kernel_fn":    kernel.elementwise_1d_device,
-        "SIGNATURE":    _SIG_TENSORS_FP16,
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "OP"],
-        "params":       {
+        "factory":      Elementwise(rank=1),
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "LAYOUT", "OP"],
+        "params": {
+            "DTYPE":      ["fp16"],
+            "OP":         ["add", "sub", "mul"],
             "n_elements": [128],
             "BLOCK_SIZE": [128],
-            # LAYOUT is a constexpr that enters the Triton cache key, so it
-            # must be hashable -- a list is not. Stored as tuple of tuples.
-            # A labelled ("name", value) pair is required: the framework's
-            # tuple-detection sees any tuple element in the values list and
-            # would misread the raw inner tuple as a (label, value) pair. The
-            # label also becomes the suffix when sweeping: adding a second
-            # layout produces elementwise__1d_device[LAYOUT=stick] and
-            # elementwise__1d_device[LAYOUT=other].
-            "LAYOUT":   [("stick", ((0, "floordiv", _S2("x_ptr")), (0, "mod", _S2("x_ptr"))))],
-            "OP": ["add"],
+            "LAYOUT":     [("stick", _stick_layout_1d("fp16"))],
         },
         "grid":         [1],
         "parallel":     False,
-        # dbo-opt can lower this one all the way to a Spyre binary, so the
-        # spyrecode-stage tests compile it. Declared here rather than named in
-        # conftest so the property travels with the variant, like `parallel`.
         "compiles_to_binary": True,
-        "reference":    run,
-        # BLOCK_SIZE is actually not used, stub it out
-        "inputs":       functools.partial(make_inputs, dtype="f16"),
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
-        "extra_checks": None, # for the device examples we disable the checks
+        "extra_checks": None,
+    },
+    "1d_device_fp32": {
+        "base": "1d_device",
+        "summary": (
+            "1D fp32 elementwise over a single tile, no distribution loop. "
+            "Sweeps add/sub/mul -- the three ops dbo-opt accepts at fp32."
+        ),
+        "params": {
+            "DTYPE":      ["fp32"],
+            "OP":         ["add", "sub", "mul"],
+            "n_elements": [128],
+            "BLOCK_SIZE": [128],
+            "LAYOUT":     [("stick", _stick_layout_1d("fp32"))],
+        },
     },
     "1d_device_grid2": {
         # The multi-core counterpart of 1d_device: still one tile per corelet and
@@ -575,25 +612,71 @@ VARIANTS = {
         "base": "1d_device",
         "tags": [
             "descriptor-load-static", "descriptor-store-static",
-            "program-id-1d", "simplified:no-loop", "spyre-tensor-layout"
+            "program-id-1d", "simplified:no-loop", "spyre-tensor-layout",
         ],
         "summary": (
-            "Elementwise add distributed over two corelets, one stick each, "
-            "with no distribution loop."
-        ),
-        "doc": (
-            "Takes two 128-element fp16 vectors in a 2-stick spyre tensor "
-            "layout and writes `C = A + B` across a `grid = [2]`.  Each corelet "
-            "reads `tl.program_id(0)` and offsets by `pid * BLOCK_SIZE`, so it "
-            "owns exactly one 64-element stick; there is no `tl.num_programs` "
-            "and no `scf.for`.\n\n"
+            "1D fp16 elementwise across two corelets, one fp16 stick each, "
+            "no distribution loop. Sweeps add/sub/mul."
         ),
         "grid": [2],
-        "params":       {
+        "params": {
+            "DTYPE":      ["fp16"],
+            "OP":         ["add", "sub", "mul"],
             "n_elements": [128],
-            "BLOCK_SIZE": [64],
-            "LAYOUT":   [("stick", ((0, "floordiv", _S2("x_ptr")), (0, "mod", _S2("x_ptr"))))],
-            "OP": ["add"],
+            "BLOCK_SIZE": [64],   # 64 elements = 1 fp16 stick per corelet
+            "LAYOUT":     [("stick", _stick_layout_1d("fp16"))],
+        },
+    },
+    "2d_device": {
+        "base": None,   # prevent inheriting reference/inputs from default
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "2D fp16 elementwise over a single tile, stick-on-N layout. "
+            "Sweeps add/sub/mul. First fixture to put a rank-3 physicalized "
+            "layout and multi-element 2D tile on hardware."
+        ),
+        "kernel_fn":    kernel.elementwise_2d_device,
+        "factory":      Elementwise(rank=2),
+        "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N",
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
+        "params": {
+            "DTYPE":    ["fp16"],
+            "OP":       ["add", "sub", "mul"],
+            "M":        [64],
+            "N":        [128],   # 2 fp16 sticks (128 / 64)
+            "BLOCK_M":  [64],
+            "BLOCK_N":  [128],
+            "X_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp16"))],
+            "Y_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp16"))],
+            "OUT_LAYOUT": [("stick", _stick_layout_2d_on_n("fp16"))],
+        },
+        "grid":         [1],
+        "parallel":     False,
+        "compiles_to_binary": True,
+        "output_key":   "output_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+        "extra_checks": None,
+    },
+    "2d_device_fp32": {
+        "base": "2d_device",
+        "summary": (
+            "2D fp32 elementwise over a single tile, stick-on-N layout. "
+            "Sweeps add/sub/mul. fp32 stick = 32 lanes; N = 64 = 2 sticks."
+        ),
+        "params": {
+            "DTYPE":    ["fp32"],
+            "OP":       ["add", "sub", "mul"],
+            "M":        [64],
+            "N":        [64],    # 2 fp32 sticks (64 / 32)
+            "BLOCK_M":  [64],
+            "BLOCK_N":  [64],
+            "X_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp32"))],
+            "Y_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp32"))],
+            "OUT_LAYOUT": [("stick", _stick_layout_2d_on_n("fp32"))],
         },
     },
     "2d_spyre_stick": {
