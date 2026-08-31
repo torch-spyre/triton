@@ -213,7 +213,8 @@ Value emitSourceStage(
     llvm::function_ref<Value(OpBuilder &, Location, llvm::ArrayRef<Value>, Value,
                              RankedTensorType)>
         emitOp,
-    llvm::ArrayRef<OperandPlan> plans) {
+    llvm::ArrayRef<OperandPlan> plans,
+    const OperandSetTripCounts &tripCounts) {
   Location loc = op.getLoc();
 
   Value cVal = op.getDpsInits()[0];
@@ -251,62 +252,13 @@ Value emitSourceStage(
     return emitTranspose(b, loc, src, perm);
   };
 
-  // Determine the stick loop trip count (stickFactor).
-  int64_t stickFactor = 1;
-  for (auto &plan : plans) {
-    for (int p : plan.dims.loopDims) {
-      if (static_cast<CoordOp>(plan.coords.op[p]) != CoordOp::FloorDiv)
-        continue;
-      int64_t logDim = plan.dimRoles[p];
-      if (logDim >= 0)
-        continue;
-      int64_t f;
-      if (plan.dims.sliceKind[p] == SliceKind::StickifiedBlock)
-        f = plan.coords.physBlock[p] / plan.dims.stickSize;
-      else
-        f = plan.coords.physBlock[p];
-      if (f <= 1)
-        continue;
-      if (stickFactor != 1 && stickFactor != f)
-        llvm_unreachable("emitSourceStage: plans disagree on stickFactor");
-      stickFactor = f;
-    }
-  }
-
-  LLVM_DEBUG(llvm::dbgs() << "  source stage: stickFactor=" << stickFactor
-                          << ", " << plans.size() << " operand plans\n");
-
-  // Determine the parallel-scatter trip count (parallelFactor): a *parallel*
-  // (role >= 0) floor dim spanning more than one stick. Such a dim cannot be
-  // folded into the op tile — `accDims` holds the per-stick extent because
-  // linalg.matmul requires its init/result extents to match the A/B slice
-  // extents — so the full parallel extent is assembled by tiling the
-  // accumulator across an outer loop.
-  //
-  // `parallelAccAxis` is the accumulator axis the parallel floor dim maps to
-  // (`dimRoles[p]`, which indexes `accDims` directly); `parallelStickSize` is
-  // that plan's lane extent, i.e. the width of one scattered slab.
-  int64_t parallelFactor = 1;
-  int64_t parallelAccAxis = -1;
-  int64_t parallelStickSize = 1;
-  for (auto &plan : plans) {
-    for (int p : plan.dims.floorDims) {
-      int64_t role = plan.dimRoles[p];
-      if (role < 0 || plan.coords.physBlock[p] <= 1)
-        continue;
-      int64_t f = plan.coords.physBlock[p];
-      if (parallelFactor != 1 &&
-          (parallelFactor != f || parallelAccAxis != role))
-        return Value{}; // caller reports; see dispatchSource
-      parallelFactor = f;
-      parallelAccAxis = role;
-      parallelStickSize = plan.coords.physBlock[plan.dims.lane];
-    }
-  }
-
-  LLVM_DEBUG(llvm::dbgs() << "  source stage: parallelFactor=" << parallelFactor
-                          << " accAxis=" << parallelAccAxis
-                          << " stickSize=" << parallelStickSize << "\n");
+  // Trip counts are derived cross-operand by reconcileOperandSet(); a
+  // disagreement there is signaled via tripCounts.parallelAgrees, which
+  // dispatchSource checks before calling this function.
+  int64_t stickFactor = tripCounts.stickFactor;
+  int64_t parallelFactor = tripCounts.parallelFactor;
+  int64_t parallelAccAxis = tripCounts.parallelAccAxis;
+  int64_t parallelStickSize = tripCounts.parallelStickSize;
 
   // Emit the reduction stick loop for one parallel slab. `acc` is the
   // per-slab accumulator (shape `accTy`); `pIV` selects the parallel stick.
@@ -434,7 +386,10 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
     }
   }
 
-  resolveAndReconcile(plans, spec);
+  OperandSetTripCounts tripCounts = reconcileOperandSet(plans);
+  for (unsigned i = 0; i < nOps; ++i)
+    resolveOperand(plans[i], spec.operands[i].targetOrder,
+                   TransposeDirection::Narrow);
 
   // Reject a scratchpad operand paired with a multi-stick reduction axis.
   for (unsigned i = 0; i < nOps; ++i) {
@@ -457,14 +412,15 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
     }
   }
 
-  OpBuilder b(op.getOperation());
-  Value result = emitSourceStage(op, b, spec.emitOp, plans);
-  if (!result)
+  if (!tripCounts.parallelAgrees)
     return emitFatalError(op, ctx,
         "spyre_tensor_layout: operands disagree on the parallel multi-stick "
         "scatter — two annotated operands carry parallel floor dims with "
         "different trip counts or on different output axes, which would need "
         "two independent scatter loops (not supported)");
+
+  OpBuilder b(op.getOperation());
+  Value result = emitSourceStage(op, b, spec.emitOp, plans, tripCounts);
   rewriter.replaceOp(op, result);
   return success();
 }
@@ -495,6 +451,9 @@ triton::SpyreTensorLayoutOp findMarkerForStore(Value value,
 }
 
 // Sink stage: scatter a logical data tile into the physical D tensor shape.
+// Preconditions (non-empty floorDims, empty loopDims) are checked by the
+// caller before `dPlan` is even built for resolution; see
+// RewriteStorePattern.
 LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
                             const OperandPlan &dPlan,
                             const PassContext &ctx,
@@ -511,36 +470,8 @@ LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
   int physRank = (int)physBlock.size();
   int64_t stickSize = physBlock[dPlan.dims.lane];
 
-  if (dPlan.dims.floorDims.empty()) {
-    ctx.hadError = true;
-    return st.emitError(
-        "spyre_tensor_layout: store sink stage requires at least one "
-        "parallel floor dim in the output layout");
-  }
-  if (!dPlan.dims.loopDims.empty()) {
-    ctx.hadError = true;
-    return st.emitError(
-        "spyre_tensor_layout: store sink stage: unexpected reduction dim");
-  }
-
   unsigned logRank = dPlan.coords.logicalRank;
-  llvm::SmallVector<int64_t> sinkPerm;
-  {
-    // The sink's target order is the logical dim order itself: logical dim d
-    // goes to position d. Dense iota, so no compaction skew here.
-    llvm::SmallVector<int64_t> targetOrderD(logRank);
-    std::iota(targetOrderD.begin(), targetOrderD.end(), 0);
-    auto fwdPerm = computeTransposePerm(dPlan.dims.opTileDims, dPlan.dimRoles,
-                                        targetOrderD);
-    if (!fwdPerm.empty()) {
-      auto inv = invertPerm(fwdPerm);
-      bool isIdentity = true;
-      for (unsigned d = 0; d < logRank; ++d)
-        if (inv[d] != (int64_t)d) { isIdentity = false; break; }
-      if (!isIdentity)
-        sinkPerm = std::move(inv);
-    }
-  }
+  llvm::ArrayRef<int64_t> sinkPerm = dPlan.transposePerm;
 
   auto logDimToPos = [&](int64_t d) -> unsigned {
     return sinkPerm.empty() ? (unsigned)d : (unsigned)sinkPerm[d];
@@ -832,6 +763,33 @@ struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
       dimRoleD[p] = marker.getPhysSrc()[p];
 
     OperandPlan dPlan = classify(st.getDataTile(), dC, dimRoleD);
+
+    // The store's two preconditions, expressed as resolution outcomes: an
+    // empty floorDims means nothing to scatter, and a non-empty loopDims
+    // means a reduction the store cannot express. Checked here rather than
+    // inside the emitter. Do not call reconcileOperandSet on this path: it
+    // is a no-op for a store (dimRoles are phys_src, always >= 0, so
+    // loopDims is always empty already) and would assert a cross-operand
+    // dependency that does not exist for a single data tile.
+    if (dPlan.dims.floorDims.empty()) {
+      ctx.hadError = true;
+      return st.emitError(
+          "spyre_tensor_layout: store sink stage requires at least one "
+          "parallel floor dim in the output layout");
+    }
+    if (!dPlan.dims.loopDims.empty()) {
+      ctx.hadError = true;
+      return st.emitError(
+          "spyre_tensor_layout: store sink stage: unexpected reduction dim");
+    }
+
+    // A store contracts nothing, so its target order is the identity — the
+    // logical dim order itself — and the inverse direction (op-tile ->
+    // physical) is what scatters into the physical D tensor shape.
+    llvm::SmallVector<int64_t> targetOrderD(logRank);
+    std::iota(targetOrderD.begin(), targetOrderD.end(), 0);
+    resolveOperand(dPlan, targetOrderD, TransposeDirection::Widen);
+
     return emitSinkStage(st, dPlan, ctx, rewriter);
   }
 };

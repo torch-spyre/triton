@@ -20,16 +20,21 @@ struct PassContext {
 
 /// Per-operand coord-map info read from a still-live marker.
 struct OperandCoords {
-  llvm::ArrayRef<int64_t> src; // phys_src
-  llvm::ArrayRef<int64_t> op;  // phys_op  (0=Identity,1=FloorDiv,2=Mod)
-  llvm::ArrayRef<int64_t> arg; // phys_arg
+  llvm::SmallVector<int64_t> src; // phys_src
+  llvm::SmallVector<int64_t> op;  // phys_op  (0=Identity,1=FloorDiv,2=Mod)
+  llvm::SmallVector<int64_t> arg; // phys_arg
   unsigned logicalRank;
+  // Aliases an MLIR type's shape (RankedTensorType::getShape() or
+  // AccessTileType::getShape()), which is uniqued and immortal, so this one
+  // stays a non-owning ArrayRef.
   llvm::ArrayRef<int64_t> physBlock;
 
   static OperandCoords fromMarker(triton::SpyreTensorLayoutOp marker,
                                   unsigned logRank,
                                   llvm::ArrayRef<int64_t> physBlock) {
-    return {marker.getPhysSrc(), marker.getPhysOp(), marker.getPhysArg(),
+    return {llvm::SmallVector<int64_t>(marker.getPhysSrc()),
+            llvm::SmallVector<int64_t>(marker.getPhysOp()),
+            llvm::SmallVector<int64_t>(marker.getPhysArg()),
             logRank, physBlock};
   }
 };
@@ -63,7 +68,7 @@ struct OperandPlan {
   llvm::SmallVector<int64_t> dimRoles;  // per-phys-dim role (>= 0 | -1)
   ClassifiedDims      dims;       // output of classify()
 
-  // Resolved fields — filled by resolveAndReconcile() after classify().
+  // Resolved fields — filled by resolveOperand() after classify().
   llvm::SmallVector<int64_t> transposePerm;
   llvm::SmallVector<int64_t> opExtents;
 };

@@ -128,10 +128,10 @@ int64_t opSliceExtent(const OperandPlan &plan, int p) {
              : plan.coords.physBlock[p];
 }
 
-void resolveAndReconcile(llvm::SmallVectorImpl<OperandPlan> &plans,
-                         const SourceOpSpec &spec) {
-  // Step 1 — StickifiedBlock demotion (before computing extents so we only
-  // derive them once).
+OperandSetTripCounts
+reconcileOperandSet(llvm::SmallVectorImpl<OperandPlan> &plans) {
+  // StickifiedBlock demotion (before the trip-count fold below, since that
+  // fold reads sliceKind).
   bool anyLoop = llvm::any_of(plans, [](const OperandPlan &p) {
     return !p.dims.loopDims.empty();
   });
@@ -144,20 +144,79 @@ void resolveAndReconcile(llvm::SmallVectorImpl<OperandPlan> &plans,
           sk = SliceKind::WholeBlock;
   }
 
-  // Step 2 — resolve per-operand transpose + extents (runs once).
-  for (unsigned i = 0; i < plans.size(); ++i) {
-    OperandPlan &plan = plans[i];
-    const SourceOperandSpec &opSpec = spec.operands[i];
+  OperandSetTripCounts result;
 
-    // `targetOrder` is a property of the *target op*, not of this operand's
-    // physical layout, so it is never reordered by an erased transpose perm.
-    plan.transposePerm = computeTransposePerm(
-        plan.dims.opTileDims, plan.dimRoles, opSpec.targetOrder);
-
-    plan.opExtents.clear();
-    for (int p : plan.dims.opTileDims)
-      plan.opExtents.push_back(opSliceExtent(plan, p));
+  // Determine the stick loop trip count (stickFactor).
+  for (auto &plan : plans) {
+    for (int p : plan.dims.loopDims) {
+      if (static_cast<CoordOp>(plan.coords.op[p]) != CoordOp::FloorDiv)
+        continue;
+      int64_t logDim = plan.dimRoles[p];
+      if (logDim >= 0)
+        continue;
+      int64_t f;
+      if (plan.dims.sliceKind[p] == SliceKind::StickifiedBlock)
+        f = plan.coords.physBlock[p] / plan.dims.stickSize;
+      else
+        f = plan.coords.physBlock[p];
+      if (f <= 1)
+        continue;
+      if (result.stickFactor != 1 && result.stickFactor != f)
+        llvm_unreachable("reconcileOperandSet: plans disagree on stickFactor");
+      result.stickFactor = f;
+    }
   }
+
+  LLVM_DEBUG(llvm::dbgs() << "    reconcile: stickFactor=" << result.stickFactor
+                          << ", " << plans.size() << " operand plans\n");
+
+  // Determine the parallel-scatter trip count (parallelFactor): a *parallel*
+  // (role >= 0) floor dim spanning more than one stick. Such a dim cannot be
+  // folded into the op tile — `accDims` holds the per-stick extent because
+  // linalg.matmul requires its init/result extents to match the A/B slice
+  // extents — so the full parallel extent is assembled by tiling the
+  // accumulator across an outer loop.
+  //
+  // `parallelAccAxis` is the accumulator axis the parallel floor dim maps to
+  // (`dimRoles[p]`, which indexes `accDims` directly); `parallelStickSize` is
+  // that plan's lane extent, i.e. the width of one scattered slab.
+  for (auto &plan : plans) {
+    for (int p : plan.dims.floorDims) {
+      int64_t role = plan.dimRoles[p];
+      if (role < 0 || plan.coords.physBlock[p] <= 1)
+        continue;
+      int64_t f = plan.coords.physBlock[p];
+      if (result.parallelFactor != 1 &&
+          (result.parallelFactor != f || result.parallelAccAxis != role)) {
+        result.parallelAgrees = false;
+        return result;
+      }
+      result.parallelFactor = f;
+      result.parallelAccAxis = role;
+      result.parallelStickSize = plan.coords.physBlock[plan.dims.lane];
+    }
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "    reconcile: parallelFactor=" << result.parallelFactor
+                          << " accAxis=" << result.parallelAccAxis
+                          << " stickSize=" << result.parallelStickSize << "\n");
+
+  return result;
+}
+
+void resolveOperand(OperandPlan &plan, llvm::ArrayRef<int64_t> targetOrder,
+                    TransposeDirection direction) {
+  // `targetOrder` is a property of the *target op*, not of this operand's
+  // physical layout, so it is never reordered by an erased transpose perm.
+  auto perm = computeTransposePerm(plan.dims.opTileDims, plan.dimRoles,
+                                   targetOrder);
+  plan.transposePerm = (direction == TransposeDirection::Widen && !perm.empty())
+                            ? invertPerm(perm)
+                            : perm;
+
+  plan.opExtents.clear();
+  for (int p : plan.dims.opTileDims)
+    plan.opExtents.push_back(opSliceExtent(plan, p));
 }
 
 } // namespace mlir::triton::ktdp
