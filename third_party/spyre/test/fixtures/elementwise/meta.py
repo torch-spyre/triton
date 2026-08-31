@@ -592,6 +592,13 @@ VARIANTS = {
     },
     "1d_device_fp32": {
         "base": "1d_device",
+        # Spelled out rather than inherited: gen_patterns_docs.py reads the raw
+        # VARIANTS dict and never resolves `base`, so a variant with no `tags`
+        # key of its own is absent from the generated pattern docs entirely.
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-loop", "spyre-tensor-layout",
+        ],
         "summary": (
             "1D fp32 elementwise over a single tile, no distribution loop. "
             "Sweeps add/sub/mul -- the three ops dbo-opt accepts at fp32."
@@ -663,6 +670,11 @@ VARIANTS = {
     },
     "2d_device_fp32": {
         "base": "2d_device",
+        # Spelled out rather than inherited -- see 1d_device_fp32.
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-loop", "spyre-tensor-layout",
+        ],
         "summary": (
             "2D fp32 elementwise over a single tile, stick-on-N layout. "
             "Sweeps add/sub/mul. fp32 stick = 32 lanes; N = 64 = 2 sticks."
