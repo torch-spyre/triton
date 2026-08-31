@@ -53,6 +53,11 @@ namespace mlir::triton::ktdp {
 // RewriteElementwisePattern, which uses a separate, purely local shape rule
 // that also covers multi-tensor-operand elementwise ops (arith.addf, select,
 // ...).
+// Load-bearing for the backward walks: with two tensor operands there is no
+// single producer to follow, and rejecting them is also what stops those walks
+// crossing a matmul (3 tensor operands) or a reduce (2). Widening this requires
+// re-proving that patterns cannot observe each other's output, i.e. convergence.
+// Forward retyping must not reuse it -- it would exclude arith.addf and friends.
 bool isSingleTensorElementwiseOp(Operation *op) {
   if (op->getNumResults() != 1 || op->getNumOperands() == 0)
     return false;

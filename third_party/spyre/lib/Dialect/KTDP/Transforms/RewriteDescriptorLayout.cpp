@@ -918,9 +918,17 @@ struct RewriteDescriptorLayoutPass
       config.enableFolding(false);
       config.enableConstantCSE(false);
       config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
-      (void)applyOpPatternsGreedily(candidates,
-                                    FrozenRewritePatternSet(std::move(patterns)),
-                                    config);
+      // Converges only if every pattern's match condition is falsified by its
+      // own rewrite: the driver re-enqueues an op whenever a neighbour it feeds
+      // or consumes changes, so a pattern that stays matchable spins to the
+      // iteration cap. Discarding this result would report success for that.
+      if (failed(applyOpPatternsGreedily(
+              candidates, FrozenRewritePatternSet(std::move(patterns)),
+              config))) {
+        module.emitError("rewrite-descriptor-layout: Phase 2 did not reach a "
+                         "fixpoint; a pattern is re-matching its own output");
+        return signalPassFailure();
+      }
       if (ctx.hadError)
         return signalPassFailure();
     }
