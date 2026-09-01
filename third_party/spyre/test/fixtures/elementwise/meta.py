@@ -219,11 +219,6 @@ class Elementwise(conftest.VariantFactory):
 
         Absent ``N_STICKS`` means the variant does not want a layout derived: the
         rank-2 Level A variants sweep neither, and pass ``X_LAYOUT: [None]``.
-
-        Values are bare, not ``("stick", ...)`` labelled pairs. A label only ever
-        names a value inside a registry key, and a derived param is resolved after
-        the key is built, so there is nothing for one to name -- and a label left
-        on would reach the kernel as part of the constexpr.
         """
         if N_STICKS is None and self.rank == 2:
             return None

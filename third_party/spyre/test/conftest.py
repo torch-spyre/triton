@@ -348,6 +348,10 @@ class VariantFactory:
         appear in it -- the key names the axes a variant sweeps, not what they
         imply. Resolved before the params are split into constexprs and runtime
         args, so a derived name can still be either.
+
+        Return values verbatim, never as ``(label, value)`` pairs: a label exists
+        to name a value inside a key, and by here the key is built. One left on
+        is not stripped and reaches the kernel as part of the constexpr.
         """
         return None
 
