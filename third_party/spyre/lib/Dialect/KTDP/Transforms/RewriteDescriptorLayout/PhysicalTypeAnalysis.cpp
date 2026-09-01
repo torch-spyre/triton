@@ -4,11 +4,12 @@
 // reachable value, the final physical type that value will carry once Phase 2
 // has rewritten the IR. Creates no ops and mutates nothing.
 //
-// Phase 2 answers "is this operand final?" from the IR it is itself
-// concurrently mutating, which it can only do by enumerating ways a value
-// might be unresolved (chainBlockedByPendingTranspose, the reshape/broadcast
-// blocklist). This analysis answers the same question as a function of Phase
-// 1's output alone.
+// Phase 2 used to answer "is this operand final?" from the IR it was itself
+// concurrently mutating, which it could only do by enumerating ways a value
+// might be unresolved. This analysis answers the same question as a function of
+// Phase 1's output alone, and dispatchSource now reads it: an operand present
+// here will be physical, so a miss on ctx.physicalValues means "not yet",
+// while absence here means "genuinely logical".
 //
 //===----------------------------------------------------------------------===//
 
@@ -427,11 +428,12 @@ void verifyPhysicalTypeAgreement(ModuleOp module, const PassContext &ctx,
                                  const PhysicalTypeMap &analysis,
                                  llvm::StringRef when) {
 #ifndef NDEBUG
-  // The third of three agreement invariants; the other two fire inside
-  // dispatchSource (assertAnalysisAgreesOnOperand), since a guard's conclusion
-  // is only observable when the guard runs. A disagreement is a defect in the
-  // analysis or in a guard, not an input the user can fix, so these are
-  // assertions rather than diagnostics.
+  // The surviving agreement invariant. The two that lived in dispatchSource
+  // compared the analysis against the guards it has now replaced, so they went
+  // with them; this one does not mention a guard, it relates the analysis to
+  // what Phase 2 actually discovered, and stays meaningful. A disagreement is a
+  // defect in the analysis, not an input the user can fix, so it is an
+  // assertion rather than a diagnostic.
 
   // ctx.physicalValues must be a SUBSET of the analysis map: every value
   // Phase 2 discovered to be physical, the analysis predicted up front. The
