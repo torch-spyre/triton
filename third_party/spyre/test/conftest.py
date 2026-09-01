@@ -337,6 +337,20 @@ class VariantFactory:
         """-> the ``inputs`` generator, ``(**param_values) -> {name: array}``."""
         return None
 
+    def derived_params(self, **combo):
+        """-> ``{name: value}`` for params that follow from the swept ones.
+
+        For a param the author should not have to keep consistent by hand: a
+        stick layout follows from the dtype, and spelling both out lets them
+        disagree. Declaring only the dtype makes the mismatch unrepresentable.
+
+        Resolved after the registry key is built, so a derived param does not
+        appear in it -- the key names the axes a variant sweeps, not what they
+        imply. Resolved before the params are split into constexprs and runtime
+        args, so a derived name can still be either.
+        """
+        return None
+
     def declares(self, hook: str) -> bool:
         """Whether *hook* is overridden here rather than inherited."""
         return getattr(type(self), hook) is not getattr(VariantFactory, hook)
@@ -382,6 +396,33 @@ def _apply_factory(entry: dict, combo: dict, *, kernel_name: str) -> None:
         value = getattr(factory, hook)(**combo_values)
         if value is not None:
             entry[field] = value
+
+
+def _apply_derived_params(entry: dict, combo: dict, *, kernel_name: str) -> None:
+    """Merge the factory's ``derived_params`` into *entry*'s ``params``, in place.
+
+    Values land as one-element lists, matching what ``_expand_params`` leaves
+    behind, so ``_resolve_variant`` cannot tell a derived param from a declared
+    one -- which is the point: a derived name is still free to be a constexpr.
+    """
+    factory = entry.get("factory")
+    if factory is None:
+        return
+    derived = factory.derived_params(**{k: v[1] for k, v in combo.items()})
+    if not derived:
+        return
+
+    # A name cannot be both, for the reason a hook cannot collide with its
+    # literal field: whichever won would be a fact about the order of these two
+    # statements rather than something the variant says.
+    clash = sorted(set(derived) & set(entry.get("params", {})))
+    if clash:
+        raise ValueError(
+            f"{kernel_name}: {clash} are declared in 'params' and also returned "
+            f"by derived_params(). Keep one -- a derived param is meant to "
+            f"replace the declaration, not to override it."
+        )
+    entry["params"] = {**entry["params"], **{k: [v] for k, v in derived.items()}}
 
 
 def _load_examples():
@@ -463,6 +504,8 @@ def _load_examples():
                 # plain dict by then. 'factory' needs no merge handling: it is a
                 # single value, so _resolve_base replaces it wholesale.
                 _apply_factory(entry, combo, kernel_name=f"{name}::{vname}{suffix}")
+                _apply_derived_params(entry, combo,
+                                      kernel_name=f"{name}::{vname}{suffix}")
 
                 if module_sig:
                     runtime, constexprs, param_values = _resolve_variant(

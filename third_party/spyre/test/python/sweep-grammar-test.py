@@ -44,6 +44,7 @@ from dataclasses import dataclass
 import pytest
 
 from conftest import (
+    _apply_derived_params,
     VariantFactory,
     _apply_factory,
     _expand_params,
@@ -426,3 +427,90 @@ def test_a_bare_callable_is_not_accepted_as_a_factory():
     them — and accepting one would mean guessing at its parameters instead."""
     with pytest.raises(TypeError, match="must be a VariantFactory"):
         _apply({"factory": lambda **kw: None}, {"M": 64})
+
+
+# ---------------------------------------------------------------------------
+# _apply_derived_params — params that follow from the swept ones
+#
+# Runs between the key and the constexpr/runtime split, which is what makes a
+# derived param invisible in the key but still eligible to be a constexpr.
+# ---------------------------------------------------------------------------
+
+def _derive(entry: dict, values: dict) -> dict:
+    """``_apply_derived_params`` on *entry* for a combination of plain *values*."""
+    combo = {k: (str(v), v) for k, v in values.items()}
+    _apply_derived_params(entry, combo, kernel_name="fix::variant")
+    return entry
+
+
+def test_an_entry_without_a_factory_derives_nothing():
+    """The path every fixture that declares all of its params takes."""
+    entry = {"params": {"M": [64]}}
+    _derive(entry, {"M": 64})
+    assert entry == {"params": {"M": [64]}}
+
+
+def test_a_factory_that_derives_nothing_leaves_params_alone():
+    """``None`` rather than ``{}`` is the normal way to decline, so both are
+    checked: a variant may want the factory's other hooks and no derivation."""
+    @dataclass(frozen=True)
+    class N(VariantFactory):
+        def derived_params(self, **_):
+            return None
+
+    @dataclass(frozen=True)
+    class E(VariantFactory):
+        def derived_params(self, **_):
+            return {}
+
+    for cls in (N, E):
+        entry = {"factory": cls(), "params": {"M": [64]}}
+        _derive(entry, {"M": 64})
+        assert entry["params"] == {"M": [64]}, cls.__name__
+
+
+def test_derived_values_land_as_one_element_lists():
+    """The shape ``_expand_params`` leaves behind, so ``_resolve_variant`` cannot
+    tell a derived param from a declared one -- which is what lets a derived name
+    be a constexpr."""
+    @dataclass(frozen=True)
+    class F(VariantFactory):
+        def derived_params(self, DTYPE, **_):
+            return {"STICK": 64 if DTYPE == "fp16" else 32}
+
+    entry = _derive({"factory": F(), "params": {"DTYPE": ["fp16"]}}, {"DTYPE": "fp16"})
+    assert entry["params"] == {"DTYPE": ["fp16"], "STICK": [64]}
+
+
+def test_derived_values_are_taken_verbatim():
+    """No label is stripped, because a derived param never reaches a key and so
+    has nothing to label. Returning ``("stick", x)`` would hand the pair to the
+    kernel as its constexpr."""
+    layout = ((1, "floordiv", 64), 0, (1, "mod", 64))
+
+    @dataclass(frozen=True)
+    class F(VariantFactory):
+        def derived_params(self, **_):
+            return {"LAYOUT": layout}
+
+    entry = _derive({"factory": F(), "params": {}}, {"DTYPE": "fp16"})
+    assert entry["params"]["LAYOUT"] == [layout]
+
+
+def test_deriving_a_declared_param_raises():
+    """Refused rather than one silently winning: which did would be a fact about
+    the order of two statements in ``_apply_derived_params``."""
+    @dataclass(frozen=True)
+    class F(VariantFactory):
+        def derived_params(self, **_):
+            return {"N": 128}
+
+    with pytest.raises(ValueError, match=r"fix::variant.*\['N'\]"):
+        _derive({"factory": F(), "params": {"N": [64]}}, {"N": 64})
+
+
+def test_a_derived_param_cannot_reach_the_registry_key():
+    """The ordering property, stated as a test: the key is built from the declared
+    params only, so sweeping DTYPE names DTYPE and never what it implies."""
+    params = {"DTYPE": ["fp16", "fp32"]}
+    assert _keys("dev", params) == ["dev[DTYPE=fp16]", "dev[DTYPE=fp32]"]
