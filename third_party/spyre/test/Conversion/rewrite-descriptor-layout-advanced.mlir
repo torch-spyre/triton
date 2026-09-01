@@ -19,8 +19,6 @@ module {
 // HOST:           %[[BASE:.*]] = builtin.unrealized_conversion_cast %{{.*}} : !tt.ptr<f32> to index
 // HOST:           %[[PHYS:.*]] = ktdp.construct_memory_view %[[BASE]], sizes: [2, 128, 64], strides: [64, 128, 1]
 // HOST-SAME:        memref<2x128x64xf32>
-// HOST:           %[[LOG:.*]] = ktdp.construct_memory_view %[[BASE]], sizes: [128, 128], strides: [128, 1]
-// HOST-SAME:        memref<128x128xf32>
 // HOST:           ktdp.load
 // HOST:           ktdp.store
 //
@@ -28,8 +26,6 @@ module {
 // DEVICE:           %[[BASE:.*]] = builtin.unrealized_conversion_cast %{{.*}} : !tt.ptr<f32> to index
 // DEVICE:           %[[PHYS:.*]] = ktdp.construct_memory_view %[[BASE]], sizes: [2, 128, 64], strides: [8192, 64, 1]
 // DEVICE-SAME:       memref<2x128x64xf32>
-// DEVICE:           %[[LOG:.*]] = ktdp.construct_memory_view %[[BASE]], sizes: [128, 128], strides: [128, 1]
-// DEVICE-SAME:       memref<128x128xf32>
 // DEVICE:           ktdp.load
 // DEVICE:           ktdp.store
 tt.func @pointwise_host_layout(%ptr: !tt.ptr<f32>, %out_ptr: !tt.ptr<f32>) {

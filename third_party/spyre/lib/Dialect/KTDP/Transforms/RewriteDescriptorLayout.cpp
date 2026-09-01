@@ -105,6 +105,12 @@ struct RewriteDescriptorLayoutPass
   // Maps each physical ConstructMemoryViewOp result -> its source marker.
   DenseMap<Value, triton::SpyreTensorLayoutOp> physMemViewToMarker;
 
+  // Logical construct_memory_view ops replaced by a physical one in Phase 1.
+  // They cannot be erased there: the marker's bridge cast still holds them as
+  // an operand, and that cast is only erased in Phase 3 (eraseMarker). So
+  // Phase 3 erases them right after, once nothing references them.
+  SmallVector<mlir::ktdp::ConstructMemoryViewOp> deadLogicalMemViews;
+
   // Loops already rescaled to stick granularity.
   DenseSet<scf::ForOp> rescaledLoops;
 
@@ -827,6 +833,11 @@ struct RewriteDescriptorLayoutPass
         return failure();
     }
 
+    // The logical view is now superseded by the physical one. Its only
+    // remaining user is the marker's bridge cast, which Phase 3 erases; queue
+    // the view so Phase 3 can drop it too.
+    deadLogicalMemViews.push_back(plan.memViewOp);
+
     return success();
   }
 
@@ -952,6 +963,13 @@ struct RewriteDescriptorLayoutPass
     // Phase 3: erase all markers (and their now-dead bridge casts).
     for (auto marker : markers)
       eraseMarker(marker);
+
+    // With the bridge casts gone, the logical views Phase 1 superseded have no
+    // users left. Erase them -- but check rather than assume: a view whose
+    // access tiles Phase 1 could not fully re-point still has real users.
+    for (auto memViewOp : deadLogicalMemViews)
+      if (memViewOp->getBlock() && memViewOp->use_empty())
+        memViewOp.erase();
   }
 };
 

@@ -221,6 +221,27 @@ Value extractOpSlice(OpBuilder &b, Location loc,
       break;
     }
   }
+  // Nothing to slice: every dim starts at 0 and spans the operand's whole
+  // extent at unit stride, so the slice would be the identity. (Strides are
+  // unit by construction above.) Emitting it costs an op the canonicalizer
+  // then folds away.
+  auto operandTy = cast<RankedTensorType>(plan.value.getType());
+  bool wholeTensor = operandTy.getRank() == rank;
+  for (int p = 0; wholeTensor && p < rank; ++p) {
+    auto constOf = [](OpFoldResult r) -> std::optional<int64_t> {
+      if (auto attr = dyn_cast<Attribute>(r))
+        if (auto i = dyn_cast<IntegerAttr>(attr))
+          return i.getInt();
+      return std::nullopt;
+    };
+    auto off = constOf(offsets[p]);
+    auto sz = constOf(sizes[p]);
+    if (!off || *off != 0 || !sz || *sz != operandTy.getDimSize(p))
+      wholeTensor = false;
+  }
+  if (wholeTensor && operandTy == resultTy)
+    return plan.value;
+
   return tensor::ExtractSliceOp::create(
       b, loc, resultTy, plan.value, offsets, sizes, strides);
 }
