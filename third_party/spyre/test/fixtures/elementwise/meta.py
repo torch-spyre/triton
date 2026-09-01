@@ -76,29 +76,42 @@ def _make_2d_scalar_dim_checks(N, **_):
 
 # ---------------------------------------------------------------------------
 # Reference (NumPy oracle) + input makers
+#
+# One generator. The named makers below only give it a shape: the framework
+# calls `inputs` with the variant's whole `params` dict, and variants spell
+# their shape with different argument names.
 # ---------------------------------------------------------------------------
 
-def make_inputs(n_elements: int, BLOCK_SIZE: int,
-                *, dtype="f32", **_unused) -> dict:
-    """Build pointer-tensor inputs for the kernel.
+def _make_inputs(shape, *, dtype="fp32", nonzero_y=False) -> dict:
+    """``x`` / ``y`` / zeroed ``output`` buffers of *shape*. Never random.
 
-    Takes the same parameter names as ``VARIANTS[...]["params"]`` so the
-    framework can pass them positionally as kwargs. ``BLOCK_SIZE`` is
-    unused here but accepted so the signature matches the full param
-    set (keeps things uniform for kernels that use it in tensor
-    construction).
+    Floats take ``x = sin`` and ``y = cos`` over the flattened index, keeping
+    both inside [-1, 1] so fp16 stays well conditioned. Integers take a ramp
+    against a constant, small enough that ``mul`` stays clear of the int32
+    boundary.
 
-    Returns only pointer/tensor args keyed by SIGNATURE name. Runtime
-    scalars (e.g. ``n_elements`` in the dynamic variant) are added by
-    the framework from ``params`` before calling ``run_cpu``.
+    ``nonzero_y`` lifts ``y`` off zero, which ``div`` needs -- ``cos`` crosses
+    zero and the quotient there is meaningless. It is a property of the buffers
+    rather than of one op, because a variant sweeping ``OP`` shares one input
+    maker across all of its ops.
+
+    *dtype* is a :data:`DTYPE_MAP` key. It was previously spelled three ways in
+    this file -- ``"f32"``, ``"fp32"`` and ``np.float32`` -- each with its own
+    lookup, so passing one maker's spelling to another raised.
     """
-    del BLOCK_SIZE  # not used in input generation, but part of the param set
-    np_dtype = {"f32": np.float32, "f16": np.float16}[dtype]
-    t = np.arange(n_elements, dtype=np.float32)
-    x = np.sin(t * 2.0 * np.pi / n_elements).astype(np_dtype)
-    y = np.cos(t * 2.0 * np.pi / n_elements).astype(np_dtype)
-    output = np.zeros(n_elements, dtype=np_dtype)
-    return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
+    np_dtype = DTYPE_MAP[dtype]
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    total = int(np.prod(shape))
+    if np.issubdtype(np_dtype, np.integer):
+        x = np.arange(1, total + 1, dtype=np_dtype)
+        y = np.full(total, 3, dtype=np_dtype)
+    else:
+        t = np.arange(total, dtype=np.float32)
+        x = np.sin(t * 2.0 * np.pi / total).astype(np_dtype)
+        y = (np.cos(t * 2.0 * np.pi / total)
+             + (2.0 if nonzero_y else 0.0)).astype(np_dtype)
+    return {"x_ptr": x.reshape(shape), "y_ptr": y.reshape(shape),
+            "output_ptr": np.zeros(shape, dtype=np_dtype)}
 
 
 def run(inputs: dict) -> np.ndarray:
@@ -106,62 +119,41 @@ def run(inputs: dict) -> np.ndarray:
     return inputs["x_ptr"] + inputs["y_ptr"]
 
 
-def make_inputs_scalar_dim(BLOCK_SIZE: int, dtype: str = "f32", n_elements: int = 4096, **_unused) -> dict:
-    """1D inputs for elementwise_1d_scalar_dim.
+# Each maker takes the shape argument names its variants use and ignores the
+# rest of ``params``. ``DTYPE`` is read from ``params`` rather than defaulted
+# separately, which is what stops the buffers' dtype drifting from the pointer
+# types ``SIGNATURE`` declares.
 
-    `n_elements` is not part of the kernel's SIGNATURE (it is read from
-    `seqlen_ptr`, not passed as an arg), so it is a keyword default here
-    rather than a `params` entry — same reasoning as
-    `make_inputs_2d_scalar_dim`. Delegates to ``make_inputs`` for the
-    x/y/output buffers and adds the scalar read as a rank-1 buffer of
-    length 1.
+def make_inputs(n_elements, DTYPE="fp32", nonzero_y=False, **_unused) -> dict:
+    return _make_inputs(n_elements, dtype=DTYPE, nonzero_y=nonzero_y)
+
+
+def make_inputs_2d(M, N, DTYPE="fp32", nonzero_y=False, **_unused) -> dict:
+    return _make_inputs((M, N), dtype=DTYPE, nonzero_y=nonzero_y)
+
+
+def make_inputs_3d(M, N, P, DTYPE="fp32", **_unused) -> dict:
+    return _make_inputs((M, N, P), dtype=DTYPE)
+
+
+def make_inputs_scalar_dim(n_elements=4096, DTYPE="fp32", **_unused) -> dict:
+    """1D, plus the length as a rank-1 buffer.
+
+    ``n_elements`` is a default here and not a ``params`` entry: the kernel
+    reads it from ``seqlen_ptr`` instead of taking it as an argument, so a
+    ``params`` entry would leak into ``run_cpu``'s kwargs and fail its
+    unknown-kwarg check.
     """
-    inputs = make_inputs(n_elements, BLOCK_SIZE, dtype=dtype)
+    inputs = _make_inputs(n_elements, dtype=DTYPE)
     inputs["seqlen_ptr"] = np.array([n_elements], dtype=np.int32)
     return inputs
 
 
-def make_inputs_2d(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
-                   *, dtype=np.float32, **_unused) -> dict:
-    """Build 2D pointer-tensor inputs for elementwise_2d."""
-    del BLOCK_M, BLOCK_N
-    total = M * N
-    t = np.arange(total, dtype=np.float32)
-    x = np.sin(t * 2.0 * np.pi / total).astype(dtype).reshape(M, N)
-    y = np.cos(t * 2.0 * np.pi / total).astype(dtype).reshape(M, N)
-    output = np.zeros((M, N), dtype=dtype)
-    return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
-
-
-def make_inputs_2d_scalar_dim(N: int, BLOCK_M: int, BLOCK_N: int, M: int = 32, **_unused) -> dict:
-    """2D inputs for elementwise_2d_scalar_dim.
-
-    `M` is not part of the kernel's SIGNATURE (it is read from
-    `seqlen_ptr`, not passed as an arg), so it is a keyword default here
-    rather than a `params` entry — a `params` entry would otherwise leak
-    into ``run_cpu``'s kwargs and fail its "unknown kwarg" check, since
-    `elementwise_2d_scalar_dim` has no `M` parameter. Delegates to
-    ``make_inputs_2d`` for the x/y/output buffers and adds the scalar
-    read as a rank-1 buffer of length 1.
-    """
-    inputs = make_inputs_2d(M, N, BLOCK_M, BLOCK_N)
+def make_inputs_2d_scalar_dim(N, M=32, DTYPE="fp32", **_unused) -> dict:
+    """2D, plus ``M`` as a rank-1 buffer -- see :func:`make_inputs_scalar_dim`."""
+    inputs = _make_inputs((M, N), dtype=DTYPE)
     inputs["seqlen_ptr"] = np.array([M], dtype=np.int32)
     return inputs
-
-
-def make_inputs_3d(
-    M: int, N: int, P: int,
-    BLOCK_M: int, BLOCK_N: int, BLOCK_P: int,
-    **_unused,
-) -> dict:
-    """Build 3D pointer-tensor inputs for elementwise_3d."""
-    del BLOCK_M, BLOCK_N, BLOCK_P
-    total = M * N * P
-    t = np.arange(total, dtype=np.float32)
-    x = np.sin(t * 2.0 * np.pi / total).astype(np.float32).reshape(M, N, P)
-    y = np.cos(t * 2.0 * np.pi / total).astype(np.float32).reshape(M, N, P)
-    output = np.zeros((M, N, P), dtype=np.float32)
-    return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
 
 
 # ---------------------------------------------------------------------------
@@ -187,42 +179,6 @@ _NUMPY_OPS = {
 _PTR = {"fp16": "*fp16", "fp32": "*fp32", "i32": "*i32"}
 
 
-def _make_inputs_compute(n_elements: int, BLOCK_SIZE: int,
-                         *, dtype: str, op: str, **_unused) -> dict:
-    """Input generator for 1d_compute: dtype/op-aware.
-
-    Floats: x = sin, y = cos + 2 (keeps div away from zero and gives
-    interesting values). i32: small positive integers so mul stays in range
-    and floordiv is exact.
-    """
-    np_dtype = DTYPE_MAP[dtype]
-    n = n_elements
-    if dtype == "i32":
-        x = np.arange(1, n + 1, dtype=np_dtype)
-        y = np.full(n, 3, dtype=np_dtype)
-    else:
-        t = np.arange(n, dtype=np.float32)
-        x = np.sin(t * 2.0 * np.pi / n).astype(np_dtype)
-        y = (np.cos(t * 2.0 * np.pi / n) + 2.0).astype(np_dtype)
-    output = np.zeros(n, dtype=np_dtype)
-    return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
-
-
-def _make_inputs_2d_device(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
-                            *, dtype: str, op: str, **_unused) -> dict:
-    """2D input generator for device variants: dtype/op-aware.
-
-    Floats: x = sin, y = cos + 2 (keeps div away from zero). Reshaped to [M, N].
-    """
-    np_dtype = DTYPE_MAP[dtype]
-    total = M * N
-    t = np.arange(total, dtype=np.float32)
-    x = np.sin(t * 2.0 * np.pi / total).astype(np_dtype).reshape(M, N)
-    y = (np.cos(t * 2.0 * np.pi / total) + 2.0).astype(np_dtype).reshape(M, N)
-    output = np.zeros((M, N), dtype=np_dtype)
-    return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
-
-
 @dataclass(frozen=True)
 class Elementwise(conftest.VariantFactory):
     """Factory for elementwise variants that sweep OP and/or DTYPE.
@@ -244,11 +200,14 @@ class Elementwise(conftest.VariantFactory):
             return _NUMPY_OPS[OP](x, y).astype(x.dtype)
         return oracle
 
-    def inputs(self, OP, DTYPE, **_):
-        if self.rank == 1:
-            return functools.partial(_make_inputs_compute, dtype=DTYPE, op=OP)
-        elif self.rank == 2:
-            return functools.partial(_make_inputs_2d_device, dtype=DTYPE, op=OP)
+    def inputs(self, **_):
+        """Shape from ``rank``; ``DTYPE`` the maker reads from ``params`` itself.
+
+        ``nonzero_y`` is unconditional because these variants sweep ``OP``, and
+        one of the ops they sweep is ``div``.
+        """
+        return functools.partial({1: make_inputs, 2: make_inputs_2d}[self.rank],
+                                 nonzero_y=True)
 
 
 # ---------------------------------------------------------------------------
@@ -777,7 +736,7 @@ VARIANTS = {
         },
         "grid":        [1],
         "data_layout": "host",
-        "inputs":      functools.partial(make_inputs_2d, dtype=np.float16),
+        "inputs":      functools.partial(make_inputs_2d, DTYPE="fp16"),
         "rtol":        1e-2,
         "atol":        5e-2,
         "extra_checks": lambda t: (
