@@ -587,10 +587,10 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>
 **Round-trip evidence**
 
 - `elementwise::default` — n_elements=1024, BLOCK_SIZE=1024, DTYPE='fp32', OP='add' (also demonstrates: descriptor-store-static, program-id-1d, num-programs-fold)
-- `elementwise::1d_compute` — DTYPE='fp16', OP='add', n_elements=128, BLOCK_SIZE=128 (also demonstrates: descriptor-store-static, program-id-1d, elementwise-compute)
 - `elementwise::2d` — M=512, N=32, BLOCK_M=16, BLOCK_N=16, X_LAYOUT=None, Y_LAYOUT=None, OUT_LAYOUT=None, OP='add' (also demonstrates: descriptor-store-static, program-id-1d, num-programs-fold)
-- `elementwise::1d_device` — DTYPE='fp16', OP='add', n_elements=128, BLOCK_SIZE=128, LAYOUT=('stick', ((0, 'floordiv', 64), (0, 'mod', 64))) (also demonstrates: descriptor-store-static, simplified:no-loop, spyre-tensor-layout)
-- `elementwise::1d_device_fp32` — DTYPE='fp32', OP='add', n_elements=128, BLOCK_SIZE=128, LAYOUT=('stick', ((0, 'floordiv', 32), (0, 'mod', 32))) (also demonstrates: descriptor-store-static, simplified:no-loop, spyre-tensor-layout)
+- `elementwise::3d` — M=64, N=32, P=16, BLOCK_M=8, BLOCK_N=8, BLOCK_P=8, OP='add' (also demonstrates: descriptor-store-static, program-id-1d, num-programs-fold)
+- `elementwise::2d_grid` — M=256, N=128, BLOCK_M=16, BLOCK_N=16, OP='add' (also demonstrates: descriptor-store-static, program-id-2d, num-programs-fold)
+- `elementwise::3d_grid` — M=64, N=32, P=16, BLOCK_M=8, BLOCK_N=8, BLOCK_P=8, OP='add' (also demonstrates: descriptor-store-static, program-id-3d, num-programs-fold)
 
 _+ 21 more variants_
 
@@ -834,10 +834,10 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
 **Round-trip evidence**
 
 - `elementwise::default` — n_elements=1024, BLOCK_SIZE=1024, DTYPE='fp32', OP='add' (also demonstrates: descriptor-load-static, program-id-1d, num-programs-fold)
-- `elementwise::1d_compute` — DTYPE='fp16', OP='add', n_elements=128, BLOCK_SIZE=128 (also demonstrates: descriptor-load-static, program-id-1d, elementwise-compute)
 - `elementwise::2d` — M=512, N=32, BLOCK_M=16, BLOCK_N=16, X_LAYOUT=None, Y_LAYOUT=None, OUT_LAYOUT=None, OP='add' (also demonstrates: descriptor-load-static, program-id-1d, num-programs-fold)
-- `elementwise::1d_device` — DTYPE='fp16', OP='add', n_elements=128, BLOCK_SIZE=128, LAYOUT=('stick', ((0, 'floordiv', 64), (0, 'mod', 64))) (also demonstrates: descriptor-load-static, simplified:no-loop, spyre-tensor-layout)
-- `elementwise::1d_device_fp32` — DTYPE='fp32', OP='add', n_elements=128, BLOCK_SIZE=128, LAYOUT=('stick', ((0, 'floordiv', 32), (0, 'mod', 32))) (also demonstrates: descriptor-load-static, simplified:no-loop, spyre-tensor-layout)
+- `elementwise::3d` — M=64, N=32, P=16, BLOCK_M=8, BLOCK_N=8, BLOCK_P=8, OP='add' (also demonstrates: descriptor-load-static, program-id-1d, num-programs-fold)
+- `elementwise::2d_grid` — M=256, N=128, BLOCK_M=16, BLOCK_N=16, OP='add' (also demonstrates: descriptor-load-static, program-id-2d, num-programs-fold)
+- `elementwise::3d_grid` — M=64, N=32, P=16, BLOCK_M=8, BLOCK_N=8, BLOCK_P=8, OP='add' (also demonstrates: descriptor-load-static, program-id-3d, num-programs-fold)
 
 _+ 21 more variants_
 

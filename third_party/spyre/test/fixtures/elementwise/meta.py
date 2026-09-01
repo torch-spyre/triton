@@ -364,7 +364,15 @@ _SIG_2D_SCALAR = {
 }
 
 VARIANTS = {
-    # --- 1D variants ---
+    # -----------------------------------------------------------------------
+    # Level A -- shape
+    #
+    # OP and DTYPE are pinned to add/fp32 throughout: these variants are about
+    # descriptor shape, and sweeping the other two axes would multiply keys
+    # without covering anything shape-related.
+    # -----------------------------------------------------------------------
+
+    # 1D
     "default": {
         # Static-shape flavor (PR #82): n_elements is a constexpr baked
         # into TTIR as the literal 2097152.
@@ -465,35 +473,8 @@ VARIANTS = {
         ),
         "extra_checks": _make_1d_scalar_dim_checks,
     },
-    # --- Level B: compute correctness (op × dtype, ktir_cpu only) ---
-    "1d_compute": {
-        # No base: prevent inheriting `reference` and `inputs` from `default`
-        # (factory hooks produce them; a literal field + hook on the same
-        # variant is a collection-time error).
-        "base": None,
-        "tags": ["descriptor-load-static", "descriptor-store-static",
-                 "program-id-1d", "elementwise-compute"],
-        "summary": (
-            "1D elementwise op across fp16/fp32/i32 and add/sub/mul/div. "
-            "Sweeps the OP × DTYPE product to cover ktir_cpu correctness; "
-            "div and i32 stop here pending #107."
-        ),
-        "kernel_fn":    kernel.elementwise_1d,
-        "factory":      Elementwise(rank=1),
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "OP"],
-        "params": {
-            "DTYPE":      ["fp16", "fp32", "i32"],
-            "OP":         ["add", "sub", "mul", "div"],
-            "n_elements": [128],
-            "BLOCK_SIZE": [128],
-        },
-        "grid":         [1],
-        "parallel":     False,
-        "output_key":   "output_ptr",
-        "rtol":         1e-2,
-        "atol":         5e-2,
-    },
-    # --- 2D variants ---
+
+    # 2D
     "2d": {
         # M=[512,520]: absorbs 2d_nonaligned (M=520, m_blocks=33 → clamp fires).
         "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-1d", "num-programs-fold"],
@@ -554,6 +535,268 @@ VARIANTS = {
             "OP": ["add"],
         },
     },
+    "2d_dynamic_from_scalar_load": {
+        "base":         "2d",
+        "kernel_fn":    kernel.elementwise_2d_scalar_dim,
+        "SIGNATURE":    _SIG_2D_SCALAR,
+        "constexpr":    ["N", "BLOCK_M", "BLOCK_N", "OP"],
+        "params":       {"N": [32], "BLOCK_M": [16], "BLOCK_N": [16], "OP": ["add"]},
+        "inputs":       make_inputs_2d_scalar_dim,
+        # 2D grid: [4, 8] = 32 cores. N is chunked across grid_n the same
+        # way the runtime M is chunked across grid_m (elementwise_2d_grid's
+        # distribution pattern), rather than walking a full row per core.
+        "grid":         [4, 8],
+        "tags": [
+            "descriptor-load-dynamic-from-scalar-load",
+            "descriptor-store-dynamic", "program-id-2d", "num-programs-fold",
+        ],
+        "summary": (
+            "2D elementwise add over a 2D grid where `M` is read from "
+            "memory via a scalar `tl.load`, then used as a tensor "
+            "descriptor's dynamic shape; `N` is chunked the same way."
+        ),
+        "doc": (
+            "not yet wired into any dataflow-scheduler/DFIR "
+            "flow (`kDynamic` has no `AddressAssignment` / "
+            "`NormalizeGridTo1D` path yet). `M` is not a kernel argument "
+            "here; it is read from `seqlen_ptr` with a scalar `tl.load`. "
+            "Uses a genuine 2D grid (`pid_m`/`pid_n`, `grid_m`/`grid_n`, "
+            "matching `elementwise_2d_grid`'s naming and distribution "
+            "pattern) so `N` is chunked across cores the same way the "
+            "runtime `M` is, instead of walking a full row per core. "
+            "This exercises the single-element 1-D scalar-read chain "
+            "(`construct_memory_view` / `construct_access_tile` / "
+            "`ktdp.load` / `tensor.extract`) feeding the dynamic-shape "
+            "path via an `arith.index_cast` bridge, producing "
+            "`memref<?x32xf32>`. Reuses the same `x + y` oracle as `2d` "
+            "(via `make_inputs_2d_scalar_dim`)."
+        ),
+        "extra_checks": _make_2d_scalar_dim_checks,
+    },
+
+    # 3D
+    "3d": {
+        # M=[64,65,256]: absorbs 3d_nonaligned (M=65) and 3d_active_cores (M=256).
+        "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-1d", "num-programs-fold"],
+        "summary": (
+            "3D elementwise add over an `M × N × P` tensor with "
+            "explicit stride arithmetic."
+        ),
+        "doc": (
+            "Takes two rank-3 tensors of shape `M × N × P` and writes "
+            "`C = A + B`. The kernel computes strides explicitly "
+            "(`stride_m = N * P`, `stride_n = P`) and sweeps nested "
+            "tile loops along all three axes. All three dimensions are "
+            "compile-time constants, producing a fully-static "
+            "descriptor (`memref<64x32x16xf32>`)."
+        ),
+        "kernel_fn":    kernel.elementwise_3d,
+        "SIGNATURE":    _SIG_3D,
+        "constexpr":    ["M", "N", "P", "BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
+        "params":       {
+            # M=[64,65,256]: absorbs 3d_nonaligned (M=65) and 3d_active_cores (M=256).
+            "M": [64, 65, 256], "N": [32], "P": [16],
+            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
+            "OP": ["add"],
+        },
+        "inputs":       make_inputs_3d,
+        "extra_checks": _make_3d_checks,
+    },
+    "3d_dynamic": {
+        "base":      "3d",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
+        "summary": (
+            "3D elementwise add where `M`, `N`, `P` are all runtime "
+            "arguments."
+        ),
+        "doc": (
+            "Same tiling structure as the static 3D add, but all three "
+            "dimensions arrive as runtime `i32` arguments. The "
+            "descriptor lowers to `memref<?x?x?xf32>`."
+        ),
+        "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
+        "extra_checks": lambda t: (
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<?x?x?xf32>"),
+        ),
+    },
+
+    # multi-axis grid
+    "2d_grid": {
+        "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-2d", "num-programs-fold"],
+        "summary": (
+            "2D grid: pid_0 distributes M-tiles, pid_1 distributes N-tiles, "
+            "each with a distribution loop."
+        ),
+        "doc": (
+            "Same elementwise add as `2d`, but uses a 2D program grid. Each "
+            "axis distributes its tiles via a loop: `pid_0` covers M, `pid_1` "
+            "covers N. The 2D grid replaces the 1D-grid outer loops."
+        ),
+        "kernel_fn":    kernel.elementwise_2d_grid,
+        "SIGNATURE":    _SIG_2D,
+        "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N", "OP"],
+        # 2D grid: [4, 8] = 32 cores
+        "params":       {"M": [256], "N": [128], "BLOCK_M": [16], "BLOCK_N": [16], "OP": ["add"]},
+        "grid":         [4, 8],
+        "inputs":       make_inputs_2d,
+        "extra_checks": lambda t: (
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<256x128xf32>"),
+        ),
+    },
+    "2d_grid_dynamic": {
+        "base":      "2d_grid",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-2d", "num-programs-fold"],
+        "summary": (
+            "2D grid with runtime `M` and `N`: distribution loop structure, "
+            "dynamic descriptor shapes."
+        ),
+        "doc": (
+            "Same as `2d_grid` but `M` and `N` are runtime `i32` arguments. "
+            "Descriptors lower to `memref<?x?xf32>`."
+        ),
+        "constexpr":    ["BLOCK_M", "BLOCK_N", "OP"],
+        "extra_checks": lambda t: (
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<?x?xf32>"),
+        ),
+    },
+    "3d_grid": {
+        "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-3d", "num-programs-fold"],
+        "summary": (
+            "3D grid: pid_0 distributes M-tiles, pid_1 N-tiles, pid_2 P-tiles, "
+            "each with a distribution loop."
+        ),
+        "doc": (
+            "Same elementwise add as `3d`, but uses a 3D program grid. Each "
+            "axis distributes its tiles via a loop: `pid_0` covers M, `pid_1` "
+            "covers N, `pid_2` covers P."
+        ),
+        "kernel_fn":    kernel.elementwise_3d_grid,
+        "SIGNATURE":    _SIG_3D,
+        "constexpr":    ["M", "N", "P", "BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
+        # 3D grid: [2, 4, 4] = 32 cores
+        "params":       {
+            "M": [64], "N": [32], "P": [16],
+            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
+            "OP": ["add"],
+        },
+        "grid":         [2, 4, 4],
+        "inputs":       make_inputs_3d,
+        "extra_checks": lambda t: (
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<64x32x16xf32>"),
+        ),
+    },
+    "3d_grid_dynamic": {
+        "base":      "3d_grid",
+        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-3d", "num-programs-fold"],
+        "summary": (
+            "3D grid with runtime `M`, `N`, `P`: distribution loop structure, "
+            "dynamic descriptor shapes."
+        ),
+        "doc": (
+            "Same as `3d_grid` but `M`, `N`, `P` are runtime `i32` arguments. "
+            "Descriptors lower to `memref<?x?x?xf32>`."
+        ),
+        "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
+        "extra_checks": lambda t: (
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<?x?x?xf32>"),
+        ),
+    },
+
+
+    # -----------------------------------------------------------------------
+    # Level B -- compute
+    #
+    # The op x dtype product on ktir_cpu. Deliberately the simplest shape in
+    # the file -- 1D, static, one tile, no layout -- so arithmetic is the only
+    # thing that differs between its entries. div and every i32 arm stop here:
+    # dbo-opt wants the spyreop spellings this repo does not yet emit.
+    # -----------------------------------------------------------------------
+    "1d_compute": {
+        # No base: prevent inheriting `reference` and `inputs` from `default`
+        # (factory hooks produce them; a literal field + hook on the same
+        # variant is a collection-time error).
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static",
+                 "program-id-1d", "elementwise-compute"],
+        "summary": (
+            "1D elementwise op across fp16/fp32/i32 and add/sub/mul/div. "
+            "Sweeps the OP × DTYPE product to cover ktir_cpu correctness; "
+            "div and i32 stop here pending #107."
+        ),
+        "kernel_fn":    kernel.elementwise_1d,
+        "factory":      Elementwise(rank=1),
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "OP"],
+        "params": {
+            "DTYPE":      ["fp16", "fp32", "i32"],
+            "OP":         ["add", "sub", "mul", "div"],
+            "n_elements": [128],
+            "BLOCK_SIZE": [128],
+        },
+        "grid":         [1],
+        "parallel":     False,
+        "output_key":   "output_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+    },
+
+
+    # -----------------------------------------------------------------------
+    # Level C -- layout
+    #
+    # Stick physicalization without going to a binary. Bases on Level A's 2d,
+    # so this section reads after it.
+    # -----------------------------------------------------------------------
+    "2d_spyre_stick": {
+        # Elementwise add with all three operands stick-on-N. Every operand
+        # physicalizes identically, so the add stays a pure elementwise op on
+        # rank-3 tiles [N//S, M, N%S] = [2, 64, 64] and no transpose or
+        # reduction loop is synthesized.
+        "base": "2d",
+        "tags": ["descriptor-load-static", "descriptor-store-static",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "2D elementwise add with x/y/out all annotated stick-on-N. "
+            "Exercises the layout path on a pure elementwise kernel."
+        ),
+        "SIGNATURE": _SIG_2D_SPYRE,
+        "params": {
+            # fp16 stick = 64; N = 128 = 2 sticks exactly.
+            "M": [64], "N": [128], "BLOCK_M": [64], "BLOCK_N": [128],
+            "X_LAYOUT":   [[(1, "floordiv", _S2("x_ptr")), 0,
+                            (1, "mod", _S2("x_ptr"))]],
+            "Y_LAYOUT":   [[(1, "floordiv", _S2("y_ptr")), 0,
+                            (1, "mod", _S2("y_ptr"))]],
+            "OUT_LAYOUT": [[(1, "floordiv", _S2("output_ptr")), 0,
+                            (1, "mod", _S2("output_ptr"))]],
+            "OP": ["add"],
+        },
+        "grid":        [1],
+        "data_layout": "host",
+        "inputs":      functools.partial(make_inputs_2d, dtype=np.float16),
+        "rtol":        1e-2,
+        "atol":        5e-2,
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            # All three operands share the rank-3 physical view [2, 64, 64].
+            t.assert_result_type("ktdp.construct_memory_view", "2x64x64xf16"),
+        ),
+    },
+
+
+    # -----------------------------------------------------------------------
+    # Level D -- device
+    #
+    # compiles_to_binary, so test_device_launch.py and the spyrecode lit tests
+    # pick these up. Loop-free and one tile per corelet -- dbo-opt rejects the
+    # scf.for every other variant outlines from its program-id distribution.
+    # One variant per dtype because the stick size, and hence the layout and
+    # the 2D shape, follow DTYPE rather than varying independently.
+    # -----------------------------------------------------------------------
     "1d_device": {
         # The device variants in the suite that reach a Spyre binary. Everything
         # else distributes tiles with an scf.for over the program id, and dbo-opt
@@ -691,209 +934,5 @@ VARIANTS = {
             "OUT_LAYOUT": [("stick", _stick_layout_2d_on_n("fp32"))],
         },
     },
-    "2d_spyre_stick": {
-        # Elementwise add with all three operands stick-on-N. Every operand
-        # physicalizes identically, so the add stays a pure elementwise op on
-        # rank-3 tiles [N//S, M, N%S] = [2, 64, 64] and no transpose or
-        # reduction loop is synthesized.
-        "base": "2d",
-        "tags": ["descriptor-load-static", "descriptor-store-static",
-                 "program-id-1d", "spyre-tensor-layout"],
-        "summary": (
-            "2D elementwise add with x/y/out all annotated stick-on-N. "
-            "Exercises the layout path on a pure elementwise kernel."
-        ),
-        "SIGNATURE": _SIG_2D_SPYRE,
-        "params": {
-            # fp16 stick = 64; N = 128 = 2 sticks exactly.
-            "M": [64], "N": [128], "BLOCK_M": [64], "BLOCK_N": [128],
-            "X_LAYOUT":   [[(1, "floordiv", _S2("x_ptr")), 0,
-                            (1, "mod", _S2("x_ptr"))]],
-            "Y_LAYOUT":   [[(1, "floordiv", _S2("y_ptr")), 0,
-                            (1, "mod", _S2("y_ptr"))]],
-            "OUT_LAYOUT": [[(1, "floordiv", _S2("output_ptr")), 0,
-                            (1, "mod", _S2("output_ptr"))]],
-            "OP": ["add"],
-        },
-        "grid":        [1],
-        "data_layout": "host",
-        "inputs":      functools.partial(make_inputs_2d, dtype=np.float16),
-        "rtol":        1e-2,
-        "atol":        5e-2,
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            # All three operands share the rank-3 physical view [2, 64, 64].
-            t.assert_result_type("ktdp.construct_memory_view", "2x64x64xf16"),
-        ),
-    },
-    "2d_dynamic_from_scalar_load": {
-        "base":         "2d",
-        "kernel_fn":    kernel.elementwise_2d_scalar_dim,
-        "SIGNATURE":    _SIG_2D_SCALAR,
-        "constexpr":    ["N", "BLOCK_M", "BLOCK_N", "OP"],
-        "params":       {"N": [32], "BLOCK_M": [16], "BLOCK_N": [16], "OP": ["add"]},
-        "inputs":       make_inputs_2d_scalar_dim,
-        # 2D grid: [4, 8] = 32 cores. N is chunked across grid_n the same
-        # way the runtime M is chunked across grid_m (elementwise_2d_grid's
-        # distribution pattern), rather than walking a full row per core.
-        "grid":         [4, 8],
-        "tags": [
-            "descriptor-load-dynamic-from-scalar-load",
-            "descriptor-store-dynamic", "program-id-2d", "num-programs-fold",
-        ],
-        "summary": (
-            "2D elementwise add over a 2D grid where `M` is read from "
-            "memory via a scalar `tl.load`, then used as a tensor "
-            "descriptor's dynamic shape; `N` is chunked the same way."
-        ),
-        "doc": (
-            "not yet wired into any dataflow-scheduler/DFIR "
-            "flow (`kDynamic` has no `AddressAssignment` / "
-            "`NormalizeGridTo1D` path yet). `M` is not a kernel argument "
-            "here; it is read from `seqlen_ptr` with a scalar `tl.load`. "
-            "Uses a genuine 2D grid (`pid_m`/`pid_n`, `grid_m`/`grid_n`, "
-            "matching `elementwise_2d_grid`'s naming and distribution "
-            "pattern) so `N` is chunked across cores the same way the "
-            "runtime `M` is, instead of walking a full row per core. "
-            "This exercises the single-element 1-D scalar-read chain "
-            "(`construct_memory_view` / `construct_access_tile` / "
-            "`ktdp.load` / `tensor.extract`) feeding the dynamic-shape "
-            "path via an `arith.index_cast` bridge, producing "
-            "`memref<?x32xf32>`. Reuses the same `x + y` oracle as `2d` "
-            "(via `make_inputs_2d_scalar_dim`)."
-        ),
-        "extra_checks": _make_2d_scalar_dim_checks,
-    },
-    # --- 3D variants ---
-    "3d": {
-        # M=[64,65,256]: absorbs 3d_nonaligned (M=65) and 3d_active_cores (M=256).
-        "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-1d", "num-programs-fold"],
-        "summary": (
-            "3D elementwise add over an `M × N × P` tensor with "
-            "explicit stride arithmetic."
-        ),
-        "doc": (
-            "Takes two rank-3 tensors of shape `M × N × P` and writes "
-            "`C = A + B`. The kernel computes strides explicitly "
-            "(`stride_m = N * P`, `stride_n = P`) and sweeps nested "
-            "tile loops along all three axes. All three dimensions are "
-            "compile-time constants, producing a fully-static "
-            "descriptor (`memref<64x32x16xf32>`)."
-        ),
-        "kernel_fn":    kernel.elementwise_3d,
-        "SIGNATURE":    _SIG_3D,
-        "constexpr":    ["M", "N", "P", "BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
-        "params":       {
-            # M=[64,65,256]: absorbs 3d_nonaligned (M=65) and 3d_active_cores (M=256).
-            "M": [64, 65, 256], "N": [32], "P": [16],
-            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
-            "OP": ["add"],
-        },
-        "inputs":       make_inputs_3d,
-        "extra_checks": _make_3d_checks,
-    },
-    "3d_dynamic": {
-        "base":      "3d",
-        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-1d", "num-programs-fold"],
-        "summary": (
-            "3D elementwise add where `M`, `N`, `P` are all runtime "
-            "arguments."
-        ),
-        "doc": (
-            "Same tiling structure as the static 3D add, but all three "
-            "dimensions arrive as runtime `i32` arguments. The "
-            "descriptor lowers to `memref<?x?x?xf32>`."
-        ),
-        "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<?x?x?xf32>"),
-        ),
-    },
-    # --- 2D grid variants ---
-    "2d_grid": {
-        "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-2d", "num-programs-fold"],
-        "summary": (
-            "2D grid: pid_0 distributes M-tiles, pid_1 distributes N-tiles, "
-            "each with a distribution loop."
-        ),
-        "doc": (
-            "Same elementwise add as `2d`, but uses a 2D program grid. Each "
-            "axis distributes its tiles via a loop: `pid_0` covers M, `pid_1` "
-            "covers N. The 2D grid replaces the 1D-grid outer loops."
-        ),
-        "kernel_fn":    kernel.elementwise_2d_grid,
-        "SIGNATURE":    _SIG_2D,
-        "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N", "OP"],
-        # 2D grid: [4, 8] = 32 cores
-        "params":       {"M": [256], "N": [128], "BLOCK_M": [16], "BLOCK_N": [16], "OP": ["add"]},
-        "grid":         [4, 8],
-        "inputs":       make_inputs_2d,
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<256x128xf32>"),
-        ),
-    },
-    "2d_grid_dynamic": {
-        "base":      "2d_grid",
-        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-2d", "num-programs-fold"],
-        "summary": (
-            "2D grid with runtime `M` and `N`: distribution loop structure, "
-            "dynamic descriptor shapes."
-        ),
-        "doc": (
-            "Same as `2d_grid` but `M` and `N` are runtime `i32` arguments. "
-            "Descriptors lower to `memref<?x?xf32>`."
-        ),
-        "constexpr":    ["BLOCK_M", "BLOCK_N", "OP"],
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<?x?xf32>"),
-        ),
-    },
-    # --- 3D grid variants ---
-    "3d_grid": {
-        "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-3d", "num-programs-fold"],
-        "summary": (
-            "3D grid: pid_0 distributes M-tiles, pid_1 N-tiles, pid_2 P-tiles, "
-            "each with a distribution loop."
-        ),
-        "doc": (
-            "Same elementwise add as `3d`, but uses a 3D program grid. Each "
-            "axis distributes its tiles via a loop: `pid_0` covers M, `pid_1` "
-            "covers N, `pid_2` covers P."
-        ),
-        "kernel_fn":    kernel.elementwise_3d_grid,
-        "SIGNATURE":    _SIG_3D,
-        "constexpr":    ["M", "N", "P", "BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
-        # 3D grid: [2, 4, 4] = 32 cores
-        "params":       {
-            "M": [64], "N": [32], "P": [16],
-            "BLOCK_M": [8], "BLOCK_N": [8], "BLOCK_P": [8],
-            "OP": ["add"],
-        },
-        "grid":         [2, 4, 4],
-        "inputs":       make_inputs_3d,
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<64x32x16xf32>"),
-        ),
-    },
-    "3d_grid_dynamic": {
-        "base":      "3d_grid",
-        "tags":      ["descriptor-load-dynamic", "descriptor-store-dynamic", "program-id-3d", "num-programs-fold"],
-        "summary": (
-            "3D grid with runtime `M`, `N`, `P`: distribution loop structure, "
-            "dynamic descriptor shapes."
-        ),
-        "doc": (
-            "Same as `3d_grid` but `M`, `N`, `P` are runtime `i32` arguments. "
-            "Descriptors lower to `memref<?x?x?xf32>`."
-        ),
-        "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<?x?x?xf32>"),
-        ),
-    },
+
 }
