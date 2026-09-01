@@ -202,33 +202,42 @@ class Elementwise(conftest.VariantFactory):
     """Factory for elementwise variants that sweep OP and/or DTYPE.
 
     ``rank`` selects the shape: which ``_SHAPE_ARGS`` entry joins the runtime
-    signature, which input maker is used, and which stick layout is derived.
+    signature, and which input maker is used.
+
+    ``stick`` names the layout params to derive, and so which operands are
+    stick-tiled. Empty means none, which is a variant that sweeps dtype without
+    annotating a layout at all. Naming them rather than assuming all three is
+    what lets an operand be left row-major -- ``gather`` has variants that
+    annotate only the output, and ``reduce`` moves ``IN_LAYOUT`` and
+    ``OUT_LAYOUT`` independently. Declare the ones left out as ``None`` in
+    ``params``; deriving a name the variant also declares is refused.
     """
     rank: int = 1
+    stick: tuple = ()
 
     def signature(self, DTYPE, **_):
         ptrs = {n: _PTR[DTYPE] for n in ("x_ptr", "y_ptr", "output_ptr")}
         return {**ptrs, **_SHAPE_ARGS[self.rank]}
 
     def derived_params(self, DTYPE, N_STICKS=None, **_):
-        """The stick layout, and at rank 2 the N it implies.
+        """Whatever follows from ``DTYPE``: the stick layouts, and the shape when
+        the variant gives it in sticks.
 
         Spelling a layout out beside its ``DTYPE`` is what lets the two disagree
         -- an fp16 layout on an fp32 variant is a pairing dbo-opt rejects with an
         error naming neither. Declaring only the dtype makes it unrepresentable.
 
-        Absent ``N_STICKS`` means the variant does not want a layout derived: the
-        rank-2 Level A variants sweep neither, and pass ``X_LAYOUT: [None]``.
+        The two halves are independent. ``N_STICKS`` derives the shape, which a
+        stick-tiled operand needs whether or not its sibling is annotated;
+        ``stick`` derives the annotations.
         """
-        if N_STICKS is None and self.rank == 2:
-            return None
         stick = _stick_of(DTYPE)
-        if self.rank == 1:
-            return {"LAYOUT": _stick_1d(stick)}
-        n = N_STICKS * stick
-        layout = _stick_2d_on_n(stick)
-        return {"N": n, "BLOCK_N": n,
-                "X_LAYOUT": layout, "Y_LAYOUT": layout, "OUT_LAYOUT": layout}
+        derived = {}
+        if N_STICKS is not None:
+            derived["N"] = derived["BLOCK_N"] = N_STICKS * stick
+        layout = _stick_1d(stick) if self.rank == 1 else _stick_2d_on_n(stick)
+        derived.update(dict.fromkeys(self.stick, layout))
+        return derived or None
 
     def reference(self, OP, **_):
         def oracle(inputs):
@@ -392,7 +401,7 @@ VARIANTS = {
             "communication."
         ),
         "kernel_fn":    kernel.elementwise_1d,
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "OP"],
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "OP"],
         "params":       {
             # n_elements=[1024,2097152,2097153]: absorbs single_block (1024)
             # and nonaligned (2097153).
@@ -424,7 +433,7 @@ VARIANTS = {
             "computes its own per-tile work based on the runtime "
             "value."
         ),
-        "constexpr":    ["BLOCK_SIZE", "DTYPE", "OP"],
+        "constexpr":    ["BLOCK_SIZE", "OP"],
         "extra_checks": lambda t: (
             # Dynamic path: construct_memory_view must carry a dynamic
             # dimension (memref<?x...>) — the whole point of this variant
@@ -492,7 +501,7 @@ VARIANTS = {
         "kernel_fn":    kernel.elementwise_2d,
         "SIGNATURE":    _SIG_2D_LAYOUT,
         "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
         "params":       {
             # M=[512,520]: absorbs 2d_nonaligned (M=520).
             "M": [512, 520], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16],
@@ -516,7 +525,7 @@ VARIANTS = {
             "unchanged across a range of matrix shapes."
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?xf32>"),
@@ -727,7 +736,7 @@ VARIANTS = {
         ),
         "kernel_fn":    kernel.elementwise_1d,
         "factory":      Elementwise(rank=1),
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "OP"],
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "OP"],
         "params": {
             "DTYPE":      ["fp16", "fp32", "i32"],
             "OP":         ["add", "sub", "mul", "div"],
@@ -829,11 +838,11 @@ VARIANTS = {
         ],
         "summary": (
             "1D elementwise over a single tile, no distribution loop. Sweeps "
-            "fp16/fp32 x add/sub/mul -- the arms dbo-opt accepts."
+            "fp16/fp32 x ops"
         ),
         "kernel_fn":    kernel.elementwise_1d_device,
-        "factory":      Elementwise(rank=1),
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "LAYOUT", "OP"],
+        "factory":      Elementwise(rank=1, stick=("LAYOUT",)),
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "OP"],
         # LAYOUT is absent: it follows from DTYPE, so derived_params supplies it.
         "params": {
             "DTYPE":      ["fp16", "fp32"],
@@ -884,9 +893,11 @@ VARIANTS = {
             "physicalized layout and a multi-element 2D tile on hardware."
         ),
         "kernel_fn":    kernel.elementwise_2d_device,
-        "factory":      Elementwise(rank=2),
+        "factory":      Elementwise(rank=2,
+                                       stick=("X_LAYOUT", "Y_LAYOUT",
+                                              "OUT_LAYOUT")),
         "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
         # N, BLOCK_N and the three layouts all follow from DTYPE, so only the
         # stick count is declared. Two sticks is 128 lanes at fp16, 64 at fp32.
         "params": {
