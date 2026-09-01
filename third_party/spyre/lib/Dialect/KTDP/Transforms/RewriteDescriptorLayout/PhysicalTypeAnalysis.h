@@ -10,19 +10,17 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/LogicalResult.h"
 
+#include <memory>
+
 namespace mlir::triton::ktdp {
 
 //===----------------------------------------------------------------------===//
 // Phase 2A: decide the final physical type of every value reachable from
 // Phase 1's roots, before any IR is rewritten.
 //
-// This is analysis only. It mutates no IR, creates no ops, and does not touch
+// Analysis only: it mutates no IR, creates no ops, and does not touch
 // ctx.physicalValues. Its output is a map from value to the physical type that
-// value will end up carrying once Phase 2B has run. Today (step 4c-A) nothing
-// consumes that map except the agreement assertions in
-// verifyPhysicalTypeAgreement() -- the map's whole purpose at this step is to
-// be *measured* against what Phase 2's in-flight guards conclude, which is
-// what makes 4c-B a verified change rather than a rewrite on faith.
+// value ends up carrying once the rewrite has run.
 //
 // Structure follows One-Shot Bufferization: an analysis over SSA use-def
 // chains first, an IR rewrite second. See
@@ -44,42 +42,44 @@ struct PhysicalTypeInfo {
   llvm::SmallVector<int64_t> transposePerm;
 };
 
-/// How one op propagates physicality from a physical operand to its result.
+/// One op's rule for how physicality flows through it.
 ///
-/// This enum -- not an isa<> list of op types -- is what the analysis
-/// dispatches on. Adding an op to this pass means naming its behaviour here
-/// (see classifyPropagation in PhysicalTypeAnalysis.cpp): the classifier has
-/// no silent default, so a new op either matches a stated behaviour or lands
-/// in `Unknown`, which the analysis treats as "stops, and say so" rather than
-/// guessing.
-enum class PhysicalPropagation {
-  /// The op's result carries its operand's physical type unchanged: it is
-  /// rank-agnostic, so physicalization passes straight through. Elementwise
-  /// ops (arith.*, and any single-result op whose tensor operands agree on a
-  /// shape), plus the whole-tensor slice a rewritten chain leaves behind.
-  PassThrough,
-  /// The op consumes the physical value and contributes only a permutation:
-  /// no new physical value appears, but the permutation must be composed into
-  /// whatever downstream op finally reads the chain. linalg.transpose.
-  Absorb,
-  /// The op consumes a physical operand and produces a value that is NOT
-  /// physical. Its own result is logical, and the chain ends here.
-  /// linalg.matmul / linalg.batch_matmul (they contract exactly one K axis,
-  /// so a split K needs real cross-stick accumulation, which the emitted
-  /// accumulator holds at logical shape); linalg.reduce (its emitted result
-  /// is the accumulator, at op-tile/logical shape -- see the reduce note in
-  /// PhysicalTypeAnalysis.cpp); ktdp.store (no result at all).
-  Stop,
-  /// Not a behaviour this analysis has been taught. Treated as Stop, and
-  /// reported, so a new op on a physicalized chain is a visible obligation
-  /// rather than a silent default.
-  Unknown,
+/// The contract: given `op` and the resolved info of one of its physical
+/// tensor operands, produce the info the op's own result carries. Returning
+/// failure means "no physical result" -- either the pattern does not handle
+/// this op (`match` said no) or the op genuinely ends the chain.
+///
+/// Each pattern computes its own result type; there is no shared category a
+/// caller could switch on. An op no pattern matches is reported and treated as
+/// producing nothing physical, so teaching this pass a new op means adding a
+/// pattern here -- never editing a central dispatch.
+class PhysicalPropagationPattern {
+public:
+  virtual ~PhysicalPropagationPattern() = default;
+
+  /// True iff this pattern is the rule for `op`.
+  virtual bool match(Operation *op) const = 0;
+
+  /// The physical info `result` carries, given `src`/`srcInfo` -- one of the
+  /// op's tensor operands already resolved to a physical type. Failure means
+  /// the op produces no physical result.
+  virtual llvm::FailureOr<PhysicalTypeInfo>
+  propagate(Operation *op, Value result, Value src,
+            const PhysicalTypeInfo &srcInfo) const = 0;
 };
+
+using PhysicalPropagationPatternSet =
+    llvm::SmallVector<std::unique_ptr<PhysicalPropagationPattern>>;
+
+/// Register the propagation rule for every op this pass has been taught,
+/// mirroring populateContractionPatterns' shape.
+void populatePhysicalPropagationPatterns(PhysicalPropagationPatternSet &patterns);
 
 // PhysicalTypeMap -- one entry per value reachable from a Phase-1 root whose
 // physicalization resolves; a value absent from the map is logical, either
-// never reachable from a root or ended by a Stop op -- is declared in Types.h
-// so PassContext can hold a pointer to it without including this header.
+// never reachable from a root or produced by an op that ends the chain -- is
+// declared in Types.h so PassContext can hold a pointer to it without
+// including this header.
 
 /// Compute the final physical type of `value`, resolving its producers
 /// transitively. Mutates no IR.
@@ -92,11 +92,12 @@ enum class PhysicalPropagation {
 /// Recursion on a cycle returns failure rather than diverging.
 ///
 /// Returns failure when the value does not resolve to a physical type: it is
-/// not reachable from a Phase-1 root, its chain ends at a Stop op, or a cycle
-/// was detected.
+/// not reachable from a Phase-1 root, no pattern gives its producer a physical
+/// result, or a cycle was detected.
 llvm::FailureOr<PhysicalTypeInfo>
 getPhysicalizedType(Value value, const PhysicalTypeMap &roots,
                     PhysicalTypeMap &resolved,
+                    const PhysicalPropagationPatternSet &patterns,
                     llvm::SmallVector<Value> &invocationStack);
 
 /// Run Phase 2A over `module`, seeded from `ctx.physicalValues` (Phase 1's
@@ -106,7 +107,7 @@ PhysicalTypeMap runPhysicalTypeAnalysis(ModuleOp module,
 
 /// Agreement checks between the analysis and the Phase-2 guards it will
 /// eventually replace. Active in assertion builds only; see the definition for
-/// the three invariants checked and what a failure means.
+/// the invariants checked and what a failure means.
 ///
 /// `when` names the point in the pass the check runs at, for diagnostics.
 void verifyPhysicalTypeAgreement(ModuleOp module, const PassContext &ctx,
