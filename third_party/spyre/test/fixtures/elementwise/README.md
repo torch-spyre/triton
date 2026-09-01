@@ -66,4 +66,4 @@ Level A  shape                fp32, add  (OP and DTYPE pinned)
   over a single fp16 tile with no distribution loop. The only variant that
   dbo-opt can lower all the way to a Spyre binary.
 - **1d_device_grid2** (`elementwise__1d_device_grid2[LAYOUT=stick]`) — Same
-  as `1d_device` but distributed over two corelets (one stick each).
+  as `1d_device` but distributed over two cores (one stick each).

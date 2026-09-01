@@ -751,7 +751,7 @@ VARIANTS = {
     # Level D -- device
     #
     # compiles_to_binary, so test_device_launch.py and the spyrecode lit tests
-    # pick these up. Loop-free and one tile per corelet -- dbo-opt rejects the
+    # pick these up. Loop-free and one tile per core -- dbo-opt rejects the
     # scf.for every other variant outlines from its program-id distribution.
     # One variant per dtype because the stick size, and hence the layout and
     # the 2D shape, follow DTYPE rather than varying independently.
@@ -814,17 +814,17 @@ VARIANTS = {
         },
     },
     "1d_device_grid2": {
-        # The multi-core counterpart of 1d_device: still one tile per corelet and
-        # still no distribution loop, but two corelets each taking half the
+        # The multi-core counterpart of 1d_device: still one tile per core and
+        # still no distribution loop, but two cores each taking half the
         # vector.  n_elements=128 over BLOCK_SIZE=64 is exactly two fp16 sticks,
-        # one per corelet, so corelet i owns stick i.
+        # one per core, so core i owns stick i.
         "base": "1d_device",
         "tags": [
             "descriptor-load-static", "descriptor-store-static",
             "program-id-1d", "simplified:no-loop", "spyre-tensor-layout",
         ],
         "summary": (
-            "1D fp16 elementwise across two corelets, one fp16 stick each, "
+            "1D fp16 elementwise across two cores, one fp16 stick each, "
             "no distribution loop. Sweeps add/sub/mul."
         ),
         "grid": [2],
@@ -832,7 +832,7 @@ VARIANTS = {
             "DTYPE":      ["fp16"],
             "OP":         ["add", "sub", "mul"],
             "n_elements": [128],
-            "BLOCK_SIZE": [64],   # 64 elements = 1 fp16 stick per corelet
+            "BLOCK_SIZE": [64],   # 64 elements = 1 fp16 stick per core
             "LAYOUT":     [("stick", _stick_layout_1d("fp16"))],
         },
     },
