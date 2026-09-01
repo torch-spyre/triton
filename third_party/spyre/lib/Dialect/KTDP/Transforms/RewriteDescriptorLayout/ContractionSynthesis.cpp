@@ -11,6 +11,7 @@
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
 #include "RewriteDescriptorLayout/Classify.h"
 #include "RewriteDescriptorLayout/PermutationUtils.h"
+#include "RewriteDescriptorLayout/PhysicalTypeAnalysis.h"
 #include "RewriteDescriptorLayout/Types.h"
 
 #include "ktir/Dialect/KTDP/KTDP.h"
@@ -390,6 +391,56 @@ static LogicalResult emitFatalError(Operation *op, const PassContext &ctx,
   return op->emitError(msg);
 }
 
+// The two operand-level agreement assertions of step 4c-A. They live here,
+// beside the guards, because a guard's conclusion is only observable at the
+// moment the guard runs: dispatchSource reads IR Phase 2 is concurrently
+// mutating, so "what did the guard decide about this operand" has no meaning
+// outside the guard's own call.
+//
+//   deferred == true  : dispatchSource is about to return failure() because
+//                       chainBlockedByPendingTranspose found a live transpose
+//                       on this operand's chain. The analysis must have this
+//                       operand -- it predicted the transpose's erasure up
+//                       front, so the value is physical in the analysis even
+//                       though Phase 2 cannot see that yet.
+//   deferred == false : dispatchSource is about to commit, classifying this
+//                       operand as a logical scratchpad. The analysis must NOT
+//                       have it -- a scratchpad is genuinely logical, and an
+//                       analysis entry would mean 4c-B physicalizes something
+//                       Phase 2 correctly leaves alone.
+//
+// Both are assertions rather than diagnostics: a disagreement is a defect in
+// the analysis (or in a guard), not an input the user can fix. Compiled out in
+// release builds; the whole suite runs with them active.
+static void assertAnalysisAgreesOnOperand(Value operand, bool deferred,
+                                          const PassContext &ctx,
+                                          Operation *op) {
+#ifndef NDEBUG
+  if (!ctx.physicalTypeAnalysis)
+    return;
+  bool inAnalysis = ctx.physicalTypeAnalysis->contains(operand);
+  LLVM_DEBUG(llvm::dbgs() << "  [2A] agreement: deferred=" << deferred
+                          << " inAnalysis=" << inAnalysis << " on "
+                          << op->getName() << "\n");
+  if (deferred) {
+    assert(inAnalysis &&
+           "Phase 2A disagreement: dispatchSource defers on an operand "
+           "(chainBlockedByPendingTranspose) that the analysis says is not "
+           "physical -- the analysis under-claims and 4c-B would commit a "
+           "wrong logical/scratchpad classification here");
+  } else {
+    assert(!inAnalysis &&
+           "Phase 2A disagreement: dispatchSource treats an operand as a "
+           "logical scratchpad but the analysis says it is physical -- 4c-B "
+           "would physicalize a value Phase 2 correctly leaves logical");
+  }
+  (void)inAnalysis;
+  (void)op;
+#else
+  (void)operand; (void)deferred; (void)ctx; (void)op;
+#endif
+}
+
 // Classify one operand and populate plans[i]. `absorbLoopDims` is declared
 // by the calling pattern: true iff its op can take its whole reduce axis set
 // directly (e.g. linalg.reduce's `dimensions`), false if a second reduce axis
@@ -447,8 +498,11 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
       // not been erased yet by RewriteTransposePattern. The latter is not a
       // fatal condition — defer to a later greedy iteration once the
       // transpose fires.
-      if (chainBlockedByPendingTranspose(operand))
+      if (chainBlockedByPendingTranspose(operand)) {
+        assertAnalysisAgreesOnOperand(operand, /*deferred=*/true, ctx,
+                                      op.getOperation());
         return failure();
+      }
       // A reshape/broadcast producing this operand is not a deferred
       // physicalization (it is not a linalg.transpose, so
       // chainBlockedByPendingTranspose does not catch it) and is not a
@@ -470,6 +524,8 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
         return emitFatalError(op, ctx,
             "spyre_tensor_layout: source op operand is neither a physical "
             "load nor a logical (scratchpad) tensor of the expected rank");
+      assertAnalysisAgreesOnOperand(operand, /*deferred=*/false, ctx,
+                                    op.getOperation());
       plans[i] = classifyScratchpad(operand, spec.operands[i]);
     }
   }

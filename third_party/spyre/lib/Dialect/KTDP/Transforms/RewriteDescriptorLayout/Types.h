@@ -27,6 +27,12 @@ struct PhysicalValueInfo {
   llvm::SmallVector<int64_t> transposePerm;
 };
 
+/// Forward declaration: Phase 2A's result map. Defined in
+/// PhysicalTypeAnalysis.h, which PassContext deliberately does not include --
+/// the analysis depends on Types.h, not the other way round.
+struct PhysicalTypeInfo;
+using PhysicalTypeMap = llvm::DenseMap<mlir::Value, PhysicalTypeInfo>;
+
 struct PassContext {
   const llvm::DenseMap<mlir::Value, triton::SpyreTensorLayoutOp> &physMemViewToMarker;
   /// Maps a physical value (a ktdp.load result, or a value Phase 2 has
@@ -45,6 +51,13 @@ struct PassContext {
   /// operand and a differently-shaped result but are not reachable from any
   /// physicalized load.
   llvm::DenseMap<mlir::Value, PhysicalValueInfo> &physicalValues;
+  /// Phase 2A's answer: the final physical type of every value reachable from
+  /// Phase 1's roots, computed before Phase 2 rewrites anything (see
+  /// PhysicalTypeAnalysis.h). Step 4c-A does not act on it -- the patterns
+  /// read it only to assert that it agrees with the in-flight guards it will
+  /// eventually replace, which is the measurement that makes 4c-B safe. Null
+  /// when the analysis was not run.
+  const PhysicalTypeMap *physicalTypeAnalysis = nullptr;
   /// Set by patterns to indicate a fatal error that should abort the pass.
   mutable bool hadError = false;
 };

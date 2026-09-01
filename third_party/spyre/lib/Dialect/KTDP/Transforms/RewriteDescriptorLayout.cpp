@@ -26,6 +26,7 @@
 #include "RewriteDescriptorLayout/Types.h"
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
 #include "RewriteDescriptorLayout/IndexDomain.h"
+#include "RewriteDescriptorLayout/PhysicalTypeAnalysis.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
@@ -881,9 +882,17 @@ struct RewriteDescriptorLayoutPass
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 1 complete, "
                             << "entering Phase 2 (contraction synthesis)\n");
 
+    // Phase 2A: decide, for every value reachable from Phase 1's roots, the
+    // final physical type it will carry -- before Phase 2 rewrites anything.
+    // Mutates no IR, creates no ops (see PhysicalTypeAnalysis.h). Step 4c-A
+    // lands the analysis and the assertions measuring it against the guards
+    // Phase 2 uses today; 4c-B is what makes the rewrite read it instead.
+    PassContext ctx{physMemViewToMarker, physicalValues};
+    PhysicalTypeMap physicalTypes = runPhysicalTypeAnalysis(module, ctx);
+    ctx.physicalTypeAnalysis = &physicalTypes;
+
     // Phase 2: synthesize contractions via greedy pattern rewrite.
     {
-      PassContext ctx{physMemViewToMarker, physicalValues};
       RewritePatternSet patterns(module.getContext());
       populateContractionPatterns(patterns, ctx);
       // Collect candidate ops: the four contraction-family ops, plus every
@@ -931,6 +940,10 @@ struct RewriteDescriptorLayoutPass
       }
       if (ctx.hadError)
         return signalPassFailure();
+      // Third agreement invariant: at end of Phase 2, everything Phase 2
+      // found to be physical was predicted by Phase 2A.
+      verifyPhysicalTypeAgreement(module, ctx, physicalTypes,
+                                  "end of Phase 2");
     }
 
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 2 complete, "
