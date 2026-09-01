@@ -42,6 +42,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IntegerSet.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SmallVector.h"
@@ -110,6 +111,17 @@ struct RewriteDescriptorLayoutPass
   // Maps a physical ktdp.load result -> the logical permutation of a
   // linalg.transpose that was erased in Phase 1.
   llvm::DenseMap<mlir::Value, SmallVector<int64_t>> physicalLoadToTransposePerm;
+
+  // Ops whose result type `retypeChain` overwrote from operand 0's shape.
+  //
+  // That rewrite assumes the result shape follows operand 0, which is true for
+  // an elementwise op and false for one that also pins its result shape in its
+  // own attributes. Phase 3 re-verifies these so a wrong assumption surfaces as
+  // a layout diagnostic here rather than as a shape error from a later verifier
+  // that cannot mention layouts. Phase 2 cannot erase these ops; the `getBlock()`
+  // tripwire in Phase 3a records why, and what would have to change if that stops
+  // holding.
+  SmallVector<Operation *> retypedOps;
 
   // Resolved from the pass option: true = "device" (physical row-major strides),
   // false = "host" (derive strides from logical strides via coord map).
@@ -543,11 +555,29 @@ struct RewriteDescriptorLayoutPass
 
   // --- Load/store consumer updates ---
 
-  // True if the op is a shape-constraining op whose result shape is NOT
-  // inherited from a single physical input.
+  // True if `op` combines its inputs along a dimension that does not survive
+  // into its result, so its result shape cannot be derived from any one operand
+  // and `retypeChain` must leave it to Phase 2.
+  //
+  // Whether Phase 2 actually has a pattern for `op` is a separate question this
+  // predicate deliberately does not ask. Phase 3 re-derives the set of ops still
+  // holding a physicalized operand by walking the final IR, so an op skipped
+  // here and then left unrepaired is reported regardless of whether this
+  // predicate recognised it. Coverage does not depend on the two sets agreeing.
+  //
+  // Uses `isaContractionOpInterface` (a structural test: does this op's
+  // indexing-map and body shape read as a contraction?) rather than
+  // `isa<ContractionOpInterface>` (does its definition declare the interface?).
+  // A `linalg.generic` written as a matmul declares nothing, so the declaration
+  // test misses it and it falls through to the elementwise retype path.
+  //
+  // `linalg.reduce` is checked separately: it reduces away a dimension but is
+  // not a contraction, so no contraction predicate matches it.
   static bool isContractionOp(Operation *op) {
-    return isa<linalg::ContractionOpInterface>(op) ||
-           isa<linalg::ReduceOp>(op);
+    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op))
+      if (linalg::isaContractionOpInterface(linalgOp))
+        return true;
+    return isa<linalg::ReduceOp>(op);
   }
 
   // Retype ktdp.load: replace with a new load of the physical tensor type.
@@ -567,18 +597,104 @@ struct RewriteDescriptorLayoutPass
     st.getAccessTileMutable().set(newTile);
   }
 
+  // True if operand `operandIndex` of `op` is still at physical rank while `op`'s
+  // own signature expects logical rank — that is, a layout repair is owed and no
+  // phase has performed it.
+  //
+  // Reads only the op's current types, so it is meaningful only once Phase 1 and
+  // Phase 2 have both finished. Asking earlier gives false positives: a store's
+  // access tile is redirected while rewriting one marker, but its data operand
+  // may still be retyped while rewriting a later one, so a mid-Phase-1 comparison
+  // can see a mismatch that Phase 1 goes on to resolve.
+  //
+  // A layout that leaves the physical shape equal to the logical shape answers
+  // false, so a pointwise kernel reaches Phase 3 with nothing to report.
+  //
+  // Compares shapes, not ranks. Equal rank is not enough to conclude a store is
+  // fine: a layout can reorder or resize dimensions without adding any, and such a
+  // store is still invalid. See the store emit site, which reports both the
+  // equal-rank and differing-rank cases.
+  //
+  // PRECONDITION: `op` is a `ktdp.store` or a `linalg.LinalgOp` — the two op
+  // forms whose shape contract this function encodes. It reports anything else,
+  // so callers must filter rather than pass the whole module;
+  // see the Phase 3a walk.
+  // Operand number of `ktdp.store`'s data tile. The store branch of
+  // `stillNeedsRepair` does not read its `operandIndex` argument — it reaches both
+  // operands by accessor name — so the caller has to pick which operand number the
+  // resulting diagnostic names. The data tile is the correct one: it is the operand
+  // physicalization leaves at logical rank while the access tile is rewritten.
+  static constexpr unsigned kStoreDataTileIndex = 0;
+
+  // True for a `ktdp.store` whose data tile and access tile shapes disagree, which
+  // is the only reason a store appears in the unrepaired list.
+  //
+  // Exists so the emit site can give stores their own message. `RewriteStorePattern`
+  // is on the supported-consumer list, so calling a store an unsupported consumer
+  // would contradict the list printed in the same sentence.
+  static bool isUnrepairedStore(Operation *op) {
+    auto st = dyn_cast<mlir::ktdp::StoreOp>(op);
+    if (!st)
+      return false;
+    auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
+    auto tileTy =
+        dyn_cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
+    if (!dataTy || !tileTy)
+      return false;
+    return dataTy.getShape() != tileTy.getShape();
+  }
+
+  static bool stillNeedsRepair(Operation *op, unsigned operandIndex) {
+    // A store is valid exactly when its data tile and access tile shapes agree;
+    // this is the condition StoreOp::verify() enforces. Whole-op, not per-operand:
+    // `operandIndex` is unused here, so every operand number gives the same answer.
+    // The Phase 3a walk therefore asks once, with kStoreDataTileIndex.
+    if (isa<mlir::ktdp::StoreOp>(op))
+      return isUnrepairedStore(op);
+
+    // A structured op is valid when no operand's rank exceeds the number of
+    // dimensions its indexing map consumes. A physicalized operand that was
+    // never rebuilt carries extra stick dimensions beyond that.
+    //
+    // One-sided on purpose: physicalization only ever adds dimensions, so `>` is
+    // the only direction this pass can produce. A rank below the map's result
+    // count is also invalid, but linalg's own verifier reports it, naming both
+    // ranks — a better message than this one, which would blame layout repair for
+    // a mismatch no layout repair can fix.
+    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+      OpOperand &use = op->getOpOperand(operandIndex);
+      auto ty = dyn_cast<RankedTensorType>(use.get().getType());
+      if (!ty)
+        return false;
+      return ty.getRank() > (int64_t)linalgOp.getMatchingIndexingMap(&use)
+                                 .getNumResults();
+    }
+
+    // An op form with no shape contract this pass understands: report it rather
+    // than assume it is fine.
+    return true;
+  }
+
   // Forward-retype the elementwise op chain.
   void retypeChain(Value oldVal, Value newVal) {
     Value physLoadResult = newVal;
     oldVal.replaceAllUsesWith(newVal);
-    SmallVector<Operation *> worklist(newVal.getUsers().begin(),
-                                      newVal.getUsers().end());
+
+    SmallVector<Operation *> worklist;
+    auto enqueueUsers = [&worklist](Value v) {
+      for (Operation *user : v.getUsers())
+        worklist.push_back(user);
+    };
+    enqueueUsers(newVal);
+
     while (!worklist.empty()) {
       Operation *op = worklist.pop_back_val();
-      if (op->getNumResults() != 1)
+      if (op->getNumResults() != 1) {
         continue;
-      if (isContractionOp(op))
+      }
+      if (isContractionOp(op)) {
         continue;
+      }
       if (auto tr = dyn_cast<linalg::TransposeOp>(op)) {
         auto perm = SmallVector<int64_t>(tr.getPermutation());
         LLVM_DEBUG({
@@ -592,7 +708,8 @@ struct RewriteDescriptorLayoutPass
         SmallVector<Operation *> fmrConsumers(tr.getResult()[0].getUsers().begin(),
                                               tr.getResult()[0].getUsers().end());
         tr.getResult()[0].replaceAllUsesWith(physInput);
-        worklist.append(fmrConsumers.begin(), fmrConsumers.end());
+        for (Operation *user : fmrConsumers)
+          worklist.push_back(user);
         tr.erase();
         continue;
       }
@@ -604,8 +721,13 @@ struct RewriteDescriptorLayoutPass
         continue;
       op->getResult(0).setType(
           RankedTensorType::get(opndTy.getShape(), resTy.getElementType()));
-      worklist.append(op->getResult(0).getUsers().begin(),
-                      op->getResult(0).getUsers().end());
+      // This assumed the op's result shape simply follows operand 0. That holds
+      // for an elementwise op and fails for anything whose result shape is also
+      // pinned by its own attributes (tensor.extract_slice's static_sizes, a
+      // reshape's result type). Record the op so Phase 3 can ask the op itself
+      // whether the assumption held, instead of trusting it silently.
+      retypedOps.push_back(op);
+      enqueueUsers(op->getResult(0));
     }
   }
 
@@ -891,6 +1013,16 @@ struct RewriteDescriptorLayoutPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
+    // Drop state from a previous invocation. MLIR resets only its own
+    // `passState` between runs; fields of the derived class survive, so a
+    // PassManager reused across modules would reach Phase 3 holding
+    // `Operation *` into ops freed with the earlier module — and `retypedOps` is
+    // dereferenced there (`op->getBlock()`), not merely looked up.
+    physMemViewToMarker.clear();
+    rescaledLoops.clear();
+    physicalLoadToTransposePerm.clear();
+    retypedOps.clear();
+
     // Resolve the data-layout option. Reject anything unrecognized rather
     // than silently falling through to the "host" branch below — the pass is
     // also invocable directly (spyre-triton-opt), bypassing the frontend's
@@ -920,14 +1052,15 @@ struct RewriteDescriptorLayoutPass
 
     // Phase 2: synthesize contractions via greedy pattern rewrite.
     {
-      PassContext ctx{physMemViewToMarker, physicalLoadToTransposePerm};
+      PassContext ctx{physMemViewToMarker, physicalLoadToTransposePerm,
+                      /*hadError=*/false};
       RewritePatternSet patterns(module.getContext());
       populateContractionPatterns(patterns, ctx);
-      // Collect candidate ops (only op types our patterns target).
+      // Offer the driver only the ops some pattern can rewrite. Derived from the
+      // same list that registered those patterns, so the two cannot disagree.
       SmallVector<Operation *> candidates;
       module.walk([&](Operation *op) {
-        if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, linalg::ReduceOp,
-                mlir::ktdp::StoreOp>(op))
+        if (isSupportedConsumer(op))
           candidates.push_back(op);
       });
       GreedyRewriteConfig config;
@@ -944,7 +1077,141 @@ struct RewriteDescriptorLayoutPass
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 2 complete, "
                             << "erasing " << markers.size() << " markers\n");
 
-    // Phase 3: erase all markers (and their now-dead bridge casts).
+    // Phase 3a: report every op left holding a physicalized operand its own
+    // signature cannot accept.
+    //
+    // Such an op has an operand at physical rank and a signature at logical rank.
+    // That is invalid IR, not merely unoptimized output, so this is an error
+    // rather than a warning: staying silent produces a module that either fails a
+    // later verifier with a message that never mentions layouts, or verifies and
+    // computes wrong numbers.
+    //
+    // The check reads only the final IR. It does not consult a record of what
+    // Phase 1 skipped or what Phase 2 rebuilt, which is what lets it stay a
+    // simple walk: a repair that happened leaves the shapes in agreement, so the
+    // op drops out on its own. A layout that moves nothing never disagrees in the
+    // first place, so a pointwise kernel reaches here with nothing to report.
+    //
+    // Scoped to the two op forms `stillNeedsRepair` encodes a shape contract for.
+    // It reports anything else by default, so handing it the whole module would
+    // turn every unrelated op into an error.
+    SmallVector<std::pair<Operation *, unsigned>> unrepaired;
+    SmallVector<Operation *> misretyped;
+    module.walk([&](Operation *op) {
+      if (isa<mlir::ktdp::StoreOp>(op)) {
+        if (stillNeedsRepair(op, kStoreDataTileIndex))
+          unrepaired.push_back({op, kStoreDataTileIndex});
+        return;
+      }
+      if (!isa<linalg::LinalgOp>(op))
+        return;
+      for (OpOperand &use : op->getOpOperands())
+        if (stillNeedsRepair(op, use.getOperandNumber()))
+          unrepaired.push_back({op, use.getOperandNumber()});
+    });
+
+    // Phase 3a (cont.): the walk above covers ops that were left holding a
+    // physical operand. This covers the opposite failure — ops `retypeChain`
+    // rewrote on the assumption that their result shape follows operand 0, when
+    // it does not. Rather than encode a shape contract per op form, ask each op
+    // to verify itself: a wrong assumption always leaves the result type
+    // contradicting the op's own attributes, which is exactly what its verifier
+    // checks. Diagnostics are suppressed so only this pass's message is emitted.
+    for (Operation *op : retypedOps) {
+      // Tripwire, not a liveness test. Phase 2 cannot erase these ops: with
+      // `ExistingAndNewOps` strictness the driver's worklist admits only the
+      // seeded consumer candidates and newly inserted ops, so a retyped
+      // elementwise op never reaches the driver's DCE; folding and constant CSE
+      // are disabled, closing the remaining erase paths.
+      //
+      // Widening the candidate set does not make this check sufficient:
+      // `Operation::erase()` frees the op, so `getBlock()` would itself be the
+      // use-after-free. That needs a `notifyOperationErased` listener pruning
+      // `retypedOps`.
+      if (!op->getBlock())
+        continue;
+      DiagnosticEngine::HandlerID id =
+          op->getContext()->getDiagEngine().registerHandler(
+              [](Diagnostic &) { return success(); });
+      bool invalid = failed(mlir::verify(op));
+      op->getContext()->getDiagEngine().eraseHandler(id);
+      if (invalid)
+        misretyped.push_back(op);
+    }
+
+    if (!unrepaired.empty()) {
+      // Sort on source location so a module with several unsupported consumers
+      // emits its diagnostics in the order a reader meets them in the file,
+      // rather than in walk order (which visits nested regions before the ops
+      // that follow their parent).
+      //
+      // Sorts on location rather than `isBeforeInBlock`, which is only defined
+      // for two ops in the same block. Unrepaired ops can sit in different blocks
+      // (a store inside an scf.for and one outside it), so a block-relative
+      // comparison is not a total order here.
+      // `stable_sort` rather than `sort`: keys collide whenever two ops share a
+      // line, or when neither carries a resolvable position. An unstable sort
+      // leaves colliding entries in an arbitrary order, which would make a
+      // multi-error `-verify-diagnostics` test flaky.
+      llvm::stable_sort(unrepaired, [](const auto &a, const auto &b) {
+        auto key = [](const auto &e) {
+          // `findInstanceOf` walks through Name/Fused/CallSite wrappers, which a
+          // frontend-generated kernel carries; a bare `dyn_cast` would miss the
+          // real position and collapse every key to (0, 0).
+          mlir::LocationAttr locAttr = e.first->getLoc();
+          auto loc = locAttr.findInstanceOf<mlir::FileLineColLoc>();
+          return std::tuple<unsigned, unsigned, unsigned>{
+              loc ? loc.getLine() : 0, loc ? loc.getColumn() : 0, e.second};
+        };
+        return key(a) < key(b);
+      });
+      for (auto [op, operandIndex] : unrepaired) {
+        // Streaming a `Type` into a Diagnostic already wraps it in quotes, so the
+        // store format strings add none of their own — unlike the `OperationName`
+        // case at the end, which does.
+        if (isUnrepairedStore(op)) {
+          auto st = cast<mlir::ktdp::StoreOp>(op);
+          auto dataTy = cast<RankedTensorType>(st.getDataTile().getType());
+          auto tileTy =
+              cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
+          InFlightDiagnostic diag =
+              op->emitError("spyre_tensor_layout: store data tile ")
+              << dataTy << " and access tile " << tileTy;
+          // Split on rank because that is what `RewriteStorePattern` matches on, so
+          // the two branches correspond to "the pattern never looked at this store"
+          // and "the pattern looked and declined".
+          if (dataTy.getRank() == (int64_t)tileTy.getShape().size())
+            diag << " have equal rank but different shapes. The store sink pattern "
+                    "only rewrites a store whose operands differ in rank, so this "
+                    "layout is not supported on a store";
+          else
+            diag << " have different ranks. The store sink pattern rewrites this "
+                    "shape, but resolves the layout from the access tile, which "
+                    "carries no spyre_tensor_layout marker; annotate the descriptor "
+                    "this store writes to";
+          continue;
+        }
+        op->emitError("spyre_tensor_layout: unsupported consumer '")
+            << op->getName() << "' for a physicalized operand #" << operandIndex
+            << "; contraction synthesis supports " << supportedConsumerNames();
+      }
+      return signalPassFailure();
+    }
+
+    if (!misretyped.empty()) {
+      for (Operation *op : misretyped)
+        op->emitError("spyre_tensor_layout: cannot propagate the physical layout "
+                      "through '")
+            << op->getName()
+            << "': its result shape does not follow its first operand, so "
+               "retyping it left the op invalid. Physicalizing a descriptor read "
+               "by this op is not supported";
+      return signalPassFailure();
+    }
+
+    // Phase 3b: erase all markers (and their now-dead bridge casts). Only safe
+    // once every repair is done — the markers are what a repair reads to learn
+    // the requested layout.
     for (auto marker : markers)
       eraseMarker(marker);
   }

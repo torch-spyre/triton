@@ -46,13 +46,34 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
           compute chain to the physical rank (stops at multi-tensor ops);
         - redirect ktdp.store's access tile operand to the physical tile.
 
-        Phase 3 — erase the tt.spyre_tensor_layout markers and the now-dead
-        UnrealizedConversionCast bridges.
+        Phase 1 cannot retype every consumer. An op that combines its inputs
+        along a dimension absent from its result (a contraction, or
+        linalg.reduce) has a result shape that follows from no single operand,
+        and a zero-result op (ktdp.store) has no result to retype at all. Phase 1
+        skips those, leaving them holding an operand at physical rank.
+
+        Phase 2 — contraction synthesis: rebuild each such op over the physical
+        layout as an explicit loop over sticks. The set of ops with a pattern is
+        declared once as `SupportedConsumers` in
+        RewriteDescriptorLayout/ContractionSynthesis.cpp; `isSupportedConsumer`
+        and `supportedConsumerNames` derive from it, so adding a pattern needs no
+        matching edit elsewhere.
+
+        Phase 3 — reconcile, then erase. The pass walks the final IR and checks
+        each ktdp.store and linalg op for an operand still at physical rank while
+        its own signature expects logical rank. That is invalid IR, so any such op
+        is reported as an unsupported consumer, naming the op and the supported
+        set, rather than emitting a module that fails a later verifier with a
+        message that never mentions layouts. The check reads only the final types,
+        so an op Phase 2 rebuilt drops out on its own; nothing is tracked across
+        phases. Otherwise the tt.spyre_tensor_layout markers and the now-dead
+        UnrealizedConversionCast bridges are erased.
 
         Output: physical ktdp.construct_memory_view + access_tile + load/store;
-        no tt.spyre_tensor_layout ops remain. Descriptors without an
-        annotation are left untouched. A pure pointwise kernel exercises only
-        Phase 1.
+        no tt.spyre_tensor_layout ops remain. Descriptors without an annotation
+        are left untouched. An identity layout (phys_op all 0) leaves physical
+        shape equal to logical, so a pure pointwise kernel reaches Phase 3 with
+        every shape already in agreement and no error is reported.
     }];
 
     let options = [
