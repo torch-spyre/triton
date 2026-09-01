@@ -156,6 +156,74 @@ struct ReducePropagation : PhysicalPropagationPattern {
   }
 };
 
+/// tensor.expand_shape / collapse_shape / reshape: no physical result.
+///
+/// Not because the result SHAPE is unknown -- it is derivable. A
+/// tensor.collapse_shape carries its reassociation map in the op, so the result
+/// extents follow from the operand's shape plus that map.
+///
+/// The obstacle is the coordinate map, not the shape. PhysicalTypeInfo pairs a
+/// type with a marker, and the marker's phys_src/phys_op/phys_arg arrays are
+/// indexed per PHYSICAL DIM. Collapsing physical [1, 64, 64] under
+/// phys_op = [floor, id, mod] via [[0, 1], [2]] fuses the stick index with the
+/// row, leaving a 2-dim result while the marker still describes 3 dims. The
+/// type and the marker would no longer agree, so the pair is internally
+/// inconsistent: the shape is knowable, the layout is not.
+///
+/// Declining is therefore a positive statement of these ops' own rule rather
+/// than a hole in the structural elementwise predicate -- which would
+/// otherwise claim them, since "every tensor operand agrees on a shape" is
+/// satisfied trivially by an op with one tensor operand, and propagate() would
+/// then hand the result the OPERAND's shape, contradicting the op's own result
+/// type.
+///
+/// An operand produced by one of these is rejected downstream as a legality
+/// question (dispatchSource's reshape/broadcast check), which is separate from
+/// asking whether the operand is physical. If someone later works out how to
+/// rewrite a marker across a reassociation map, this is the one place that
+/// changes.
+struct ReshapePropagation : PhysicalPropagationPattern {
+  bool match(Operation *op) const override {
+    return isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp,
+               tensor::ReshapeOp>(op);
+  }
+
+  llvm::FailureOr<PhysicalTypeInfo>
+  propagate(Operation *op, Value result, Value src,
+            const PhysicalTypeInfo &srcInfo) const override {
+    return failure();
+  }
+};
+
+/// linalg.broadcast: no physical result -- but for a different reason than the
+/// reshape family above, which is why it is stated separately.
+///
+/// A broadcast's result shape is not derived from its operand at all: it is a
+/// target shape fixed when the op was built, and `dimensions` names the axes
+/// added to reach it. LowerComputeOps builds it from tt.broadcast against the
+/// operand's LOGICAL rank. Given a physical operand, that target shape is
+/// simply stale -- it describes a tensor of the wrong rank, and a consuming
+/// elementwise op then fails its same-type constraint.
+///
+/// Unlike a reshape's coordinate map, this is recoverable in principle: the
+/// target shape and `dimensions` could be recomputed against the physical rank,
+/// which would let the op work on physical operands directly. That capability
+/// does not exist yet, and it is what a reduce -> broadcast -> elementwise chain
+/// needs -- the shape softmax and layernorm are written in. Until it does,
+/// declining here is the safe answer, and an operand produced by a broadcast is
+/// rejected downstream rather than guessed at.
+struct BroadcastPropagation : PhysicalPropagationPattern {
+  bool match(Operation *op) const override {
+    return isa<linalg::BroadcastOp>(op);
+  }
+
+  llvm::FailureOr<PhysicalTypeInfo>
+  propagate(Operation *op, Value result, Value src,
+            const PhysicalTypeInfo &srcInfo) const override {
+    return failure();
+  }
+};
+
 /// The tensor operand an op inherits its physicality from: the first tensor
 /// operand already known to be physical.
 Value findPhysicalTensorOperand(Operation *op, const PhysicalTypeMap &roots,
@@ -187,14 +255,20 @@ lookupPattern(Operation *op, const PhysicalPropagationPatternSet &patterns) {
 
 void populatePhysicalPropagationPatterns(
     PhysicalPropagationPatternSet &patterns) {
-  // Order matters only where two patterns could match the same op: transpose,
-  // matmul, store and reduce are named ops and must be asked before the
-  // structural elementwise rule, which a linalg op with uniformly shaped
-  // operands could otherwise satisfy.
+  // Order matters only where two patterns could match the same op. Every
+  // named-op pattern must be asked before the structural elementwise rule,
+  // which a linalg op with uniformly shaped operands could otherwise satisfy.
+  // The reshape family and linalg.broadcast are the load-bearing cases: those
+  // ops have a single tensor operand, so the elementwise rule's "every tensor
+  // operand agrees on a shape" test is satisfied trivially and it WOULD claim
+  // them if asked first -- recording the operand's shape against a result of a
+  // different one. Both are registered ahead of it for exactly that reason.
   patterns.push_back(std::make_unique<TransposePropagation>());
   patterns.push_back(std::make_unique<MatmulPropagation>());
   patterns.push_back(std::make_unique<StorePropagation>());
   patterns.push_back(std::make_unique<ReducePropagation>());
+  patterns.push_back(std::make_unique<ReshapePropagation>());
+  patterns.push_back(std::make_unique<BroadcastPropagation>());
   patterns.push_back(std::make_unique<ElementwisePropagation>());
 }
 
