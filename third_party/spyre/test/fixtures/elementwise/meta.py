@@ -57,6 +57,24 @@ def _make_1d_scalar_dim_checks(**_):
     return checks
 
 
+def _make_spyre_stick_checks(M, N, DTYPE, **_):
+    """Level C: the marker is gone and every operand shares one physical view.
+
+    Stick-on-N turns ``[M, N]`` into ``[ceil(N/stick), M, stick]``. All three
+    operands physicalize identically, so the add stays pure elementwise on rank-3
+    tiles and no transpose or reduction loop is synthesized -- asserting the view
+    is what pins that.
+    """
+    stick = sticksize({"p": f"*{DTYPE}"}, "p")
+    elem = {"fp16": "f16", "fp32": "f32", "i32": "i32"}[DTYPE]
+    view = f"{-(-N // stick)}x{M}x{stick}x{elem}"
+
+    def checks(t):
+        t.assert_absent("tt.spyre_tensor_layout")
+        t.assert_result_type("ktdp.construct_memory_view", view)
+    return checks
+
+
 def _make_2d_scalar_dim_checks(N, **_):
     def checks(t):
         # Single-element 1-D scalar-read chain: construct_memory_view
@@ -269,8 +287,6 @@ _SIG_TENSORS_FP16 = {
 # order.
 _SIG_2D_SPYRE = {**_SIG_2D_LAYOUT, **_SIG_TENSORS_FP16}
 
-_S2 = functools.partial(sticksize, _SIG_TENSORS_FP16)
-
 
 def _stick_layout_1d(dtype_str: str) -> tuple:
     """1D stick layout for a given dtype, as a hashable tuple-of-tuples.
@@ -454,12 +470,12 @@ VARIANTS = {
         "kernel_fn":    kernel.elementwise_2d,
         "SIGNATURE":    _SIG_2D_LAYOUT,
         "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
         "params":       {
             # M=[512,520]: absorbs 2d_nonaligned (M=520).
             "M": [512, 520], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16],
             "X_LAYOUT": [None], "Y_LAYOUT": [None], "OUT_LAYOUT": [None],
-            "OP": ["add"],
+            "DTYPE": ["fp32"], "OP": ["add"],
         },
         "inputs":       make_inputs_2d,
         "extra_checks": _make_2d_checks,
@@ -478,7 +494,7 @@ VARIANTS = {
             "unchanged across a range of matrix shapes."
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?xf32>"),
@@ -491,7 +507,7 @@ VARIANTS = {
         "params": {
             "M": [256], "N": [64], "BLOCK_M": [16], "BLOCK_N": [16],
             "X_LAYOUT": [None], "Y_LAYOUT": [None], "OUT_LAYOUT": [None],
-            "OP": ["add"],
+            "DTYPE": ["fp32"], "OP": ["add"],
         },
     },
     "2d_dynamic_from_scalar_load": {
@@ -724,26 +740,46 @@ VARIANTS = {
         ),
         "SIGNATURE": _SIG_2D_SPYRE,
         "params": {
-            # fp16 stick = 64; N = 128 = 2 sticks exactly.
+            # fp16 stick = 64, so N = 128 is exactly 2 sticks.
             "M": [64], "N": [128], "BLOCK_M": [64], "BLOCK_N": [128],
-            "X_LAYOUT":   [[(1, "floordiv", _S2("x_ptr")), 0,
-                            (1, "mod", _S2("x_ptr"))]],
-            "Y_LAYOUT":   [[(1, "floordiv", _S2("y_ptr")), 0,
-                            (1, "mod", _S2("y_ptr"))]],
-            "OUT_LAYOUT": [[(1, "floordiv", _S2("output_ptr")), 0,
-                            (1, "mod", _S2("output_ptr"))]],
-            "OP": ["add"],
+            # list(), not the tuple the helper returns: _normalise_param_list
+            # reads any tuple in a values list as a (label, value) pair. Left
+            # unlabelled so the key stays suffix-free, as it was.
+            "X_LAYOUT":   [list(_stick_layout_2d_on_n("fp16"))],
+            "Y_LAYOUT":   [list(_stick_layout_2d_on_n("fp16"))],
+            "OUT_LAYOUT": [list(_stick_layout_2d_on_n("fp16"))],
+            "DTYPE": ["fp16"], "OP": ["add"],
         },
         "grid":        [1],
         "data_layout": "host",
-        "inputs":      functools.partial(make_inputs_2d, DTYPE="fp16"),
         "rtol":        1e-2,
         "atol":        5e-2,
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            # All three operands share the rank-3 physical view [2, 64, 64].
-            t.assert_result_type("ktdp.construct_memory_view", "2x64x64xf16"),
+        "extra_checks": _make_spyre_stick_checks,
+    },
+    "2d_spyre_stick_fp32": {
+        # The same layout path one stick width down: fp32 sticks are 32 lanes, so
+        # the physical view is [2, 64, 32] rather than [2, 64, 64]. Level D covers
+        # fp32 stick-tiling on device; this covers it in KTIR and on ktir_cpu,
+        # where the numbers are checked rather than just the shapes.
+        "base": "2d_spyre_stick",
+        "summary": (
+            "2D fp32 elementwise add with x/y/out all annotated stick-on-N. "
+            "The fp32 arm of the layout path: 32 lanes to a stick, not 64."
         ),
+        "SIGNATURE": _SIG_2D_LAYOUT,
+        "params": {
+            # fp32 stick = 32, so N = 64 is exactly 2 sticks.
+            "M": [64], "N": [64], "BLOCK_M": [64], "BLOCK_N": [64],
+            # list(), not the tuple the helper returns: _normalise_param_list
+            # reads any tuple in a values list as a (label, value) pair. Left
+            # unlabelled so the key stays suffix-free, as it was.
+            "X_LAYOUT":   [list(_stick_layout_2d_on_n("fp32"))],
+            "Y_LAYOUT":   [list(_stick_layout_2d_on_n("fp32"))],
+            "OUT_LAYOUT": [list(_stick_layout_2d_on_n("fp32"))],
+            "DTYPE": ["fp32"], "OP": ["add"],
+        },
+        "rtol":        1e-6,
+        "atol":        0.0,
     },
 
 

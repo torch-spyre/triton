@@ -26,6 +26,23 @@ No-grid kernel — one tile, no distribution loop at all:
 Scalar-load variant of the 1D kernel — same idea, one axis:
 - :func:`elementwise_1d_scalar_dim` — 1D, but `n_elements` is a scalar read
   from memory rather than a kernel argument. KTIR-structural only for now.
+
+``DTYPE: tl.constexpr``, on the four kernels whose fixtures sweep dtype, is
+deliberately unread. There is nothing for a kernel to do with it: the element
+type is already fixed by the pointer arguments, and
+``tl.make_tensor_descriptor`` takes it from there — the same source text
+compiles at fp16, fp32 and i32 with no reference to ``DTYPE`` at all. It is
+also not needed to tell the compiled variants apart, since the pointer types
+in the signature already give them distinct hashes.
+
+It exists because sweeping dtype in the fixture forces it. ``DTYPE`` has to be
+in ``params`` for the factory hooks to read; a ``params`` entry that is not a
+constexpr reaches ``run_cpu`` as a runtime scalar and is rejected as an unknown
+kwarg; and a constexpr with no matching kernel parameter is rejected by
+``ASTSource`` (``ValueError: 'DTYPE' is not in list``). So the parameter is an
+artifact of the framework having no notion of a param that drives the fixture
+without being passed to the kernel — the same gap a derived-params hook would
+close.
 """
 
 import triton
@@ -153,6 +170,7 @@ def elementwise_2d(
     X_LAYOUT: tl.constexpr,
     Y_LAYOUT: tl.constexpr,
     OUT_LAYOUT: tl.constexpr,
+    DTYPE: tl.constexpr,
     OP: tl.constexpr,
 ):
     """2D elementwise op: out[M, N] = x[M, N] OP y[M, N].

@@ -55,7 +55,7 @@ Expected diagnostics:
 - `elementwise::default` — n_elements=1024, BLOCK_SIZE=1024, DTYPE='fp32', OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d)
 - `elementwise::dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, program-id-1d)
 - `elementwise::dynamic_from_scalar_load` — BLOCK_SIZE=1024, OP='add' (also demonstrates: descriptor-load-dynamic-from-scalar-load, descriptor-store-dynamic, program-id-1d)
-- `elementwise::2d` — M=512, N=32, BLOCK_M=16, BLOCK_N=16, X_LAYOUT=None, Y_LAYOUT=None, OUT_LAYOUT=None, OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d)
+- `elementwise::2d` — M=512, N=32, BLOCK_M=16, BLOCK_N=16, X_LAYOUT=None, Y_LAYOUT=None, OUT_LAYOUT=None, DTYPE='fp32', OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, program-id-1d)
 - `elementwise::2d_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, program-id-1d)
 
 _+ 16 more variants_
@@ -86,7 +86,7 @@ offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 - `elementwise::default` — n_elements=1024, BLOCK_SIZE=1024, DTYPE='fp32', OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, num-programs-fold)
 - `elementwise::dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, num-programs-fold)
 - `elementwise::dynamic_from_scalar_load` — BLOCK_SIZE=1024, OP='add' (also demonstrates: descriptor-load-dynamic-from-scalar-load, descriptor-store-dynamic, num-programs-fold)
-- `elementwise::2d` — M=512, N=32, BLOCK_M=16, BLOCK_N=16, X_LAYOUT=None, Y_LAYOUT=None, OUT_LAYOUT=None, OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, num-programs-fold)
+- `elementwise::2d` — M=512, N=32, BLOCK_M=16, BLOCK_N=16, X_LAYOUT=None, Y_LAYOUT=None, OUT_LAYOUT=None, DTYPE='fp32', OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, num-programs-fold)
 - `elementwise::2d_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, num-programs-fold)
 
 _+ 17 more variants_
