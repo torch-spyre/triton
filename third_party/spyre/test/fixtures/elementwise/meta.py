@@ -370,7 +370,7 @@ VARIANTS = {
             "communication."
         ),
         "kernel_fn":    kernel.elementwise_1d,
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "OP"],
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "OP"],
         "params":       {
             # n_elements=[1024,2097152,2097153]: absorbs single_block (1024)
             # and nonaligned (2097153).
@@ -402,7 +402,7 @@ VARIANTS = {
             "computes its own per-tile work based on the runtime "
             "value."
         ),
-        "constexpr":    ["BLOCK_SIZE", "DTYPE", "OP"],
+        "constexpr":    ["BLOCK_SIZE", "OP"],
         "extra_checks": lambda t: (
             # Dynamic path: construct_memory_view must carry a dynamic
             # dimension (memref<?x...>) — the whole point of this variant
@@ -470,7 +470,7 @@ VARIANTS = {
         "kernel_fn":    kernel.elementwise_2d,
         "SIGNATURE":    _SIG_2D_LAYOUT,
         "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
         "params":       {
             # M=[512,520]: absorbs 2d_nonaligned (M=520).
             "M": [512, 520], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16],
@@ -494,7 +494,7 @@ VARIANTS = {
             "unchanged across a range of matrix shapes."
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?xf32>"),
@@ -705,7 +705,7 @@ VARIANTS = {
         ),
         "kernel_fn":    kernel.elementwise_1d,
         "factory":      Elementwise(rank=1),
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "OP"],
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "OP"],
         "params": {
             "DTYPE":      ["fp16", "fp32", "i32"],
             "OP":         ["add", "sub", "mul", "div"],
@@ -812,7 +812,7 @@ VARIANTS = {
         ),
         "kernel_fn":    kernel.elementwise_1d_device,
         "factory":      Elementwise(rank=1),
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "LAYOUT", "OP"],
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "OP"],
         "params": {
             "DTYPE":      ["fp16"],
             "OP":         ["add", "sub", "mul"],
@@ -886,7 +886,7 @@ VARIANTS = {
         "kernel_fn":    kernel.elementwise_2d_device,
         "factory":      Elementwise(rank=2),
         "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
         "params": {
             "DTYPE":    ["fp16"],
             "OP":       ["add", "sub", "mul"],

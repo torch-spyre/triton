@@ -386,18 +386,25 @@ class TestExample(KTIRCpuTester, KTIRStructuralTester):
         self.EXAMPLE = key
         self.setup_method()
 
-        # ``inputs(**param_values)`` returns the kernel's buffer kwargs
-        # plus any runtime scalars the oracle needs to see (e.g.
-        # gather's ``y_offset``). Runtime scalars not already in
-        # ``inputs`` come from ``params`` \ ``constexpr`` and are
-        # merged in here — the ``not in inputs`` filter keeps the
-        # ``run_cpu`` kwarg merge collision-free when ``make_inputs``
-        # chooses to stash a scalar alongside the buffers.
+        # ``inputs(**param_values)`` returns the kernel's buffer kwargs plus any
+        # runtime scalars the oracle needs to see (e.g. gather's ``y_offset``).
+        # The rest of the kernel's runtime args are filled from ``params``.
+        #
+        # Taken from ``signature``, which is the runtime ABI, rather than as
+        # ``params`` minus ``constexprs``: a param need not be an argument of the
+        # kernel at all. ``DTYPE`` is one -- it drives ``signature()`` and
+        # ``inputs()`` and no kernel reads it -- so subtracting left it in and
+        # ``run_cpu`` rejected it as an unknown kwarg. That is what made the dead
+        # ``DTYPE: tl.constexpr`` parameters undeletable; asking the signature
+        # what the kernel takes cannot invent an argument it does not have.
+        #
+        # The ``not in inputs`` filter keeps the ``run_cpu`` kwarg merge
+        # collision-free when ``make_inputs`` stashes a scalar beside the buffers.
         param_values = entry["param_values"]
         inputs = entry["inputs"](**param_values)
         runtime_scalars = {
-            k: v for k, v in param_values.items()
-            if k not in entry["constexprs"] and k not in inputs
+            k: param_values[k] for k in entry["signature"]
+            if k not in inputs and k in param_values
         }
         func_name = entry.get("func_name") or entry["kernel_fn"].__name__
         outputs = self.run_cpu(

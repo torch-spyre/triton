@@ -27,22 +27,21 @@ Scalar-load variant of the 1D kernel — same idea, one axis:
 - :func:`elementwise_1d_scalar_dim` — 1D, but `n_elements` is a scalar read
   from memory rather than a kernel argument. KTIR-structural only for now.
 
-``DTYPE: tl.constexpr``, on the four kernels whose fixtures sweep dtype, is
-deliberately unread. There is nothing for a kernel to do with it: the element
-type is already fixed by the pointer arguments, and
-``tl.make_tensor_descriptor`` takes it from there — the same source text
-compiles at fp16, fp32 and i32 with no reference to ``DTYPE`` at all. It is
-also not needed to tell the compiled variants apart, since the pointer types
-in the signature already give them distinct hashes.
+No kernel here takes a ``DTYPE`` parameter, though several of their fixtures
+sweep dtype. There would be nothing to do with one: the element type is fixed by
+the pointer arguments and ``tl.make_tensor_descriptor`` takes it from there, so
+the same source text compiles at fp16, fp32 and i32. Nor is it needed to tell
+the compiled variants apart — the pointer types in the signature already give
+them distinct hashes.
 
-It exists because sweeping dtype in the fixture forces it. ``DTYPE`` has to be
-in ``params`` for the factory hooks to read; a ``params`` entry that is not a
-constexpr reaches ``run_cpu`` as a runtime scalar and is rejected as an unknown
-kwarg; and a constexpr with no matching kernel parameter is rejected by
-``ASTSource`` (``ValueError: 'DTYPE' is not in list``). So the parameter is an
-artifact of the framework having no notion of a param that drives the fixture
-without being passed to the kernel — the same gap a derived-params hook would
-close.
+Four of these kernels did carry such a parameter, unread, until the fixture
+framework stopped requiring it. Sweeping a dtype needs ``DTYPE`` in ``params``
+for the factory hooks to read, and a ``params`` entry that was not a constexpr
+used to reach ``run_cpu`` as a runtime scalar and be rejected as an unknown
+kwarg — while a constexpr with no matching parameter is rejected by
+``ASTSource`` (``ValueError: 'DTYPE' is not in list``). Taking the runtime
+scalars from the variant's signature instead broke that chain: a param can now
+drive a fixture without being an argument of anything.
 """
 
 import triton
@@ -56,7 +55,6 @@ def elementwise_1d(
     output_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
-    DTYPE: tl.constexpr,
     OP: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -170,7 +168,6 @@ def elementwise_2d(
     X_LAYOUT: tl.constexpr,
     Y_LAYOUT: tl.constexpr,
     OUT_LAYOUT: tl.constexpr,
-    DTYPE: tl.constexpr,
     OP: tl.constexpr,
 ):
     """2D elementwise op: out[M, N] = x[M, N] OP y[M, N].
@@ -468,7 +465,6 @@ def elementwise_1d_device(
     n_elements: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     LAYOUT: tl.constexpr,
-    DTYPE: tl.constexpr,
     OP: tl.constexpr,
 ):
     """Elementwise op over exactly one tile, with no distribution loop.
@@ -520,7 +516,6 @@ def elementwise_2d_device(
     X_LAYOUT: tl.constexpr,
     Y_LAYOUT: tl.constexpr,
     OUT_LAYOUT: tl.constexpr,
-    DTYPE: tl.constexpr,
     OP: tl.constexpr,
 ):
     """2D elementwise op over a single tile, no distribution loop.
