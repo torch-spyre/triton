@@ -65,7 +65,7 @@ def _make_spyre_stick_checks(M, N, DTYPE, **_):
     tiles and no transpose or reduction loop is synthesized -- asserting the view
     is what pins that.
     """
-    stick = sticksize({"p": f"*{DTYPE}"}, "p")
+    stick = _stick_of(DTYPE)
     elem = {"fp16": "f16", "fp32": "f32", "i32": "i32"}[DTYPE]
     view = f"{-(-N // stick)}x{M}x{stick}x{elem}"
 
@@ -201,8 +201,10 @@ _PTR = {"fp16": "*fp16", "fp32": "*fp32", "i32": "*i32"}
 class Elementwise(conftest.VariantFactory):
     """Factory for elementwise variants that sweep OP and/or DTYPE.
 
-    ``rank`` selects which _SHAPE_ARGS entry to use for the runtime signature.
-    Only rank=1 is used in Stage 2 (1d_compute); rank=2 is for Stage 3 (2d_device).
+    ``rank`` selects the shape: which ``_SHAPE_ARGS`` entry joins the runtime
+    signature, and which input maker is used. Nothing here has anything to say
+    about the layout a variant sticks -- that follows from ``DTYPE``, and a
+    ``params`` group states it beside the dtype without a factory in sight.
     """
     rank: int = 1
 
@@ -250,8 +252,10 @@ SIGNATURE = {
 #   - ``constexpr`` : list of arg names to bake in as Triton constexprs.
 #                     Each variant declares the full list explicitly; no
 #                     subset overrides of the default's list.
-#   - ``params``    : dict of arg name -> list of values. Single-element
-#                     lists for now; the Cartesian expansion is deferred.
+#   - ``params``    : dict of arg name -> list of values, crossed to one
+#                     registry entry per combination. A key may instead be a
+#                     tuple of names whose value is a list of rows, sweeping
+#                     those names jointly -- see ``fixtures/README.md``.
 # ---------------------------------------------------------------------------
 
 _SIG_2D = {
@@ -288,25 +292,58 @@ _SIG_TENSORS_FP16 = {
 _SIG_2D_SPYRE = {**_SIG_2D_LAYOUT, **_SIG_TENSORS_FP16}
 
 
-def _stick_layout_1d(dtype_str: str) -> tuple:
-    """1D stick layout for a given dtype, as a hashable tuple-of-tuples.
+def _stick_of(dtype: str) -> int:
+    """Lanes to a stick at *dtype*: 64 at fp16, 32 at fp32 and i32."""
+    return sticksize({"p": f"*{dtype}"}, "p")
 
-    stick=64 for fp16, stick=32 for fp32. The 1D layout maps:
-      physical dim 0 = logical_idx[0] // stick  (which stick)
-      physical dim 1 = logical_idx[0] % stick   (lane within stick)
+
+# Both layout helpers take a *dtype*, not a width, because every call site had one
+# and passed _stick_of(dtype) -- which put the chance of pairing a dtype with the
+# wrong width at each of them. And both return the ``("stick", layout)`` pair rather
+# than the bare layout, so a layout has one spelling everywhere in this file and the
+# only tuples written into ``params`` are rows. Handing the bare tuple over meant
+# wrapping it in ``list()`` at every unlabelled site: _normalise_param_list reads any
+# tuple in a values list as a (label, value) pair, and a 3-element layout is not one,
+# so it raised rather than mislabelled. The value inside the pair stays a tuple
+# because it reaches Triton as a constexpr and has to be hashable.
+
+def _stick_1d(dtype: str) -> tuple:
+    """Labelled 1D stick layout at *dtype*, ``[n]`` -> ``[ceil(n/S), S]``.
+
+    Physical dim 0 is which stick, dim 1 the lane within it.
     """
-    stick = sticksize({"x_ptr": f"*{dtype_str}"}, "x_ptr")
-    return ((0, "floordiv", stick), (0, "mod", stick))
+    stick = _stick_of(dtype)
+    return ("stick", ((0, "floordiv", stick), (0, "mod", stick)))
 
 
-def _stick_layout_2d_on_n(dtype_str: str) -> tuple:
-    """2D stick-on-N layout for a given dtype, as a hashable tuple.
+def _stick_2d_on_n(dtype: str) -> tuple:
+    """Labelled stick-on-N layout at *dtype*, ``[M, N]`` -> ``[ceil(N/S), M, S]``.
 
-    Physicalizes [M, N] -> [N//stick, M, stick]:
-      (1, "floordiv", stick), 0, (1, "mod", stick)
+    Every operand physicalizes identically under this, so an elementwise op stays
+    elementwise on the rank-3 tiles and no transpose is synthesized.
     """
-    stick = sticksize({"x_ptr": f"*{dtype_str}"}, "x_ptr")
-    return ((1, "floordiv", stick), 0, (1, "mod", stick))
+    stick = _stick_of(dtype)
+    return ("stick", ((1, "floordiv", stick), 0, (1, "mod", stick)))
+
+
+def _stick_on_n_row(dtype: str, n_sticks: int) -> tuple:
+    """One row for the ``("DTYPE", "N", "BLOCK_N", *_LAYOUT)`` group: a rank-2
+    shape *n_sticks* sticks wide at *dtype*, with the layout that matches it.
+
+    ``N``, ``BLOCK_N`` and the layout all take their width from the one *dtype*
+    argument, so a row cannot pair a 128-lane ``N`` with a 32-lane layout -- the
+    mismatch dbo-opt rejects with an error naming neither operand.
+    Spelling the layout beside its dtype is what let the two disagree; a row makes
+    it unrepresentable, with no hook to gate the fixtures that get the property.
+
+    No width is written here or at the call site: *n_sticks* says how many, the
+    dtype says how wide. Named for the row it makes rather than for a size, for
+    the reason ``_SS = functools.partial(sticksize, ...)`` is in
+    ``fixtures/reduce/meta.py``.
+    """
+    n = n_sticks * _stick_of(dtype)
+    layout = _stick_2d_on_n(dtype)
+    return (dtype, n, n, layout, layout, layout)
 
 _SIG_3D = {
     "x_ptr":      "*fp32",
@@ -742,12 +779,9 @@ VARIANTS = {
         "params": {
             # fp16 stick = 64, so N = 128 is exactly 2 sticks.
             "M": [64], "N": [128], "BLOCK_M": [64], "BLOCK_N": [128],
-            # list(), not the tuple the helper returns: _normalise_param_list
-            # reads any tuple in a values list as a (label, value) pair. Left
-            # unlabelled so the key stays suffix-free, as it was.
-            "X_LAYOUT":   [list(_stick_layout_2d_on_n("fp16"))],
-            "Y_LAYOUT":   [list(_stick_layout_2d_on_n("fp16"))],
-            "OUT_LAYOUT": [list(_stick_layout_2d_on_n("fp16"))],
+            "X_LAYOUT":   [_stick_2d_on_n("fp16")],
+            "Y_LAYOUT":   [_stick_2d_on_n("fp16")],
+            "OUT_LAYOUT": [_stick_2d_on_n("fp16")],
             "DTYPE": ["fp16"], "OP": ["add"],
         },
         "grid":        [1],
@@ -761,6 +795,14 @@ VARIANTS = {
         # the physical view is [2, 64, 32] rather than [2, 64, 64]. Level D covers
         # fp32 stick-tiling on device; this covers it in KTIR and on ktir_cpu,
         # where the numbers are checked rather than just the shapes.
+        #
+        # Its ``params`` would collapse into one of Level D's dtype groups, and its
+        # SIGNATURE differs from its sibling's only in the pointer dtype the
+        # factory already derives. What keeps the two apart is rtol/atol: an fp32
+        # add is exact and is checked as such, while its fp16 sibling is not.
+        # Those are fields, not params, and the params grammar has nothing to say
+        # about them -- collapsing the pair would mean a tolerance hook, growing
+        # the mechanism, or weakening the fp32 check.
         "base": "2d_spyre_stick",
         "summary": (
             "2D fp32 elementwise add with x/y/out all annotated stick-on-N. "
@@ -770,12 +812,9 @@ VARIANTS = {
         "params": {
             # fp32 stick = 32, so N = 64 is exactly 2 sticks.
             "M": [64], "N": [64], "BLOCK_M": [64], "BLOCK_N": [64],
-            # list(), not the tuple the helper returns: _normalise_param_list
-            # reads any tuple in a values list as a (label, value) pair. Left
-            # unlabelled so the key stays suffix-free, as it was.
-            "X_LAYOUT":   [list(_stick_layout_2d_on_n("fp32"))],
-            "Y_LAYOUT":   [list(_stick_layout_2d_on_n("fp32"))],
-            "OUT_LAYOUT": [list(_stick_layout_2d_on_n("fp32"))],
+            "X_LAYOUT":   [_stick_2d_on_n("fp32")],
+            "Y_LAYOUT":   [_stick_2d_on_n("fp32")],
+            "OUT_LAYOUT": [_stick_2d_on_n("fp32")],
             "DTYPE": ["fp32"], "OP": ["add"],
         },
         "rtol":        1e-6,
@@ -789,8 +828,10 @@ VARIANTS = {
     # compiles_to_binary, so test_device_launch.py and the spyrecode lit tests
     # pick these up. Loop-free and one tile per core -- dbo-opt rejects the
     # scf.for every other variant outlines from its program-id distribution.
-    # One variant per dtype because the stick size, and hence the layout and
-    # the 2D shape, follow DTYPE rather than varying independently.
+    #
+    # One variant per rank, not per dtype: the stick size and everything that
+    # follows from it are grouped with DTYPE in ``params``, one row per dtype, so
+    # the fp32 arm is a row rather than a variant that repeats the fp16 one.
     # -----------------------------------------------------------------------
     "1d_device": {
         # The device variants in the suite that reach a Spyre binary. Everything
@@ -800,25 +841,29 @@ VARIANTS = {
         #
         # That makes it the fixture the spyrecode-stage tests compile, which is
         # why it lives here rather than inline in a test module.
-        # Stage 3: sweep {fp16} x {add, sub, mul}. fp32 is in 1d_device_fp32.
         "base": None,   # prevent inheriting reference/inputs from default
         "tags": [
             "descriptor-load-static", "descriptor-store-static",
             "simplified:no-loop", "spyre-tensor-layout",
         ],
         "summary": (
-            "1D fp16 elementwise over a single tile, no distribution loop. "
-            "Sweeps add/sub/mul -- the three ops dbo-opt accepts at fp16."
+            "1D elementwise over a single tile, no distribution loop. Sweeps "
+            "fp16/fp32 x add/sub/mul -- the arms dbo-opt accepts."
         ),
         "kernel_fn":    kernel.elementwise_1d_device,
         "factory":      Elementwise(rank=1),
         "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "OP"],
         "params": {
-            "DTYPE":      ["fp16"],
+            # One row per dtype, because the layout's stick width follows from it.
+            # Written out rather than built: at rank 1 there is no shape to keep
+            # in step, so a row is just the dtype and the layout it implies.
+            ("DTYPE", "LAYOUT"): [
+                ("fp16", _stick_1d("fp16")),
+                ("fp32", _stick_1d("fp32")),
+            ],
             "OP":         ["add", "sub", "mul"],
             "n_elements": [128],
             "BLOCK_SIZE": [128],
-            "LAYOUT":     [("stick", _stick_layout_1d("fp16"))],
         },
         "grid":         [1],
         "parallel":     False,
@@ -827,27 +872,6 @@ VARIANTS = {
         "rtol":         1e-2,
         "atol":         5e-2,
         "extra_checks": None,
-    },
-    "1d_device_fp32": {
-        "base": "1d_device",
-        # Spelled out rather than inherited: gen_patterns_docs.py reads the raw
-        # VARIANTS dict and never resolves `base`, so a variant with no `tags`
-        # key of its own is absent from the generated pattern docs entirely.
-        "tags": [
-            "descriptor-load-static", "descriptor-store-static",
-            "simplified:no-loop", "spyre-tensor-layout",
-        ],
-        "summary": (
-            "1D fp32 elementwise over a single tile, no distribution loop. "
-            "Sweeps add/sub/mul -- the three ops dbo-opt accepts at fp32."
-        ),
-        "params": {
-            "DTYPE":      ["fp32"],
-            "OP":         ["add", "sub", "mul"],
-            "n_elements": [128],
-            "BLOCK_SIZE": [128],
-            "LAYOUT":     [("stick", _stick_layout_1d("fp32"))],
-        },
     },
     "1d_device_grid2": {
         # The multi-core counterpart of 1d_device: still one tile per core and
@@ -865,11 +889,15 @@ VARIANTS = {
         ),
         "grid": [2],
         "params": {
-            "DTYPE":      ["fp16"],
+            # The parent's group with its fp16 row alone: this variant is about
+            # work division, not dtype. Redeclared in full because ``params``
+            # merges wholesale, so a partial override would leave the fp32 row in.
+            ("DTYPE", "LAYOUT"): [
+                ("fp16", _stick_1d("fp16")),
+            ],
             "OP":         ["add", "sub", "mul"],
             "n_elements": [128],
             "BLOCK_SIZE": [64],   # 64 elements = 1 fp16 stick per core
-            "LAYOUT":     [("stick", _stick_layout_1d("fp16"))],
         },
     },
     "2d_device": {
@@ -879,24 +907,27 @@ VARIANTS = {
             "simplified:no-loop", "spyre-tensor-layout",
         ],
         "summary": (
-            "2D fp16 elementwise over a single tile, stick-on-N layout. "
-            "Sweeps add/sub/mul. First fixture to put a rank-3 physicalized "
-            "layout and multi-element 2D tile on hardware."
+            "2D elementwise over a single tile, stick-on-N layout. Sweeps "
+            "fp16/fp32 x add/sub/mul. First fixture to put a rank-3 "
+            "physicalized layout and a multi-element 2D tile on hardware."
         ),
         "kernel_fn":    kernel.elementwise_2d_device,
         "factory":      Elementwise(rank=2),
         "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N",
                          "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
         "params": {
-            "DTYPE":    ["fp16"],
+            # N, BLOCK_N and the three layouts all follow from DTYPE, so they
+            # share its rows -- two sticks is 128 lanes at fp16 and 64 at fp32,
+            # and no row can say one while its layout says the other. M and
+            # BLOCK_M are outside the group because they follow from nothing.
+            ("DTYPE", "N", "BLOCK_N",
+             "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT"): [
+                _stick_on_n_row("fp16", n_sticks=2),
+                _stick_on_n_row("fp32", n_sticks=2),
+            ],
             "OP":       ["add", "sub", "mul"],
             "M":        [64],
-            "N":        [128],   # 2 fp16 sticks (128 / 64)
             "BLOCK_M":  [64],
-            "BLOCK_N":  [128],
-            "X_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp16"))],
-            "Y_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp16"))],
-            "OUT_LAYOUT": [("stick", _stick_layout_2d_on_n("fp16"))],
         },
         "grid":         [1],
         "parallel":     False,
@@ -905,29 +936,6 @@ VARIANTS = {
         "rtol":         1e-2,
         "atol":         5e-2,
         "extra_checks": None,
-    },
-    "2d_device_fp32": {
-        "base": "2d_device",
-        # Spelled out rather than inherited -- see 1d_device_fp32.
-        "tags": [
-            "descriptor-load-static", "descriptor-store-static",
-            "simplified:no-loop", "spyre-tensor-layout",
-        ],
-        "summary": (
-            "2D fp32 elementwise over a single tile, stick-on-N layout. "
-            "Sweeps add/sub/mul. fp32 stick = 32 lanes; N = 64 = 2 sticks."
-        ),
-        "params": {
-            "DTYPE":    ["fp32"],
-            "OP":       ["add", "sub", "mul"],
-            "M":        [64],
-            "N":        [64],    # 2 fp32 sticks (64 / 32)
-            "BLOCK_M":  [64],
-            "BLOCK_N":  [64],
-            "X_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp32"))],
-            "Y_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp32"))],
-            "OUT_LAYOUT": [("stick", _stick_layout_2d_on_n("fp32"))],
-        },
     },
 
 }
