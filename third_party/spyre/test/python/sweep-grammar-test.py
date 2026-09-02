@@ -29,11 +29,20 @@ That gives the rule these tests pin: a param appears in the suffix when it is
 swept **or** when it was written with a label. The second half is why a param
 with only one value can still show up in a key.
 
-Three helpers, bottom-up: ``_normalise_param_list`` turns one param's list into
-``(label, value)`` pairs; ``_expand_params`` takes the Cartesian product across
-params; ``_sweep_suffix`` renders one combination's suffix. Then the *factory
-protocol*, where a variant's ``"factory"`` key supplies the fields that vary
-with the combination — so ``OP`` × ``DTYPE`` is one declaration, not twelve.
+A ``params`` key is also allowed to be a **tuple of names**, whose value is a
+list of rows rather than of values. Then those names are swept *jointly*: only
+the rows written are enumerated, never their product. That states a functional
+dependency — the ``N`` a dtype implies sits on the same row as the dtype, so an
+fp16 width beside an fp32 dtype is unrepresentable — and it skips an invalid
+combination by the same means, which is to not list it.
+
+Four helpers, bottom-up: ``_normalise_param_list`` turns one param's list into
+``(label, value)`` pairs; ``_normalise_param_group`` does the same per column of
+a tuple key's rows; ``_expand_params`` takes the Cartesian product across keys
+and decides which names a key is worth naming for; ``_sweep_suffix`` renders one
+combination's suffix. Then the *factory protocol*, where a variant's
+``"factory"`` key supplies the fields that vary with the combination — so
+``OP`` × ``DTYPE`` is one declaration, not twelve.
 
 A lit test rather than a pytest module: it needs no dbo-opt and no device, and a
 test that needs nothing should not sit in the suite that serializes the device.
@@ -47,6 +56,7 @@ from conftest import (
     VariantFactory,
     _apply_factory,
     _expand_params,
+    _normalise_param_group,
     _normalise_param_list,
     _sweep_suffix,
 )
@@ -126,26 +136,137 @@ def test_a_tuple_that_is_not_a_pair_is_refused():
 
 
 # ---------------------------------------------------------------------------
-# _expand_params — all params → (combinations, names that used labels)
+# _normalise_param_group — a tuple key's rows → the same pairs, per column
 #
-# One combination per registry entry. The second return value is the only
-# record of which spelling was used, and _sweep_suffix needs it.
+# Transposes the rows into columns, hands each column to
+# _normalise_param_list, transposes back. So a group member is labelled by
+# exactly the rule a scalar param is, and the validation here is only about the
+# shape a row has to have to be transposable at all.
+# ---------------------------------------------------------------------------
+
+def test_a_group_normalises_each_column_the_way_a_scalar_is():
+    """Column-wise, not row-wise: labelling is a property of the argument, so
+    ``DTYPE`` gets its own repr as a label while ``LAYOUT`` keeps the author's."""
+    rows, labelled = _normalise_param_group(
+        ("DTYPE", "LAYOUT"),
+        [("fp16", ("stick", 64)), ("fp32", ("stick", 32))],
+    )
+    assert rows == [
+        (("fp16", "fp16"), ("stick", 64)),
+        (("fp32", "fp32"), ("stick", 32)),
+    ]
+    assert labelled == {"LAYOUT"}
+
+
+def test_group_rows_keep_the_order_they_were_written_in():
+    """The rows are what the registry enumerates, so their order is the order of
+    the keys a fixture generates."""
+    rows, _ = _normalise_param_group(("N",), [(16,), (8,), (32,)])
+    assert [row[0][1] for row in rows] == [16, 8, 32]
+
+
+def test_a_group_of_one_row_is_legal():
+    """A group with nothing to vary is still the right spelling when the names
+    belong together — a sibling variant pinning one row of its parent's sweep."""
+    rows, labelled = _normalise_param_group(("DTYPE", "N"), [("fp16", 128)])
+    assert rows == [(("fp16", "fp16"), ("128", 128))]
+    assert labelled == set()
+
+
+def test_a_group_with_no_rows_normalises_to_no_rows():
+    """Like an empty scalar list: not an error here, but zero combinations
+    upstream, which is where a group declared and never populated is caught."""
+    assert _normalise_param_group(("A", "B"), []) == ([], set())
+
+
+def test_a_row_shorter_than_the_group_is_refused():
+    """Rows are positional, so a missing value does not leave a hole — it shifts
+    every later column onto the wrong name, which no downstream check can see."""
+    with pytest.raises(ValueError, match="has 2 value"):
+        _normalise_param_group(("DTYPE", "N", "BLOCK_N"), [("fp16", 128)])
+
+
+def test_a_row_longer_than_the_group_is_refused():
+    """The same reason in the other direction, and the more likely typo: a name
+    was dropped from the key while its value stayed in the rows."""
+    with pytest.raises(ValueError, match="has 3 value"):
+        _normalise_param_group(("DTYPE", "N"), [("fp16", 128, 128)])
+
+
+def test_the_row_length_error_names_the_row():
+    """A group is a list of rows that look alike, so naming the group is not
+    enough — the message has to say which row is the odd one."""
+    with pytest.raises(ValueError, match=r"\('fp32', 64\)"):
+        _normalise_param_group(
+            ("DTYPE", "N", "BLOCK_N"),
+            [("fp16", 128, 128), ("fp32", 64)],
+        )
+
+
+def test_a_row_that_is_not_a_sequence_is_refused():
+    """Writing the bare value instead of a one-element row is the easy mistake in
+    a group of one name; it would otherwise be transposed character by character
+    or not at all."""
+    with pytest.raises(ValueError, match="must be a tuple or list"):
+        _normalise_param_group(("DTYPE",), ["fp16"])
+
+
+def test_a_non_string_name_in_a_group_is_refused():
+    """A group key's elements are argument names. Anything else means the author
+    wrote a row where the key belongs."""
+    with pytest.raises(ValueError, match="is not a str"):
+        _normalise_param_group(("DTYPE", 64), [("fp16", 128)])
+
+
+def test_a_name_repeated_inside_a_group_is_refused():
+    """Two columns for one argument: the second would win the ``combo.update``
+    and the first would vanish silently."""
+    with pytest.raises(ValueError, match=r"repeats \['N'\]"):
+        _normalise_param_group(("N", "N"), [(128, 64)])
+
+
+def test_a_group_column_obeys_the_all_or_nothing_labelling_rule():
+    """Per column, which is the point of transposing first: a layout is labelled
+    in every row or in none, and a half-labelled column is the same typo it is at
+    scalar level."""
+    with pytest.raises(ValueError, match="mixes labelled tuples"):
+        _normalise_param_group(
+            ("DTYPE", "LAYOUT"),
+            [("fp16", ("stick", 64)), ("fp32", 32)],
+        )
+
+
+def test_a_group_error_names_the_fixture_and_variant():
+    """``_load_examples`` passes ``fixture::variant``, and a group's failures are
+    the ones most in need of it — a bad row says nothing about where it lives."""
+    with pytest.raises(ValueError, match="elementwise::2d_device"):
+        _normalise_param_group(("DTYPE", "N"), [("fp16",)],
+                               kernel_name="elementwise::2d_device")
+
+
+# ---------------------------------------------------------------------------
+# _expand_params — all params → (combinations, names worth naming in a key)
+#
+# One combination per registry entry. The second return value is the set of
+# names _sweep_suffix renders: computed here because only here is it known
+# whether a name came from a scalar list or a group column, and the two rules
+# differ.
 # ---------------------------------------------------------------------------
 
 def test_one_value_gives_one_combination():
     """The state every fixture was in before sweeps existed: a single entry, and
-    nothing reported as labelled."""
-    combos, labelled = _expand_params({"M": [64]})
+    nothing worth naming."""
+    combos, suffixed = _expand_params({"M": [64]})
     assert combos == [{"M": ("64", 64)}]
-    assert labelled == set()
+    assert suffixed == set()
 
 
 def test_each_value_gives_its_own_combination():
     """In the order written, which is what keeps generated keys stable across
     edits to unrelated params."""
-    combos, labelled = _expand_params({"M": [1, 2, 3]})
+    combos, suffixed = _expand_params({"M": [1, 2, 3]})
     assert [c["M"][1] for c in combos] == [1, 2, 3]
-    assert labelled == set()
+    assert suffixed == {"M"}
 
 
 def test_params_are_crossed_not_zipped():
@@ -156,23 +277,23 @@ def test_params_are_crossed_not_zipped():
         (1, 3), (1, 4), (2, 3), (2, 4)}
 
 
-def test_a_labelled_param_is_reported_as_labelled():
-    """Being in this set is what later lets a one-value param into the key; the
+def test_a_labelled_param_is_named_even_with_one_value():
+    """Being in this set is what lets a one-value param into the key; the
     combination alone no longer shows which spelling produced it."""
-    combos, labelled = _expand_params({"BLOCK": [("t64", 64)]})
+    combos, suffixed = _expand_params({"BLOCK": [("t64", 64)]})
     assert combos == [{"BLOCK": ("t64", 64)}]
-    assert labelled == {"BLOCK"}
+    assert suffixed == {"BLOCK"}
 
 
-def test_only_the_params_that_used_labels_are_reported():
-    """``M`` was labelled and ``K`` was not, so only ``M`` earns the right to
-    appear in a key when it is down to one value."""
-    combos, labelled = _expand_params({
+def test_an_unswept_unlabelled_param_is_not_named():
+    """``K`` has one value and no label, so it stays out however many of its
+    siblings are swept — a key names what distinguishes it, not the whole dict."""
+    combos, suffixed = _expand_params({
         "M": [("small", 16), ("large", 256)],
-        "K": [32, 64],
+        "K": [32],
     })
-    assert len(combos) == 4
-    assert labelled == {"M"}
+    assert len(combos) == 2
+    assert suffixed == {"M"}
 
 
 def test_no_params_gives_one_empty_combination():
@@ -189,22 +310,96 @@ def test_expansion_refuses_a_mixed_list_too():
         _expand_params({"M": [1, ("big", 512)]})
 
 
+def test_a_group_enumerates_its_rows_rather_than_their_product():
+    """The whole reason for the form. Two rows of two names give two
+    combinations, not four — so the pairing the author wrote is the pairing that
+    runs, and the two it did not write are unrepresentable."""
+    combos, _ = _expand_params({("DTYPE", "N"): [("fp16", 128), ("fp32", 64)]})
+    assert [(c["DTYPE"][1], c["N"][1]) for c in combos] == [
+        ("fp16", 128), ("fp32", 64)]
+
+
+def test_a_group_member_lands_as_an_ordinary_param():
+    """Flattened into the combination under its own name, with no trace of the
+    group. That is what lets the constexpr/runtime split, ``inputs()`` and the
+    docs generator stay ignorant of the form entirely."""
+    combos, _ = _expand_params({("DTYPE", "N"): [("fp16", 128)]})
+    assert combos == [{"DTYPE": ("fp16", "fp16"), "N": ("128", 128)}]
+
+
+def test_a_group_crosses_with_the_other_keys():
+    """Joint *within* a group, Cartesian *across* keys — so a dependent pair
+    still sweeps against an independent axis like ``OP``."""
+    combos, _ = _expand_params({
+        ("DTYPE", "N"): [("fp16", 128), ("fp32", 64)],
+        "OP": ["add", "sub", "mul"],
+    })
+    assert len(combos) == 6
+    assert {(c["DTYPE"][1], c["N"][1]) for c in combos} == {
+        ("fp16", 128), ("fp32", 64)}
+
+
+def test_a_varying_group_column_is_named_and_a_constant_one_is_not():
+    """The asymmetry against scalars, stated: a group's *row* count says nothing
+    about any single column. ``M`` repeated across both rows is not what tells the
+    two entries apart, so it must stay out of the key."""
+    _, suffixed = _expand_params({
+        ("DTYPE", "N", "M"): [("fp16", 128, 64), ("fp32", 64, 64)],
+    })
+    assert suffixed == {"DTYPE", "N"}
+
+
+def test_a_group_of_one_row_behaves_like_a_scalar_of_one_value():
+    """Nothing distinguishes the single entry, so the key stays bare — the group
+    form costs nothing when a sibling variant pins one row of its parent's
+    sweep."""
+    combos, suffixed = _expand_params({("DTYPE", "N"): [("fp16", 128)]})
+    assert len(combos) == 1
+    assert suffixed == set()
+
+
+def test_a_labelled_group_column_is_named_even_when_constant():
+    """A label is a request to be visible and holding still does not withdraw it,
+    exactly as at scalar level. This is how the stick layouts stay in the key
+    while the fp16/fp32 widths behind them differ."""
+    _, suffixed = _expand_params({
+        ("DTYPE", "LAYOUT"): [("fp16", ("stick", 64)), ("fp32", ("stick", 32))],
+    })
+    assert suffixed == {"DTYPE", "LAYOUT"}
+
+
+def test_a_name_under_two_keys_is_refused():
+    """``combo.update`` runs key by key, so one of the two values would be
+    dropped and which one would be a fact about dict order."""
+    with pytest.raises(ValueError, match=r"\['N'\]"):
+        _expand_params({("DTYPE", "N"): [("fp16", 128)], "N": [64]})
+
+
+def test_a_name_under_two_groups_is_refused():
+    """Same rule with no scalar involved — an argument belongs to exactly one
+    axis."""
+    with pytest.raises(ValueError, match=r"\['N'\]"):
+        _expand_params({
+            ("DTYPE", "N"): [("fp16", 128)],
+            ("OP", "N"): [("add", 64)],
+        })
+
+
 # ---------------------------------------------------------------------------
 # _sweep_suffix — one combination → "[k=v, ...]"
 #
-# Decides which params are worth naming in a key. Everything above exists to
-# feed this: a param is named when it is swept, or when it was labelled.
+# Renders the names _expand_params picked. It no longer sees ``params`` at all,
+# so there is nowhere left for it to re-derive the rule from and disagree.
 # ---------------------------------------------------------------------------
 
 def _suffix(params: dict, index: int = 0) -> str:
     """The key suffix the *index*-th combination of *params* would get.
 
-    Wires the three helpers together the way ``_load_examples`` does, so each
-    test below can state a ``params`` dict and the suffix it should produce.
+    Wires the helpers together the way ``_load_examples`` does, so each test
+    below can state a ``params`` dict and the suffix it should produce.
     """
-    combos, labelled = _expand_params(params)
-    normalised = {k: _normalise_param_list(k, v) for k, v in params.items()}
-    return _sweep_suffix(normalised, combos[index], labelled)
+    combos, suffix_names = _expand_params(params)
+    return _sweep_suffix(suffix_names, combos[index])
 
 
 def test_an_unswept_plain_param_adds_no_suffix():
@@ -250,7 +445,7 @@ def test_suffix_params_are_sorted_by_name():
 
 
 # ---------------------------------------------------------------------------
-# The registry keys the three helpers produce together
+# The registry keys the helpers produce together
 #
 # What a fixture author actually sees, and what test IDs are made of.
 # ---------------------------------------------------------------------------
@@ -261,9 +456,8 @@ def _keys(variant_name: str, params: dict) -> list[str]:
     A re-implementation of its key-building loop, not a call into it — that
     would need the fixtures directory and a Triton build.
     """
-    combos, labelled = _expand_params(params, kernel_name=variant_name)
-    normalised = {k: _normalise_param_list(k, v) for k, v in params.items()}
-    return [variant_name + _sweep_suffix(normalised, combo, labelled)
+    combos, suffix_names = _expand_params(params, kernel_name=variant_name)
+    return [variant_name + _sweep_suffix(suffix_names, combo)
             for combo in combos]
 
 
@@ -306,6 +500,64 @@ def test_a_malformed_param_list_raises_before_any_key_is_built():
     build, which would leave a fixture half-present."""
     with pytest.raises(ValueError, match="mixes labelled tuples"):
         _keys("bad_kernel", {"X": [1, ("label", 2)]})
+
+
+def test_a_group_gives_one_key_per_row():
+    """Two rows, two keys, and both of the group's varying names in each — there
+    is no driving axis a group nominates to stand for the rest."""
+    assert _keys("dev", {("DTYPE", "N"): [("fp16", 128), ("fp32", 64)]}) == [
+        "dev[DTYPE=fp16, N=128]", "dev[DTYPE=fp32, N=64]"]
+
+
+def test_a_constant_group_column_stays_out_of_the_key():
+    """``M`` is 64 on both rows, so naming it would pad every key with something
+    that never varies — while ``N``, which does vary, has to be there or the two
+    keys collide."""
+    assert _keys("dev", {("DTYPE", "N", "M"): [("fp16", 128, 64),
+                                              ("fp32", 64, 64)]}) == [
+        "dev[DTYPE=fp16, N=128]", "dev[DTYPE=fp32, N=64]"]
+
+
+def test_a_labelled_row_element_is_labelled_in_the_key():
+    """Rows go through ``_normalise_param_list`` per column, so a layout is named
+    in the key by the same label a scalar param would give it, rather than
+    printing its nested repr."""
+    assert _keys("dev", {
+        ("DTYPE", "LAYOUT"): [("fp16", ("stick", ((0, "floordiv", 64),))),
+                              ("fp32", ("stick", ((0, "floordiv", 32),)))],
+    }) == ["dev[DTYPE=fp16, LAYOUT=stick]", "dev[DTYPE=fp32, LAYOUT=stick]"]
+
+
+def test_a_labelled_row_element_reaches_the_kernel_as_its_bare_value():
+    """The other half of the same property, and the class of bug worth pinning: a
+    label names a value inside a key and must not survive into the value the
+    combination carries, or the kernel gets ``("stick", layout)`` as its
+    constexpr. Rows cannot get this wrong, because normalising per column is what
+    splits the pair."""
+    layout = ((0, "floordiv", 64), (0, "mod", 64))
+    combos, _ = _expand_params({("DTYPE", "LAYOUT"): [("fp16", ("stick", layout))]})
+    # What ``_load_examples`` writes back as the entry's ``params``.
+    params = {k: [v[1]] for k, v in combos[0].items()}
+    assert params == {"DTYPE": ["fp16"], "LAYOUT": [layout]}
+
+
+def test_a_group_crossed_with_a_scalar_names_both():
+    """What the device variants generate: a dependent pair against an independent
+    ``OP``, product-ordered with the first key outermost."""
+    assert _keys("dev", {
+        ("DTYPE", "N"): [("fp16", 128), ("fp32", 64)],
+        "OP": ["add", "sub"],
+    }) == [
+        "dev[DTYPE=fp16, N=128, OP=add]", "dev[DTYPE=fp16, N=128, OP=sub]",
+        "dev[DTYPE=fp32, N=64, OP=add]", "dev[DTYPE=fp32, N=64, OP=sub]",
+    ]
+
+
+def test_a_malformed_group_row_raises_before_any_key_is_built():
+    """Same whole-or-nothing rule as a malformed scalar list, and the message
+    names the row so the author is not left bisecting the group."""
+    with pytest.raises(ValueError, match=r"\('fp32',\)"):
+        _keys("bad_kernel", {("DTYPE", "N"): [("fp16", 128), ("fp32",)]})
 
 
 # ---------------------------------------------------------------------------

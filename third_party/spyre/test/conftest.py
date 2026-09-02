@@ -126,9 +126,10 @@ from utils import (  # noqa: E402
 # The ``constexprs`` grammar supports only ``dict[str, scalar]`` — each entry
 # names one arg to bake into TTIR as a single compile-time constant. Sweeping
 # which value a combination uses is a separate mechanism, the ``params`` dict
-# (see _expand_params below), which already supports multi-value lists and
-# Cartesian expansion across them. List-valued ``constexprs`` keys and
-# list[dict] for heterogeneous concat remain unimplemented.
+# (see _expand_params below), which supports multi-value lists, Cartesian
+# expansion across them, and tuple keys for names swept jointly. List-valued
+# ``constexprs`` keys and list[dict] for heterogeneous concat remain
+# unimplemented.
 # ---------------------------------------------------------------------------
 
 
@@ -264,48 +265,148 @@ def _normalise_param_list(
         return [(str(v), v) for v in values]
 
 
+def _normalise_param_group(
+    names, rows: list, kernel_name: str = ""
+) -> tuple[list[tuple], set]:
+    """Normalise a tuple-keyed axis. Returns ``(rows, labelled_names)``.
+
+    A tuple key ``("DTYPE", "N")`` sweeps its names *jointly*: each row of
+    *rows* carries one value per name, positionally, and only the rows written
+    are enumerated. That is how a functional dependency gets stated -- the ``N``
+    a dtype implies sits on the same row as the dtype, so the two cannot
+    disagree -- and it is the same grammar used for its own sake when a
+    combination is invalid and simply is not listed.
+
+    Each *column* goes through :func:`_normalise_param_list`, so a group member
+    is labelled exactly the way a scalar param is, and the all-or-nothing
+    labelling rule applies per column: a layout column is labelled in every row
+    or in none. *labelled_names* is the subset of *names* whose column was
+    written with labels, mirroring what ``_expand_params`` records for a scalar.
+
+    Rows are returned as tuples of ``(label, value)`` pairs, in the order given.
+    """
+    prefix = f"{kernel_name}: " if kernel_name else ""
+    names = tuple(names)
+
+    bad = [n for n in names if not isinstance(n, str)]
+    if bad:
+        raise ValueError(
+            f"{prefix}params key {names!r} is a group, so every element must be "
+            f"an argument name; {bad!r} is not a str."
+        )
+    repeated = sorted({n for n in names if names.count(n) > 1})
+    if repeated:
+        raise ValueError(
+            f"{prefix}params key {names!r} repeats {repeated} — one column per "
+            f"name, or the row would say two things about the same argument."
+        )
+
+    for row in rows:
+        if not isinstance(row, (tuple, list)):
+            raise ValueError(
+                f"{prefix}params[{names!r}] row {row!r} must be a tuple or list "
+                f"of {len(names)} values, one per name."
+            )
+        if len(row) != len(names):
+            raise ValueError(
+                f"{prefix}params[{names!r}] row {row!r} has {len(row)} value(s) "
+                f"but the group names {len(names)}. Rows are positional, so a "
+                f"missing or extra value silently shifts every later column."
+            )
+
+    columns = list(zip(*rows)) if rows else [()] * len(names)
+    normalised = [
+        _normalise_param_list(name, list(column), kernel_name)
+        for name, column in zip(names, columns)
+    ]
+    labelled = {
+        name for name, column in zip(names, columns)
+        if any(isinstance(v, tuple) for v in column)
+    }
+    return [tuple(row) for row in zip(*normalised)], labelled
+
+
 def _expand_params(
     params: dict, kernel_name: str = ""
 ) -> tuple[list[dict], set]:
-    """Return ``(combos, always_suffixed)``.
+    """Return ``(combos, suffix_names)``.
 
     *combos* is a list of dicts mapping param name → ``(label, value)`` pair.
+    A key is either one name (its list swept on its own) or a tuple of names
+    (its rows swept jointly, see :func:`_normalise_param_group`); the Cartesian
+    product runs across keys, and within a group only over the rows listed. A
+    group member lands in the combo as an ordinary param, so nothing downstream
+    can tell it from a declared one.
 
-    *always_suffixed* is the set of param names whose original list contained
-    labelled tuples — these params always appear in the suffix string even when
-    only one value is present.
+    *suffix_names* is the set of names worth naming in a registry key. One
+    asymmetry, because the two forms fail differently: a scalar param earns its
+    place by having more than one *entry* (two entries sharing a label would
+    otherwise collide two keys), a group column by having more than one
+    *distinct label* (a group's row count says nothing about any single column,
+    so an ``M`` held constant across rows must stay out). Either form is always
+    named when it was written with labels -- a label is a request to be visible.
     """
-    normalised: dict = {}
-    always_suffixed: set = set()
-    for name, values in params.items():
-        normed = _normalise_param_list(name, values, kernel_name)
-        normalised[name] = normed
-        if any(isinstance(v, tuple) for v in values):
-            always_suffixed.add(name)
+    axes: list[tuple[tuple, list[tuple]]] = []
+    labelled: set = set()
+    for key, values in params.items():
+        if isinstance(key, tuple):
+            rows, group_labelled = _normalise_param_group(
+                key, values, kernel_name)
+            axes.append((tuple(key), rows))
+            labelled |= group_labelled
+        else:
+            pairs = _normalise_param_list(key, values, kernel_name)
+            axes.append(((key,), [(pair,) for pair in pairs]))
+            if any(isinstance(v, tuple) for v in values):
+                labelled.add(key)
 
-    names = list(normalised)
-    combos = [
-        dict(zip(names, combo))
-        for combo in itertools.product(*[normalised[n] for n in names])
-    ]
-    return combos, always_suffixed
+    # A name in two keys would have one of its values silently dropped by the
+    # combo merge below, and which one would be a fact about dict order.
+    seen: set = set()
+    for names, _ in axes:
+        clash = sorted(seen & set(names))
+        if clash:
+            raise ValueError(
+                f"{kernel_name + ': ' if kernel_name else ''}params names "
+                f"{clash} under more than one key. Each argument belongs to "
+                f"exactly one axis, scalar or group."
+            )
+        seen |= set(names)
+
+    suffix_names = set(labelled)
+    for names, rows in axes:
+        if len(names) == 1:
+            if len(rows) > 1:
+                suffix_names.add(names[0])
+            continue
+        for i, name in enumerate(names):
+            if len({row[i][0] for row in rows}) > 1:
+                suffix_names.add(name)
+
+    combos = []
+    for pick in itertools.product(*[rows for _, rows in axes]):
+        combo: dict = {}
+        for (names, _), row in zip(axes, pick):
+            combo.update(zip(names, row))
+        combos.append(combo)
+    return combos, suffix_names
 
 
-def _sweep_suffix(merged_params: dict, combo: dict, always_suffixed: set = frozenset()) -> str:
-    """Build a ``[k=v, ...]`` suffix for params that have more than one value
-    or are explicitly labelled (in *always_suffixed*).
+def _sweep_suffix(suffix_names, combo: dict) -> str:
+    """Render one combination's ``[k=v, ...]`` suffix over *suffix_names*.
 
     *combo* maps param name → ``(label, value)`` pair (post-normalisation).
+    Which names qualify is decided once, in :func:`_expand_params` — it is the
+    only place that can see whether a name came from a scalar list or a group
+    column, and the two rules differ.
 
-    Returns ``""`` when no param qualifies.
+    Sorted by name, so reordering the ``params`` dict does not rename every key
+    a fixture generates. Returns ``""`` when no name qualifies.
     """
-    swept = sorted(
-        k for k, v in merged_params.items()
-        if len(v) > 1 or k in always_suffixed
-    )
-    if not swept:
+    if not suffix_names:
         return ""
-    return "[" + ", ".join(f"{k}={combo[k][0]}" for k in swept) + "]"
+    return "[" + ", ".join(
+        f"{k}={combo[k][0]}" for k in sorted(suffix_names)) + "]"
 
 
 @dataclass(frozen=True)
@@ -428,20 +529,38 @@ def _load_examples():
 
             # Disabled variants: one entry, no expansion.
             if merged.get("disabled"):
+                # Which means the raw ``params`` survive into the registry, and
+                # gen_patterns_docs.py renders them as ``f"{k}={vals[0]!r}"`` --
+                # so a tuple key would print as a tuple against a row. Refused
+                # here rather than left to produce nonsense in the docs.
+                grouped = [k for k in merged.get("params", {})
+                           if isinstance(k, tuple)]
+                if grouped:
+                    raise ValueError(
+                        f"{name}::{vname}: a disabled variant skips param "
+                        f"expansion and keeps its 'params' raw, so it cannot use "
+                        f"the group form; {grouped} must be spelled as separate "
+                        f"single-name keys."
+                    )
                 key = name if vname == "default" else f"{name}__{vname}"
                 registry[key] = merged
                 continue
 
             merged_params = merged.get("params", {})
-            combos, always_suffixed = _expand_params(
+            combos, suffix_names = _expand_params(
                 merged_params, kernel_name=f"{name}::{vname}"
             )
             base_key = name if vname == "default" else f"{name}__{vname}"
 
             for combo in combos:
                 entry = dict(merged)
-                entry["params"] = {k: [combo[k][1]] for k in merged_params}
-                suffix = _sweep_suffix(merged_params, combo, always_suffixed)
+                # Keyed by ``combo``, not by ``merged_params``: that is what
+                # flattens a group's members into ordinary single-valued params,
+                # so _resolve_variant, the constexpr/runtime split,
+                # ``inputs(**param_values)`` and binary_source need no notion of
+                # a group at all.
+                entry["params"] = {k: [combo[k][1]] for k in combo}
+                suffix = _sweep_suffix(suffix_names, combo)
                 key = base_key + suffix
 
                 # extra_checks factory protocol: if the callable accepts
