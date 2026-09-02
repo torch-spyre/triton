@@ -11,6 +11,15 @@ namespace mlir::triton::ktdp {
 
 enum class CoordOp : int64_t { Identity = 0, FloorDiv = 1, Mod = 2 };
 
+/// A physical dim is a floor (stick-index) dim iff it carries a parallel
+/// (non-reduced) role and a FloorDiv coord op. Shared by classify() and any
+/// caller that must derive floor-dim membership from the same role/coord-op
+/// pair without re-running classify() (e.g. building a target order from a
+/// marker directly).
+inline bool isFloorDim(int64_t role, CoordOp op) {
+  return role >= 0 && op == CoordOp::FloorDiv;
+}
+
 /// Apply one coordinate op to a static (compile-time) logical extent.
 /// Returns a non-kDynamic int64 on success, or std::nullopt when the result
 /// is dynamic (i.e. needs a runtime SSA value).

@@ -26,6 +26,7 @@
 #include "RewriteDescriptorLayout/Types.h"
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
 #include "RewriteDescriptorLayout/IndexDomain.h"
+#include "RewriteDescriptorLayout/PhysicalTypeAnalysis.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
@@ -104,12 +105,20 @@ struct RewriteDescriptorLayoutPass
   // Maps each physical ConstructMemoryViewOp result -> its source marker.
   DenseMap<Value, triton::SpyreTensorLayoutOp> physMemViewToMarker;
 
+  // Logical construct_memory_view ops replaced by a physical one in Phase 1.
+  // They cannot be erased there: the marker's bridge cast still holds them as
+  // an operand, and that cast is only erased in Phase 3 (eraseMarker). So
+  // Phase 3 erases them right after, once nothing references them.
+  SmallVector<mlir::ktdp::ConstructMemoryViewOp> deadLogicalMemViews;
+
   // Loops already rescaled to stick granularity.
   DenseSet<scf::ForOp> rescaledLoops;
 
-  // Maps a physical ktdp.load result -> the logical permutation of a
-  // linalg.transpose that was erased in Phase 1.
-  llvm::DenseMap<mlir::Value, SmallVector<int64_t>> physicalLoadToTransposePerm;
+  // Maps a physical value (a ktdp.load result, or a value Phase 2 has
+  // retyped to physical) to what is known about it -- see PassContext's
+  // physicalValues in Types.h. Seeded here in Phase 1 (retypeLoad) and grown
+  // by Phase 2 as it retypes elementwise ops and erases transposes.
+  llvm::DenseMap<mlir::Value, mlir::triton::ktdp::PhysicalValueInfo> physicalValues;
 
   // Resolved from the pass option: true = "device" (physical row-major strides),
   // false = "host" (derive strides from logical strides via coord map).
@@ -270,7 +279,8 @@ struct RewriteDescriptorLayoutPass
                                   Value newMemView,
                                   ArrayRef<int64_t> physSrc,
                                   ArrayRef<int64_t> physOp,
-                                  ArrayRef<int64_t> physArg) {
+                                  ArrayRef<int64_t> physArg,
+                                  triton::SpyreTensorLayoutOp marker) {
     OpBuilder b(tileOp);
     Location loc = tileOp.getLoc();
 
@@ -390,7 +400,7 @@ struct RewriteDescriptorLayoutPass
     // Update consumers (ktdp.load / ktdp.store).
     for (auto *user : llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
       if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
-        retypeLoad(ld, newTileResult, physBlock);
+        retypeLoad(ld, newTileResult, physBlock, marker);
       } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
         redirectStoreAccessTile(st, newTileResult);
       } else {
@@ -407,7 +417,7 @@ struct RewriteDescriptorLayoutPass
   LogicalResult rewriteIndirectAccessTile(
       mlir::ktdp::ConstructIndirectAccessTilesOp tileOp, Value newMemView,
       ArrayRef<int64_t> physSrc, ArrayRef<int64_t> physOp,
-      ArrayRef<int64_t> physArg) {
+      ArrayRef<int64_t> physArg, triton::SpyreTensorLayoutOp marker) {
     OpBuilder b(tileOp);
     Location loc = tileOp.getLoc();
     MLIRContext *ctx = b.getContext();
@@ -530,7 +540,7 @@ struct RewriteDescriptorLayoutPass
     // Update consumers.
     for (auto *user : llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
       if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
-        retypeLoad(ld, newTile.getResult(), physBlock);
+        retypeLoad(ld, newTile.getResult(), physBlock, marker);
       } else {
         return user->emitError(
             "spyre_tensor_layout: unexpected user of indirect access tile");
@@ -543,70 +553,30 @@ struct RewriteDescriptorLayoutPass
 
   // --- Load/store consumer updates ---
 
-  // True if the op is a shape-constraining op whose result shape is NOT
-  // inherited from a single physical input.
-  static bool isContractionOp(Operation *op) {
-    return isa<linalg::ContractionOpInterface>(op) ||
-           isa<linalg::ReduceOp>(op);
-  }
-
   // Retype ktdp.load: replace with a new load of the physical tensor type.
+  // Phase 1 stops here — it no longer forward-retypes the consuming chain;
+  // Phase 2 decides each consuming op individually (see ContractionSynthesis.cpp).
   void retypeLoad(mlir::ktdp::LoadOp ld, Value newTile,
-                  ArrayRef<int64_t> physBlock) {
+                  ArrayRef<int64_t> physBlock,
+                  triton::SpyreTensorLayoutOp marker) {
     OpBuilder b(ld);
     auto elemTy = cast<RankedTensorType>(ld.getResult().getType())
                       .getElementType();
     auto physResTy = RankedTensorType::get(physBlock, elemTy);
     auto newLd = mlir::ktdp::LoadOp::create(b, ld.getLoc(), physResTy, newTile);
-    retypeChain(ld.getResult(), newLd.getResult());
+    ld.getResult().replaceAllUsesWith(newLd.getResult());
     ld.erase();
+    // Seed Phase 2's reachability map: this is a physicalized load result,
+    // the root of every forward elementwise chain Phase 2 will retype, and
+    // carries this descriptor's marker for dispatchSource/findMarkerForStore
+    // to read directly (no backward walk needed).
+    physicalValues[newLd.getResult()] =
+        mlir::triton::ktdp::PhysicalValueInfo{marker, {}};
   }
 
   // Redirect ktdp.store's access tile operand to the new physical tile.
   void redirectStoreAccessTile(mlir::ktdp::StoreOp st, Value newTile) {
     st.getAccessTileMutable().set(newTile);
-  }
-
-  // Forward-retype the elementwise op chain.
-  void retypeChain(Value oldVal, Value newVal) {
-    Value physLoadResult = newVal;
-    oldVal.replaceAllUsesWith(newVal);
-    SmallVector<Operation *> worklist(newVal.getUsers().begin(),
-                                      newVal.getUsers().end());
-    while (!worklist.empty()) {
-      Operation *op = worklist.pop_back_val();
-      if (op->getNumResults() != 1)
-        continue;
-      if (isContractionOp(op))
-        continue;
-      if (auto tr = dyn_cast<linalg::TransposeOp>(op)) {
-        auto perm = SmallVector<int64_t>(tr.getPermutation());
-        LLVM_DEBUG({
-          llvm::dbgs() << "  erasing transpose, perm: ";
-          llvm::interleaveComma(perm, llvm::dbgs());
-          llvm::dbgs() << "\n";
-        });
-        auto &slot = physicalLoadToTransposePerm[physLoadResult];
-        slot = slot.empty() ? perm : composePerm(slot, perm);
-        Value physInput = tr.getInput();
-        SmallVector<Operation *> fmrConsumers(tr.getResult()[0].getUsers().begin(),
-                                              tr.getResult()[0].getUsers().end());
-        tr.getResult()[0].replaceAllUsesWith(physInput);
-        worklist.append(fmrConsumers.begin(), fmrConsumers.end());
-        tr.erase();
-        continue;
-      }
-      auto resTy  = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-      auto opndTy = op->getNumOperands() > 0
-                        ? dyn_cast<RankedTensorType>(op->getOperand(0).getType())
-                        : nullptr;
-      if (!resTy || !opndTy || resTy.getShape() == opndTy.getShape())
-        continue;
-      op->getResult(0).setType(
-          RankedTensorType::get(opndTy.getShape(), resTy.getElementType()));
-      worklist.append(op->getResult(0).getUsers().begin(),
-                      op->getResult(0).getUsers().end());
-    }
   }
 
   // --- Phase 1: physicalize one descriptor ---
@@ -854,14 +824,19 @@ struct RewriteDescriptorLayoutPass
     // Rebuild each access tile that uses the old memView.
     for (auto tileOp : plan.directTiles) {
       if (failed(rewriteAccessTile(tileOp, newMemView, plan.physSrc, plan.physOp,
-                                   plan.physArg)))
+                                   plan.physArg, marker)))
         return failure();
     }
     for (auto tileOp : plan.indirectTiles) {
       if (failed(rewriteIndirectAccessTile(tileOp, newMemView, plan.physSrc,
-                                           plan.physOp, plan.physArg)))
+                                           plan.physOp, plan.physArg, marker)))
         return failure();
     }
+
+    // The logical view is now superseded by the physical one. Its only
+    // remaining user is the marker's bridge cast, which Phase 3 erases; queue
+    // the view so Phase 3 can drop it too.
+    deadLogicalMemViews.push_back(plan.memViewOp);
 
     return success();
   }
@@ -918,27 +893,68 @@ struct RewriteDescriptorLayoutPass
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 1 complete, "
                             << "entering Phase 2 (contraction synthesis)\n");
 
+    // Phase 2A: decide, for every value reachable from Phase 1's roots, the
+    // final physical type it will carry -- before Phase 2 rewrites anything.
+    // Mutates no IR, creates no ops (see PhysicalTypeAnalysis.h). Step 4c-A
+    // lands the analysis and the assertions measuring it against the guards
+    // Phase 2 uses today; 4c-B is what makes the rewrite read it instead.
+    PassContext ctx{physMemViewToMarker, physicalValues};
+    PhysicalTypeMap physicalTypes = runPhysicalTypeAnalysis(module, ctx);
+    ctx.physicalTypeAnalysis = &physicalTypes;
+
     // Phase 2: synthesize contractions via greedy pattern rewrite.
     {
-      PassContext ctx{physMemViewToMarker, physicalLoadToTransposePerm};
       RewritePatternSet patterns(module.getContext());
       populateContractionPatterns(patterns, ctx);
-      // Collect candidate ops (only op types our patterns target).
+      // Collect candidate ops: the four contraction-family ops, plus every
+      // other op that consumes a physical value (elementwise ops and
+      // linalg.transpose) so Phase 2 decides them too, rather than Phase 1
+      // retyping/erasing them in passing.
+      //
+      // The elementwise membership test here is deliberately not
+      // isSingleTensorElementwiseOp -- that predicate is scoped to the
+      // backward walk in walkToLoad (see its comment) and would silently
+      // exclude multi-tensor-operand elementwise ops like arith.addf from
+      // ever being retyped by RewriteElementwisePattern. This test only
+      // needs to be a superset of what that pattern's own local rule
+      // matches: any single-result op with at least one tensor operand.
       SmallVector<Operation *> candidates;
       module.walk([&](Operation *op) {
         if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, linalg::ReduceOp,
-                mlir::ktdp::StoreOp>(op))
+                mlir::ktdp::StoreOp, linalg::TransposeOp>(op)) {
+          candidates.push_back(op);
+          return;
+        }
+        if (op->getNumResults() != 1 ||
+            !isa<RankedTensorType>(op->getResult(0).getType()))
+          return;
+        bool hasTensorOperand = llvm::any_of(op->getOperands(), [](Value v) {
+          return isa<RankedTensorType>(v.getType());
+        });
+        if (hasTensorOperand)
           candidates.push_back(op);
       });
       GreedyRewriteConfig config;
       config.enableFolding(false);
       config.enableConstantCSE(false);
       config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
-      (void)applyOpPatternsGreedily(candidates,
-                                    FrozenRewritePatternSet(std::move(patterns)),
-                                    config);
+      // Converges only if every pattern's match condition is falsified by its
+      // own rewrite: the driver re-enqueues an op whenever a neighbour it feeds
+      // or consumes changes, so a pattern that stays matchable spins to the
+      // iteration cap. Discarding this result would report success for that.
+      if (failed(applyOpPatternsGreedily(
+              candidates, FrozenRewritePatternSet(std::move(patterns)),
+              config))) {
+        module.emitError("rewrite-descriptor-layout: Phase 2 did not reach a "
+                         "fixpoint; a pattern is re-matching its own output");
+        return signalPassFailure();
+      }
       if (ctx.hadError)
         return signalPassFailure();
+      // Third agreement invariant: at end of Phase 2, everything Phase 2
+      // found to be physical was predicted by Phase 2A.
+      verifyPhysicalTypeAgreement(module, ctx, physicalTypes,
+                                  "end of Phase 2");
     }
 
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 2 complete, "
@@ -947,6 +963,13 @@ struct RewriteDescriptorLayoutPass
     // Phase 3: erase all markers (and their now-dead bridge casts).
     for (auto marker : markers)
       eraseMarker(marker);
+
+    // With the bridge casts gone, the logical views Phase 1 superseded have no
+    // users left. Erase them -- but check rather than assume: a view whose
+    // access tiles Phase 1 could not fully re-point still has real users.
+    for (auto memViewOp : deadLogicalMemViews)
+      if (memViewOp->getBlock() && memViewOp->use_empty())
+        memViewOp.erase();
   }
 };
 

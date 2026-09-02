@@ -188,10 +188,10 @@ VARIANTS = {
     "middle_axis_spyre_stick": {
         # in_ptr stick-on-D2 (fp32 stick = 32, D2 = 64 = 2 sticks exactly):
         #   phys [D2//32, D0, D1, D2%32] = [2, 16, 96, 32]
-        # The reduced axis (D1) is non-trailing in the physical tile, so the
-        # pass must emit a linalg.transpose rotating it to the end before
-        # linalg.reduce. A slot-index-derived permutation would be identity
-        # here and would reduce the wrong axis.
+        # The reduced axis (D1) is non-trailing in the physical tile. linalg.reduce
+        # takes a sorted `dimensions` list, so it is named in place and no
+        # transpose is emitted. A slot-index-derived permutation would be
+        # identity here and would reduce the wrong axis.
         "base": "middle_axis",
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
                  "spyre-tensor-layout"],
@@ -210,8 +210,9 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.reduce"),
-            # The reduced (D1) axis must be rotated to the trailing position.
-            t.assert_present("linalg.transpose"),
+            # No transpose: linalg.reduce takes a sorted `dimensions` list, so a
+            # reduced axis is named where it sits rather than rotated to the end.
+            t.assert_absent("linalg.transpose"),
         ),
     },
     # ---- Grid variation -----------------------------------------------------

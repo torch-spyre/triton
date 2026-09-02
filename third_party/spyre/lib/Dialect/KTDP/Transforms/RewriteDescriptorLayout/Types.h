@@ -11,25 +11,74 @@
 
 namespace mlir::triton::ktdp {
 
+/// What is known about one physical value (a physicalized ktdp.load result,
+/// or a value retyped to physical by Phase 2's elementwise pattern).
+struct PhysicalValueInfo {
+  /// The layout marker for the descriptor this value ultimately derives
+  /// from. Always set when a PhysicalValueInfo exists at all: Phase 1 seeds
+  /// every entry from a ktdp.load whose access tile resolves to a marker via
+  /// physMemViewToMarker, and Phase 2 only ever grows the map by copying an
+  /// existing entry from an operand to that operand's op result.
+  triton::SpyreTensorLayoutOp marker;
+  /// The logical permutation of a linalg.transpose erased on this value's
+  /// chain, empty if none. Populated by Phase 2's transpose pattern
+  /// (RewriteTransposePattern) as it erases transposes, and read by
+  /// dispatchSource to fold the erased permutation into canonicalAxes.
+  llvm::SmallVector<int64_t> transposePerm;
+};
+
+/// Forward declaration: Phase 2A's result map. Defined in
+/// PhysicalTypeAnalysis.h, which PassContext deliberately does not include --
+/// the analysis depends on Types.h, not the other way round.
+struct PhysicalTypeInfo;
+using PhysicalTypeMap = llvm::DenseMap<mlir::Value, PhysicalTypeInfo>;
+
 struct PassContext {
   const llvm::DenseMap<mlir::Value, triton::SpyreTensorLayoutOp> &physMemViewToMarker;
-  const llvm::DenseMap<mlir::Value, llvm::SmallVector<int64_t>> &physicalLoadToTransposePerm;
+  /// Maps a physical value (a ktdp.load result, or a value Phase 2 has
+  /// retyped to physical) to what is known about it -- see PhysicalValueInfo.
+  /// Seeded by Phase 1 with every physical ktdp.load result (the root of
+  /// every chain Phase 2 will retype), and grown by Phase 2's
+  /// RewriteElementwisePattern with the result of each op it retypes (a
+  /// value it just made physical, carrying forward its operand's info) and
+  /// by RewriteTransposePattern as it erases transposes (recording the
+  /// permutation against the transpose's input, which is already an entry).
+  /// Presence answers "is this value reachable from a physicalized load"
+  /// without re-walking the chain: an op on a path that was never
+  /// physicalized (no marker anywhere upstream) is simply never in this map.
+  /// This is what keeps the elementwise pattern's local shape rule from
+  /// mis-firing on ops like tt.expand_dims that happen to have one tensor
+  /// operand and a differently-shaped result but are not reachable from any
+  /// physicalized load.
+  llvm::DenseMap<mlir::Value, PhysicalValueInfo> &physicalValues;
+  /// Phase 2A's answer: the final physical type of every value reachable from
+  /// Phase 1's roots, computed before Phase 2 rewrites anything (see
+  /// PhysicalTypeAnalysis.h). Step 4c-A does not act on it -- the patterns
+  /// read it only to assert that it agrees with the in-flight guards it will
+  /// eventually replace, which is the measurement that makes 4c-B safe. Null
+  /// when the analysis was not run.
+  const PhysicalTypeMap *physicalTypeAnalysis = nullptr;
   /// Set by patterns to indicate a fatal error that should abort the pass.
   mutable bool hadError = false;
 };
 
 /// Per-operand coord-map info read from a still-live marker.
 struct OperandCoords {
-  llvm::ArrayRef<int64_t> src; // phys_src
-  llvm::ArrayRef<int64_t> op;  // phys_op  (0=Identity,1=FloorDiv,2=Mod)
-  llvm::ArrayRef<int64_t> arg; // phys_arg
+  llvm::SmallVector<int64_t> src; // phys_src
+  llvm::SmallVector<int64_t> op;  // phys_op  (0=Identity,1=FloorDiv,2=Mod)
+  llvm::SmallVector<int64_t> arg; // phys_arg
   unsigned logicalRank;
+  // Aliases an MLIR type's shape (RankedTensorType::getShape() or
+  // AccessTileType::getShape()), which is uniqued and immortal, so this one
+  // stays a non-owning ArrayRef.
   llvm::ArrayRef<int64_t> physBlock;
 
   static OperandCoords fromMarker(triton::SpyreTensorLayoutOp marker,
                                   unsigned logRank,
                                   llvm::ArrayRef<int64_t> physBlock) {
-    return {marker.getPhysSrc(), marker.getPhysOp(), marker.getPhysArg(),
+    return {llvm::SmallVector<int64_t>(marker.getPhysSrc()),
+            llvm::SmallVector<int64_t>(marker.getPhysOp()),
+            llvm::SmallVector<int64_t>(marker.getPhysArg()),
             logRank, physBlock};
   }
 };
@@ -49,7 +98,7 @@ struct ClassifiedDims {
   int                lane;        // innermost phys dim = rank-1
   int64_t            stickSize;   // stick/lane width = physBlock[lane]
   llvm::SmallVector<int>   floorDims;   // parallel stick-index dims
-  llvm::SmallVector<int>   reduceDims;  // all -1 dims in right-to-left order
+  llvm::SmallVector<int>   reduceDims;  // all -1 dims, ascending
   int                opInnerDim;  // rightmost reduceDim; -1 if none
   llvm::SmallVector<int>   loopDims;    // reduceDims minus opInnerDim
   llvm::SmallVector<int>   opTileDims;  // residual >= 0 non-floor dims
@@ -63,7 +112,7 @@ struct OperandPlan {
   llvm::SmallVector<int64_t> dimRoles;  // per-phys-dim role (>= 0 | -1)
   ClassifiedDims      dims;       // output of classify()
 
-  // Resolved fields — filled by resolveAndReconcile() after classify().
+  // Resolved fields — filled by resolveOperand() after classify().
   llvm::SmallVector<int64_t> transposePerm;
   llvm::SmallVector<int64_t> opExtents;
 };
