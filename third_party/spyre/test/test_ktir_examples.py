@@ -287,11 +287,12 @@ class TestExample(KTIRCpuTester, KTIRStructuralTester):
         """DistributeWork must lower ``tl.program_id`` and wrap the body.
 
         Applies only to variants that use ``tl.program_id`` — single-
-        program kernels (e.g. ``gather``) produce neither
+        program kernels (e.g. ``gather__1core``) produce neither
         ``ktdp.get_compute_tile_id`` nor the distribution ``scf.for``
         because DistributeWork has nothing to rewrite. Such variants opt
         out by setting ``"parallel": False`` in ``meta.py`` (default is
-        ``True``).
+        ``True``); such variants should carry a ``"summary"`` explaining
+        why, which is surfaced in the skip reason below.
 
         When ``parallel`` is True, both ops must be present. If the
         compute_tile_id op is missing, DistributeWork was skipped or
@@ -305,7 +306,9 @@ class TestExample(KTIRCpuTester, KTIRStructuralTester):
         """
         entry = EXAMPLES[key]
         if not entry.get("parallel", True):
-            pytest.skip(f"{key}: not a parallel kernel (no tl.program_id)")
+            reason = entry.get("summary")
+            suffix = f" — {reason}" if reason else ""
+            pytest.skip(f"{key}: not a parallel kernel (no tl.program_id){suffix}")
         self.EXAMPLE = key
         self.setup_method()
         self.assert_present("ktdp.get_compute_tile_id")

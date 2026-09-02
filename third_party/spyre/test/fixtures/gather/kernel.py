@@ -5,17 +5,25 @@ embedding lookups and block-indexed fetches: given a 1D index tensor of
 row positions, read those rows from a source tensor into a contiguous
 output tile.
 
-Three ``@triton.jit`` functions for rank-2 and rank-1 sources:
+Four ``@triton.jit`` functions for rank-2 and rank-1 sources:
 
-- :func:`gather_kernel`    — single-program: one kernel invocation
-                              consumes the whole index array and writes
-                              the whole output tile.
+- :func:`gather_kernel` — multi-program: the fixed
+                              ``[y_offset, y_offset + BLOCK_COLS)`` column
+                              slice, tiled into ``BLOCK_ROWS``-sized row
+                              chunks and distributed across a 1D core grid.
+- :func:`gather_kernel_1core` — single-program counterpart to
+                              :func:`gather_kernel`: same fixed column
+                              slice, but one kernel invocation consumes
+                              the whole index array and writes the whole
+                              output tile in one ``descriptor_gather``
+                              call — no ``tl.program_id``.
 - :func:`gather_2d_kernel` — multi-program: tiled across a 2D core
                               grid, each ``(pid_m, pid_n)`` produces a
                               ``BLOCK_ROWS x BLOCK_COLS`` output tile.
-                              Adds a ``BLOCK_ROWS`` constexpr; gathers
-                              the full row width by column-tiling
-                              instead of taking a fixed slice.
+                              Gathers the full row width by column-tiling
+                              instead of taking a fixed slice — unlike
+                              :func:`gather_kernel`, it has no
+                              ``y_offset`` argument at all.
 - :func:`gather_1d_kernel` — multi-program 1D-source gather:
                               ``out[i] = in[idx[i]]`` over a 1D source
                               vector, distributed across a 1D core grid
@@ -76,7 +84,7 @@ import triton.language as tl
 
 
 @triton.jit
-def gather_kernel(
+def gather_kernel_1core(
     in_ptr,
     out_ptr,
     idx_ptr,
@@ -109,7 +117,7 @@ def gather_kernel(
     array is consumed in one descriptor_gather call, which means
     ``K_INDICES`` must equal the total number of indices to gather. This is
     the minimal shape needed to exercise the gather lowering; multi-program
-    tiling over a larger index array is left to a future variant.
+    tiling over a larger index array is what :func:`gather_kernel` does.
 
     Constraints baked in by ``tt.descriptor_gather``:
       * The source descriptor's ``block_shape`` must have **exactly one row**
@@ -164,6 +172,83 @@ def gather_kernel(
 
 
 @triton.jit
+def gather_kernel(
+    in_ptr,
+    out_ptr,
+    idx_ptr,
+    y_offset,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K_INDICES: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    """Multi-program gather: the parallel counterpart to gather_kernel_1core.
+
+    Same fixed-column-slice semantics as :func:`gather_kernel_1core` —
+    ``out[i, :] = in[idx[i], y_offset : y_offset + BLOCK_COLS]`` — but the
+    ``K_INDICES`` rows are tiled into ``BLOCK_ROWS``-sized chunks and
+    distributed across the 1D core grid via ``tl.program_id(0)``, instead
+    of gathered in one ``descriptor_gather`` call.
+
+    Preconditions:
+      * ``BLOCK_ROWS`` must be at least 8 — under row-tiling it is the
+        gathered index tile's leading dim that the ``descriptor_gather``
+        verifier's "at least 8" minimum binds on, not ``K_INDICES``.
+      * ``K_INDICES`` must be a multiple of ``BLOCK_ROWS`` — no masking is
+        done for a partial final tile.
+      * ``y_offset + BLOCK_COLS <= N`` (the slice must fit inside the
+        source row).
+      * ``BLOCK_COLS`` must be a power of two (Triton frontend constraint
+        on descriptor block shapes).
+
+    Distribution mirrors :func:`gather_kernel_spyre`'s row split
+    (``rows_per_core = cdiv(m_blocks, grid_m)``, clamped at ``m_blocks``)
+    minus the column-stick loop and the Spyre layout annotations — this
+    kernel always gathers the full ``BLOCK_COLS``-wide slice in one shot
+    per row tile.
+    """
+    pid_m = tl.program_id(0)
+    grid_m = tl.num_programs(0)
+
+    m_blocks = tl.cdiv(K_INDICES, BLOCK_ROWS)
+    rows_per_core = tl.cdiv(m_blocks, grid_m)
+
+    idx_desc = tl.make_tensor_descriptor(
+        idx_ptr,
+        shape=[K_INDICES],
+        strides=[1],
+        block_shape=[BLOCK_ROWS],
+    )
+
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[1, BLOCK_COLS],
+    )
+
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[K_INDICES, BLOCK_COLS],
+        strides=[BLOCK_COLS, 1],
+        block_shape=[BLOCK_ROWS, BLOCK_COLS],
+    )
+
+    # See gather_kernel_spyre for why the clamp is needed: rows_per_core
+    # rounds up, so the last core's unclamped end can walk past m_blocks
+    # whenever grid_m does not divide m_blocks evenly.
+    m_start = pid_m * rows_per_core
+    m_end = tl.minimum(m_start + rows_per_core, m_blocks)
+
+    for m_block in range(m_start, m_end):
+        offset_m = m_block * BLOCK_ROWS
+        idx = idx_desc.load([offset_m])
+        result = in_desc.gather(idx, y_offset)
+        out_desc.store([offset_m, 0], result)
+
+
+@triton.jit
 def gather_kernel_spyre(
     in_ptr,
     out_ptr,
@@ -179,8 +264,9 @@ def gather_kernel_spyre(
 ):
     """Spyre physical-layout variant of gather_kernel.
 
-    Gathers K_INDICES full rows of the [M, N] source into a [K_INDICES, N]
-    output, tiling the column dim into N // BLOCK_COLS chunks. in_desc and
+    Row-splits like :func:`gather_kernel`, but gathers K_INDICES full rows
+    of the [M, N] source into a [K_INDICES, N] output, tiling the column
+    dim into N // BLOCK_COLS chunks. in_desc and
     out_desc are annotated with Spyre stick-tiling layouts via
     tl.spyre_tensor_layout; idx_desc is not (index arrays have no stick layout).
 
@@ -261,7 +347,7 @@ def gather_2d_kernel(
     ``BLOCK_ROWS`` rows of the source matrix (selected by ``idx``) and
     a ``BLOCK_COLS``-wide column slice.
 
-    Differences from :func:`gather_kernel`:
+    Differences from :func:`gather_kernel_1core`:
 
     - Two-axis ``tl.program_id`` (``(pid_m, pid_n)``); the single-program
       kernel uses no ``tl.program_id`` at all.
