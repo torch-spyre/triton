@@ -456,6 +456,98 @@ worklist drains and the driver calls that a fixpoint, so a permanent deferral is
 reported as success. Deferral must therefore be a prediction the analysis
 supports, never a guess.
 
+## Proposed: a backward requirement analysis
+
+**Not implemented.** This section states a design and the questions it still owes
+answers to, so the next person does not have to re-derive it.
+
+### The shape of it
+
+Phase 2A asks one question, forward: *what layout does this value have?* The reduce
+showed there is a second question — *what layout is wanted of it?* — and today that
+one is answered by a forward rule walking forward again, to the store, to fetch a
+fact it cannot receive. That is `findStoreDestination`, and it is the tell.
+
+Make it a direction instead. Two facts per value:
+
+| fact | direction | seeded from |
+|---|---|---|
+| **have** | forward | the markers on physicalized `ktdp.load`s (Phase 1's roots) |
+| **want** | backward | the markers on the `ktdp.store`s the values reach |
+
+The decision at an op becomes a comparison of the two *at the same value*, rather
+than a derivation from one of them. Agreement means physical; disagreement, or a
+`want` with no satisfiable `have`, means logical and a bridge — which is what
+happens today, reached deliberately rather than by fallthrough.
+
+### The backward rules
+
+Given a requirement `R` on an op's result, what does it require of each operand?
+This is the part worth getting right, and the rules are not symmetric with the
+forward ones.
+
+| op | requirement induced on the operand |
+|---|---|
+| elementwise / single-tensor shape-preserving | `R` unchanged — rank-agnostic, so it passes straight through |
+| `linalg.transpose` | `R` permuted by the inverse permutation |
+| `linalg.reduce` | the **surviving** dims must match `R`; the reduced dims are unconstrained |
+| `linalg.matmul`, `linalg.batch_matmul` | none — the result cannot be physical at all, so the requirement terminates here and the bridge goes here |
+| reshape, broadcast, expand_dims, collapse_shape | none — the physical dim count changes, so no requirement can cross |
+| `ktdp.load` | terminus: this is where `want` meets `have` |
+| `tensor.empty` / `linalg.fill` as a DPS init | `R` **is** the shape to build at — the fact the forward pass structurally cannot supply |
+
+### The hard part: a requirement is partial, not a layout
+
+A `want` cannot be represented as "a layout". For a reduce, `R` constrains only the
+surviving axes — the reduced axis's own split is invisible to `R`, because it is
+folded away and nothing downstream can see it. So a requirement is a **partial**
+map: some physical dims constrained, others free. Modelling it as a full layout
+either over-constrains (rejecting operands that would have worked) or needs a
+sentinel value doing the same job less legibly.
+
+The consequence is worth stating, because it is easy to expect otherwise: the
+reduce decision stays a *comparison of two facts*, not a derivation from one.
+Backward supplies `R` over the survivors, forward supplies the operand's actual
+layout, and agreement is "the operand's layout, restricted to the survivors,
+induces `R`". That is today's equality test — with `R` arriving instead of being
+fetched.
+
+### What it collapses
+
+- `findStoreDestination` and `lookupMarkerFromTile`'s use from 2A: gone. The walk
+  is what the direction gives for free.
+- `populatePhysicalPropagationPatterns` stops taking `const MarkerByMemView &`, and
+  every rule becomes a pure function of the op and the incoming fact. Narrowing
+  that parameter from `PassContext` closed a real hole, but the parameter exists
+  because the direction is wrong for one rule; this removes the cause.
+- The init. A requirement reaches `tensor.empty`/`linalg.fill`, so
+  `rebuildPhysicalInit` becomes a **retype** rather than a mint — the same thing
+  `RewriteElementwisePattern` already does — and `canRebuildPhysicalInit` stops
+  needing to be asked across the 2A/2B boundary. Nothing is left dead behind the
+  rewrite, so the question `eraseDeadProducers` used to answer does not return.
+- The markers themselves do **not** go away, and neither does
+  `physMemViewToMarker`: the markers are the only source of layout truth, and 2B
+  still resolves one from an access tile while rewriting. What changes is that the
+  store's marker is held at the seed rather than walked to.
+
+### What it owes answers to
+
+- **Conflicting requirements.** A value reaching two stores with different layouts
+  has two incompatible `want`s. Inexpressible today. The answer must be detect and
+  fall back to logical plus bridges — not pick one.
+- **Cycles.** The backward worklist needs the visit-stack detection the forward one
+  already has, for the same reason.
+- **The subset invariant.** `verifyPhysicalTypeAgreement` relates `physicalValues`
+  to the forward map. A second map needs either its own check or a restatement
+  covering both.
+- **`want` without a satisfiable `have`.** A store requiring a layout of a value
+  produced by an op that cannot be physical. This is the bridge case, and it should
+  be the explicit answer of a rule rather than what happens when no rule fires —
+  the driver reports a drained worklist as a fixpoint, so a permanent deferral
+  reads as success.
+- **Ordering.** Backward seeds from stores whose access tile Phase 1 physicalized,
+  so both analyses still run before Phase 2B and the phase structure is unchanged.
+
 ## Rejected inputs
 
 | Input | Rejected because |
