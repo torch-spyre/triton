@@ -490,27 +490,47 @@ forward ones.
 |---|---|
 | elementwise / single-tensor shape-preserving | `R` unchanged — rank-agnostic, so it passes straight through |
 | `linalg.transpose` | `R` permuted by the inverse permutation |
-| `linalg.reduce` | the **surviving** dims must match `R`; the reduced dims are unconstrained |
+| `linalg.reduce` | nothing crosses. `R` is **consumed here**: the reduce compares it against what its operand's forward layout induces. The operand's own layout comes from forward, not from `R` |
 | `linalg.matmul`, `linalg.batch_matmul` | nothing crosses to the operands. The op is fixed at logical rank, so its result cannot carry `R`; `R` is discharged *here*, as the widen the store already emits. The operands are still narrowed, from their own `have` — the requirement does not have to cross to establish that |
 | reshape, broadcast, expand_dims, collapse_shape | none — the physical dim count changes, so no requirement can cross |
 | `ktdp.load` | terminus: this is where `want` meets `have` |
 | `tensor.empty` / `linalg.fill` as a DPS init | `R` **is** the shape to build at — the fact the forward pass structurally cannot supply |
 
-### The hard part: a requirement is partial, not a layout
+### A requirement is total, because it is consumed rather than crossed
 
-A `want` cannot be represented as "a layout". For a reduce, `R` constrains only the
-surviving axes — the reduced axis's own split is invisible to `R`, because it is
-folded away and nothing downstream can see it. So a requirement is a **partial**
-map: some physical dims constrained, others free. Modelling it as a full layout
-either over-constrains (rejecting operands that would have worked) or needs a
-sentinel value doing the same job less legibly.
+The tempting model is that a requirement must be **partial** — that a reduce hands
+its operand "the survivors must look like `R`, the reduced dims are free", which is
+not a layout and needs a representation with free slots. It also cannot be a
+fixed-length per-physical-dim structure at all, since the operand's physical rank
+is not determined by `R`: a reduced logical dim may contribute one physical dim or
+two, and `R` cannot see which.
 
-The consequence is worth stating, because it is easy to expect otherwise: the
-reduce decision stays a *comparison of two facts*, not a derivation from one.
-Backward supplies `R` over the survivors, forward supplies the operand's actual
-layout, and agreement is "the operand's layout, restricted to the survivors,
-induces `R`". That is today's equality test — with `R` arriving instead of being
-fetched.
+None of that is needed, because **a requirement is consumed at the op that can
+satisfy it rather than passed through it.** What a reduce needs is `R` at *its own
+result*, which the store supplies through shape-preserving ops. Its operand's
+layout is a *forward* fact. The decision compares the two:
+
+    induced(have(operand), reducedDims)  ==  R
+
+and both sides are total. Nothing partial is ever constructed.
+
+So a requirement has exactly the shape a marker already has — the three coordinate
+arrays plus the physical extents — and every backward rule either passes a total
+requirement through (elementwise, transpose-with-inverse-permutation), consumes it
+(reduce, matmul), or terminates (reshape, broadcast).
+
+The crossing would only be forced if a reduce's operand had **no** forward fact
+while having a backward one — a reduce whose input is itself produced by a reduce
+with nothing but shape-preserving ops between. Softmax looks like that case and is
+not: its second reduction consumes `numerator`, which chains back to the *load*,
+while the first reduction's result reaches it only through a broadcast, which
+terminates a requirement. Layernorm has the same shape for the same reason.
+
+Should that case ever arise, the answer is to refuse it — Logical plus a bridge —
+with a diagnostic, rather than to model partiality for it. That keeps the
+representation total and makes the gap visible instead of silent. It is also
+measurable: it is the count of variants where a reduce's operand has a backward
+requirement and no forward layout, and today that count is zero.
 
 ### What it collapses
 
