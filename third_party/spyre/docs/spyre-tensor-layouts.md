@@ -491,7 +491,7 @@ forward ones.
 | elementwise / single-tensor shape-preserving | `R` unchanged — rank-agnostic, so it passes straight through |
 | `linalg.transpose` | `R` permuted by the inverse permutation |
 | `linalg.reduce` | the **surviving** dims must match `R`; the reduced dims are unconstrained |
-| `linalg.matmul`, `linalg.batch_matmul` | none — the result cannot be physical at all, so the requirement terminates here and the bridge goes here |
+| `linalg.matmul`, `linalg.batch_matmul` | nothing crosses to the operands. The op is fixed at logical rank, so its result cannot carry `R`; `R` is discharged *here*, as the widen the store already emits. The operands are still narrowed, from their own `have` — the requirement does not have to cross to establish that |
 | reshape, broadcast, expand_dims, collapse_shape | none — the physical dim count changes, so no requirement can cross |
 | `ktdp.load` | terminus: this is where `want` meets `have` |
 | `tensor.empty` / `linalg.fill` as a DPS init | `R` **is** the shape to build at — the fact the forward pass structurally cannot supply |
@@ -520,10 +520,13 @@ fetched.
   every rule becomes a pure function of the op and the incoming fact. Narrowing
   that parameter from `PassContext` closed a real hole, but the parameter exists
   because the direction is wrong for one rule; this removes the cause.
-- The init. A requirement reaches `tensor.empty`/`linalg.fill`, so
+- The init, for a reduce. A requirement reaches `tensor.empty`/`linalg.fill`, so
   `rebuildPhysicalInit` becomes a **retype** rather than a mint — the same thing
   `RewriteElementwisePattern` already does — and `canRebuildPhysicalInit` stops
-  needing to be asked across the 2A/2B boundary. Nothing is left dead behind the
+  needing to be asked across the 2A/2B boundary. Reduce-scoped on purpose:
+  `dispatchSource` rebuilds an init only in the Physical space, and a matmul is
+  always Logical, so its accumulator is a slab of the wider container and is minted
+  at slice extents either way. Nothing is left dead behind the
   rewrite, so the question `eraseDeadProducers` used to answer does not return.
 - The markers themselves do **not** go away, and neither does
   `physMemViewToMarker`: the markers are the only source of layout truth, and 2B
@@ -547,6 +550,14 @@ fetched.
   reads as success.
 - **Ordering.** Backward seeds from stores whose access tile Phase 1 physicalized,
   so both analyses still run before Phase 2B and the phase structure is unchanged.
+- **A tie-break where both answers are legal.** Agreement/disagreement is a
+  legality test, and it says nothing about a value with **no** `want` at all, where
+  more than one answer verifies and the difference is cost. A free-typed op needs a
+  rule for choosing, not just for rejecting.
+- **A join at multi-operand `arith.*` ops.** The elementwise rule hands the same
+  `R` to every operand, but nothing states that the operands' `have`s must agree
+  with each other. `reconcileOperandSet` does that for source ops; a mixed pair at
+  an `arith` op is a parse failure rather than a cost, and no rule covers it.
 
 ## Rejected inputs
 
