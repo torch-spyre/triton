@@ -211,18 +211,12 @@ tt.func @reduce_two_batch_dims(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>) {
 // the store. Nothing about the reduce changes -- what this adds is that the
 // layout has to reach it across another op.
 //
-// Two mechanisms have to agree for this to lower. findStoreDestination walks
-// forward past the math.exp to find the annotated store, which is what
-// ReducePropagation compares against. The backward requirement analysis
-// (Phase 2A, measurement only for now) has to reach the same value by its own
-// elementwise rule, and verifyRequirementAgreement asserts it did -- so if that
-// rule ever terminates here instead of passing the requirement through, this
-// test fails on the assertion rather than on a CHECK.
-//
-// The elementwise op is deliberately single-operand: isSingleTensorElementwiseOp
-// counts tensor operands, so `arith.addf %r, %r` would be two and the walk would
-// stop at it. That asymmetry is a known wart in the predicate, not something this
-// case is asserting.
+// This is the narrow guard on the backward analysis's reach. ReducePropagation
+// selects the Physical space by comparing what its operand induces against the
+// requirement AT ITS OWN RESULT, and the only thing that puts a requirement there
+// is the backward elementwise rule carrying it back across the math.exp. If that
+// rule ever terminates here instead, the reduce falls back to Logical and the
+// CHECK-NOTs below catch the stick loop that replaces it.
 module {
 // CHECK-LABEL:   tt.func @reduce_batch_dim_through_elementwise(
 // CHECK:           %[[LOAD:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf16>

@@ -22,18 +22,20 @@ namespace mlir::triton::ktdp {
 // of it". Design, rule table and open questions: "a backward requirement
 // analysis" in docs/spyre-tensor-layouts.md.
 //
-// Slice 1 is a MEASUREMENT: nothing reads the result to make a decision, no IR
-// is mutated, and verifyRequirementAgreement asserts the result agrees with
-// findStoreDestination, which still makes every decision it made before.
+// This runs BEFORE the forward analysis, which consumes it: ReducePropagation
+// compares what its operand's layout induces against the requirement at its
+// result. Nothing here reads a forward fact, so the order is an ordering and not
+// a cycle. Mutates no IR.
 //===----------------------------------------------------------------------===//
 
 /// The layout wanted of one value. Total, never partial: a requirement is
 /// consumed at the op that can satisfy it rather than crossed through it, so no
 /// dim slot is ever free (see "A requirement is total" in the doc).
 ///
-/// The four arrays are what a marker plus an access-tile shape already carry --
-/// a seed is exactly a `StoreDestination` -- held as data rather than as the
-/// marker op because `linalg.transpose` reorders them relative to the marker.
+/// The four arrays are what a marker plus its store's access-tile shape already
+/// carry, held as data rather than read off the marker op because
+/// `linalg.transpose` reorders them relative to the marker. That is why
+/// ReducePropagation's comparison is arrays-against-arrays.
 struct LayoutRequirement {
   llvm::SmallVector<int64_t> physSrc;
   llvm::SmallVector<int64_t> physOp;
@@ -117,16 +119,6 @@ void propagateRequirement(Value value, const LayoutRequirement &req,
 /// whose access tile Phase 1 physicalized. Mutates no IR.
 RequirementAnalysis runRequirementAnalysis(ModuleOp module,
                                            const PassContext &ctx);
-
-/// Agreement check between the requirement map and `findStoreDestination`, the
-/// forward walk it will eventually replace. Active in assertion builds only;
-/// see the definition for the two directions and what a failure means.
-///
-/// Must be called before Phase 2 rewrites anything: `findStoreDestination`
-/// reads the store chain the rewrite dismantles.
-void verifyRequirementAgreement(ModuleOp module, const PassContext &ctx,
-                                const RequirementAnalysis &analysis,
-                                llvm::StringRef when);
 
 } // namespace mlir::triton::ktdp
 

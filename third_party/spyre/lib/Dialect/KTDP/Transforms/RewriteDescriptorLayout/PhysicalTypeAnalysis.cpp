@@ -139,24 +139,33 @@ struct StorePropagation : PhysicalPropagationPattern {
 ///   1. One input and one init, and the input is the value that resolved
 ///      physical. A multi-operand reduce (argmax) would need every input to
 ///      induce the same layout; nothing asks for that yet.
-///   2. The induced layout equals the declared one. Reducing a logical dim away
+///   2. The induced layout equals the one WANTED of this result -- the backward
+///      analysis's requirement at the result. Reducing a logical dim away
 ///      deletes the physical dims sourced from it, so the survivors in order --
 ///      same coord op and arg, axes renumbered -- are the layout the result
-///      would carry. Compared against the store's marker on all three coordinate
-///      arrays AND its access-tile shape: the arrays fix the order, the shape
-///      fixes the extents.
+///      would carry. Compared against the requirement on all three coordinate
+///      arrays AND its physical extents: the arrays fix the order, the extents
+///      fix the sizes.
 ///   3. The init is rebuildable at the physical shape, asked here so this
 ///      decision and the emission cannot disagree (canRebuildPhysicalInit).
 ///
 /// Why a reduce has to be asked at all, and why the answer belongs to the store
 /// rather than the input: "Which physical shape" in docs/spyre-tensor-layouts.md.
 struct ReducePropagation : PhysicalPropagationPattern {
-  /// Only to resolve the store's marker, via findStoreDestination. A forward
-  /// rule reaching forward again is the tell that this fact wants to arrive
-  /// backward; a backward 2A would hand it in and this member would go.
-  const MarkerByMemView &markers;
-  explicit ReducePropagation(const MarkerByMemView &markers)
-      : markers(markers) {}
+  /// The backward half of Phase 2A, handed in. "What layout is wanted of this
+  /// result" is a fact that ARRIVES here: RequirementAnalysis seeds it at the
+  /// stores Phase 1 physicalized and propagates it back to this result through
+  /// the shape-preserving ops in between. Compare the requirement's own
+  /// coordinate arrays, not a marker's -- linalg.transpose reorders them
+  /// relative to the marker, which is why LayoutRequirement holds them as data.
+  ///
+  /// Reading the map means the requirement analysis must run BEFORE this one.
+  /// Sound because no backward rule reads a forward fact; see
+  /// runPhysicalTypeAnalysis and "a backward requirement analysis" in
+  /// docs/spyre-tensor-layouts.md.
+  const RequirementMap &requirements;
+  explicit ReducePropagation(const RequirementMap &requirements)
+      : requirements(requirements) {}
 
   bool match(Operation *op) const override {
     return isa<linalg::ReduceOp>(op);
@@ -221,22 +230,25 @@ struct ReducePropagation : PhysicalPropagationPattern {
     if (!canRebuildPhysicalInit(rd.getDpsInits()[0]))
       return failure();
 
-    StoreDestination dest = findStoreDestination(result, markers);
-    if (!dest.marker)
+    auto reqIt = requirements.find(result);
+    if (reqIt == requirements.end())
       return failure();
-    if (llvm::ArrayRef<int64_t>(indSrc) != dest.marker.getPhysSrc() ||
-        llvm::ArrayRef<int64_t>(indOp) != dest.marker.getPhysOp() ||
-        llvm::ArrayRef<int64_t>(indArg) != dest.marker.getPhysArg() ||
+    const LayoutRequirement &req = reqIt->second;
+    if (llvm::ArrayRef<int64_t>(indSrc) !=
+            llvm::ArrayRef<int64_t>(req.physSrc) ||
+        llvm::ArrayRef<int64_t>(indOp) != llvm::ArrayRef<int64_t>(req.physOp) ||
+        llvm::ArrayRef<int64_t>(indArg) !=
+            llvm::ArrayRef<int64_t>(req.physArg) ||
         llvm::ArrayRef<int64_t>(indShape) !=
-            llvm::ArrayRef<int64_t>(dest.tileShape))
+            llvm::ArrayRef<int64_t>(req.physExtents))
       return failure();
 
     // The marker recorded is the OUTPUT's, not the operand's: it is the layout
     // this value carries, and it is what the emission registers against the
-    // value it mints.
+    // value it mints. It comes from the requirement, so it is the store's marker
+    // -- the same one the forward walk used to fetch.
     return PhysicalTypeInfo{
-        RankedTensorType::get(indShape, resTy.getElementType()), dest.marker,
-        {}};
+        RankedTensorType::get(indShape, resTy.getElementType()), req.marker, {}};
   }
 };
 
@@ -324,7 +336,8 @@ lookupPattern(Operation *op, const PhysicalPropagationPatternSet &patterns) {
 //===----------------------------------------------------------------------===//
 
 void populatePhysicalPropagationPatterns(
-    PhysicalPropagationPatternSet &patterns, const MarkerByMemView &markers) {
+    PhysicalPropagationPatternSet &patterns,
+    const RequirementMap &requirements) {
   // Order matters only where two patterns could match the same op. Every
   // named-op pattern must be asked before the structural elementwise rule,
   // which a linalg op with uniformly shaped operands could otherwise satisfy.
@@ -336,7 +349,7 @@ void populatePhysicalPropagationPatterns(
   patterns.push_back(std::make_unique<TransposePropagation>());
   patterns.push_back(std::make_unique<MatmulPropagation>());
   patterns.push_back(std::make_unique<StorePropagation>());
-  patterns.push_back(std::make_unique<ReducePropagation>(markers));
+  patterns.push_back(std::make_unique<ReducePropagation>(requirements));
   patterns.push_back(std::make_unique<ReshapePropagation>());
   patterns.push_back(std::make_unique<BroadcastPropagation>());
   patterns.push_back(std::make_unique<ElementwisePropagation>());
@@ -428,8 +441,8 @@ getPhysicalizedType(Value value, const PhysicalTypeMap &roots,
 // runPhysicalTypeAnalysis
 //===----------------------------------------------------------------------===//
 
-PhysicalTypeMap runPhysicalTypeAnalysis(ModuleOp module,
-                                        const PassContext &ctx) {
+PhysicalTypeMap runPhysicalTypeAnalysis(ModuleOp module, const PassContext &ctx,
+                                        const RequirementMap &requirements) {
   // Phase 1's roots. retypeLoad is Phase 1's only writer to
   // ctx.physicalValues, so at this point the map holds exactly one entry per
   // physicalized ktdp.load result, and no pattern creates a ktdp.load -- the
@@ -441,7 +454,7 @@ PhysicalTypeMap runPhysicalTypeAnalysis(ModuleOp module,
   }
 
   PhysicalPropagationPatternSet patterns;
-  populatePhysicalPropagationPatterns(patterns, ctx.physMemViewToMarker);
+  populatePhysicalPropagationPatterns(patterns, requirements);
 
   PhysicalTypeMap resolved;
 

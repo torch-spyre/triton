@@ -77,9 +77,9 @@ diverging.
 
 Most rules are a function of the operand alone, but not all: whether a
 `linalg.reduce` produces a physical result is a question about the layout its
-result is *stored under*, so that rule walks forward to the store, the mirror of
-what the store pattern does backward. Nothing about that walk mutates IR, and it
-reads only what Phase 1 produced, so it stays an analysis.
+result is *stored under*. That fact is handed in rather than fetched — a second,
+backward analysis computes it and runs first. See "a backward requirement
+analysis" below for why the direction, not the lookup, was the problem.
 
 *2B, rewrite.* Walk the ops and act on the recorded types rather than on the
 current IR. An operand's physicality is a lookup: resolved, or predicted and not
@@ -456,21 +456,33 @@ worklist drains and the driver calls that a fixpoint, so a permanent deferral is
 reported as success. Deferral must therefore be a prediction the analysis
 supports, never a guess.
 
-## Proposed: a backward requirement analysis
+## A backward requirement analysis
 
-**Slice 1 implemented, as a measurement only.** The analysis exists — see
-`RewriteDescriptorLayout/RequirementAnalysis.{h,cpp}`: it computes a requirement
-for every value it reaches, seeded from the physicalized `ktdp.store`s, with the
-rule table below as its pattern set. Nothing reads it to make a decision and it
-mutates no IR. `ReducePropagation` still answers *what layout is wanted of this*
-with `findStoreDestination`, and `verifyRequirementAgreement` asserts the two
-concur at every `linalg.reduce` result, both directions, on every compile in an
-asserts build — the same play the forward analysis made before it was flipped
-over.
+**Slices 1 and 2 implemented. Slice 3 — the init retype — remains.** The analysis
+lives in `RewriteDescriptorLayout/RequirementAnalysis.{h,cpp}`: it computes a
+requirement for every value it reaches, seeded from the physicalized
+`ktdp.store`s, with the rule table below as its pattern set, and mutates no IR.
 
-**What the agreement showed.** It holds across all 149 registry variants, with no
-rule in the table below turning out wrong and no conflicts detected. Two things
-the measurement did establish:
+Slice 1 landed it as a *measurement*, agreeing with the forward walk it was to
+replace. Slice 2 made it the only answer: `ReducePropagation` now reads the
+requirement at its own result and compares it arrays-against-arrays, the walk
+(`findStoreDestination`, `findMarkerForStore`, `isSingleTensorElementwiseOp`) is
+deleted from every caller, and the agreement check went with it — with nothing
+left to agree with, a check comparing the analysis to itself would be worse than
+none. What guards the reach now is the reduce coverage itself: Case 4 of
+`Conversion/rewrite-descriptor-layout-reduce-batch-dim.mlir` (`reduce` →
+`math.exp` → annotated store) pins that a requirement crosses an op between the
+reduce and its store, and `reduce__one_tile[stick, stick]` on device fails to
+compile at all if the Physical selection is lost.
+
+**Ordering.** The backward analysis runs *before* the forward one, because the
+forward one consumes it. Not a cycle: no backward rule reads a forward fact — the
+seeds come from Phase 1's physicalized stores, the elementwise match is
+structural, and the reduce rule consumes and propagates nothing.
+
+**What the measurement showed.** Agreement held across all 149 registry variants,
+with no rule in the table below turning out wrong and no conflicts detected. Two
+things it did establish:
 
 - The elementwise rule cannot also require the result's shape to match its
   operands'. Phase 1 physicalizes the loads and stops, so a mid-chain
@@ -483,16 +495,15 @@ the measurement did establish:
   unruled op rather than silently absorbed, and `tensor.empty` / `linalg.fill`
   will land in the same place once slice 3 gives the init a rule.
 
-The rest of this section is the spec for slices 2 (flip `ReducePropagation` to
-read the requirement, delete the walk) and 3 (make the init a retype), and states
-the questions those still owe answers to.
+The rest of this section is the design, the spec for slice 3 (make the init a
+retype), and the questions still owed answers.
 
 ### The shape of it
 
 Phase 2A asks one question, forward: *what layout does this value have?* The reduce
-showed there is a second question — *what layout is wanted of it?* — and today that
-one is answered by a forward rule walking forward again, to the store, to fetch a
-fact it cannot receive. That is `findStoreDestination`, and it is the tell.
+showed there is a second question — *what layout is wanted of it?* — and that one
+used to be answered by a forward rule walking forward again, to the store, to fetch
+a fact it could not receive. That was `findStoreDestination`, and it was the tell.
 
 Make it a direction instead. Two facts per value:
 
@@ -560,15 +571,21 @@ requirement and no forward layout, and today that count is zero.
 
 ### What it collapses
 
-- `findStoreDestination`'s **walk**: gone. Reaching forward to a store is what the
-  backward direction gives for free. The function itself survives one caller,
-  `findMarkerForStore` in Phase 2B, which asks only "is this store annotated" — and
-  that is a walk of length one, since `RewriteStorePattern` already holds the store
-  and finds it on the first user. It could be a plain `lookupMarkerFromTile`.
-- `populatePhysicalPropagationPatterns` stops taking `const MarkerByMemView &`, and
-  every rule becomes a pure function of the op and the incoming fact. Narrowing
-  that parameter from `PassContext` closed a real hole, but the parameter exists
-  because the direction is wrong for one rule; this removes the cause.
+- `findStoreDestination` and its **walk**: gone entirely, along with
+  `findMarkerForStore` and `isSingleTensorElementwiseOp` — the predicate that
+  scoped the walk, whose habit of counting a DPS `outs` as a second tensor operand
+  used to need a note wherever it mattered and now needs none. Reaching forward to
+  a store is what the backward direction gives for free. The one Phase 2B caller asked only "is this store annotated", which
+  `RewriteStorePattern` can settle about the store it already holds:
+  `lookupMarkerFromTile(st.getAccessTile(), ...)`. That also fixed a latent
+  ambiguity — the walk returned the marker of whichever store came first among the
+  data tile's users, which need not be the store being rewritten.
+- `populatePhysicalPropagationPatterns` stops taking `const MarkerByMemView &`. It
+  takes `const RequirementMap &` instead — the parameter does not disappear, which
+  an earlier draft of this section claimed it would. That is right rather than a
+  compromise: the reduce genuinely needs a second fact, and the point was never to
+  have no second parameter but to have the rule *receive* the fact rather than go
+  looking for it. What did go is any route from an analysis rule to Phase 2B state.
 - The init, for a reduce. A requirement reaches `tensor.empty`/`linalg.fill`, so
   `rebuildPhysicalInit` becomes a **retype** rather than a mint — the same thing
   `RewriteElementwisePattern` already does — and `canRebuildPhysicalInit` stops

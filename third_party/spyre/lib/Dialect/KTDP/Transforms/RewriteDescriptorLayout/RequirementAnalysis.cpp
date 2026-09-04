@@ -4,21 +4,15 @@
 // for every value it reaches, the layout that store wants of it. Creates no ops
 // and mutates nothing.
 //
-// Slice 1 consumes nothing: ReducePropagation still answers the same question
-// with findStoreDestination, and verifyRequirementAgreement asserts the two
-// concur. See "a backward requirement analysis" in
-// docs/spyre-tensor-layouts.md for the rule table and what the later slices
-// collapse.
+// The result is what ReducePropagation reads to decide whether a reduce's result
+// is physical, so this runs before the forward analysis. See "a backward
+// requirement analysis" in docs/spyre-tensor-layouts.md for the rule table and
+// the questions still owed answers.
 //
 //===----------------------------------------------------------------------===//
 
 #include "RewriteDescriptorLayout/RequirementAnalysis.h"
-#include "RewriteDescriptorLayout/ContractionSynthesis.h"
 #include "RewriteDescriptorLayout/PermutationUtils.h"
-// For the complete PhysicalTypeInfo: Types.h only forward-declares it, so
-// PhysicalTypeMap cannot be queried without this. The same incompleteness is why
-// PhysicalTypeCarryForward's methods are out of line.
-#include "RewriteDescriptorLayout/PhysicalTypeAnalysis.h"
 
 #include "ktir/Dialect/KTDP/KTDP.h"
 
@@ -242,8 +236,8 @@ lookupPattern(Operation *op, const RequirementBackwardPatternSet &patterns) {
 /// operand. What identifies one is the tile's own base -- Phase 1 built the new
 /// tile over the physical memory view it registered in `physMemViewToMarker`, so
 /// a marker resolving from the tile IS the record that the tile is physical.
-/// Same test `findStoreDestination` makes of the store it arrives at, asked here
-/// of the store directly rather than at the end of a forward walk.
+/// The same test RewriteStorePattern makes of its own access tile, asked of every
+/// store up front rather than one at a time during the rewrite.
 llvm::FailureOr<LayoutRequirement> seedFromStore(mlir::ktdp::StoreOp st,
                                                 const MarkerByMemView &markers) {
   auto tileOp =
@@ -377,92 +371,6 @@ RequirementAnalysis runRequirementAnalysis(ModuleOp module,
   });
   (void)seeds;
   return result;
-}
-
-//===----------------------------------------------------------------------===//
-// verifyRequirementAgreement
-//===----------------------------------------------------------------------===//
-
-void verifyRequirementAgreement(ModuleOp module, const PassContext &ctx,
-                                const RequirementAnalysis &analysis,
-                                llvm::StringRef when) {
-// #ifndef NDEBUG rather than LLVM_DEBUG or a bare assert, for the reasons
-// verifyPhysicalTypeAgreement states: LLVM_DEBUG runs only when someone asks,
-// and this has to run unasked on every compile, while assert() alone would
-// leave the module walk that feeds it in a release build. The default build is
-// TritonRelBuildWithAsserts, so this is live everywhere we build.
-#ifndef NDEBUG
-  // Asserts one thing: wherever RewriteReducePattern would select the Physical
-  // space, the requirement map can answer. It selects with
-  // physicalTypeAnalysis->find(rd.getResult(0)), so this walks that same lookup
-  // and requires an entry at the same value, naming the same marker and tile shape
-  // as the destination the selection was made against.
-  //
-  // That is the property slice 2 needs: reading the requirement instead of walking
-  // to the store reaches the same answer, so no Physical selection is lost.
-  //
-  // Two things it is careful NOT to be:
-  //
-  //   Not a claim about `failure()` in general. A propagation pattern failing does
-  //   not mean "logical" -- StorePropagation fails because a store has no result
-  //   to propagate to. Only at a reduce result does presence in the map coincide
-  //   with the space selection, which is why that is the only op walked here.
-  //
-  //   Not symmetric. A requirement where findStoreDestination found nothing is the
-  //   backward rules being more capable, not a defect: they cross a
-  //   linalg.transpose by inverse permutation, which the walk stops at because
-  //   isSingleTensorElementwiseOp counts a DPS `outs` as a second tensor operand.
-  //   Asserting equality would forbid the improvement. Same asymmetry as
-  //   verifyPhysicalTypeAgreement -- the invariant is no UNDER-claiming.
-  //
-  // Walking the rewriter's lookup rather than the walk's return value also avoids
-  // a case where the walk over-claims: it crosses a tensor.expand_shape, whose
-  // rank change means the store's layout cannot describe the reduce's result. That
-  // destination never becomes a selection, so nothing has to match it.
-  //
-  // The counts are how you tell this is not agreeing vacuously: a module with no
-  // annotated store has no seeds, so both sides are empty at every reduce.
-  unsigned reduceResults = 0, selectedPhysical = 0;
-  module.walk([&](linalg::ReduceOp rd) {
-    for (Value result : rd.getResults()) {
-      ++reduceResults;
-      // No forward analysis means nothing decided anything; nothing to relate.
-      if (!ctx.physicalTypeAnalysis ||
-          !ctx.physicalTypeAnalysis->contains(result))
-        continue;
-      ++selectedPhysical;
-
-      auto it = analysis.requirements.find(result);
-      assert(it != analysis.requirements.end() &&
-             "Phase 2A backward disagreement: this linalg.reduce result is what "
-             "RewriteReducePattern reads to select the Physical space, but the "
-             "requirement map has "
-             "no entry for its result -- a backward rule terminates where the "
-             "space selection needs it to arrive");
-      assert((it == analysis.requirements.end() ||
-              (it->second.marker ==
-                   findStoreDestination(result, ctx.physMemViewToMarker).marker &&
-               it->second.physExtents ==
-                   findStoreDestination(result, ctx.physMemViewToMarker)
-                       .tileShape)) &&
-             "Phase 2A backward disagreement: the requirement at a Physical "
-             "linalg.reduce result names a different marker or tile shape than "
-             "the destination the space selection was made against");
-    }
-  });
-
-  LLVM_DEBUG(llvm::dbgs()
-             << "[rewrite-descriptor-layout] Phase 2A backward agreement ("
-             << when << "): " << analysis.requirements.size()
-             << " requirement(s), " << selectedPhysical << " of " << reduceResults
-             << " linalg.reduce result(s) selected Physical, "
-             << analysis.conflicts.size() << " conflict(s)\n");
-#else
-  (void)module;
-  (void)ctx;
-  (void)analysis;
-  (void)when;
-#endif
 }
 
 } // namespace mlir::triton::ktdp
