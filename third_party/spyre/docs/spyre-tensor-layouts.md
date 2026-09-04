@@ -458,8 +458,34 @@ supports, never a guess.
 
 ## Proposed: a backward requirement analysis
 
-**Not implemented.** This section states a design and the questions it still owes
-answers to, so the next person does not have to re-derive it.
+**Slice 1 implemented, as a measurement only.** The analysis exists — see
+`RewriteDescriptorLayout/RequirementAnalysis.{h,cpp}`: it computes a requirement
+for every value it reaches, seeded from the physicalized `ktdp.store`s, with the
+rule table below as its pattern set. Nothing reads it to make a decision and it
+mutates no IR. `ReducePropagation` still answers *what layout is wanted of this*
+with `findStoreDestination`, and `verifyRequirementAgreement` asserts the two
+concur at every `linalg.reduce` result, both directions, on every compile in an
+asserts build — the same play the forward analysis made before it was flipped
+over.
+
+**What the agreement showed.** It holds across all 149 registry variants, with no
+rule in the table below turning out wrong and no conflicts detected. Two things
+the measurement did establish:
+
+- The elementwise rule cannot also require the result's shape to match its
+  operands'. Phase 1 physicalizes the loads and stops, so a mid-chain
+  `arith.addf` has physical operands and a still-logical result until Phase 2
+  retypes it, and that conjunct terminated every requirement at the first
+  elementwise op. The backward match is therefore the forward one verbatim.
+- The table has no rule for a **leaf tensor producer** — an `arith.constant`
+  splat feeding an elementwise op reached by a requirement. Five matmul variants
+  hit it. Harmless (there is nothing to induce on), but it is counted as an
+  unruled op rather than silently absorbed, and `tensor.empty` / `linalg.fill`
+  will land in the same place once slice 3 gives the init a rule.
+
+The rest of this section is the spec for slices 2 (flip `ReducePropagation` to
+read the requirement, delete the walk) and 3 (make the init a retype), and states
+the questions those still owe answers to.
 
 ### The shape of it
 
@@ -534,8 +560,11 @@ requirement and no forward layout, and today that count is zero.
 
 ### What it collapses
 
-- `findStoreDestination` and `lookupMarkerFromTile`'s use from 2A: gone. The walk
-  is what the direction gives for free.
+- `findStoreDestination`'s **walk**: gone. Reaching forward to a store is what the
+  backward direction gives for free. The function itself survives one caller,
+  `findMarkerForStore` in Phase 2B, which asks only "is this store annotated" — and
+  that is a walk of length one, since `RewriteStorePattern` already holds the store
+  and finds it on the first user. It could be a plain `lookupMarkerFromTile`.
 - `populatePhysicalPropagationPatterns` stops taking `const MarkerByMemView &`, and
   every rule becomes a pure function of the op and the incoming fact. Narrowing
   that parameter from `PassContext` closed a real hole, but the parameter exists

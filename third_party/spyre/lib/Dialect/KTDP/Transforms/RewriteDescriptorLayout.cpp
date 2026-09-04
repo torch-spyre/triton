@@ -27,6 +27,7 @@
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
 #include "RewriteDescriptorLayout/IndexDomain.h"
 #include "RewriteDescriptorLayout/PhysicalTypeAnalysis.h"
+#include "RewriteDescriptorLayout/RequirementAnalysis.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
@@ -903,6 +904,14 @@ struct RewriteDescriptorLayoutPass
     // through this handle, which grants exactly one operation -- see
     // PhysicalTypeCarryForward.
     ctx.physicalTypes = PhysicalTypeCarryForward(physicalTypeMap);
+
+    // Phase 2A, backward: what layout is WANTED of each value, seeded from the
+    // stores Phase 1 physicalized. A measurement only -- nothing reads it, and
+    // ReducePropagation above still answers the same question with
+    // findStoreDestination. The agreement between the two is asserted here,
+    // before Phase 2 dismantles the store chain that walk reads.
+    RequirementAnalysis requirements = runRequirementAnalysis(module, ctx);
+    verifyRequirementAgreement(module, ctx, requirements, "after Phase 2A");
 
     // Phase 2: synthesize contractions via greedy pattern rewrite.
     {

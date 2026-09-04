@@ -204,3 +204,67 @@ tt.func @reduce_two_batch_dims(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>) {
   tt.return
 }
 }
+
+// -----
+
+// Case 4: the same batch-dim form with an elementwise op between the reduce and
+// the store. Nothing about the reduce changes -- what this adds is that the
+// layout has to reach it across another op.
+//
+// Two mechanisms have to agree for this to lower. findStoreDestination walks
+// forward past the math.exp to find the annotated store, which is what
+// ReducePropagation compares against. The backward requirement analysis
+// (Phase 2A, measurement only for now) has to reach the same value by its own
+// elementwise rule, and verifyRequirementAgreement asserts it did -- so if that
+// rule ever terminates here instead of passing the requirement through, this
+// test fails on the assertion rather than on a CHECK.
+//
+// The elementwise op is deliberately single-operand: isSingleTensorElementwiseOp
+// counts tensor operands, so `arith.addf %r, %r` would be two and the walk would
+// stop at it. That asymmetry is a known wart in the predicate, not something this
+// case is asserting.
+module {
+// CHECK-LABEL:   tt.func @reduce_batch_dim_through_elementwise(
+// CHECK:           %[[LOAD:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf16>
+// CHECK-NOT:       scf.for
+// CHECK-NOT:       tensor.extract_slice
+// CHECK-NOT:       tensor.empty
+// CHECK:           %[[EMPTY:.*]] = tensor.empty() : tensor<2x64xf16>
+// CHECK:           %[[ACC:.*]] = linalg.fill ins(%{{.*}} : f16) outs(%[[EMPTY]] : tensor<2x64xf16>) -> tensor<2x64xf16>
+// CHECK:           %[[RED:.*]] = linalg.reduce ins(%[[LOAD]] : tensor<2x64x64xf16>) outs(%[[ACC]] : tensor<2x64xf16>) dimensions = [1]
+// The elementwise op is retyped to the physical shape and the store takes it
+// directly: the reduce's result never returns to logical rank on the way out.
+// CHECK:           %[[EXP:.*]] = math.exp %[[RED]] : tensor<2x64xf16>
+// CHECK-NOT:       linalg.reduce
+// CHECK-NOT:       scf.for
+// CHECK-NOT:       tensor.extract_slice
+// CHECK-NOT:       tensor.insert_slice
+// CHECK:           ktdp.store %[[EXP]], %{{.*}} : tensor<2x64xf16>, <2x64xindex>
+tt.func @reduce_batch_dim_through_elementwise(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>) {
+  %c0_i32 = arith.constant 0 : i32
+  %c64_i32 = arith.constant 64 : i32
+  %c128_i32 = arith.constant 128 : i32
+  %c128_i64 = arith.constant 128 : i64
+  %c1_i64 = arith.constant 1 : i64
+
+  %a_desc = tt.make_tensor_descriptor %a_ptr, [%c64_i32, %c128_i32], [%c128_i64, %c1_i64]
+      : !tt.ptr<f16>, !tt.tensordesc<64x128xf16>
+  tt.spyre_tensor_layout %a_desc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf16>
+  %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
+
+  %c_desc = tt.make_tensor_descriptor %c_ptr, [%c128_i32], [%c1_i64]
+      : !tt.ptr<f16>, !tt.tensordesc<128xf16>
+  tt.spyre_tensor_layout %c_desc {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : !tt.tensordesc<128xf16>
+
+  %r = "tt.reduce"(%a) ({
+  ^bb0(%arg0: f16, %arg1: f16):
+    %add = arith.addf %arg0, %arg1 : f16
+    tt.reduce.return %add : f16
+  }) {axis = 0 : i32} : (tensor<64x128xf16>) -> tensor<128xf16>
+
+  %e = math.exp %r : tensor<128xf16>
+
+  tt.descriptor_store %c_desc[%c0_i32], %e : !tt.tensordesc<128xf16>, tensor<128xf16>
+  tt.return
+}
+}
