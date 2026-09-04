@@ -61,12 +61,21 @@ public:
   /// True iff this pattern is the rule for `op`.
   virtual bool match(Operation *op) const = 0;
 
-  /// The physical info `result` carries, given `src`/`srcInfo` -- one of the
-  /// op's tensor operands already resolved to a physical type. Failure means
-  /// the op produces no physical result.
+  /// The physical info `result` carries, given both facts about it:
+  ///   `src`/`srcInfo` -- what one of the op's tensor operands HAS, already
+  ///                      resolved to a physical type (forward).
+  ///   `want`          -- the layout the backward analysis says is wanted of
+  ///                      `result`, or null when nothing wants one.
+  /// Failure means the op produces no physical result.
+  ///
+  /// Both arrive as arguments so a rule is a pure function of the op and its
+  /// facts. Only ReducePropagation reads `want` today; the alternative was to
+  /// hand that one pattern the whole requirement map, which would let it query
+  /// values it was not asked about.
   virtual llvm::FailureOr<PhysicalTypeInfo>
   propagate(Operation *op, Value result, Value src,
-            const PhysicalTypeInfo &srcInfo) const = 0;
+            const PhysicalTypeInfo &srcInfo,
+            const LayoutRequirement *want) const = 0;
 };
 
 using PhysicalPropagationPatternSet =
@@ -82,8 +91,7 @@ using PhysicalPropagationPatternSet =
 /// would hand them a writable `physicalValues` (a non-const reference member)
 /// and `hadError`, i.e. Phase 2B's state, which is exactly what the phase split
 /// exists to prevent.
-void populatePhysicalPropagationPatterns(PhysicalPropagationPatternSet &patterns,
-                                         const RequirementMap &requirements);
+void populatePhysicalPropagationPatterns(PhysicalPropagationPatternSet &patterns);
 
 // PhysicalTypeMap -- one entry per value reachable from a Phase-1 root whose
 // physicalization resolves; a value absent from the map is logical, either

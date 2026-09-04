@@ -69,7 +69,8 @@ struct ElementwisePropagation : PhysicalPropagationPattern {
 
   llvm::FailureOr<PhysicalTypeInfo>
   propagate(Operation *op, Value result, Value src,
-            const PhysicalTypeInfo &srcInfo) const override {
+            const PhysicalTypeInfo &srcInfo,
+            const LayoutRequirement *want) const override {
     PhysicalTypeInfo info = srcInfo;
     auto resTy = cast<RankedTensorType>(result.getType());
     auto srcTy = cast<RankedTensorType>(srcInfo.type);
@@ -91,7 +92,8 @@ struct TransposePropagation : PhysicalPropagationPattern {
 
   llvm::FailureOr<PhysicalTypeInfo>
   propagate(Operation *op, Value result, Value src,
-            const PhysicalTypeInfo &srcInfo) const override {
+            const PhysicalTypeInfo &srcInfo,
+            const LayoutRequirement *want) const override {
     PhysicalTypeInfo info = srcInfo;
     auto tr = cast<linalg::TransposeOp>(op);
     auto perm = llvm::SmallVector<int64_t>(tr.getPermutation());
@@ -113,7 +115,8 @@ struct MatmulPropagation : PhysicalPropagationPattern {
 
   llvm::FailureOr<PhysicalTypeInfo>
   propagate(Operation *op, Value result, Value src,
-            const PhysicalTypeInfo &srcInfo) const override {
+            const PhysicalTypeInfo &srcInfo,
+            const LayoutRequirement *want) const override {
     return failure();
   }
 };
@@ -126,7 +129,8 @@ struct StorePropagation : PhysicalPropagationPattern {
 
   llvm::FailureOr<PhysicalTypeInfo>
   propagate(Operation *op, Value result, Value src,
-            const PhysicalTypeInfo &srcInfo) const override {
+            const PhysicalTypeInfo &srcInfo,
+            const LayoutRequirement *want) const override {
     return failure();
   }
 };
@@ -152,20 +156,6 @@ struct StorePropagation : PhysicalPropagationPattern {
 /// Why a reduce has to be asked at all, and why the answer belongs to the store
 /// rather than the input: "Which physical shape" in docs/spyre-tensor-layouts.md.
 struct ReducePropagation : PhysicalPropagationPattern {
-  /// The backward half of Phase 2A, handed in. "What layout is wanted of this
-  /// result" is a fact that ARRIVES here: RequirementAnalysis seeds it at the
-  /// stores Phase 1 physicalized and propagates it back to this result through
-  /// the shape-preserving ops in between. Compare the requirement's own
-  /// coordinate arrays, not a marker's -- linalg.transpose reorders them
-  /// relative to the marker, which is why LayoutRequirement holds them as data.
-  ///
-  /// Reading the map means the requirement analysis must run BEFORE this one.
-  /// Sound because no backward rule reads a forward fact; see
-  /// runPhysicalTypeAnalysis and "a backward requirement analysis" in
-  /// docs/spyre-tensor-layouts.md.
-  const RequirementMap &requirements;
-  explicit ReducePropagation(const RequirementMap &requirements)
-      : requirements(requirements) {}
 
   bool match(Operation *op) const override {
     return isa<linalg::ReduceOp>(op);
@@ -173,7 +163,8 @@ struct ReducePropagation : PhysicalPropagationPattern {
 
   llvm::FailureOr<PhysicalTypeInfo>
   propagate(Operation *op, Value result, Value src,
-            const PhysicalTypeInfo &srcInfo) const override {
+            const PhysicalTypeInfo &srcInfo,
+            const LayoutRequirement *want) const override {
     auto rd = cast<linalg::ReduceOp>(op);
     // Condition 1.
     if (rd.getNumDpsInputs() != 1 || rd.getNumDpsInits() != 1 ||
@@ -230,10 +221,10 @@ struct ReducePropagation : PhysicalPropagationPattern {
     if (!canRebuildPhysicalInit(rd.getDpsInits()[0]))
       return failure();
 
-    auto reqIt = requirements.find(result);
-    if (reqIt == requirements.end())
+    // Nothing wants a layout of this result, so it carries none.
+    if (!want)
       return failure();
-    const LayoutRequirement &req = reqIt->second;
+    const LayoutRequirement &req = *want;
     if (llvm::ArrayRef<int64_t>(indSrc) !=
             llvm::ArrayRef<int64_t>(req.physSrc) ||
         llvm::ArrayRef<int64_t>(indOp) != llvm::ArrayRef<int64_t>(req.physOp) ||
@@ -274,7 +265,8 @@ struct ReshapePropagation : PhysicalPropagationPattern {
 
   llvm::FailureOr<PhysicalTypeInfo>
   propagate(Operation *op, Value result, Value src,
-            const PhysicalTypeInfo &srcInfo) const override {
+            const PhysicalTypeInfo &srcInfo,
+            const LayoutRequirement *want) const override {
     return failure();
   }
 };
@@ -301,7 +293,8 @@ struct BroadcastPropagation : PhysicalPropagationPattern {
 
   llvm::FailureOr<PhysicalTypeInfo>
   propagate(Operation *op, Value result, Value src,
-            const PhysicalTypeInfo &srcInfo) const override {
+            const PhysicalTypeInfo &srcInfo,
+            const LayoutRequirement *want) const override {
     return failure();
   }
 };
@@ -336,8 +329,7 @@ lookupPattern(Operation *op, const PhysicalPropagationPatternSet &patterns) {
 //===----------------------------------------------------------------------===//
 
 void populatePhysicalPropagationPatterns(
-    PhysicalPropagationPatternSet &patterns,
-    const RequirementMap &requirements) {
+    PhysicalPropagationPatternSet &patterns) {
   // Order matters only where two patterns could match the same op. Every
   // named-op pattern must be asked before the structural elementwise rule,
   // which a linalg op with uniformly shaped operands could otherwise satisfy.
@@ -349,7 +341,7 @@ void populatePhysicalPropagationPatterns(
   patterns.push_back(std::make_unique<TransposePropagation>());
   patterns.push_back(std::make_unique<MatmulPropagation>());
   patterns.push_back(std::make_unique<StorePropagation>());
-  patterns.push_back(std::make_unique<ReducePropagation>(requirements));
+  patterns.push_back(std::make_unique<ReducePropagation>());
   patterns.push_back(std::make_unique<ReshapePropagation>());
   patterns.push_back(std::make_unique<BroadcastPropagation>());
   patterns.push_back(std::make_unique<ElementwisePropagation>());
@@ -363,6 +355,7 @@ llvm::FailureOr<PhysicalTypeInfo>
 getPhysicalizedType(Value value, const PhysicalTypeMap &roots,
                     PhysicalTypeMap &resolved,
                     const PhysicalPropagationPatternSet &patterns,
+                    const RequirementMap &requirements,
                     llvm::SmallVector<Value> &invocationStack) {
   // Already decided.
   if (auto it = resolved.find(value); it != resolved.end())
@@ -414,7 +407,8 @@ getPhysicalizedType(Value value, const PhysicalTypeMap &roots,
       if (!isa<RankedTensorType>(o.getType()))
         continue;
       auto sub =
-          getPhysicalizedType(o, roots, resolved, patterns, invocationStack);
+          getPhysicalizedType(o, roots, resolved, patterns, requirements,
+                              invocationStack);
       if (succeeded(sub)) {
         src = o;
         break;
@@ -425,11 +419,17 @@ getPhysicalizedType(Value value, const PhysicalTypeMap &roots,
     return failure();
 
   auto srcInfo =
-      getPhysicalizedType(src, roots, resolved, patterns, invocationStack);
+      getPhysicalizedType(src, roots, resolved, patterns, requirements,
+                          invocationStack);
   if (failed(srcInfo))
     return failure();
 
-  auto info = pattern->propagate(defOp, value, src, *srcInfo);
+  // The one lookup, done here rather than in the pattern: a rule is asked about
+  // `value`, so it is handed `value`'s requirement and nothing else.
+  auto reqIt = requirements.find(value);
+  const LayoutRequirement *want =
+      reqIt != requirements.end() ? &reqIt->second : nullptr;
+  auto info = pattern->propagate(defOp, value, src, *srcInfo, want);
   if (failed(info))
     return failure();
 
@@ -454,7 +454,7 @@ PhysicalTypeMap runPhysicalTypeAnalysis(ModuleOp module, const PassContext &ctx,
   }
 
   PhysicalPropagationPatternSet patterns;
-  populatePhysicalPropagationPatterns(patterns, requirements);
+  populatePhysicalPropagationPatterns(patterns);
 
   PhysicalTypeMap resolved;
 
@@ -477,6 +477,7 @@ PhysicalTypeMap runPhysicalTypeAnalysis(ModuleOp module, const PassContext &ctx,
           continue;
         llvm::SmallVector<Value> invocationStack;
         if (failed(getPhysicalizedType(result, roots, resolved, patterns,
+                                      requirements,
                                        invocationStack)))
           continue;
         if (enqueued.insert(result).second)
