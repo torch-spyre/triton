@@ -134,6 +134,9 @@ Two crossings are deliberate and worth knowing:
 - `canRebuildPhysicalInit` is defined in `ContractionSynthesis.cpp` (2B) and
   called from `PhysicalTypeAnalysis.cpp` (2A). It is a pure predicate, and 2A
   asks the emitter's own question so the decision and the emission cannot drift.
+  Inherent rather than provisional: 2A must not promise the Physical space unless
+  2B can produce an accumulator at `accTy`, and that is a property of the init's
+  producer alone.
 - `PhysicalTypeCarryForward` is 2B's only write into 2A's map, a handle holding
   it privately behind one method. `ctx.physicalTypeAnalysis` stays a pointer to
   const. Symmetrically, the 2A rules take `const MarkerByMemView &` — Phase 1's
@@ -358,15 +361,21 @@ reduce can absorb its reduce axes while still being Logical.
   for a logical result, then have the reduce replace that value underneath it. It
   defers while its data tile is *predicted* physical but not yet registered — the
   analysis-shaped sibling of the `pendingElementwiseRetype` deferral.
-- **The init operand.** Rebuilt at physical shape rather than retyped, because
-  nothing physical flows *into* an init — it is a root the forward propagation
-  cannot reach, so there is no retype to ride and the shape has to be stated.
-  What that leaves behind, the userless logical `tensor.empty`, is not this pass's
-  problem: `_make_ktir` canonicalizes and CSEs immediately after, nothing between
-  consumes it, and the emitted KTIR is byte-identical either way. A standalone
-  `--rewrite-descriptor-layout` run therefore shows it, which is why
-  `rewrite-descriptor-layout-reduce-batch-dim.mlir` canonicalizes in its RUN line
-  — only against the folded module can it assert `CHECK-NOT: tensor.empty`.
+- **The init operand.** Nothing physical flows *into* an init — it is a root the
+  forward propagation cannot reach — so there is no retype to *ride*, and the shape
+  has to be stated. It is stated as `accTy`, which the operand plans already
+  determine, and `rebuildPhysicalInit` then retypes the existing
+  `tensor.empty`/`linalg.fill` to it in place when that is sound (single-use,
+  statically sized), minting only as a fallback for a shared or dynamically sized
+  producer. Retyping needs the `PatternRewriter` rather than a plain `OpBuilder`:
+  changing a result type without notifying the driver would leave the users it
+  should re-enqueue unvisited. `ConvertTTReduce` gives every reduction its own init
+  and no CSE runs before this pass, so the fallback is for hand-written IR rather
+  than anything the pipeline emits.
+
+  Whether the init is retyped or minted, `canRebuildPhysicalInit` still has to be
+  asked from Phase 2A, because only those two producers admit *either* treatment;
+  see the backward-analysis section for why that crossing is inherent.
 
 #### Designs rejected
 
@@ -458,7 +467,7 @@ supports, never a guess.
 
 ## A backward requirement analysis
 
-**Slices 1 and 2 implemented. Slice 3 — the init retype — remains.** The analysis
+**All three slices implemented.** The analysis
 lives in `RewriteDescriptorLayout/RequirementAnalysis.{h,cpp}`: it computes a
 requirement for every value it reaches, seeded from the physicalized
 `ktdp.store`s, with the rule table below as its pattern set, and mutates no IR.
@@ -474,6 +483,13 @@ none. What guards the reach now is the reduce coverage itself: Case 4 of
 `math.exp` → annotated store) pins that a requirement crosses an op between the
 reduce and its store, and `reduce__one_tile[stick, stick]` on device fails to
 compile at all if the Physical selection is lost.
+
+Slice 3 turned out not to need the analysis at all, which is the more interesting
+result and is recorded under the init below: `rebuildPhysicalInit` retypes the
+existing `tensor.empty`/`linalg.fill` in place where that is sound, and the shape
+it retypes to comes from the operand plans, not from a requirement. So the init
+row of the rule table is a rule that was never written, and the 2A/2B crossing the
+proposal expected to remove is still there — inherently.
 
 **Ordering.** The backward analysis runs *before* the forward one, because the
 forward one consumes it. Not a cycle: no backward rule reads a forward fact — the
@@ -492,11 +508,10 @@ things it did establish:
 - The table has no rule for a **leaf tensor producer** — an `arith.constant`
   splat feeding an elementwise op reached by a requirement. Five matmul variants
   hit it. Harmless (there is nothing to induce on), but it is counted as an
-  unruled op rather than silently absorbed, and `tensor.empty` / `linalg.fill`
-  will land in the same place once slice 3 gives the init a rule.
+  unruled op rather than silently absorbed. `tensor.empty` / `linalg.fill` stay
+  there too — slice 3 gave the init no rule.
 
-The rest of this section is the design, the spec for slice 3 (make the init a
-retype), and the questions still owed answers.
+The rest of this section is the design and the questions still owed answers.
 
 ### The shape of it
 
@@ -531,7 +546,7 @@ forward ones.
 | `linalg.matmul`, `linalg.batch_matmul` | nothing crosses to the operands. The op is fixed at logical rank, so its result cannot carry `R`; `R` is discharged *here*, as the widen the store already emits. The operands are still narrowed, from their own `have` — the requirement does not have to cross to establish that |
 | reshape, broadcast, expand_dims, collapse_shape | none — the physical dim count changes, so no requirement can cross |
 | `ktdp.load` | terminus: this is where `want` meets `have` |
-| `tensor.empty` / `linalg.fill` as a DPS init | `R` **is** the shape to build at — the fact the forward pass structurally cannot supply |
+| `tensor.empty` / `linalg.fill` as a DPS init | no rule, and none is needed. The proposal expected `R` to be the shape to build at; slice 3 showed the shape was already available as `accTy`, derived from the operand plans (see "What it collapses") |
 
 ### A requirement is total, because it is consumed rather than crossed
 
@@ -586,14 +601,31 @@ requirement and no forward layout, and today that count is zero.
   compromise: the reduce genuinely needs a second fact, and the point was never to
   have no second parameter but to have the rule *receive* the fact rather than go
   looking for it. What did go is any route from an analysis rule to Phase 2B state.
-- The init, for a reduce. A requirement reaches `tensor.empty`/`linalg.fill`, so
-  `rebuildPhysicalInit` becomes a **retype** rather than a mint — the same thing
-  `RewriteElementwisePattern` already does — and `canRebuildPhysicalInit` stops
-  needing to be asked across the 2A/2B boundary. Reduce-scoped on purpose:
-  `dispatchSource` rebuilds an init only in the Physical space, and a matmul is
-  always Logical, so its accumulator is a slab of the wider container and is minted
-  at slice extents either way. Nothing is left dead behind the
-  rewrite, so the question `eraseDeadProducers` used to answer does not return.
+- The init, for a reduce — but not through the analysis, and the crossing stays.
+  `rebuildPhysicalInit` is a **retype** where that is sound: the existing
+  `tensor.empty`, or the `linalg.fill` over one, has its result type set to `accTy`
+  when it is single-use and statically sized, and is minted for otherwise. So
+  nothing is left dead behind the rewrite and the question `eraseDeadProducers`
+  used to answer does not return.
+
+  What the proposal got wrong is *where the shape comes from*. It does not come
+  from a requirement: `accTy` is already derived from the operand plans, so nothing
+  has to reach the init to know what to retype it to — the init is read only for
+  its element type. The init row of the backward rule table is therefore a rule
+  that was never needed.
+
+  And `canRebuildPhysicalInit` still crosses 2A/2B — one declaration in
+  `ContractionSynthesis.h`, called from `PhysicalTypeAnalysis.cpp`. That crossing
+  is **inherent, not residue**: Phase 2A must not promise the Physical space unless
+  Phase 2B can produce an accumulator at `accTy`, and only a `tensor.empty` or a
+  `linalg.fill` over one can be retyped *or* rebuilt — an init holding real data
+  can be neither. The predicate is the one place that condition is spelled, so 2A
+  asking the emitter's own question is what keeps the promise and the emission from
+  drifting. No backward fact removes it.
+
+  Reduce-scoped on purpose either way: `dispatchSource` rebuilds an init only in
+  the Physical space, and a matmul is always Logical, so its accumulator is a slab
+  of the wider container and is minted at slice extents regardless.
 - The markers themselves do **not** go away, and neither does
   `physMemViewToMarker`: the markers are the only source of layout truth, and 2B
   still resolves one from an access tile while rewriting. What changes is that the

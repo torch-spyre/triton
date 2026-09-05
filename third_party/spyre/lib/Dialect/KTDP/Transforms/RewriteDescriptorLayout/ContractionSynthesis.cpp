@@ -60,20 +60,59 @@ namespace mlir::triton::ktdp {
 //
 // Anything else — a loaded tensor carrying incoming data, say — holds values a
 // rebuild would silently drop, so it is refused rather than guessed at.
-static Value rebuildPhysicalInit(OpBuilder &b, Location loc, Value init,
-                                 RankedTensorType accTy) {
+// The accumulator at `accTy`, from the init the op arrived with at the logical
+// shape. Retyped in place where that is sound, so the pass leaves no dead op
+// behind; minted otherwise. Only a tensor.empty, or a linalg.fill over one,
+// qualifies either way -- anything else holds values a rebuild would drop, which
+// is what canRebuildPhysicalInit gates in Phase 2A.
+//
+// accTy comes from the operand plans, not from the init, so nothing has to reach
+// the init to know its shape -- the init is read only for its element type.
+//
+// Retyping needs the rewriter rather than a plain builder: changing a result type
+// without notifying the driver would leave the users it should re-enqueue
+// unvisited. A shared producer is minted for instead of retyped, since retyping
+// would change the type under its other users. ConvertTTReduce gives every
+// reduction its own init and no CSE runs before this pass, so the fallback is for
+// hand-written IR rather than anything the pipeline emits.
+static Value rebuildPhysicalInit(PatternRewriter &rewriter, Location loc,
+                                 Value init, RankedTensorType accTy) {
   if (init.getType() == accTy)
     return init;
-  auto empty = [&] {
-    return tensor::EmptyOp::create(b, loc, accTy.getShape(),
+
+  auto mintEmpty = [&] {
+    return tensor::EmptyOp::create(rewriter, loc, accTy.getShape(),
                                    accTy.getElementType())
         .getResult();
   };
-  if (auto fill = init.getDefiningOp<linalg::FillOp>())
-    return linalg::FillOp::create(b, loc, fill.getInputs()[0], empty())
+  // A dynamic size is one operand per dynamic dim, so a retype would leave the
+  // operand list describing a different rank.
+  auto retypeable = [](tensor::EmptyOp e) {
+    return e && e.getDynamicSizes().empty() && e.getResult().hasOneUse();
+  };
+
+  if (auto fill = init.getDefiningOp<linalg::FillOp>()) {
+    auto empty = fill.getOutputs()[0].getDefiningOp<tensor::EmptyOp>();
+    if (init.hasOneUse() && retypeable(empty)) {
+      rewriter.modifyOpInPlace(
+          empty, [&] { empty.getResult().setType(accTy); });
+      rewriter.modifyOpInPlace(
+          fill, [&] { fill.getResult(0).setType(accTy); });
+      return fill.getResult(0);
+    }
+    return linalg::FillOp::create(rewriter, loc, fill.getInputs()[0],
+                                  mintEmpty())
         .getResult(0);
-  if (init.getDefiningOp<tensor::EmptyOp>())
-    return empty();
+  }
+
+  if (auto empty = init.getDefiningOp<tensor::EmptyOp>()) {
+    if (retypeable(empty)) {
+      rewriter.modifyOpInPlace(
+          empty, [&] { empty.getResult().setType(accTy); });
+      return init;
+    }
+    return mintEmpty();
+  }
   return {};
 }
 
@@ -275,7 +314,13 @@ Value extractOpSlice(OpBuilder &b, Location loc,
 // Returns the replacement value for the original op's result.
 Value emitNarrowStage(
     linalg::LinalgOp op,
+    // Two builders on purpose. `b` emits new ops and is swapped by value as the
+    // loop nest descends (see the emitCountedLoop bodies below), which a
+    // PatternRewriter reference cannot be. `rewriter` is only for retyping an op
+    // that already exists -- a mutation the driver has to be told about so it
+    // re-enqueues that op's users.
     OpBuilder &b,
+    PatternRewriter &rewriter,
     const SourceOpSpec &spec,
     llvm::ArrayRef<OperandPlan> plans,
     const OperandSetTripCounts &tripCounts) {
@@ -321,7 +366,7 @@ Value emitNarrowStage(
   // Phase 2A only puts a reduce in this space when canRebuildPhysicalInit holds
   // for the same init, so a null here means those two have drifted apart.
   if (spec.outputAxes == OutputAxisSpace::Physical) {
-    cVal = rebuildPhysicalInit(b, loc, cVal, accTy);
+    cVal = rebuildPhysicalInit(rewriter, loc, cVal, accTy);
     if (!cVal)
       return {};
   }
@@ -549,7 +594,7 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
         "two independent scatter loops (not supported)");
 
   OpBuilder b(op.getOperation());
-  Value result = emitNarrowStage(op, b, spec, plans, tripCounts);
+  Value result = emitNarrowStage(op, b, rewriter, spec, plans, tripCounts);
   if (!result)
     return emitFatalError(op, ctx,
         "spyre_tensor_layout: the op's output is to be physicalized but its "
