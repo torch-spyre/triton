@@ -895,12 +895,14 @@ struct RewriteDescriptorLayoutPass
 
     // Phase 2A: decide, for every value reachable from Phase 1's roots, the
     // final physical type it will carry -- before Phase 2 rewrites anything.
-    // Mutates no IR, creates no ops (see PhysicalTypeAnalysis.h). Step 4c-A
-    // lands the analysis and the assertions measuring it against the guards
-    // Phase 2 uses today; 4c-B is what makes the rewrite read it instead.
+    // Mutates no IR, creates no ops (see PhysicalTypeAnalysis.h).
     PassContext ctx{physMemViewToMarker, physicalValues};
-    PhysicalTypeMap physicalTypes = runPhysicalTypeAnalysis(module, ctx);
-    ctx.physicalTypeAnalysis = &physicalTypes;
+    PhysicalTypeMap physicalTypeMap = runPhysicalTypeAnalysis(module, ctx);
+    ctx.physicalTypeAnalysis = &physicalTypeMap;
+    // Phase 2B reads that map through the const pointer above and writes it
+    // through this handle, which grants exactly one operation -- see
+    // PhysicalTypeCarryForward.
+    ctx.physicalTypes = PhysicalTypeCarryForward(physicalTypeMap);
 
     // Phase 2: synthesize contractions via greedy pattern rewrite.
     {
@@ -912,10 +914,9 @@ struct RewriteDescriptorLayoutPass
       // retyping/erasing them in passing.
       //
       // The elementwise membership test here is deliberately not
-      // isSingleTensorElementwiseOp -- that predicate is scoped to the
-      // backward walk in walkToLoad (see its comment) and would silently
-      // exclude multi-tensor-operand elementwise ops like arith.addf from
-      // ever being retyped by RewriteElementwisePattern. This test only
+      // isSingleTensorElementwiseOp (see its comment): that predicate would
+      // silently exclude multi-tensor-operand elementwise ops like arith.addf
+      // from ever being retyped by RewriteElementwisePattern. This test only
       // needs to be a superset of what that pattern's own local rule
       // matches: any single-result op with at least one tensor operand.
       SmallVector<Operation *> candidates;
@@ -951,9 +952,9 @@ struct RewriteDescriptorLayoutPass
       }
       if (ctx.hadError)
         return signalPassFailure();
-      // Third agreement invariant: at end of Phase 2, everything Phase 2
-      // found to be physical was predicted by Phase 2A.
-      verifyPhysicalTypeAgreement(module, ctx, physicalTypes,
+      // At end of Phase 2, everything Phase 2 found to be physical was
+      // predicted by Phase 2A.
+      verifyPhysicalTypeAgreement(module, ctx, physicalTypeMap,
                                   "end of Phase 2");
     }
 

@@ -19,8 +19,9 @@ fixture skip is what keeps that from erroring. lit's feature is the *visible* ga
 the fixture is the one that holds under direct invocation.
 
 The kernel comes from whichever fixture variants declare ``compiles_to_binary`` in
-their ``meta.py`` -- today one, the loop-free single-tile add, because dbo-opt
-refuses the loop the others outline from their program-id distribution.
+their ``meta.py`` -- the loop-free ones, because dbo-opt refuses the loop the
+others outline from their program-id distribution. Nothing below is specific to
+which kernel that is.
 
 Every test gets its binary from a fixture; none builds an ASTSource of its own. Two
 do call triton_compile a second time, because recompiling is precisely what they

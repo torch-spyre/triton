@@ -1,6 +1,8 @@
 #ifndef KTDP_TRANSFORMS_REWRITEDESCRIPTORLAYOUT_TYPES_H
 #define KTDP_TRANSFORMS_REWRITEDESCRIPTORLAYOUT_TYPES_H
 
+#include "RewriteDescriptorLayout/PermutationUtils.h"
+
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
@@ -33,8 +35,63 @@ struct PhysicalValueInfo {
 struct PhysicalTypeInfo;
 using PhysicalTypeMap = llvm::DenseMap<mlir::Value, PhysicalTypeInfo>;
 
+/// Phase 2B's ONLY write access to Phase 2A's PhysicalTypeMap, and it grants
+/// exactly one operation.
+///
+/// Phase 2B reads the analysis through `PassContext::physicalTypeAnalysis`,
+/// which is a pointer to const on purpose: a rewrite must not be able to invent
+/// a physical-type decision, or revise one, behind the analysis's back. The one
+/// thing a rewrite legitimately needs is this: when a source pattern REPLACES an
+/// op whose result the analysis decided is physical, the replacement is a
+/// brand-new value the analysis never saw, carrying the decision made for the
+/// value it replaced. That is not a new decision, and without recording it
+/// `verifyPhysicalTypeAgreement`'s containment check (every value Phase 2 found
+/// physical, the analysis predicted) would fail on the replacement, leaving only
+/// the option of exempting it -- a hole in the check. With it, containment holds
+/// BY CONSTRUCTION for minted values.
+///
+/// The map is held privately and the class is defined here while
+/// `PhysicalTypeInfo` is still incomplete, so `carryForward` cannot be inlined
+/// and no Phase 2B translation unit can reach the map through this handle by
+/// any other route. Widening what 2B may write therefore means adding a method
+/// here, named and reviewed, rather than a `const` quietly going missing inside
+/// a pattern.
+class PhysicalTypeCarryForward {
+public:
+  /// Inert: no analysis to carry anything forward in. Calling `carryForward` on
+  /// one of these is a bug, and asserts.
+  PhysicalTypeCarryForward() = default;
+  /// Out-of-line, like `carryForward` and for the same reason: taking the
+  /// address of the map needs `PhysicalTypeInfo` complete, which it is not here.
+  explicit PhysicalTypeCarryForward(PhysicalTypeMap &analysis);
+
+  /// Record that `replacement` carries the physical-type decision the analysis
+  /// already made for `replaced`, by copying `replaced`'s entry onto it.
+  ///
+  /// Precondition: `replaced` HAS an entry. That is not a hope -- it is the very
+  /// thing that put the pattern on the path where it mints a replacement (see
+  /// RewriteReducePattern, where the presence of the result's entry is what
+  /// selects OutputAxisSpace::Physical). Absence would mean those two have
+  /// drifted apart, so it asserts rather than skipping: carrying nothing forward
+  /// would silently re-open exactly the hole this exists to close.
+  ///
+  /// Const because it is the map that is mutated, not the handle -- patterns
+  /// hold `const PassContext &`, the same way they already mutate
+  /// `ctx.physicalValues` through it.
+  void carryForward(mlir::Value replaced, mlir::Value replacement) const;
+
+private:
+  PhysicalTypeMap *analysis = nullptr;
+};
+
+/// Phase 1's output: which marker each physicalized memory view came from.
+/// Immutable for everything downstream, and named because Phase 2A's propagation
+/// rules take *this* rather than the whole PassContext -- see the note there.
+using MarkerByMemView =
+    llvm::DenseMap<mlir::Value, triton::SpyreTensorLayoutOp>;
+
 struct PassContext {
-  const llvm::DenseMap<mlir::Value, triton::SpyreTensorLayoutOp> &physMemViewToMarker;
+  const MarkerByMemView &physMemViewToMarker;
   /// Maps a physical value (a ktdp.load result, or a value Phase 2 has
   /// retyped to physical) to what is known about it -- see PhysicalValueInfo.
   /// Seeded by Phase 1 with every physical ktdp.load result (the root of
@@ -45,19 +102,19 @@ struct PassContext {
   /// permutation against the transpose's input, which is already an entry).
   /// Presence answers "is this value reachable from a physicalized load"
   /// without re-walking the chain: an op on a path that was never
-  /// physicalized (no marker anywhere upstream) is simply never in this map.
-  /// This is what keeps the elementwise pattern's local shape rule from
-  /// mis-firing on ops like tt.expand_dims that happen to have one tensor
-  /// operand and a differently-shaped result but are not reachable from any
-  /// physicalized load.
+  /// physicalized (no marker anywhere upstream) is simply never in this map,
+  /// which is what keeps the elementwise pattern's local shape rule from
+  /// mis-firing on ops like tt.expand_dims (see RewriteElementwisePattern).
   llvm::DenseMap<mlir::Value, PhysicalValueInfo> &physicalValues;
   /// Phase 2A's answer: the final physical type of every value reachable from
   /// Phase 1's roots, computed before Phase 2 rewrites anything (see
-  /// PhysicalTypeAnalysis.h). Step 4c-A does not act on it -- the patterns
-  /// read it only to assert that it agrees with the in-flight guards it will
-  /// eventually replace, which is the measurement that makes 4c-B safe. Null
-  /// when the analysis was not run.
+  /// PhysicalTypeAnalysis.h). Null when the analysis was not run.
   const PhysicalTypeMap *physicalTypeAnalysis = nullptr;
+  /// The one write path back into that map -- see PhysicalTypeCarryForward for
+  /// why it is a handle with a single method rather than dropping the `const`
+  /// above. Inert when the analysis was not run, which is consistent: nothing
+  /// then decides a value is physical, so nothing mints a replacement either.
+  PhysicalTypeCarryForward physicalTypes;
   /// Set by patterns to indicate a fatal error that should abort the pass.
   mutable bool hadError = false;
 };
@@ -85,8 +142,8 @@ struct OperandCoords {
 
 /// How a single physical dim is sliced when extracting the per-iteration tile.
 enum class SliceKind {
-  StickIndex,       // floor/loopDims dim: offset = this operand's own loop IV,
-                    // size = 1 (selects one stick along a stick-index dim).
+  StickIndex,       // scatterDims/reduceLoopDims dim: offset = this operand's
+                    // own loop IV, size = 1 (one stick along a stick-index dim).
   StickifiedBlock,  // opInnerDim spanning >1 stick (B's K-flat): offset =
                     // reduction IV * stickSize, size = stickSize (one stick).
   WholeBlock,       // lane / opSlice / single-stick opInnerDim: offset = 0,
@@ -94,14 +151,30 @@ enum class SliceKind {
 };
 
 /// Pure output of classify(): per-physical-dim role assignments.
+///
+/// Two of these buckets, `scatterDims` and `reduceLoopDims`, hold dims that are
+/// SLICED IDENTICALLY — both get `SliceKind::StickIndex`, one stick per
+/// iteration of their own loop — and are named for the only thing that
+/// distinguishes them, which is what their loop DOES with the slice:
+///
+///   scatterDims     surviving (role >= 0) stick indices. The loop SCATTERS:
+///                   each iteration writes a different slice of the output.
+///   reduceLoopDims  reduced (role == -1) dims beyond the first (`opInnerDim`
+///                   takes that one). The loop ACCUMULATES: every iteration
+///                   folds into the same accumulator.
+///
+/// The store sink path reads exactly that distinction as its two preconditions
+/// (see RewriteStorePattern): an empty `scatterDims` means nothing to scatter,
+/// and a non-empty `reduceLoopDims` means a reduction the store cannot express.
 struct ClassifiedDims {
   int                lane;        // innermost phys dim = rank-1
   int64_t            stickSize;   // stick/lane width = physBlock[lane]
-  llvm::SmallVector<int>   floorDims;   // parallel stick-index dims
+  llvm::SmallVector<int>   scatterDims; // surviving stick indices: loop scatters
   llvm::SmallVector<int>   reduceDims;  // all -1 dims, ascending
   int                opInnerDim;  // rightmost reduceDim; -1 if none
-  llvm::SmallVector<int>   loopDims;    // reduceDims minus opInnerDim
-  llvm::SmallVector<int>   opTileDims;  // residual >= 0 non-floor dims
+  // reduceDims minus opInnerDim: loop accumulates.
+  llvm::SmallVector<int>   reduceLoopDims;
+  llvm::SmallVector<int>   opTileDims;  // residual >= 0 non-scatter dims
   llvm::SmallVector<SliceKind> sliceKind; // per-phys-dim slice behavior
 };
 
@@ -152,16 +225,38 @@ struct OperandPlan {
 /// The store sink path needs no `SourceOperandSpec`: a store contracts
 /// nothing, so there is no -1 and no compaction, and its target order is
 /// always the identity (logical dim `d` -> position `d`). It therefore builds
-/// a dense iota inline rather than carrying a spec. See `emitSinkStage`.
+/// a dense iota inline rather than carrying a spec. See `emitWidenStage`.
 struct SourceOperandSpec {
   llvm::SmallVector<int64_t> canonicalAxes;
   llvm::SmallVector<int64_t> targetOrder;
 };
 
 /// Descriptor for one source contraction op (e.g. linalg.matmul).
+///
+/// The two flags below are the synthesis's two absorption questions, declared
+/// by the calling pattern because only it knows the answers. They are separate
+/// because they are about different dim sets and are answered from different
+/// evidence:
+///
+///   `absorbReduceLoopDims` — the op's REDUCE axis set. True iff the emitted op
+///     can name every reduced axis at once (linalg.reduce's `dimensions`), false
+///     when a second reduce axis must become a real cross-stick accumulation
+///     loop (matmul contracts exactly one K). A property of the op kind.
+///
+///   `outputAxes` — the op's OUTPUT axes, and hence the fate of a *surviving*
+///     stick-index dim. A property of this op instance, decided by Phase 2A
+///     against the layout the result is stored under (see OutputAxisSpace).
 struct SourceOpSpec {
   llvm::SmallVector<SourceOperandSpec> operands;
   unsigned logicalRank;
+  bool absorbReduceLoopDims = false;
+  OutputAxisSpace outputAxes = OutputAxisSpace::Logical;
+  /// The layout the emitted op's output carries, when `outputAxes` is
+  /// Physical: the marker of the descriptor the result is stored to, as Phase
+  /// 2A resolved it. Null in the Logical space, where the result carries no
+  /// layout of its own and any physical form is built afterwards by the
+  /// store's widen stage.
+  triton::SpyreTensorLayoutOp outputMarker;
   llvm::function_ref<Value(OpBuilder &, Location, llvm::ArrayRef<Value>,
                            Value, RankedTensorType)>
       emitOp;

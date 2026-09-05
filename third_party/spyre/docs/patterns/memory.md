@@ -592,7 +592,7 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>
 - `elementwise::2d_grid` — M=256, N=128, BLOCK_M=16, BLOCK_N=16, OP='add' (also demonstrates: descriptor-store-static, program-id-2d, num-programs-fold)
 - `elementwise::3d_grid` — M=64, N=32, P=16, BLOCK_M=8, BLOCK_N=8, BLOCK_P=8, OP='add' (also demonstrates: descriptor-store-static, program-id-3d, num-programs-fold)
 
-_+ 19 more variants_
+_+ 21 more variants_
 
 ## descriptor-offset-base
 
@@ -839,7 +839,7 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
 - `elementwise::2d_grid` — M=256, N=128, BLOCK_M=16, BLOCK_N=16, OP='add' (also demonstrates: descriptor-load-static, program-id-2d, num-programs-fold)
 - `elementwise::3d_grid` — M=64, N=32, P=16, BLOCK_M=8, BLOCK_N=8, BLOCK_P=8, OP='add' (also demonstrates: descriptor-load-static, program-id-3d, num-programs-fold)
 
-_+ 19 more variants_
+_+ 21 more variants_
 
 
 ---

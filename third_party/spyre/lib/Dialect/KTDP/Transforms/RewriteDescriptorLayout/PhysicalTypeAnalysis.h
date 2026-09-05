@@ -73,7 +73,12 @@ using PhysicalPropagationPatternSet =
 
 /// Register the propagation rule for every op this pass has been taught,
 /// mirroring populateContractionPatterns' shape.
-void populatePhysicalPropagationPatterns(PhysicalPropagationPatternSet &patterns);
+/// Takes Phase 1's marker map, not the PassContext. The rules are pure analysis
+/// -- handing them the context would hand them a writable `physicalValues` (a
+/// non-const reference member) and `hadError`, i.e. Phase 2B's state, which is
+/// exactly what the phase split exists to prevent.
+void populatePhysicalPropagationPatterns(PhysicalPropagationPatternSet &patterns,
+                                         const MarkerByMemView &markers);
 
 // PhysicalTypeMap -- one entry per value reachable from a Phase-1 root whose
 // physicalization resolves; a value absent from the map is logical, either

@@ -75,6 +75,12 @@ reported, and gets the conservative answer. Resolution is transitive and carries
 a visit stack, so a value already being resolved is a cycle and fails rather than
 diverging.
 
+Most rules are a function of the operand alone, but not all: whether a
+`linalg.reduce` produces a physical result is a question about the layout its
+result is *stored under*, so that rule walks forward to the store, the mirror of
+what the store pattern does backward. Nothing about that walk mutates IR, and it
+reads only what Phase 1 produced, so it stays an analysis.
+
 *2B, rewrite.* Walk the ops and act on the recorded types rather than on the
 current IR. An operand's physicality is a lookup: resolved, or predicted and not
 yet reached (defer to a later visit), or absent and therefore logical.
@@ -93,6 +99,52 @@ query and cannot see past an op with two tensor operands, where the walk has no
 single producer to follow.
 
 **Phase 3 — cleanup.** Erase the markers and any now-dead bridge casts.
+
+### Where the phases live
+
+Phase and file do not coincide, which is worth stating because three of the
+init helpers sit in Phase 2B's file and one of them is called from 2A.
+
+```
+  markers (tt.spyre_tensor_layout)
+        │
+   ┌────▼──────────────────────────────────────────────────────────┐
+   │ PHASE 1   RewriteDescriptorLayout.cpp                         │
+   │   memory view + access tiles + ktdp.load retyped              │
+   └────┬───────────────────────────────────────────────┬──────────┘
+        │ physicalValues (the roots)                    │ physMemViewToMarker
+   ┌────▼───────────────────────────────────────────────▼──────────┐
+   │ PHASE 2A  PhysicalTypeAnalysis.cpp        (mutates nothing)   │
+   │   worklist forward from the roots; one                        │
+   │   PhysicalPropagationPattern per op kind                      │
+   └────┬──────────────────────────────────────────────────────────┘
+        │ PhysicalTypeMap ──▶ ctx.physicalTypeAnalysis   read, const
+        │                 ◀── ctx.physicalTypes          write, one method
+   ┌────▼──────────────────────────────────────────────────────────┐
+   │ PHASE 2B  ContractionSynthesis.cpp, Classify.cpp              │
+   │   SourceOpSpec → dispatchSource → classify →                  │
+   │   reconcileOperandSet → resolveOperand → emitNarrowStage      │
+   └────┬──────────────────────────────────────────────────────────┘
+        │ verifyPhysicalTypeAgreement: physicalValues ⊆ PhysicalTypeMap
+        ▼  PHASE 3   erase markers, bridge casts, dead logical views
+```
+
+Two crossings are deliberate and worth knowing:
+
+- `canRebuildPhysicalInit` is defined in `ContractionSynthesis.cpp` (2B) and
+  called from `PhysicalTypeAnalysis.cpp` (2A). It is a pure predicate, and 2A
+  asks the emitter's own question so the decision and the emission cannot drift.
+- `PhysicalTypeCarryForward` is 2B's only write into 2A's map, a handle holding
+  it privately behind one method. `ctx.physicalTypeAnalysis` stays a pointer to
+  const. Symmetrically, the 2A rules take `const MarkerByMemView &` — Phase 1's
+  marker map — rather than the whole `PassContext`, whose `physicalValues` is a
+  non-const reference member and would let an analysis rule write 2B's state.
+  The phase split is only worth something if neither side can reach across.
+
+The 2A/2B vocabulary is this doc's and `Passes.td`'s, not the driver's:
+`RewriteDescriptorLayout.cpp` says "Phase 2A" and never "Phase 2B", its second
+block is labelled just "Phase 2", and its file-header staged-model comment lists
+only Phase 1 and Phase 3. Reconciling that is unfinished business.
 
 ## Operand reconciliation
 
@@ -121,23 +173,20 @@ With inputs physical, Phase 2 fires on the op and decides what to do with the
 | Can be physicalized | Physicalize it. The op consumes and produces physical shape; no loop. |
 | Cannot be physicalized | Leave it logical and emit a loop that bridges physical inputs to the logical result. |
 
-Whether the output can be physicalized is a property of the op, not of the
-shapes:
+Whether the output can be physicalized *at all* is a property of the op, not of
+the shapes:
 
 | Op | Output can be physical | Why |
 |---|---|---|
 | elementwise (`arith`, `linalg.generic`) | Yes | Rank-agnostic; the physical type propagates unchanged. |
-| `linalg.reduce` | Yes | `dimensions` is a list, so a stick-split reduced axis is expressible in one op. |
+| `linalg.reduce` | Yes | `dimensions` is a list, so a stick-split reduced axis is expressible in one op, and a *surviving* one rides along as a batch dim. |
 | `ktdp.store` | Yes | `AnyTensor`; the verifier checks only that data-tile and access-tile shapes agree. |
-| `linalg.matmul`, `linalg.batch_matmul` | No | Contracts exactly one `K` axis, so a split `K` needs accumulation across sticks. |
+| `linalg.matmul`, `linalg.batch_matmul` | No | Contracts exactly one `K` axis, so a split `K` needs accumulation across sticks; and its init extents must match the A/B slice extents, so a surviving multi-stick axis is scattered by an outer loop rather than carried. |
 
 An annotated output is what makes the first outcome available: the store's
 access tile is physicalized alongside it, so the two sides agree. A reduce whose
 output descriptor carries no marker takes the second outcome — the result stays
 `tensor<64xf32>` and an `scf.for` accumulates into it.
-
-`linalg.reduce` and `ktdp.store` are therefore one category, differing only in
-which outcome their output lands in. There is no separate sink path.
 
 The first outcome, for a reduce over a stick-split axis with physical input
 `[2, 64, 64]` and physical output `[64]`:
@@ -148,6 +197,205 @@ The first outcome, for a reduce over a stick-split axis with physical input
 
 This is legal because `dimensions` is `DenseArrayStrictlySorted` with no
 adjacency or trailing-position requirement.
+
+### Which physical shape: the output axis space
+
+For a reduce, "can be physicalized" leaves a second question the table above does
+not answer: *which* physical shape. Reducing away a logical axis deletes every
+physical dim sourced from it and leaves the rest in place, so the operand's layout
+**induces** one — the surviving physical dims, in order, with their coord ops and
+args intact, against the surviving axes renumbered. If the output descriptor
+declares exactly that layout, the reduce is emitted at it directly and the store
+has nothing left to do. If it declares anything else, or nothing, the result stays
+logical and the store's widen stage builds the physical form afterwards.
+
+#### Why this had to become an explicit choice
+
+A `role` answers "which output axis does this physical dim feed", and every source
+op numbered those axes per surviving *logical* dim. That silently assumed one
+surviving logical axis implies one output axis — true for every op the pass was
+built for, and false the moment a surviving logical axis is stick-split, because
+then one logical axis occupies two physical dims and both survive.
+
+For `[M=64, N=128]` fp16 stick-split on `N`, physically `[2, 64, 64]`, folding `M`:
+
+| physical dim | logical | survives? |
+|---|---|---|
+| 0, `N floordiv 64` | N | yes — stick index |
+| 1, `M` | M | no — reduced |
+| 2, `N mod 64` | N | yes — lane |
+
+Under logical numbering dims 0 and 2 both take role 0, and the accumulator is
+built as `accDims[role] = extent`, so they collide: the last write wins and the
+accumulator comes out rank-1. The stick-tiled `tensor<2x64xf16>` the store wants
+is not merely unbuilt, it is inexpressible. The old code was not wrong, it was
+complete for its inputs; what it lacked was a way to say that this op's output
+axes are counted differently.
+
+That choice is named `OutputAxisSpace`, and it is what a `role` numbers positions
+in:
+
+- **Logical** — one output axis per surviving *logical* dim. The two physical dims
+  of a stick-split axis share one role, so a surviving stick-index dim is not an
+  output axis at all: it is a scatter dim, sliced away at extent 1 or scattered by
+  an outer loop. Every matmul-like op is here.
+- **Physical** — one output axis per surviving *physical* dim, in physical order. A
+  surviving stick-index dim is an output axis of its own, i.e. a batch dim of the
+  emitted op, so one logical axis can occupy two output axes (its stick index and
+  its lane) — which is exactly what a role numbered per logical dim cannot
+  express, and why the accumulator is keyed by output axis rather than by role.
+
+What makes the second space cheap is that **roles stay unique in both.** Only the
+numbering of survivors changes, never whether a dim survives, so
+`accDims[role] = extent` and the transpose permutation's uniqueness assumption
+are untouched — the accumulator code did not change at all. `canonicalAxes` keeps
+answering *whether* a logical dim survives, which is space-independent;
+`buildDimRoles` takes the space and numbers the survivors.
+
+The space is a property of the op **instance**, not the op kind: the same
+`linalg.reduce` lands in either space depending on what its result is stored
+under. So the pattern does not choose. Phase 2A decides and the pattern reads the
+verdict — `ReducePropagation` computes the induced layout and compares it against
+the output descriptor's marker, all three coordinate arrays and the access-tile
+shape. That is the same direction "decide physical types before rewriting" set,
+and it is what the pass's own older comment already said the rule had to be: a
+result is physical only under a layout of its own, which a reduce result acquires
+only when the output descriptor is annotated.
+
+One predicate, `isScatterDim(role, coordOp, space)`, decides for both `classify()`
+and any caller building a target order from a marker directly, so the two cannot
+disagree about which dims are excluded. It is named for the decision it makes —
+and specifically for what the dim's loop then *does*, scatter — rather than for a
+property of the dim, because it takes three facts to reach: the dim survives, it
+is a stick index (`isFloorCoord`), and the space is Logical so it has no output
+axis to occupy. Its sibling bucket, `reduceLoopDims`, is sliced identically and
+differs only in that its loop accumulates rather than scatters — see the bucket
+table below.
+
+Worked, for a logical `[M=64, N=128]` fp16 stick-split on `N` (`S=64`, physical
+`[2, 64, 64]` = stick index, `M`, lane) reducing **M**, a whole physical
+dimension, into `[128]` declared with the same split (physical `[2, 64]`):
+
+```mlir
+%acc = tensor.empty() : tensor<2x64xf16>
+%r = linalg.reduce ins(%tile : tensor<2x64x64xf16>) outs(%acc : tensor<2x64xf16>) dimensions = [1]
+ktdp.store %r, %out_tile : tensor<2x64xf16>, <2x64xindex>
+```
+
+One reduce, no loop, no slicing, and `ktdp.store` consuming the result. The
+accumulator is rebuilt at the physical shape rather than reused: it is a different
+physicalization of the same logical tensor than the init the op arrived with, not
+a slab of it. Only a `tensor.empty` or a `linalg.fill` over one can be rebuilt —
+which is what `LowerComputeOps` emits for a reduction's `outs` — since anything
+else holds values a rebuild would drop; that keeps the Logical answer.
+
+Reducing `N` instead, the stick axis itself, consumes both of its physical dims,
+so nothing stick-split survives, the induced layout is a single identity dim, and
+a `[64]` output declaring a split does not match it. That is the Logical answer,
+and it is the `dimensions = [0, 2]` form above.
+
+#### The two stick-index buckets: scatter vs accumulate
+
+`classify()` puts stick-index dims in one of two buckets, and what separates them
+is *not* how they are sliced — both get `SliceKind::StickIndex`, one stick per
+iteration of their own loop. What differs is what the loop does with the slice:
+
+| bucket | which dims | the loop |
+|---|---|---|
+| `scatterDims` | surviving (`role >= 0`) stick indices | **scatters** — each iteration writes a different slice of the output |
+| `reduceLoopDims` | reduced (`role == -1`) dims past the first, since `opInnerDim` takes that one | **accumulates** — every iteration folds into the same accumulator |
+
+Naming one of them for the `floordiv` coordinate they *both* carry hid exactly
+that, and stopped being descriptive once a surviving floor coordinate could land
+inside the op tile as a batch dim. A floor *coordinate* is still one:
+`isFloorCoord` and `CoordOp::FloorDiv` name the coordinate, not a fate.
+
+The distinction is load-bearing twice. `RewriteStorePattern` reads it as its two
+preconditions — an empty `scatterDims` means nothing to scatter, a non-empty
+`reduceLoopDims` means a reduction the store cannot express. And
+`absorbReduceLoopDims` folds only the accumulating bucket into the op tile:
+absorbing a reduce axis says nothing about where the output axes are, so
+`scatterDims` stay outside it either way.
+
+#### What `SourceOpSpec` carries
+
+Two absorption-ish fields sit on it and they answer different questions, from
+different places, at different times:
+
+- `absorbReduceLoopDims` — can this op **kind** fold its whole reduce axis set
+  into one emitted op? True for `linalg.reduce`, whose `dimensions` takes a
+  sorted list; false for matmul, which contracts one axis at a time. Fixed at the
+  pattern.
+- `outputAxes` — does **this instance's** output get physical axes? Supplied by
+  Phase 2A, with `outputMarker` beside it: the layout the result carries, null in
+  the Logical space where the result has no layout of its own.
+
+They were briefly one flag, and merging them is wrong in both directions — a
+reduce can absorb its reduce axes while still being Logical.
+
+#### Invariants the Physical space had to re-establish
+
+- **`targetOrder` ⟷ `opTileDims`, 1:1 in physical order.** A surviving stick
+  index can now be an op-tile dim, so both sides must exclude the same dims.
+  `RewriteReducePattern` calls `buildDimRoles` itself and filters with the same
+  `isScatterDim` in the same space `classify()` will use, rather than re-deriving
+  the rule.
+- **Idempotence.** See the section below: `dimensions` can now name a physical
+  position inside logical range, which the older guard cannot see.
+- **The subset invariant.** `verifyPhysicalTypeAgreement` asserts that everything
+  Phase 2B found physical, 2A predicted. This matters because 2B reads *absence*
+  from the map as "genuinely logical" and commits on that basis, so an
+  under-claiming analysis would silently mis-lower. A minted replacement
+  postdates the analysis, so the minting pattern carries the decision across with
+  `PhysicalTypeCarryForward::carryForward` and containment holds by construction
+  — with no exemption in the check, which keeps its full strength for Phase 1's
+  roots and for what the elementwise and transpose patterns record. The assertion
+  is live in the default build (`TritonRelBuildWithAsserts`); it is the library's
+  only `#ifndef NDEBUG`, deliberately not an `LLVM_DEBUG` (runtime-gated, so it
+  would run only when asked) and not a bare `assert` (which drops the condition
+  but not the walk feeding it).
+- **Store ordering.** `RewriteStorePattern` could fire first, build a widen loop
+  for a logical result, then have the reduce replace that value underneath it. It
+  defers while its data tile is *predicted* physical but not yet registered — the
+  analysis-shaped sibling of the `pendingElementwiseRetype` deferral.
+- **The init operand.** Rebuilt at physical shape rather than retyped, because
+  nothing physical flows *into* an init — it is a root the forward propagation
+  cannot reach, so there is no retype to ride and the shape has to be stated.
+  What that leaves behind, the userless logical `tensor.empty`, is not this pass's
+  problem: `_make_ktir` canonicalizes and CSEs immediately after, nothing between
+  consumes it, and the emitted KTIR is byte-identical either way. A standalone
+  `--rewrite-descriptor-layout` run therefore shows it, which is why
+  `rewrite-descriptor-layout-reduce-batch-dim.mlir` canonicalizes in its RUN line
+  — only against the folded module can it assert `CHECK-NOT: tensor.empty`.
+
+#### Designs rejected
+
+- **A third array (`accAxisOfTarget`) beside `targetOrder`.** Identical to
+  `targetOrder` for every existing op — a whole indexing concept whose only
+  distinct use is one new case.
+- **Absorbing surviving scatter dims unconditionally for reduce.** A simpler flag
+  with wrong answers: a rank-3 middle-axis reduce would emit a rank-3 result
+  against a logical rank-2 store, and two lit tests regress. The decision
+  genuinely depends on the output descriptor.
+- **Special-casing the reduce in `emitNarrowStage`, or mutating it in place.**
+  Provably safe in this one configuration, but it carves a per-op path through
+  shared code, and the next op with a stick-split surviving axis would need its
+  own.
+- **Loosening the subset invariant**, broadly or by exempting minted values.
+  Something has to give — with nothing done the assertion fires — but every
+  exemption spends the check to buy it, and a flag saying "do not check me"
+  spends it where it is hardest to notice.
+
+#### Extending this to another source op
+
+A new source op needs `absorbReduceLoopDims` for its kind and, if its result can
+carry a layout of its own, a `PhysicalPropagationPattern` stating which output
+layout its operand's layout induces. It does **not** need to touch the
+accumulator or the permutation code — that is what keeping roles unique bought.
+The case a per-logical-dim role provably cannot express is the rank-4 case in
+`test/Conversion/rewrite-descriptor-layout-reduce-batch-dim.mlir`: two batch dims,
+a stick index and an untouched dim. If that test ever needs a special case, the
+abstraction has sprung a leak.
 
 ## One conversion path
 
@@ -185,6 +433,21 @@ place the rank does not change, so the pattern must test whether the work is
 already done — a reduce whose `dimensions` already covers the physical reduce
 dims does not match. Running the pass on its own output is a no-op, and a lit
 fixture asserts it by diffing the two.
+
+A reduce emitted in the Physical output axis space needs a second test, because
+neither of those catches it: it consumes the physical `ktdp.load` unsliced, so
+every other match condition still holds, and its `dimensions` can name a physical
+position that is *within* logical range (a single surviving reduce axis at
+physical position 1, say), so "already covers the physical reduce dims" cannot see
+it. What does is the registration: a result the rewrite recorded as physical is a
+result this pattern already produced.
+
+Recording that result is also what the Phase 2A subset invariant needs. A source
+pattern *replaces* its op, minting a value that did not exist when the analysis
+ran, so that value has no entry of its own; the pattern hands the analysis the one
+fact it is missing, that the replacement carries the decision already made for the
+value it replaced. Containment then holds by construction rather than by exempting
+the new value from the check.
 
 The driver's convergence result is checked, so a pattern that stays matchable
 fails the pass with a diagnostic instead of spinning to the iteration cap and

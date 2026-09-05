@@ -20,19 +20,28 @@ namespace mlir::triton::ktdp {
 
 void buildDimRoles(const OperandCoords &coords,
                    llvm::ArrayRef<int64_t> canonicalAxes,
+                   OutputAxisSpace space,
                    llvm::SmallVectorImpl<int64_t> &roles) {
   int n = (int)coords.src.size();
   roles.resize(n);
+  int64_t nextPhysicalAxis = 0;
   for (int p = 0; p < n; ++p) {
     int64_t logDim = coords.src[p];
-    roles[p] = (logDim < (int64_t)canonicalAxes.size())
-                   ? canonicalAxes[logDim]
-                   : -1;
+    int64_t logicalRole = (logDim < (int64_t)canonicalAxes.size())
+                              ? canonicalAxes[logDim]
+                              : -1;
+    // `canonicalAxes` answers the same question in both spaces -- does this
+    // logical dim survive -- so the reduced dims are identical and only the
+    // numbering of the survivors differs.
+    roles[p] = (space == OutputAxisSpace::Logical)
+                   ? logicalRole
+                   : (logicalRole < 0 ? -1 : nextPhysicalAxis++);
   }
 }
 
 OperandPlan classify(Value val, const OperandCoords &coords,
-                     llvm::ArrayRef<int64_t> dimRoles) {
+                     llvm::ArrayRef<int64_t> dimRoles,
+                     OutputAxisSpace space) {
   int rank = (int)dimRoles.size();
   OperandPlan plan;
   plan.value     = val;
@@ -53,23 +62,24 @@ OperandPlan classify(Value val, const OperandCoords &coords,
 
   for (int p = rank - 1; p >= 0; --p) {
     int64_t role = dimRoles[p];
-    bool isFloor = isFloorDim(role, static_cast<CoordOp>(coords.op[p]));
+    bool scatters =
+        isScatterDim(role, static_cast<CoordOp>(coords.op[p]), space);
     if (role == -1) {
       d.reduceDims.push_back(p);
       if (d.opInnerDim == -1) {
         d.opInnerDim = p;
         d.opTileDims.push_back(p);
       } else {
-        d.loopDims.push_back(p);
+        d.reduceLoopDims.push_back(p);
       }
-    } else if (isFloor) {
-      d.floorDims.push_back(p);
+    } else if (scatters) {
+      d.scatterDims.push_back(p);
     } else {
       d.opTileDims.push_back(p);
     }
   }
-  std::reverse(d.floorDims.begin(), d.floorDims.end());
-  std::reverse(d.loopDims.begin(), d.loopDims.end());
+  std::reverse(d.scatterDims.begin(), d.scatterDims.end());
+  std::reverse(d.reduceLoopDims.begin(), d.reduceLoopDims.end());
   std::reverse(d.opTileDims.begin(), d.opTileDims.end());
   std::reverse(d.reduceDims.begin(), d.reduceDims.end());
 
@@ -78,8 +88,11 @@ OperandPlan classify(Value val, const OperandCoords &coords,
     for (int p : dims)
       d.sliceKind[p] = SliceKind::StickIndex;
   };
-  markList(d.floorDims);
-  markList(d.loopDims);
+  // Both buckets slice the same way -- one stick per iteration of their own
+  // loop. What differs is what that loop does with the slice (scatter vs.
+  // accumulate), which is not a slicing question.
+  markList(d.scatterDims);
+  markList(d.reduceLoopDims);
   if (d.opInnerDim != -1 &&
       coords.physBlock[d.opInnerDim] > d.stickSize)
     d.sliceKind[d.opInnerDim] = SliceKind::StickifiedBlock;
@@ -88,14 +101,17 @@ OperandPlan classify(Value val, const OperandCoords &coords,
     llvm::dbgs() << "    classify: lane=" << d.lane
                  << " stickSize=" << d.stickSize
                  << " opInner=" << d.opInnerDim
-                 << " floorDims=" << d.floorDims.size()
-                 << " loopDims=" << d.loopDims.size()
+                 << " scatterDims=" << d.scatterDims.size()
+                 << " reduceLoopDims=" << d.reduceLoopDims.size()
                  << " reduceDims=" << d.reduceDims.size() << "\n";
   });
 
   return plan;
 }
 
+// A scratchpad operand carries no marker, so nothing about it is stick-split
+// and its roles are its logical axes -- the Logical output-axis space, with no
+// choice to make. The two spaces coincide here.
 OperandPlan classifyScratchpad(Value val, const SourceOperandSpec &opSpec) {
   auto tensorTy = mlir::cast<RankedTensorType>(val.getType());
   int rank = (int)tensorTy.getRank();
@@ -134,7 +150,7 @@ reconcileOperandSet(llvm::SmallVectorImpl<OperandPlan> &plans) {
   // StickifiedBlock demotion (before the trip-count fold below, since that
   // fold reads sliceKind).
   bool anyLoop = llvm::any_of(plans, [](const OperandPlan &p) {
-    return !p.dims.loopDims.empty();
+    return !p.dims.reduceLoopDims.empty();
   });
   LLVM_DEBUG(llvm::dbgs() << "    reconcile: anyLoop=" << anyLoop
                           << (anyLoop ? " (no demotion)" : " (demoting StickifiedBlock)") << "\n");
@@ -149,7 +165,7 @@ reconcileOperandSet(llvm::SmallVectorImpl<OperandPlan> &plans) {
 
   // Determine the stick loop trip count (stickFactor).
   for (auto &plan : plans) {
-    for (int p : plan.dims.loopDims) {
+    for (int p : plan.dims.reduceLoopDims) {
       if (static_cast<CoordOp>(plan.coords.op[p]) != CoordOp::FloorDiv)
         continue;
       int64_t logDim = plan.dimRoles[p];
@@ -171,18 +187,17 @@ reconcileOperandSet(llvm::SmallVectorImpl<OperandPlan> &plans) {
   LLVM_DEBUG(llvm::dbgs() << "    reconcile: stickFactor=" << result.stickFactor
                           << ", " << plans.size() << " operand plans\n");
 
-  // Determine the parallel-scatter trip count (parallelFactor): a *parallel*
-  // (role >= 0) floor dim spanning more than one stick. Such a dim cannot be
-  // folded into the op tile — `accDims` holds the per-stick extent because
-  // linalg.matmul requires its init/result extents to match the A/B slice
-  // extents — so the full parallel extent is assembled by tiling the
-  // accumulator across an outer loop.
+  // Determine the parallel-scatter trip count (parallelFactor): a scatter dim
+  // spanning more than one stick. Such a dim cannot be folded into the op tile
+  // — `accDims` holds the per-stick extent because linalg.matmul requires its
+  // init/result extents to match the A/B slice extents — so the full parallel
+  // extent is assembled by tiling the accumulator across an outer loop.
   //
-  // `parallelAccAxis` is the accumulator axis the parallel floor dim maps to
+  // `parallelAccAxis` is the accumulator axis the scatter dim maps to
   // (`dimRoles[p]`, which indexes `accDims` directly); `parallelStickSize` is
   // that plan's lane extent, i.e. the width of one scattered slab.
   for (auto &plan : plans) {
-    for (int p : plan.dims.floorDims) {
+    for (int p : plan.dims.scatterDims) {
       int64_t role = plan.dimRoles[p];
       if (role < 0 || plan.coords.physBlock[p] <= 1)
         continue;

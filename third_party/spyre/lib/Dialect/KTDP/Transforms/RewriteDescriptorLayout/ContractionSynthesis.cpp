@@ -65,6 +65,46 @@ bool isSingleTensorElementwiseOp(Operation *op) {
   return tensorOps == 1;
 }
 
+// Rebuild a DPS init at `accTy`, or null when its producer is one this cannot
+// reproduce.
+//
+// Needed only in the Physical output-axis space, and there it is unavoidable:
+// the accumulator is a *different physicalization of the same logical tensor*
+// than the init the op arrived with (tensor<2x64xf16> against tensor<128xf16>),
+// not a slab of it, so it can be neither reused nor sliced out — it has to be
+// built again at the physical shape.
+//
+// Exactly two producers can be, and they are the two LowerComputeOps emits for
+// a reduction's `outs`: a tensor.empty, and a linalg.fill of the combiner's
+// neutral element over one (ConvertTTReduce). The fill is re-emitted rather than
+// dropped: it is the neutral element the reduce's semantics need, and removing
+// it is a device-specific fixup that belongs to DropReductionInitFill, which
+// runs later and recognizes exactly this shape.
+//
+// Anything else — a loaded tensor carrying incoming data, say — holds values a
+// rebuild would silently drop, so it is refused rather than guessed at.
+static Value rebuildPhysicalInit(OpBuilder &b, Location loc, Value init,
+                                 RankedTensorType accTy) {
+  if (init.getType() == accTy)
+    return init;
+  auto empty = [&] {
+    return tensor::EmptyOp::create(b, loc, accTy.getShape(),
+                                   accTy.getElementType())
+        .getResult();
+  };
+  if (auto fill = init.getDefiningOp<linalg::FillOp>())
+    return linalg::FillOp::create(b, loc, fill.getInputs()[0], empty())
+        .getResult(0);
+  if (init.getDefiningOp<tensor::EmptyOp>())
+    return empty();
+  return {};
+}
+
+bool canRebuildPhysicalInit(Value init) {
+  return init.getDefiningOp<linalg::FillOp>() ||
+         init.getDefiningOp<tensor::EmptyOp>();
+}
+
 } // namespace mlir::triton::ktdp
 
 namespace {
@@ -93,13 +133,13 @@ Value emitTranspose(OpBuilder &b, Location loc, Value src,
 
 // Look up the marker for an access tile's base memView in the pass context.
 triton::SpyreTensorLayoutOp
-lookupMarkerFromTile(Value accessTile, const PassContext &ctx) {
+lookupMarkerFromTile(Value accessTile, const MarkerByMemView &markers) {
   auto tileOp = accessTile.getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>();
   if (!tileOp)
     return {};
-  auto it = ctx.physMemViewToMarker.find(tileOp.getBase());
-  return it != ctx.physMemViewToMarker.end() ? it->second
-                                             : triton::SpyreTensorLayoutOp{};
+  auto it = markers.find(tileOp.getBase());
+  return it != markers.end() ? it->second
+                             : triton::SpyreTensorLayoutOp{};
 }
 
 // Look up the originating marker for an operand directly from
@@ -154,7 +194,6 @@ bool pendingElementwiseRetype(Value val, const PassContext &ctx) {
   });
   return reachesPhysicalLoad;
 }
-
 
 // Emit a counted loop (scf.for) over a single iter_arg, or inline for trip <=
 // 1. Used both for a reduction's stick loop (iter_arg is the accumulator) and
@@ -249,11 +288,10 @@ Value extractOpSlice(OpBuilder &b, Location loc,
 //===----------------------------------------------------------------------===//
 // Conversion stage: narrow N physical operands into one op-tile (a source op
 // feeding matmul/reduce), or widen one op-tile into physical (a store's data
-// tile). One direction parameter, not two emitters: both narrow N physical
-// operands into one op-tile, or widen one op-tile into physical -- they
-// transpose, drive a counted loop, slice, and insert, differing only in which
-// side of the loop is the physical container and whether an op fires inside
-// it (narrow) or the loop body is a plain gather/scatter (widen).
+// tile). One direction parameter, not two emitters: both transpose, drive a
+// counted loop, slice, and insert, differing only in which side of the loop is
+// the physical container and whether an op fires inside it (narrow) or the loop
+// body is a plain gather/scatter (widen).
 //===----------------------------------------------------------------------===//
 
 // Narrow stage emission: extract slices, optional transpose, call emitOp.
@@ -261,12 +299,11 @@ Value extractOpSlice(OpBuilder &b, Location loc,
 Value emitNarrowStage(
     linalg::LinalgOp op,
     OpBuilder &b,
-    llvm::function_ref<Value(OpBuilder &, Location, llvm::ArrayRef<Value>, Value,
-                             RankedTensorType)>
-        emitOp,
+    const SourceOpSpec &spec,
     llvm::ArrayRef<OperandPlan> plans,
     const OperandSetTripCounts &tripCounts) {
   Location loc = op.getLoc();
+  auto emitOp = spec.emitOp;
 
   Value cVal = op.getDpsInits()[0];
   auto accElemTy = cast<RankedTensorType>(cVal.getType()).getElementType();
@@ -297,6 +334,20 @@ Value emitNarrowStage(
         accDims[role] = plan.opExtents[j];
     }
   auto accTy = RankedTensorType::get(accDims, accElemTy);
+
+  // In the Physical output-axis space the accumulator is rebuilt at accTy
+  // rather than reused (see rebuildPhysicalInit). Not gated on a type mismatch
+  // alone: in the Logical space a mismatch is the parallel-scatter slab
+  // relation below, where cVal is deliberately the wider container and accTy
+  // one slab of it.
+  //
+  // Phase 2A only puts a reduce in this space when canRebuildPhysicalInit holds
+  // for the same init, so a null here means those two have drifted apart.
+  if (spec.outputAxes == OutputAxisSpace::Physical) {
+    cVal = rebuildPhysicalInit(b, loc, cVal, accTy);
+    if (!cVal)
+      return {};
+  }
 
   // Transpose helper (delegates to free function).
   auto doTranspose = [&](Value src, llvm::ArrayRef<int64_t> perm) -> Value {
@@ -378,13 +429,12 @@ static LogicalResult emitFatalError(Operation *op, const PassContext &ctx,
   return op->emitError(msg);
 }
 
-// Classify one operand and populate plans[i]. `absorbLoopDims` is declared
-// by the calling pattern: true iff its op can take its whole reduce axis set
-// directly (e.g. linalg.reduce's `dimensions`), false if a second reduce axis
-// must become a real cross-stick accumulation loop (matmul).
+// Classify one operand and populate plans[i]. What the op tile may absorb --
+// its reduce axis set, its surviving stick-index dims -- is declared by the
+// calling pattern on the spec; see SourceOpSpec.
 LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
-                             const PassContext &ctx, PatternRewriter &rewriter,
-                             bool absorbLoopDims = false) {
+                             const PassContext &ctx,
+                             PatternRewriter &rewriter) {
   unsigned nOps = spec.operands.size();
   llvm::SmallVector<OperandPlan, 2> plans(nOps);
 
@@ -420,13 +470,13 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
         }
       }
       llvm::SmallVector<int64_t> dimRoles;
-      buildDimRoles(coords, effectiveCanonicalAxes, dimRoles);
-      plans[i] = classify(operand, coords, dimRoles);
+      buildDimRoles(coords, effectiveCanonicalAxes, spec.outputAxes, dimRoles);
+      plans[i] = classify(operand, coords, dimRoles, spec.outputAxes);
       LLVM_DEBUG({
         llvm::dbgs() << "  operand " << i << ": opTileDims=[";
         llvm::interleaveComma(plans[i].dims.opTileDims, llvm::dbgs());
-        llvm::dbgs() << "] loopDims=[";
-        llvm::interleaveComma(plans[i].dims.loopDims, llvm::dbgs());
+        llvm::dbgs() << "] reduceLoopDims=[";
+        llvm::interleaveComma(plans[i].dims.reduceLoopDims, llvm::dbgs());
         llvm::dbgs() << "]\n";
       });
     } else {
@@ -458,14 +508,6 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
       //    analysis map WILL be physical; it just is not yet, because the
       //    rewrite that makes it so (a transpose erasure, an upstream retype)
       //    has not landed in this greedy iteration. Defer.
-      //
-      //    This replaces a backward walk that hunted a live linalg.transpose.
-      //    That walk could only enumerate ways a value might be unresolved,
-      //    and it read IR Phase 2 was concurrently mutating; the analysis
-      //    answers the same question as a function of Phase 1's output.
-      //    Deferral itself remains -- under a greedy driver the answer "will
-      //    be physical" still means "not now" -- but it is now a lookup
-      //    rather than an inspection of half-rewritten IR.
       if (ctx.physicalTypeAnalysis &&
           ctx.physicalTypeAnalysis->contains(operand))
         return failure();
@@ -480,16 +522,18 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
     }
   }
 
-  // When the op can absorb its whole reduce axis set directly, fold loopDims
-  // into opTileDims (as WholeBlock slices spanning the full physical extent)
-  // before reconcileOperandSet folds loopDims into a trip count.
-  if (absorbLoopDims) {
+  // When the op can absorb its whole reduce axis set directly, fold
+  // reduceLoopDims into opTileDims (as WholeBlock slices spanning the full
+  // physical extent) before reconcileOperandSet folds them into a trip count.
+  // Only the accumulating bucket moves: scatterDims stay outside the op tile,
+  // since absorbing a reduce axis says nothing about where the output axes are.
+  if (spec.absorbReduceLoopDims) {
     for (auto &plan : plans) {
-      for (int p : plan.dims.loopDims) {
+      for (int p : plan.dims.reduceLoopDims) {
         plan.dims.opTileDims.push_back(p);
         plan.dims.sliceKind[p] = SliceKind::WholeBlock;
       }
-      plan.dims.loopDims.clear();
+      plan.dims.reduceLoopDims.clear();
       llvm::sort(plan.dims.opTileDims);
     }
   }
@@ -504,7 +548,7 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
     if (plans[i].coords.src.empty())
       continue;
     bool multiStickReduction = false;
-    for (int p : plans[i].dims.loopDims)
+    for (int p : plans[i].dims.reduceLoopDims)
       if (plans[i].coords.physBlock[p] > 1) { multiStickReduction = true; break; }
     if (!multiStickReduction)
       continue;
@@ -523,12 +567,31 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
   if (!tripCounts.parallelAgrees)
     return emitFatalError(op, ctx,
         "spyre_tensor_layout: operands disagree on the parallel multi-stick "
-        "scatter — two annotated operands carry parallel floor dims with "
+        "scatter — two annotated operands carry multi-stick scatter dims with "
         "different trip counts or on different output axes, which would need "
         "two independent scatter loops (not supported)");
 
   OpBuilder b(op.getOperation());
-  Value result = emitNarrowStage(op, b, spec.emitOp, plans, tripCounts);
+  Value result = emitNarrowStage(op, b, spec, plans, tripCounts);
+  if (!result)
+    return emitFatalError(op, ctx,
+        "spyre_tensor_layout: the op's output is to be physicalized but its "
+        "init operand cannot be rebuilt at the physical shape — only a "
+        "tensor.empty or a linalg.fill over one can be");
+
+  // A Physical output-axis space means this op's result IS physical, under the
+  // layout Phase 2A paired it with. Record it, so a consumer (an elementwise op
+  // downstream, or a store deciding sink vs. nothing-to-do) sees a physical
+  // value rather than deciding against a shape it cannot account for.
+  //
+  // `result` is a value the analysis never saw, so it also inherits the entry
+  // the analysis made for the result it replaces -- see
+  // PhysicalTypeCarryForward. Every pattern that mints a replacement wants this
+  // pair of lines, and nothing else.
+  if (spec.outputAxes == OutputAxisSpace::Physical) {
+    ctx.physicalValues[result] = PhysicalValueInfo{spec.outputMarker, {}};
+    ctx.physicalTypes.carryForward(op->getResult(0), result);
+  }
   rewriter.replaceOp(op, result);
   return success();
 }
@@ -537,25 +600,13 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
 // Sink stage (store scatter)
 //===----------------------------------------------------------------------===//
 
-// Walk the forward use chain from value through elementwise ops to a
-// ktdp.store, then look up the store's access tile base in physMemViewToMarker.
+// The marker half of findStoreDestination: the layout of the store this value
+// ultimately feeds, ignoring that store's tile shape. Named separately because
+// the store pattern only ever asks "is the output annotated", where a shape it
+// already has in hand would be noise.
 triton::SpyreTensorLayoutOp findMarkerForStore(Value value,
                                                const PassContext &ctx) {
-  llvm::SmallVector<Value> worklist = {value};
-  while (!worklist.empty()) {
-    Value v = worklist.pop_back_val();
-    for (auto *user : v.getUsers()) {
-      if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
-        auto marker = lookupMarkerFromTile(st.getAccessTile(), ctx);
-        if (marker)
-          return marker;
-      }
-      if (!isSingleTensorElementwiseOp(user))
-        continue;
-      worklist.push_back(user->getResult(0));
-    }
-  }
-  return {};
+  return findStoreDestination(value, ctx.physMemViewToMarker).marker;
 }
 
 // Which side of a store's widening conversion is the physical one. The other
@@ -569,28 +620,26 @@ enum class WidenTarget {
 
 // Widen stage: the shared conversion path's Widen direction. One op-tile
 // side and one physical-block side; the loop scatters (Physical target) or
-// gathers (Logical target) stick slices between them, one floor dim at a
+// gathers (Logical target) stick slices between them, one scatter dim at a
 // time, then repoints the store's data tile operand to the assembled result.
 //
 // Whichever side is logical always carries the multiply-by-stickSize offset
 // (it is the wide side being addressed one stick at a time); whichever side
 // is physical always carries the raw stick index `p` (it already has one
 // slot per stick). That invariant holds regardless of which side plays
-// source vs. destination, which is what lets the two original emitters
-// (emitSinkStage, emitBridgeToLogical) collapse into this one, selected by
-// `target`.
+// source vs. destination, which is what lets one emitter serve both, selected
+// by `target`.
 //
 // Only the Physical target ever transposes: `plan.transposePerm` is filled by
 // resolveOperand(), which the sink caller runs and the bridge caller does
 // not (see RewriteStorePattern) -- so for a Logical target `plan.transposePerm`
-// is always empty and the guard below is simply never taken, matching
-// emitBridgeToLogical's behavior of never transposing.
+// is always empty and the guard below is simply never taken.
 LogicalResult emitWidenStage(mlir::ktdp::StoreOp st,
                              const OperandPlan &plan,
                              WidenTarget target,
                              PatternRewriter &rewriter) {
   LLVM_DEBUG(llvm::dbgs() << "  widen stage: stickSize=" << plan.dims.stickSize
-                          << ", floorDims=" << plan.dims.floorDims.size()
+                          << ", scatterDims=" << plan.dims.scatterDims.size()
                           << ", target=" << (target == WidenTarget::Physical
                                                   ? "physical" : "logical")
                           << "\n");
@@ -628,7 +677,7 @@ LogicalResult emitWidenStage(mlir::ktdp::StoreOp st,
     if (logDim >= 0 && (unsigned)logDim < logRank)
       logSizesBase[logDimToPos(logDim)] = idx(physBlock[p]);
   }
-  for (int p : plan.dims.floorDims) {
+  for (int p : plan.dims.scatterDims) {
     int64_t logDim = plan.dimRoles[p];
     if (logDim >= 0 && (unsigned)logDim < logRank)
       logSizesBase[logDimToPos(logDim)] = idx(stickSize);
@@ -638,11 +687,11 @@ LogicalResult emitWidenStage(mlir::ktdp::StoreOp st,
   llvm::SmallVector<OpFoldResult> physSizes(physRank);
   llvm::SmallVector<OpFoldResult> physStrides(physRank, idx(1));
   for (int p = 0; p < physRank; ++p)
-    physSizes[p] = llvm::is_contained(plan.dims.floorDims, p)
+    physSizes[p] = llvm::is_contained(plan.dims.scatterDims, p)
                        ? idx(1) : idx(physBlock[p]);
 
   // The container is the physical block for a Physical target, or the
-  // logical (opTileDims/floorDims-derived) shape for a Logical target.
+  // logical (opTileDims/scatterDims-derived) shape for a Logical target.
   Value container;
   if (target == WidenTarget::Physical) {
     llvm::SmallVector<int64_t> physShape(physBlock.begin(), physBlock.end());
@@ -654,7 +703,7 @@ LogicalResult emitWidenStage(mlir::ktdp::StoreOp st,
       if (logDim >= 0 && (unsigned)logDim < logRank)
         logShape[logDim] = physBlock[p];
     }
-    for (int p : plan.dims.floorDims) {
+    for (int p : plan.dims.scatterDims) {
       int64_t logDim = plan.dimRoles[p];
       if (logDim >= 0 && (unsigned)logDim < logRank)
         logShape[logDim] = stickSize * physBlock[p];
@@ -663,7 +712,7 @@ LogicalResult emitWidenStage(mlir::ktdp::StoreOp st,
   }
 
   Value acc = container;
-  for (int p : plan.dims.floorDims) {
+  for (int p : plan.dims.scatterDims) {
     int64_t logDim = plan.dimRoles[p];
     if (logDim < 0 || (unsigned)logDim >= logRank) continue;
 
@@ -754,6 +803,13 @@ static LogicalResult rewriteMatmulLike(
   spec.operands.assign(operandSpecs.begin(), operandSpecs.end());
   spec.logicalRank = logicalRank;
   spec.emitOp = emitOp;
+  // Both absorption flags keep their defaults, and both defaults are the answer
+  // for a matmul-like op rather than a fallback. It contracts exactly one K, so
+  // a second reduce axis must be a real accumulation loop (absorbReduceLoopDims =
+  // false); and its accumulator extents must match the A/B slice extents, so a
+  // surviving multi-stick parallel dim is scattered by an outer loop rather than
+  // carried as an output axis (outputAxes = Logical). MatmulPropagation states
+  // the second of those as its own rule.
   return dispatchSource(op, spec, ctx, rewriter);
 }
 
@@ -816,6 +872,18 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
 
   LogicalResult matchAndRewrite(linalg::ReduceOp rd,
                                 PatternRewriter &rewriter) const override {
+    // Idempotence, first half. A reduce this pattern already rewrote into the
+    // Physical output-axis space has its own result registered as physical (see
+    // dispatchSource), and that registration is the direct statement of "this
+    // op is already final". It is needed because such a reduce keeps consuming
+    // the physical ktdp.load unsliced, so every other match condition below
+    // still holds -- and its `dimensions` now hold physical positions that are
+    // *within* logical range (a single surviving reduce axis at physical
+    // position 1, say), so the second half of the guard further down cannot see
+    // it either.
+    if (ctx.physicalValues.contains(rd.getResult(0)))
+      return failure();
+
     auto rdMarker = findMarkerForOperand(rd.getInputs()[0], ctx);
     unsigned logicalInputRank = 2;
     if (rdMarker) {
@@ -846,7 +914,8 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
       if ((unsigned)(src + 1) > logicalRank)
         logicalRank = (unsigned)(src + 1);
 
-    // Guard against re-matching an already-rewritten case-1 reduce. A case-1
+    // Idempotence, second half: an already-rewritten case-1 reduce, i.e. one
+    // left in the Logical output-axis space. Such a
     // reduce keeps its physical extract_slice as input; when every dim on
     // that slice is a WholeBlock (no narrowing at all -- e.g. a fully
     // absorbed reduce with no residual stick loop), RewriteElementwisePattern
@@ -869,24 +938,45 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
       if (!llvm::is_contained(rd.getDimensions(), (int64_t)d))
         canonicalAxes[d] = outAxis++;
 
+    // Where this reduce's output axes live is Phase 2A's answer, not a local
+    // guess. ReducePropagation decided whether the result is physical -- i.e.
+    // whether the descriptor it is stored to carries exactly the layout the
+    // operand's surviving stick structure induces -- and recorded the type and
+    // the marker when it is. Present means Physical; absent means Logical, the
+    // shape every reduce had before, where a surviving stick-index dim is a
+    // scatter dim and any physical form is built afterwards by the store.
+    OutputAxisSpace outputAxes = OutputAxisSpace::Logical;
+    triton::SpyreTensorLayoutOp outputMarker;
+    if (ctx.physicalTypeAnalysis) {
+      auto it = ctx.physicalTypeAnalysis->find(rd.getResult(0));
+      if (it != ctx.physicalTypeAnalysis->end()) {
+        outputAxes = OutputAxisSpace::Physical;
+        outputMarker = it->second.marker;
+      }
+    }
+
     // targetOrder holds one entry per non-floor physical dim, in physical
     // order, role or -1 for a reduced dim. linalg.reduce's `dimensions` is
     // DenseArrayStrictlySorted with no trailing-position requirement, so
-    // reduced dims need not be moved to the end. Floor-dim exclusion uses
-    // isFloorDim, matching classify()'s own test, so entries line up 1:1
-    // with opTileDims in physical order.
+    // reduced dims need not be moved to the end.
+    //
+    // Derived from buildDimRoles' own output rather than from a second copy of
+    // the role rule, and filtered by the same predicate in the same
+    // OutputAxisSpace that classify() will use. That is what re-establishes the
+    // 1:1 correspondence with opTileDims in physical order now that a surviving
+    // stick-index dim can be an op-tile dim: the two sides cannot disagree about which
+    // dims are excluded, because they ask one predicate with one argument.
+    auto physShape = cast<RankedTensorType>(rd.getInputs()[0].getType())
+                         .getShape();
+    OperandCoords coords =
+        OperandCoords::fromMarker(marker, logicalRank, physShape);
+    llvm::SmallVector<int64_t> physDimRoles;
+    buildDimRoles(coords, canonicalAxes, outputAxes, physDimRoles);
     llvm::SmallVector<int64_t> targetOrder;
-    {
-      auto physOp = marker.getPhysOp();
-      for (unsigned p = 0; p < physOp.size(); ++p) {
-        int64_t logDim = marker.getPhysSrc()[p];
-        int64_t role = (logDim < (int64_t)canonicalAxes.size())
-                            ? canonicalAxes[logDim]
-                            : -1;
-        if (!isFloorDim(role, static_cast<CoordOp>(physOp[p])))
-          targetOrder.push_back(role);
-      }
-    }
+    for (unsigned p = 0; p < physDimRoles.size(); ++p)
+      if (!isScatterDim(physDimRoles[p],
+                                  static_cast<CoordOp>(coords.op[p]), outputAxes))
+        targetOrder.push_back(physDimRoles[p]);
 
     // The reduced slice-local axis positions are exactly the -1 slots of
     // targetOrder: resolveOperand's transpose (if any) reorders the operand
@@ -931,10 +1021,13 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
     SourceOpSpec spec;
     spec.operands = {SourceOperandSpec{canonicalAxes, targetOrder}};
     spec.logicalRank = logicalRank;
-    spec.emitOp = emitReduceOp;
     // linalg.reduce can absorb its whole reduce axis set directly via
     // `dimensions`, unlike matmul, which can only ever contract one axis.
-    return dispatchSource(rd, spec, ctx, rewriter, /*absorbLoopDims=*/true);
+    spec.absorbReduceLoopDims = true;
+    spec.outputAxes = outputAxes;
+    spec.outputMarker = outputMarker;
+    spec.emitOp = emitReduceOp;
+    return dispatchSource(rd, spec, ctx, rewriter);
   }
 };
 
@@ -943,34 +1036,26 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
 //===----------------------------------------------------------------------===//
 
 // An elementwise op's output can always be physicalized: it is rank-agnostic,
-// so the physical type of its tensor operand(s) propagates unchanged (the
-// work retypeChain used to do forward, in passing, over the whole chain).
+// so the physical type of its tensor operand(s) propagates unchanged.
 //
 // Deliberately local, and deliberately not isSingleTensorElementwiseOp (see
 // the comment there): by the time Phase 2 runs, Phase 1 has already made
 // every load's result physical, so the decision for an elementwise op is
-// local to that op's own operand/result shapes, not a backward walk. This
-// also means the rule covers multi-tensor-operand elementwise ops (addf,
-// mulf, select, ...) for free -- it just requires every tensor operand to
-// already agree on a shape before retyping the result to match.
+// local to that op's own operand/result shapes, not a backward walk. That
+// also covers multi-tensor-operand elementwise ops (addf, mulf, select, ...)
+// for free -- it just requires every tensor operand to already agree on a
+// shape before retyping the result to match.
 //
 // The shape-mismatch test alone is not sufficient to scope this pattern: it
 // also matches ops that are not elementwise at all but happen to have one
 // tensor operand and a differently-shaped result, e.g. tt.expand_dims
-// (tensor<1xf32> -> tensor<1x1xf32> in softmax's row-max reduction). Base
-// retypeChain never touched such ops because it only ever walked values
-// reachable from a physicalized load's users -- an unannotated function
-// (softmax has zero tt.spyre_tensor_layout markers) never seeded that walk
-// at all.
-//
-// ctx.physicalValues restores that same reachability scoping, as a seeded
-// worklist rather than a backward traceback: Phase 1 seeds it with every
-// physical ktdp.load result (the root of every chain Phase 2 will retype),
-// and this pattern grows it with the result of each op it retypes -- so
-// membership IS the "reachable from a physicalized load" answer, propagated
-// forward exactly the way base retypeChain did, just now living in Phase 2
-// where the per-op decision belongs. An op on an unannotated path is simply
-// never in the set, so tt.expand_dims in softmax is never retyped.
+// (tensor<1xf32> -> tensor<1x1xf32> in softmax's row-max reduction).
+// ctx.physicalValues supplies the missing reachability scoping: Phase 1 seeds
+// it with every physical ktdp.load result (the root of every chain Phase 2
+// will retype) and this pattern grows it with the result of each op it
+// retypes, so membership IS the "reachable from a physicalized load" answer.
+// An op on an unannotated path is simply never in the set, so tt.expand_dims
+// in softmax (zero tt.spyre_tensor_layout markers) is never retyped.
 struct RewriteElementwisePattern : RewritePattern {
   const PassContext &ctx;
   RewriteElementwisePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
@@ -1045,8 +1130,6 @@ struct RewriteElementwisePattern : RewritePattern {
     //
     // The analysis cannot substitute here. It predicts what a type WILL be, not
     // when a neighbour's in-place retype has landed, and this is the latter.
-    // Measured: removing it breaks rewrite-descriptor-layout-chained-transpose
-    // and -elementwise-chain with "input rank 3 does not match init rank 2".
     for (Operation *user : llvm::make_early_inc_range(op->getResult(0).getUsers()))
       rewriter.modifyOpInPlace(user, [] {});
     return success();
@@ -1065,11 +1148,9 @@ struct RewriteElementwisePattern : RewritePattern {
 // permutation from somewhere once the transpose is gone.
 struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
   const PassContext &ctx;
-  // Benefit 1, like every other pattern here. It was 3 so that a transpose was
-  // erased before dispatchSource read physicalValues -- a miss there could not
-  // be told from "genuinely logical". dispatchSource asks the Phase 2A analysis
-  // now, which knows the transpose's permutation up front, so the ordering has
-  // nothing left to buy; removing it is byte-identical on every fixture.
+  // Benefit 1, like every other pattern here: dispatchSource asks the Phase 2A
+  // analysis, which knows the transpose's permutation up front, so erasing the
+  // transpose ahead of it buys nothing.
   RewriteTransposePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
       : OpRewritePattern(mlirCtx, /*benefit=*/1), ctx(layoutCtx) {}
 
@@ -1090,8 +1171,7 @@ struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
     slot = slot.empty() ? perm : composePerm(slot, perm);
     // No re-enqueue of former users needed. Erasing this transpose does not
     // change any consumer's dispatchability: dispatchSource reads the analysis,
-    // which already accounts for this permutation. Measured removable --
-    // byte-identical on every fixture.
+    // which already accounts for this permutation.
     rewriter.replaceOp(tr, input);
     return success();
   }
@@ -1119,6 +1199,21 @@ struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
     // wrong answer (see pendingElementwiseRetype).
     if (pendingElementwiseRetype(st.getDataTile(), ctx))
       return failure();
+    // The same hazard for a producer Phase 2A has predicted physical whose
+    // rewrite has not landed yet, asked as the analysis question it is rather
+    // than by inspecting the producer. A source op (a reduce whose result is
+    // physicalized) REPLACES its op, so until it does, the data tile is still
+    // the logical value and dataTy.getRank() below would send this store down
+    // the sink path -- building a widen loop whose whole job is to produce the
+    // shape the replacement will already have, around a value about to be
+    // swapped out from under it. Deferral is safe rather than a stall for the
+    // reason dispatchSource's own deferral is: presence in the analysis means
+    // the value WILL be physical, and whatever makes it so registers it in
+    // ctx.physicalValues, which re-enqueues this store.
+    if (ctx.physicalTypeAnalysis &&
+        ctx.physicalTypeAnalysis->contains(st.getDataTile()) &&
+        !ctx.physicalValues.contains(st.getDataTile()))
+      return failure();
     if (dataTy.getRank() == (int)tileTy.getShape().size())
       return failure();
     auto marker = findMarkerForStore(st.getDataTile(), ctx);
@@ -1143,11 +1238,16 @@ struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
       llvm::SmallVector<int64_t> dimRoleS(physRank);
       for (int p = 0; p < physRank; ++p)
         dimRoleS[p] = srcMarker.getPhysSrc()[p];
-      OperandPlan sPlan = classify(st.getDataTile(), sC, dimRoleS);
+      // A store's own axes are the logical dims of the tensor it writes; it has
+      // no output-axis space of its own to choose, so the widen stage always
+      // classifies in the Logical one -- the scatter dims it finds are exactly
+      // the sticks it must gather or scatter one at a time.
+      OperandPlan sPlan =
+          classify(st.getDataTile(), sC, dimRoleS, OutputAxisSpace::Logical);
 
-      if (sPlan.dims.floorDims.empty())
+      if (sPlan.dims.scatterDims.empty())
         return failure();
-      if (!sPlan.dims.loopDims.empty()) {
+      if (!sPlan.dims.reduceLoopDims.empty()) {
         ctx.hadError = true;
         return st.emitError(
             "spyre_tensor_layout: store bridge stage: unexpected reduction "
@@ -1170,24 +1270,25 @@ struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
     llvm::SmallVector<int64_t> identityAxes(logRank);
     std::iota(identityAxes.begin(), identityAxes.end(), 0);
     llvm::SmallVector<int64_t> dimRoleD;
-    buildDimRoles(dC, identityAxes, dimRoleD);
+    buildDimRoles(dC, identityAxes, OutputAxisSpace::Logical, dimRoleD);
 
-    OperandPlan dPlan = classify(st.getDataTile(), dC, dimRoleD);
+    OperandPlan dPlan =
+        classify(st.getDataTile(), dC, dimRoleD, OutputAxisSpace::Logical);
 
     // The store's two preconditions, expressed as resolution outcomes: an
-    // empty floorDims means nothing to scatter, and a non-empty loopDims
-    // means a reduction the store cannot express. Checked here rather than
-    // inside the emitter. Do not call reconcileOperandSet on this path: it
-    // is a no-op for a store (dimRoles are phys_src, always >= 0, so
-    // loopDims is always empty already) and would assert a cross-operand
+    // empty scatterDims means nothing to scatter, and a non-empty
+    // reduceLoopDims means a reduction the store cannot express. Checked here
+    // rather than inside the emitter. Do not call reconcileOperandSet on this
+    // path: it is a no-op for a store (dimRoles are phys_src, always >= 0, so
+    // reduceLoopDims is always empty already) and would assert a cross-operand
     // dependency that does not exist for a single data tile.
-    if (dPlan.dims.floorDims.empty()) {
+    if (dPlan.dims.scatterDims.empty()) {
       ctx.hadError = true;
       return st.emitError(
           "spyre_tensor_layout: store sink stage requires at least one "
-          "parallel floor dim in the output layout");
+          "scatter dim in the output layout");
     }
-    if (!dPlan.dims.loopDims.empty()) {
+    if (!dPlan.dims.reduceLoopDims.empty()) {
       ctx.hadError = true;
       return st.emitError(
           "spyre_tensor_layout: store sink stage: unexpected reduction dim");
@@ -1207,6 +1308,34 @@ struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
 } // namespace
 
 namespace mlir::triton::ktdp {
+
+//===----------------------------------------------------------------------===//
+// Store destination lookup
+//===----------------------------------------------------------------------===//
+
+StoreDestination findStoreDestination(Value value,
+                                     const MarkerByMemView &markers) {
+  llvm::SmallVector<Value> worklist = {value};
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    for (auto *user : v.getUsers()) {
+      if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
+        auto marker = lookupMarkerFromTile(st.getAccessTile(), markers);
+        if (!marker)
+          continue;
+        auto tileTy =
+            dyn_cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
+        if (!tileTy)
+          continue;
+        return {marker, llvm::SmallVector<int64_t>(tileTy.getShape())};
+      }
+      if (!isSingleTensorElementwiseOp(user))
+        continue;
+      worklist.push_back(user->getResult(0));
+    }
+  }
+  return {};
+}
 
 //===----------------------------------------------------------------------===//
 // Entry point

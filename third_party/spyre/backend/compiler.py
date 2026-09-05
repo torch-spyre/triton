@@ -154,6 +154,74 @@ _PASS_OPTIONS = {
 }
 
 
+def _add_ktdp_pass(pm, name, options, **overrides):
+    """Add the KTDP pass *name* to *pm*, forwarding the options it declares.
+
+    Passes are exposed as ``add_<name>`` on ``spyre.passes.ttir_to_ktdp``, taking
+    the pass manager plus any :class:`SpyreOptions` fields named in
+    ``_PASS_OPTIONS``. A missing binding means a requested pass would silently
+    never run, so raise.
+
+    ``overrides`` supplies a value the *stage* computed rather than one the
+    caller set -- the derived base addresses are the only such value today.
+
+    Shared by both stages that install KTDP passes, so the binding convention and
+    the missing-binding diagnostic have one home.
+    """
+    from triton._C.libtriton import spyre
+
+    adder = getattr(spyre.passes.ttir_to_ktdp, f"add_{name}", None)
+    if adder is None:
+        raise ValueError(
+            f"no pass binding 'add_{name}' on "
+            "spyre.passes.ttir_to_ktdp; declare it in "
+            "third_party/spyre/triton_spyre.cc and rebuild libtriton"
+        )
+    kwargs = {opt: getattr(options, opt) for opt in _PASS_OPTIONS.get(name, ())}
+    kwargs.update(overrides)
+    adder(pm, **kwargs)
+
+
+# Passes the spyrecode stage installs on its way to dbo-opt, as binding names on
+# spyre.passes.ttir_to_ktdp. They run *after* the whole TTIR→KTIR pipeline, on
+# only the compiles that go on to build a binary.
+#
+# A pass belongs here rather than in that pipeline -- including via
+# SpyreOptions.required_fixes, which is otherwise the way to add one -- when
+# either half of the pipeline's contract fails for it:
+#
+#   - it is required by dbo-opt rather than by the IR. The pipeline runs for every
+#     compile, and most stop at KTIR, so a pass that only the scheduler needs
+#     costs them nothing and may be outright *invalid* for them: a kernel that
+#     never reaches a binary can be one the pass rejects.
+#   - its output is no longer standalone KTIR. The pipeline's output is the cached
+#     .ktir artifact other tools read, so a rewrite whose correctness rests on a
+#     guarantee the IR does not express cannot be part of it.
+#
+# The constraint is not idempotence -- the KTIR pass manager runs once, and so
+# does this one. It is (a) validity for every kernel and (b) preserving the KTIR
+# contract.
+_SPYRECODE_STAGE_PASSES = (
+    # DropReductionInitFill. LowerComputeOps gives every reduction a zero
+    # `linalg.fill` on its `outs` per upstream linalg semantics; the scheduler's
+    # allowlist is add/mul/sub/reduce and the fill is none of those, so a
+    # reduction carrying one cannot become a binary.
+    #
+    # It fails both halves of the rule above. It admits `addf`/`subf` only --
+    # the scheduler resets an accumulator to zero whatever the combiner is, so
+    # `mul` (needs 1.0) and `max`/`min` (need -/+inf) would get the wrong answer
+    # and are refused rather than silently lowered -- so in the pipeline it would
+    # *error* on a max reduce that otherwise lowers and runs on ktir_cpu. And a
+    # reduce stripped of its neutral element is correct only given that same
+    # zero-reset guarantee, which no KTIR reader can see.
+    #
+    # A no-op for everything else: it matches only linalg ops carrying a
+    # reduction iterator, so the other producer of linalg.fill in this pipeline
+    # (tt.splat) is out of scope.
+    "drop_reduction_init_fill",
+)
+
+
 @dataclass
 class SpyreOptions:
     # Per-axis partition of the Spyre hardware grid. One entry per
@@ -558,7 +626,7 @@ class SpyreBackend(BaseBackend):
         own, names the pass in options.required_fixes and sets
         options.base_addresses; `dft triton-lower` does exactly that.
         """
-        from triton._C.libtriton import ir, passes, spyre
+        from triton._C.libtriton import ir, passes
 
         # Only the address-binding mode has any use for these. Inferring them in
         # symbolic mode would also mean reporting a pointer-width or pointer-count
@@ -568,33 +636,18 @@ class SpyreBackend(BaseBackend):
             metadata["base_addresses"] = infer_base_addresses_from_ptr_types(mod)
 
         fixes = options.required_fixes
-        ttir_to_ktdp = spyre.passes.ttir_to_ktdp
-
-        def add_pass(name):
-            # Passes are exposed as add_<name>, taking the pass manager plus any
-            # SpyreOptions fields named in _PASS_OPTIONS. A missing binding
-            # means a requested fix would silently never run, so raise.
-            adder = getattr(ttir_to_ktdp, f"add_{name}", None)
-            if adder is None:
-                raise ValueError(
-                    f"no pass binding 'add_{name}' on "
-                    "spyre.passes.ttir_to_ktdp; declare it in "
-                    "third_party/spyre/triton_spyre.cc and rebuild libtriton"
-                )
-            adder(pm, **{opt: getattr(options, opt)
-                         for opt in _PASS_OPTIONS.get(name, ())})
 
         pm = ir.pass_manager(mod.context)
         if fixes:
             # Compose pass-by-pass so each fix lands after its anchor.
             for core_pass in _CORE_PIPELINE_PASSES:
-                add_pass(core_pass)
+                _add_ktdp_pass(pm, core_pass, options)
                 for fix, anchor in fixes.items():
                     if anchor == core_pass:
-                        add_pass(fix)
+                        _add_ktdp_pass(pm, fix, options)
         else:
-            add_pass("convert_ttir_to_ktdp")
-        add_pass("distribute_work")
+            _add_ktdp_pass(pm, "convert_ttir_to_ktdp", options)
+        _add_ktdp_pass(pm, "distribute_work", options)
         # Clean up redundant arithmetic (fold muli x,1; simplify cast chains)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
@@ -616,9 +669,12 @@ class SpyreBackend(BaseBackend):
         ``<dir>/spyrecode.json`` and the ``init_bin_file`` it names, both by
         name and with no directory scan.
 
-        Two steps:
+        Three steps, the first two in one pass manager:
 
-        1. Resolve the entry function's arguments, which is where
+        1. ``_SPYRECODE_STAGE_PASSES``, the rewrites dbo-opt requires that cannot
+           live in the TTIR→KTIR pipeline. Its own comment states the rule that
+           admits a pass to it.
+        2. Resolve the entry function's arguments, which is where
            ``options.symbolic_args`` is honoured — the one place in the backend
            that branches on the mode. With it False (the default),
            ``MaterializeBaseAddresses`` replaces the pointer arguments with
@@ -629,7 +685,7 @@ class SpyreBackend(BaseBackend):
            ``required_fixes`` already ran it. Running here rather than in
            ``_make_ktir`` is what lets the cached ``.ktir`` artifact keep the
            argument-passing calling convention.
-        2. ``dbo-opt --from-ktir --kEmitSpyreCode``, whose scheduler +
+        3. ``dbo-opt --from-ktir --kEmitSpyreCode``, whose scheduler +
            codegen stages write the spyreCodeDir. ``--kEmitSpyreCode`` is a pass
            pipeline that has to be requested explicitly; ``--export-dir`` alone
            makes dbo-opt exit 0 having written nothing.
@@ -642,13 +698,22 @@ class SpyreBackend(BaseBackend):
         ``ktdp.load`` operand, because the memref keeps a dynamic
         ``strided<..., offset: ?>`` layout until a ``linalg`` consumer pins it.
         """
-        from triton._C.libtriton import ir, passes, spyre
+        from triton._C.libtriton import ir, passes
+
+        # The always-on set, whose admission rule is documented on it, then the
+        # one pass that is genuinely a choice: MaterializeBaseAddresses is
+        # guarded because `symbolic_args` and `base_addresses` pick between real
+        # argument-passing modes. So the stage is a list plus a conditional, not
+        # one flat list.
+        pm = ir.pass_manager(mod.context)
+        for stage_pass in _SPYRECODE_STAGE_PASSES:
+            _add_ktdp_pass(pm, stage_pass, options)
 
         if options.symbolic_args:
             # Symbolic mode: leave the pointer arguments alone. The addresses are
             # not known at compile time -- dbo-opt records a correction table in
             # the artifact and the runtime patches the real ones in at launch.
-            # Nothing to install, so fall straight through to dbo-opt.
+            # Nothing to install; the stage set above is all this pass manager runs.
             pass
         # required_fixes may have installed MaterializeBaseAddresses already, at
         # the anchor the caller chose, in which case the pointer arguments are
@@ -656,8 +721,6 @@ class SpyreBackend(BaseBackend):
         # than there are `index` arguments left to put them in, and it fails on
         # exactly that (MaterializeBaseAddresses.cpp, step 2a).
         elif "materialize_base_addresses" not in options.required_fixes:
-            # options.base_addresses is an override; without one, use the fixed
-            # policy _make_ktir derived from the TTIR pointer types.
             base_addresses = options.base_addresses or metadata.get("base_addresses")
             if base_addresses is None:
                 # A compile that starts from a .ktir source skips _make_ktir, and
@@ -671,12 +734,16 @@ class SpyreBackend(BaseBackend):
                     "SpyreOptions.base_addresses explicitly."
                 )
 
-            pm = ir.pass_manager(mod.context)
-            spyre.passes.ttir_to_ktdp.add_materialize_base_addresses(
-                pm, base_addresses=list(base_addresses))
+            _add_ktdp_pass(pm, "materialize_base_addresses", options,
+                           base_addresses=list(base_addresses))
+            # Part of the materialization, not of the stage: they fold the
+            # arith.constant addresses it just introduced into their users.
+            # Symbolic mode has no constants to fold, so they stay inside this
+            # branch rather than running for every binary compile.
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
-            pm.run(mod, "make_spyrecode")
+
+        pm.run(mod, "make_spyrecode")
 
         dbo_opt = resolve_dbo_opt()
         device = resolve_device()

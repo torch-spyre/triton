@@ -46,6 +46,24 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
           compute chain to the physical rank (stops at multi-tensor ops);
         - redirect ktdp.store's access tile operand to the physical tile.
 
+        Phase 2 — decide each remaining op's OUTPUT, then rewrite it. Phase 2A
+        resolves, for every value reachable from Phase 1's loads, the physical
+        type it will carry; Phase 2B rewrites against those answers. An op whose
+        output cannot be physicalized (matmul / batch_matmul, which contract
+        exactly one K) keeps a logical result and gets a stick loop; one whose
+        output can be is emitted at physical shape directly.
+
+        For linalg.reduce that second case has a condition, since it decides
+        WHICH physical shape: reducing a logical axis away deletes the physical
+        dims sourced from it, so the operand's layout induces an output layout
+        (surviving physical dims, in order, coord ops and args intact). When the
+        descriptor the result is stored to declares exactly that layout, the
+        reduce is emitted at it and a surviving stick-index dim becomes a batch
+        dim of the one op — e.g. physical [2, 64, 64] reduced on the middle dim
+        gives `outs tensor<2x64xf16> dimensions = [1]`, which ktdp.store consumes
+        directly. Otherwise the result stays logical and the store's widen stage
+        builds the physical form. See docs/spyre-tensor-layouts.md.
+
         Phase 3 — erase the tt.spyre_tensor_layout markers and the now-dead
         UnrealizedConversionCast bridges.
 

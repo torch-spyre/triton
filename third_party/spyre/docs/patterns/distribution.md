@@ -89,7 +89,7 @@ offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 - `elementwise::2d` — M=512, N=32, BLOCK_M=16, BLOCK_N=16, X_LAYOUT=None, Y_LAYOUT=None, OUT_LAYOUT=None, DTYPE='fp32', OP='add' (also demonstrates: descriptor-load-static, descriptor-store-static, num-programs-fold)
 - `elementwise::2d_dynamic` (also demonstrates: descriptor-load-dynamic, descriptor-store-dynamic, num-programs-fold)
 
-_+ 17 more variants_
+_+ 18 more variants_
 
 ## program-id-2d
 

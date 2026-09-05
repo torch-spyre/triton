@@ -337,9 +337,10 @@ def _stick_on_n_row(dtype: str, n_sticks: int) -> tuple:
     it unrepresentable, with no hook to gate the fixtures that get the property.
 
     No width is written here or at the call site: *n_sticks* says how many, the
-    dtype says how wide. Named for the row it makes rather than for a size, for
-    the reason ``_SS = functools.partial(sticksize, ...)`` is in
-    ``fixtures/reduce/meta.py``.
+    dtype says how wide. Named for the row it makes rather than for a size.
+    (This used to point at ``_SS = functools.partial(sticksize, _SIG_SPYRE)`` in
+    ``fixtures/reduce/meta.py`` as the counter-example; that fixture now derives
+    its stick widths from a dtype the same way and the partial is gone.)
     """
     n = n_sticks * _stick_of(dtype)
     layout = _stick_2d_on_n(dtype)

@@ -11,13 +11,62 @@ namespace mlir::triton::ktdp {
 
 enum class CoordOp : int64_t { Identity = 0, FloorDiv = 1, Mod = 2 };
 
-/// A physical dim is a floor (stick-index) dim iff it carries a parallel
-/// (non-reduced) role and a FloorDiv coord op. Shared by classify() and any
-/// caller that must derive floor-dim membership from the same role/coord-op
-/// pair without re-running classify() (e.g. building a target order from a
-/// marker directly).
-inline bool isFloorDim(int64_t role, CoordOp op) {
-  return role >= 0 && op == CoordOp::FloorDiv;
+/// Where a synthesized op's OUTPUT axes live — the space a `role` (and hence
+/// `dimRoles`, `targetOrder` and the accumulator's axes) numbers positions in.
+/// A property of the op *instance*, not of the op kind: the same linalg.reduce
+/// lands in either space depending on whether the descriptor its result is
+/// stored to carries the layout the operand's surviving stick structure
+/// induces. See "Which physical shape" in docs/spyre-tensor-layouts.md.
+enum class OutputAxisSpace {
+  /// One output axis per surviving LOGICAL dim. A surviving stick-index dim is
+  /// not an output axis at all: it is sliced away (extent 1) or scattered by an
+  /// outer loop, so it is bucketed as a scatter dim and the accumulator carries
+  /// the op's logical rank. Every matmul-like op is here, and so is a reduce
+  /// whose result acquires no layout of its own.
+  Logical,
+  /// One output axis per surviving PHYSICAL dim, in physical order. A surviving
+  /// stick-index dim rides along as a batch dim of the emitted op and gets an
+  /// accumulator axis of its own, so it belongs in the op tile rather than in
+  /// scatterDims. This is the space in which one logical axis can occupy two
+  /// output axes (its stick index and its lane), which is exactly what a
+  /// role numbered per logical dim cannot express.
+  Physical,
+};
+
+/// Is this physical dim a stick index? A property of the coordinate op alone:
+/// the dim carries the `floordiv` half of a stick split, so it counts sticks.
+/// Says nothing about what the op consuming it does with the dim.
+inline bool isFloorCoord(CoordOp op) { return op == CoordOp::FloorDiv; }
+
+/// Must this physical dim be SCATTERED — driven from outside the op tile, so
+/// that each iteration of its loop writes a different output slice — rather
+/// than being an axis of the emitted op? True for exactly one situation, and it
+/// takes three facts to name it:
+///
+///   role >= 0            the dim survives the op (it is not reduced away)
+///   isFloorCoord(op)     it is a stick index
+///   space == Logical     output axes are numbered per surviving *logical* dim
+///
+/// The third is what makes this a decision rather than a property: in the
+/// Logical space a surviving stick index shares its logical axis with the lane
+/// dim beside it and has nowhere to go, so it is bucketed into `scatterDims` and
+/// driven from outside; in the Physical space it has an output axis of its own —
+/// a batch dim of the emitted op — so it stays in the op tile and this is false.
+///
+/// The three conjuncts used to sit behind the name `isFloorDim`, which read as
+/// a property of the dim. `isFloorCoord` is the property; this is the decision,
+/// named for what the dim's loop *does* — scatter — because the sibling bucket
+/// (`reduceLoopDims`) is sliced identically and differs only in that its loop
+/// accumulates.
+///
+/// Shared by classify() and by any caller deriving the same membership from a
+/// role/coord-op pair without re-running classify() (building a target order
+/// from a marker directly, say). `space` is a parameter rather than a default
+/// precisely because those callers must agree on it — that agreement is what
+/// keeps a target order lined up 1:1 with opTileDims.
+inline bool isScatterDim(int64_t role, CoordOp op, OutputAxisSpace space) {
+  return role >= 0 && isFloorCoord(op) &&
+         space == OutputAxisSpace::Logical;
 }
 
 /// Apply one coordinate op to a static (compile-time) logical extent.
