@@ -1,6 +1,7 @@
 #ifndef KTDP_TRANSFORMS_REWRITEDESCRIPTORLAYOUT_PHYSICALTYPEANALYSIS_H
 #define KTDP_TRANSFORMS_REWRITEDESCRIPTORLAYOUT_PHYSICALTYPEANALYSIS_H
 
+#include "RewriteDescriptorLayout/RequirementAnalysis.h"
 #include "RewriteDescriptorLayout/Types.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -60,12 +61,21 @@ public:
   /// True iff this pattern is the rule for `op`.
   virtual bool match(Operation *op) const = 0;
 
-  /// The physical info `result` carries, given `src`/`srcInfo` -- one of the
-  /// op's tensor operands already resolved to a physical type. Failure means
-  /// the op produces no physical result.
+  /// The physical info `result` carries, given both facts about it:
+  ///   `src`/`srcInfo` -- what one of the op's tensor operands HAS, already
+  ///                      resolved to a physical type (forward).
+  ///   `want`          -- the layout the backward analysis says is wanted of
+  ///                      `result`, or null when nothing wants one.
+  /// Failure means the op produces no physical result.
+  ///
+  /// Both arrive as arguments so a rule is a pure function of the op and its
+  /// facts. Only ReducePropagation reads `want` today; the alternative was to
+  /// hand that one pattern the whole requirement map, which would let it query
+  /// values it was not asked about.
   virtual llvm::FailureOr<PhysicalTypeInfo>
   propagate(Operation *op, Value result, Value src,
-            const PhysicalTypeInfo &srcInfo) const = 0;
+            const PhysicalTypeInfo &srcInfo,
+            const LayoutRequirement *want) const = 0;
 };
 
 using PhysicalPropagationPatternSet =
@@ -73,12 +83,15 @@ using PhysicalPropagationPatternSet =
 
 /// Register the propagation rule for every op this pass has been taught,
 /// mirroring populateContractionPatterns' shape.
-/// Takes Phase 1's marker map, not the PassContext. The rules are pure analysis
-/// -- handing them the context would hand them a writable `physicalValues` (a
-/// non-const reference member) and `hadError`, i.e. Phase 2B's state, which is
-/// exactly what the phase split exists to prevent.
-void populatePhysicalPropagationPatterns(PhysicalPropagationPatternSet &patterns,
-                                         const MarkerByMemView &markers);
+///
+/// Takes the backward analysis's result, not the PassContext. ReducePropagation
+/// is the one rule needing a fact about the layout its result is stored under,
+/// and it now receives that fact instead of walking forward for it. The context
+/// stays out because the rules are pure analysis -- handing them the context
+/// would hand them a writable `physicalValues` (a non-const reference member)
+/// and `hadError`, i.e. Phase 2B's state, which is exactly what the phase split
+/// exists to prevent.
+void populatePhysicalPropagationPatterns(PhysicalPropagationPatternSet &patterns);
 
 // PhysicalTypeMap -- one entry per value reachable from a Phase-1 root whose
 // physicalization resolves; a value absent from the map is logical, either
@@ -107,8 +120,14 @@ getPhysicalizedType(Value value, const PhysicalTypeMap &roots,
 
 /// Run Phase 2A over `module`, seeded from `ctx.physicalValues` (Phase 1's
 /// roots). Returns the resolved map. Mutates no IR.
-PhysicalTypeMap runPhysicalTypeAnalysis(ModuleOp module,
-                                        const PassContext &ctx);
+///
+/// `requirements` is the backward analysis's result and must already have been
+/// computed: the forward walk consumes it (at a linalg.reduce), so
+/// runRequirementAnalysis runs first. That is not a cycle -- no backward rule
+/// reads a forward fact; the backward seeds come from Phase 1's physicalized
+/// stores and every rule is a function of the op and the incoming requirement.
+PhysicalTypeMap runPhysicalTypeAnalysis(ModuleOp module, const PassContext &ctx,
+                                        const RequirementMap &requirements);
 
 /// Agreement checks between the analysis and the Phase-2 guards it will
 /// eventually replace. Active in assertion builds only; see the definition for

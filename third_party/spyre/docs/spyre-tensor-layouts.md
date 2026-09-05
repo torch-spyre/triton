@@ -77,9 +77,9 @@ diverging.
 
 Most rules are a function of the operand alone, but not all: whether a
 `linalg.reduce` produces a physical result is a question about the layout its
-result is *stored under*, so that rule walks forward to the store, the mirror of
-what the store pattern does backward. Nothing about that walk mutates IR, and it
-reads only what Phase 1 produced, so it stays an analysis.
+result is *stored under*. That fact is handed in rather than fetched — a second,
+backward analysis computes it and runs first. See "a backward requirement
+analysis" below for why the direction, not the lookup, was the problem.
 
 *2B, rewrite.* Walk the ops and act on the recorded types rather than on the
 current IR. An operand's physicality is a lookup: resolved, or predicted and not
@@ -134,6 +134,9 @@ Two crossings are deliberate and worth knowing:
 - `canRebuildPhysicalInit` is defined in `ContractionSynthesis.cpp` (2B) and
   called from `PhysicalTypeAnalysis.cpp` (2A). It is a pure predicate, and 2A
   asks the emitter's own question so the decision and the emission cannot drift.
+  Inherent rather than provisional: 2A must not promise the Physical space unless
+  2B can produce an accumulator at `accTy`, and that is a property of the init's
+  producer alone.
 - `PhysicalTypeCarryForward` is 2B's only write into 2A's map, a handle holding
   it privately behind one method. `ctx.physicalTypeAnalysis` stays a pointer to
   const. Symmetrically, the 2A rules take `const MarkerByMemView &` — Phase 1's
@@ -358,15 +361,21 @@ reduce can absorb its reduce axes while still being Logical.
   for a logical result, then have the reduce replace that value underneath it. It
   defers while its data tile is *predicted* physical but not yet registered — the
   analysis-shaped sibling of the `pendingElementwiseRetype` deferral.
-- **The init operand.** Rebuilt at physical shape rather than retyped, because
-  nothing physical flows *into* an init — it is a root the forward propagation
-  cannot reach, so there is no retype to ride and the shape has to be stated.
-  What that leaves behind, the userless logical `tensor.empty`, is not this pass's
-  problem: `_make_ktir` canonicalizes and CSEs immediately after, nothing between
-  consumes it, and the emitted KTIR is byte-identical either way. A standalone
-  `--rewrite-descriptor-layout` run therefore shows it, which is why
-  `rewrite-descriptor-layout-reduce-batch-dim.mlir` canonicalizes in its RUN line
-  — only against the folded module can it assert `CHECK-NOT: tensor.empty`.
+- **The init operand.** Nothing physical flows *into* an init — it is a root the
+  forward propagation cannot reach — so there is no retype to *ride*, and the shape
+  has to be stated. It is stated as `accTy`, which the operand plans already
+  determine, and `rebuildPhysicalInit` then retypes the existing
+  `tensor.empty`/`linalg.fill` to it in place when that is sound (single-use,
+  statically sized), minting only as a fallback for a shared or dynamically sized
+  producer. Retyping needs the `PatternRewriter` rather than a plain `OpBuilder`:
+  changing a result type without notifying the driver would leave the users it
+  should re-enqueue unvisited. `ConvertTTReduce` gives every reduction its own init
+  and no CSE runs before this pass, so the fallback is for hand-written IR rather
+  than anything the pipeline emits.
+
+  Whether the init is retyped or minted, `canRebuildPhysicalInit` still has to be
+  asked from Phase 2A, because only those two producers admit *either* treatment;
+  see the backward-analysis section for why that crossing is inherent.
 
 #### Designs rejected
 
@@ -455,6 +464,198 @@ reporting success. Note what that does not catch: if every pattern declines, the
 worklist drains and the driver calls that a fixpoint, so a permanent deferral is
 reported as success. Deferral must therefore be a prediction the analysis
 supports, never a guess.
+
+## A backward requirement analysis
+
+**All three slices implemented.** The analysis
+lives in `RewriteDescriptorLayout/RequirementAnalysis.{h,cpp}`: it computes a
+requirement for every value it reaches, seeded from the physicalized
+`ktdp.store`s, with the rule table below as its pattern set, and mutates no IR.
+
+Slice 1 landed it as a *measurement*, agreeing with the forward walk it was to
+replace. Slice 2 made it the only answer: `ReducePropagation` now reads the
+requirement at its own result and compares it arrays-against-arrays, the walk
+(`findStoreDestination`, `findMarkerForStore`, `isSingleTensorElementwiseOp`) is
+deleted from every caller, and the agreement check went with it — with nothing
+left to agree with, a check comparing the analysis to itself would be worse than
+none. What guards the reach now is the reduce coverage itself: Case 4 of
+`Conversion/rewrite-descriptor-layout-reduce-batch-dim.mlir` (`reduce` →
+`math.exp` → annotated store) pins that a requirement crosses an op between the
+reduce and its store, and `reduce__one_tile[stick, stick]` on device fails to
+compile at all if the Physical selection is lost.
+
+Slice 3 turned out not to need the analysis at all, which is the more interesting
+result and is recorded under the init below: `rebuildPhysicalInit` retypes the
+existing `tensor.empty`/`linalg.fill` in place where that is sound, and the shape
+it retypes to comes from the operand plans, not from a requirement. So the init
+row of the rule table is a rule that was never written, and the 2A/2B crossing the
+proposal expected to remove is still there — inherently.
+
+**Ordering.** The backward analysis runs *before* the forward one, because the
+forward one consumes it. Not a cycle: no backward rule reads a forward fact — the
+seeds come from Phase 1's physicalized stores, the elementwise match is
+structural, and the reduce rule consumes and propagates nothing.
+
+**What the measurement showed.** Agreement held across all 149 registry variants,
+with no rule in the table below turning out wrong and no conflicts detected. Two
+things it did establish:
+
+- The elementwise rule cannot also require the result's shape to match its
+  operands'. Phase 1 physicalizes the loads and stops, so a mid-chain
+  `arith.addf` has physical operands and a still-logical result until Phase 2
+  retypes it, and that conjunct terminated every requirement at the first
+  elementwise op. The backward match is therefore the forward one verbatim.
+- The table has no rule for a **leaf tensor producer** — an `arith.constant`
+  splat feeding an elementwise op reached by a requirement. Five matmul variants
+  hit it. Harmless (there is nothing to induce on), but it is counted as an
+  unruled op rather than silently absorbed. `tensor.empty` / `linalg.fill` stay
+  there too — slice 3 gave the init no rule.
+
+The rest of this section is the design and the questions still owed answers.
+
+### The shape of it
+
+Phase 2A asks one question, forward: *what layout does this value have?* The reduce
+showed there is a second question — *what layout is wanted of it?* — and that one
+used to be answered by a forward rule walking forward again, to the store, to fetch
+a fact it could not receive. That was `findStoreDestination`, and it was the tell.
+
+Make it a direction instead. Two facts per value:
+
+| fact | direction | seeded from |
+|---|---|---|
+| **have** | forward | the markers on physicalized `ktdp.load`s (Phase 1's roots) |
+| **want** | backward | the markers on the `ktdp.store`s the values reach |
+
+The decision at an op becomes a comparison of the two *at the same value*, rather
+than a derivation from one of them. Agreement means physical; disagreement, or a
+`want` with no satisfiable `have`, means logical and a bridge — which is what
+happens today, reached deliberately rather than by fallthrough.
+
+### The backward rules
+
+Given a requirement `R` on an op's result, what does it require of each operand?
+This is the part worth getting right, and the rules are not symmetric with the
+forward ones.
+
+| op | requirement induced on the operand |
+|---|---|
+| elementwise / single-tensor shape-preserving | `R` unchanged — rank-agnostic, so it passes straight through |
+| `linalg.transpose` | `R` permuted by the inverse permutation |
+| `linalg.reduce` | nothing crosses. `R` is **consumed here**: the reduce compares it against what its operand's forward layout induces. The operand's own layout comes from forward, not from `R` |
+| `linalg.matmul`, `linalg.batch_matmul` | nothing crosses to the operands. The op is fixed at logical rank, so its result cannot carry `R`; `R` is discharged *here*, as the widen the store already emits. The operands are still narrowed, from their own `have` — the requirement does not have to cross to establish that |
+| reshape, broadcast, expand_dims, collapse_shape | none — the physical dim count changes, so no requirement can cross |
+| `ktdp.load` | terminus: this is where `want` meets `have` |
+| `tensor.empty` / `linalg.fill` as a DPS init | no rule, and none is needed. The proposal expected `R` to be the shape to build at; slice 3 showed the shape was already available as `accTy`, derived from the operand plans (see "What it collapses") |
+
+### A requirement is total, because it is consumed rather than crossed
+
+The tempting model is that a requirement must be **partial** — that a reduce hands
+its operand "the survivors must look like `R`, the reduced dims are free", which is
+not a layout and needs a representation with free slots. It also cannot be a
+fixed-length per-physical-dim structure at all, since the operand's physical rank
+is not determined by `R`: a reduced logical dim may contribute one physical dim or
+two, and `R` cannot see which.
+
+None of that is needed, because **a requirement is consumed at the op that can
+satisfy it rather than passed through it.** What a reduce needs is `R` at *its own
+result*, which the store supplies through shape-preserving ops. Its operand's
+layout is a *forward* fact. The decision compares the two:
+
+    induced(have(operand), reducedDims)  ==  R
+
+and both sides are total. Nothing partial is ever constructed.
+
+So a requirement has exactly the shape a marker already has — the three coordinate
+arrays plus the physical extents — and every backward rule either passes a total
+requirement through (elementwise, transpose-with-inverse-permutation), consumes it
+(reduce, matmul), or terminates (reshape, broadcast).
+
+The crossing would only be forced if a reduce's operand had **no** forward fact
+while having a backward one — a reduce whose input is itself produced by a reduce
+with nothing but shape-preserving ops between. Softmax looks like that case and is
+not: its second reduction consumes `numerator`, which chains back to the *load*,
+while the first reduction's result reaches it only through a broadcast, which
+terminates a requirement. Layernorm has the same shape for the same reason.
+
+Should that case ever arise, the answer is to refuse it — Logical plus a bridge —
+with a diagnostic, rather than to model partiality for it. That keeps the
+representation total and makes the gap visible instead of silent. It is also
+measurable: it is the count of variants where a reduce's operand has a backward
+requirement and no forward layout, and today that count is zero.
+
+### What it collapses
+
+- `findStoreDestination` and its **walk**: gone entirely, along with
+  `findMarkerForStore` and `isSingleTensorElementwiseOp` — the predicate that
+  scoped the walk, whose habit of counting a DPS `outs` as a second tensor operand
+  used to need a note wherever it mattered and now needs none. Reaching forward to
+  a store is what the backward direction gives for free. The one Phase 2B caller asked only "is this store annotated", which
+  `RewriteStorePattern` can settle about the store it already holds:
+  `lookupMarkerFromTile(st.getAccessTile(), ...)`. That also fixed a latent
+  ambiguity — the walk returned the marker of whichever store came first among the
+  data tile's users, which need not be the store being rewritten.
+- `populatePhysicalPropagationPatterns` stops taking `const MarkerByMemView &`. It
+  takes `const RequirementMap &` instead — the parameter does not disappear, which
+  an earlier draft of this section claimed it would. That is right rather than a
+  compromise: the reduce genuinely needs a second fact, and the point was never to
+  have no second parameter but to have the rule *receive* the fact rather than go
+  looking for it. What did go is any route from an analysis rule to Phase 2B state.
+- The init, for a reduce — but not through the analysis, and the crossing stays.
+  `rebuildPhysicalInit` is a **retype** where that is sound: the existing
+  `tensor.empty`, or the `linalg.fill` over one, has its result type set to `accTy`
+  when it is single-use and statically sized, and is minted for otherwise. So
+  nothing is left dead behind the rewrite and the question `eraseDeadProducers`
+  used to answer does not return.
+
+  What the proposal got wrong is *where the shape comes from*. It does not come
+  from a requirement: `accTy` is already derived from the operand plans, so nothing
+  has to reach the init to know what to retype it to — the init is read only for
+  its element type. The init row of the backward rule table is therefore a rule
+  that was never needed.
+
+  And `canRebuildPhysicalInit` still crosses 2A/2B — one declaration in
+  `ContractionSynthesis.h`, called from `PhysicalTypeAnalysis.cpp`. That crossing
+  is **inherent, not residue**: Phase 2A must not promise the Physical space unless
+  Phase 2B can produce an accumulator at `accTy`, and only a `tensor.empty` or a
+  `linalg.fill` over one can be retyped *or* rebuilt — an init holding real data
+  can be neither. The predicate is the one place that condition is spelled, so 2A
+  asking the emitter's own question is what keeps the promise and the emission from
+  drifting. No backward fact removes it.
+
+  Reduce-scoped on purpose either way: `dispatchSource` rebuilds an init only in
+  the Physical space, and a matmul is always Logical, so its accumulator is a slab
+  of the wider container and is minted at slice extents regardless.
+- The markers themselves do **not** go away, and neither does
+  `physMemViewToMarker`: the markers are the only source of layout truth, and 2B
+  still resolves one from an access tile while rewriting. What changes is that the
+  store's marker is held at the seed rather than walked to.
+
+### What it owes answers to
+
+- **Conflicting requirements.** A value reaching two stores with different layouts
+  has two incompatible `want`s. Inexpressible today. The answer must be detect and
+  fall back to logical plus bridges — not pick one.
+- **Cycles.** The backward worklist needs the visit-stack detection the forward one
+  already has, for the same reason.
+- **The subset invariant.** `verifyPhysicalTypeAgreement` relates `physicalValues`
+  to the forward map. A second map needs either its own check or a restatement
+  covering both.
+- **`want` without a satisfiable `have`.** A store requiring a layout of a value
+  produced by an op that cannot be physical. This is the bridge case, and it should
+  be the explicit answer of a rule rather than what happens when no rule fires —
+  the driver reports a drained worklist as a fixpoint, so a permanent deferral
+  reads as success.
+- **Ordering.** Backward seeds from stores whose access tile Phase 1 physicalized,
+  so both analyses still run before Phase 2B and the phase structure is unchanged.
+- **A tie-break where both answers are legal.** Agreement/disagreement is a
+  legality test, and it says nothing about a value with **no** `want` at all, where
+  more than one answer verifies and the difference is cost. A free-typed op needs a
+  rule for choosing, not just for rejecting.
+- **A join at multi-operand `arith.*` ops.** The elementwise rule hands the same
+  `R` to every operand, but nothing states that the operands' `have`s must agree
+  with each other. `reconcileOperandSet` does that for source ops; a mixed pair at
+  an `arith` op is a parse failure rather than a cost, and no rule covers it.
 
 ## Rejected inputs
 

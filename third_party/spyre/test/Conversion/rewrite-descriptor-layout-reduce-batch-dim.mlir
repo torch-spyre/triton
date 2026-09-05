@@ -20,18 +20,20 @@
 // --canonicalize is in the RUN line because this pass never runs alone: the
 // backend follows it with canonicalize + CSE in the same pass manager
 // (SpyreBackend._make_ktir), so the module *after* folding is the one that
-// becomes KTIR, and it is the one worth pinning. Two things it removes, both of
-// which a standalone run would leave behind and this file would then have to
-// assert as if they mattered:
+// becomes KTIR, and it is the one worth pinning. One thing it removes that a
+// standalone run would leave behind, and this file would then have to assert as
+// if it mattered:
 //
-//   - the logical init the Physical-space path leaves dead. rebuildPhysicalInit
-//     mints the accumulator at the physical shape rather than retyping the
-//     original, so a userless tensor.empty is left over. The pass used to erase
-//     it by hand; the canonicalizer collects it, which is why the CHECK-NOTs
-//     below can say tensor.empty at all.
 //   - an identity tensor.extract_slice. The widen stage emits one per stick, and
 //     at a single stick that is a slice of the whole thing into its own type --
 //     a no-op the folder drops (case 2).
+//
+// It used to be two. The other was the dead logical init: rebuildPhysicalInit
+// minted the accumulator at the physical shape instead of retyping the original,
+// leaving a userless tensor.empty per Physical-space case. It now retypes in
+// place, so the standalone output carries no dead init -- tensor.empty over this
+// file goes 8 -> 5. The CHECK-NOT: tensor.empty below would hold without
+// --canonicalize now; case 2's extract_slice is what still needs it.
 //
 // The CHECK-NOTs are interleaved between consecutive positive checks rather than
 // gathered at the end: a CHECK-NOT's range runs from the previous match to the
@@ -52,13 +54,14 @@
 module {
 // CHECK-LABEL:   tt.func @reduce_surviving_stick_is_a_batch_dim(
 // CHECK:           %[[LOAD:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf16>
-// The accumulator is rebuilt at the PHYSICAL shape: rank 2, stick index first.
+// The accumulator is at the PHYSICAL shape: rank 2, stick index first -- the
+// original logical init retyped in place, not a second one minted beside it.
 // The neutral-element fill survives here on purpose — dropping it is
 // DropReductionInitFill's job, later, in the spyrecode stage only.
 // CHECK-NOT:       scf.for
 // CHECK-NOT:       tensor.extract_slice
 // One tensor.empty in the whole function -- the accumulator. A second one here
-// would be the dead logical init surviving the fold.
+// would be a minted accumulator with the logical init left dead beside it.
 // CHECK-NOT:       tensor.empty
 // CHECK:           %[[EMPTY:.*]] = tensor.empty() : tensor<2x64xf16>
 // CHECK:           %[[ACC:.*]] = linalg.fill ins(%{{.*}} : f16) outs(%[[EMPTY]] : tensor<2x64xf16>) -> tensor<2x64xf16>
@@ -201,6 +204,64 @@ tt.func @reduce_two_batch_dims(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>) {
   }) {axis = 1 : i32} : (tensor<2x64x128xf16>) -> tensor<2x128xf16>
 
   tt.descriptor_store %c_desc[%c0_i32, %c0_i32], %r : !tt.tensordesc<2x128xf16>, tensor<2x128xf16>
+  tt.return
+}
+}
+
+// -----
+
+// Case 4: the same batch-dim form with an elementwise op between the reduce and
+// the store. Nothing about the reduce changes -- what this adds is that the
+// layout has to reach it across another op.
+//
+// This is the narrow guard on the backward analysis's reach. ReducePropagation
+// selects the Physical space by comparing what its operand induces against the
+// requirement AT ITS OWN RESULT, and the only thing that puts a requirement there
+// is the backward elementwise rule carrying it back across the math.exp. If that
+// rule ever terminates here instead, the reduce falls back to Logical and the
+// CHECK-NOTs below catch the stick loop that replaces it.
+module {
+// CHECK-LABEL:   tt.func @reduce_batch_dim_through_elementwise(
+// CHECK:           %[[LOAD:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf16>
+// CHECK-NOT:       scf.for
+// CHECK-NOT:       tensor.extract_slice
+// CHECK-NOT:       tensor.empty
+// CHECK:           %[[EMPTY:.*]] = tensor.empty() : tensor<2x64xf16>
+// CHECK:           %[[ACC:.*]] = linalg.fill ins(%{{.*}} : f16) outs(%[[EMPTY]] : tensor<2x64xf16>) -> tensor<2x64xf16>
+// CHECK:           %[[RED:.*]] = linalg.reduce ins(%[[LOAD]] : tensor<2x64x64xf16>) outs(%[[ACC]] : tensor<2x64xf16>) dimensions = [1]
+// The elementwise op is retyped to the physical shape and the store takes it
+// directly: the reduce's result never returns to logical rank on the way out.
+// CHECK:           %[[EXP:.*]] = math.exp %[[RED]] : tensor<2x64xf16>
+// CHECK-NOT:       linalg.reduce
+// CHECK-NOT:       scf.for
+// CHECK-NOT:       tensor.extract_slice
+// CHECK-NOT:       tensor.insert_slice
+// CHECK:           ktdp.store %[[EXP]], %{{.*}} : tensor<2x64xf16>, <2x64xindex>
+tt.func @reduce_batch_dim_through_elementwise(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>) {
+  %c0_i32 = arith.constant 0 : i32
+  %c64_i32 = arith.constant 64 : i32
+  %c128_i32 = arith.constant 128 : i32
+  %c128_i64 = arith.constant 128 : i64
+  %c1_i64 = arith.constant 1 : i64
+
+  %a_desc = tt.make_tensor_descriptor %a_ptr, [%c64_i32, %c128_i32], [%c128_i64, %c1_i64]
+      : !tt.ptr<f16>, !tt.tensordesc<64x128xf16>
+  tt.spyre_tensor_layout %a_desc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf16>
+  %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
+
+  %c_desc = tt.make_tensor_descriptor %c_ptr, [%c128_i32], [%c1_i64]
+      : !tt.ptr<f16>, !tt.tensordesc<128xf16>
+  tt.spyre_tensor_layout %c_desc {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : !tt.tensordesc<128xf16>
+
+  %r = "tt.reduce"(%a) ({
+  ^bb0(%arg0: f16, %arg1: f16):
+    %add = arith.addf %arg0, %arg1 : f16
+    tt.reduce.return %add : f16
+  }) {axis = 0 : i32} : (tensor<64x128xf16>) -> tensor<128xf16>
+
+  %e = math.exp %r : tensor<128xf16>
+
+  tt.descriptor_store %c_desc[%c0_i32], %e : !tt.tensordesc<128xf16>, tensor<128xf16>
   tt.return
 }
 }
