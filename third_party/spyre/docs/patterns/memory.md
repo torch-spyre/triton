@@ -129,13 +129,13 @@ Expected diagnostics:
 
 **Round-trip evidence**
 
-- `gather::default` — M=1024, N=64, K_INDICES=32, BLOCK_COLS=32, y_offset=16
+- `gather::default` — M=1024, N=64, K_INDICES=256, BLOCK_ROWS=8, BLOCK_COLS=32, y_offset=16
+- `gather::1core` — M=1024, N=64, K_INDICES=32, BLOCK_COLS=32, y_offset=16 (also demonstrates: 1core)
 - `gather::2d` — M=1024, N=128, K_INDICES=64, BLOCK_ROWS=8, BLOCK_COLS=16 (also demonstrates: program-id-2d, num-programs-fold)
 - `gather::2d_serial`
 - `gather::1d` — K=1024, K_INDICES=256, BLOCK_ROWS=8 (also demonstrates: 1d-source)
-- `gather::2d_large_table_serial`
 
-_+ 4 more variants_
+_+ 5 more variants_
 
 ## descriptor-gather-2d-indices
 
