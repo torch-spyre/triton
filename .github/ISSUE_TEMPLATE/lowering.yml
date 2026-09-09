@@ -6,31 +6,43 @@ body:
 - type: markdown
   attributes:
     value: |
-      The best way to report a lowering gap is a pull request adding a
-      `@pattern(..., negative=True, example=[...])` single-pass test that pins
-      the unsupported IR. The test should:
+      The best way to report a lowering gap is a pull request adding a lit test
+      that pins the unsupported IR. The test should run today by asserting the
+      current gap, and have a clear flip path when the lowering lands.
 
-      - run today by asserting the current gap,
-      - generate an entry in `third_party/spyre/docs/patterns/*.md`,
-      - have a clear flip path when the lowering lands: drop `negative=True`
-        and update the assertion from "still present" to "lowered away".
+      If the pass **rejects** the input with a diagnostic, add a case to the
+      matching `*-invalid.mlir` under `third_party/spyre/test/Conversion/` and
+      pin the message:
 
-      Minimal example:
+      ```mlir
+      // RUN: spyre-triton-opt %s --lower-compute-ops -split-input-file -verify-diagnostics
 
-      ```python
-      @pattern("foo", category="compute", negative=True, example=[
-          "x = tl.foo(y)   # NOT supported: tt.foo survives lowering",
-      ])
-      def test_foo_survives(self):
-          """tt.foo has no lowering pattern yet; flip when one lands."""
-          self.run("module { tt.func @k() { tt.foo : () -> () ; tt.return } }")
-          self.assert_present("tt.foo")
+      tt.func @k(%arg0: tensor<4xf32>) {
+        // expected-error @below {{no lowering for tt.foo}}
+        %0 = tt.foo %arg0 : tensor<4xf32> -> tensor<4xf32>
+        tt.return
+      }
       ```
 
-      Add the test to the closest matching file under `third_party/spyre/test/`,
-      then run `uv run python third_party/spyre/scripts/gen_patterns_docs.py`
-      before opening the PR. Use this issue template if you cannot construct
-      the test yet and need maintainer help.
+      If the pass **succeeds but leaves the op behind**, pin that instead with
+      FileCheck — the op surviving is itself the gap:
+
+      ```mlir
+      // RUN: spyre-triton-opt %s --lower-compute-ops | FileCheck %s
+
+      // CHECK-LABEL: @k
+      // CHECK: tt.foo
+      tt.func @k(%arg0: tensor<4xf32>) {
+        %0 = tt.foo %arg0 : tensor<4xf32> -> tensor<4xf32>
+        tt.return
+      }
+      ```
+
+      In both cases explain in a comment why the case is expected to fail today
+      and what should change when the lowering lands. Run
+      `uv run lit build/cmake.*/third_party/spyre/test -v` before opening the PR.
+      Use this issue template if you cannot construct the test yet and need
+      maintainer help.
 - type: textarea
   attributes:
     label: Triton pattern or IR that exposed the gap
@@ -43,20 +55,23 @@ body:
     required: true
 - type: dropdown
   attributes:
-    label: Closest test area
-    description: Pick the closest existing test file, or choose unknown if a maintainer should route it.
+    label: Suspected pass
+    description: Pick the pass you believe should handle this, or choose unknown if a maintainer should route it.
     options:
-      - lower_compute_ops
-      - lower_desc_memory
-      - distribute_work
-      - ktir_examples
+      - LowerComputeOps
+      - LowerDescriptorMemory
+      - LowerScalarLoad
+      - RewriteDescriptorLayout
+      - ConvertFunctions
+      - DistributeWork
+      - end-to-end kernel example (fixtures)
       - unknown
   validations:
     required: true
 - type: input
   attributes:
-    label: Linked negative-pattern PR
-    description: If you opened a PR adding a `@pattern(..., negative=True)` test, link it here.
+    label: Linked test PR
+    description: If you opened a PR adding a test that pins this gap, link it here.
     placeholder: "#NNN"
   validations:
     required: false

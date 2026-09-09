@@ -15,7 +15,6 @@ to verify both the RuntimeError and the MLIR diagnostic on stderr.
 
 import pytest
 from conftest import SinglePassTester
-from utils_pattern import pattern
 
 
 class LowerComputeOpsTester(SinglePassTester):
@@ -35,16 +34,19 @@ class TestSplat(LowerComputeOpsTester):
     # test_i32_2d    — 2-D tensor, i32 (also checks tensor.empty emitted)
     # test_f16_3d    — 3-D tensor, f16
 
-    @pattern("splat", category="compute", example=[
-        "scalar = 1.0",
-        "tensor = tl.broadcast(scalar, shape=[BLOCK_SIZE])  # tl.splat",
-    ])
     def test_f32_1d(self):
         """Broadcast a scalar to fill every element of a 1-D tensor.
 
         ``tt.splat`` (``tl.broadcast``) lowers to ``linalg.fill`` into a
         ``tensor.empty``.  The scalar value is broadcast to every element;
         the output shape comes from the ``tt.splat`` result type.
+
+        Triton source pattern:
+
+        ```python
+        scalar = 1.0
+        tensor = tl.broadcast(scalar, shape=[BLOCK_SIZE])  # tl.splat
+        ```
         """
         self.run("""
         module {
@@ -99,10 +101,13 @@ class TestReshape(LowerComputeOpsTester):
     # test_2d_to_3d    — increase rank (also checks tensor.from_elements)
     # test_allow_reorder — allow_reorder attribute is accepted
 
-    @pattern("reshape", category="compute", example=[
-        "x = tl.reshape(x, [BLOCK_M, BLOCK_N])  # reinterpret flat tile as 2D",
-    ])
     def test_1d_to_2d(self):
+        """Triton source pattern:
+
+        ```python
+        x = tl.reshape(x, [BLOCK_M, BLOCK_N])  # reinterpret flat tile as 2D
+        ```
+        """
         self.run("""
         module {
           tt.func @k(%t: tensor<512xf32>) -> tensor<16x32xf32> {
@@ -153,13 +158,6 @@ class TestReshape(LowerComputeOpsTester):
         self.assert_present("tensor.reshape")
         self.assert_absent("tt.reshape")
 
-    @pattern("reshape", category="compute", example=[
-        "# Collapse the rank-4 output of an N-D gather into a rank-2 tile",
-        "# so tl.dot can consume it. OUT_LEN = NUM_BLOCKS * NUM_GROUPS * BLOCK_SIZE.",
-        "gathered_4d = src_desc.gather(indices, group_idx)  # [NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM]",
-        "gathered_2d = tl.reshape(gathered_4d, [OUT_LEN, INNER_DIM])",
-        "out         = tl.dot(lhs, tl.trans(gathered_2d))   # 2-D dot",
-    ])
     def test_4d_to_2d_collapse_three_leading_dims(self):
         """Rank-4 → rank-2 contiguous flatten that collapses three leading dims into one.
 
@@ -179,6 +177,16 @@ class TestReshape(LowerComputeOpsTester):
         Shape values: ``NUM_BLOCKS = 8``, ``NUM_GROUPS = 1``,
         ``BLOCK_SIZE = 16``, ``INNER_DIM = 64`` →
         ``OUT_LEN = NUM_BLOCKS * NUM_GROUPS * BLOCK_SIZE = 128``.
+
+        Triton source pattern:
+
+        ```python
+        # Collapse the rank-4 output of an N-D gather into a rank-2 tile
+        # so tl.dot can consume it. OUT_LEN = NUM_BLOCKS * NUM_GROUPS * BLOCK_SIZE.
+        gathered_4d = src_desc.gather(indices, group_idx)  # [NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM]
+        gathered_2d = tl.reshape(gathered_4d, [OUT_LEN, INNER_DIM])
+        out         = tl.dot(lhs, tl.trans(gathered_2d))   # 2-D dot
+        ```
         """
         self.run("""
         module {
@@ -205,12 +213,16 @@ class TestExpandDims(LowerComputeOpsTester):
     # test_axis_1         — insert size-1 dim at end   (1-D → 2-D)
     # test_2d_middle_axis — insert size-1 dim in middle (2-D → 3-D)
 
-    @pattern("expand-dims", category="compute", example=[
-        "x = tl.load(x_ptr + offsets)          # tensor<BLOCK x f32>",
-        "x = tl.expand_dims(x, axis=0)         # tensor<1 x BLOCK x f32>",
-    ])
     def test_axis_0(self):
-        """tensor<8xf32> → tensor<1x8xf32>  (insert dim at front)"""
+        """tensor<8xf32> → tensor<1x8xf32>  (insert dim at front)
+
+        Triton source pattern:
+
+        ```python
+        x = tl.load(x_ptr + offsets)          # tensor<BLOCK x f32>
+        x = tl.expand_dims(x, axis=0)         # tensor<1 x BLOCK x f32>
+        ```
+        """
         self.run("""
         module {
           tt.func @k(%t: tensor<8xf32>) -> tensor<1x8xf32> {
@@ -265,13 +277,17 @@ class TestBroadcast(LowerComputeOpsTester):
     # test_expand_multiple_dims — broadcast two dims simultaneously
     # test_noop_same_shape     — no size-1 dims → replaced with input directly
 
-    @pattern("broadcast", category="compute", example=[
-        "row = tl.load(row_ptr + tl.arange(0, N))  # tensor<N x f32>",
-        "row = tl.expand_dims(row, axis=0)          # tensor<1 x N x f32>",
-        "mat = tl.broadcast_to(row, [M, N])         # tensor<M x N x f32>",
-    ])
     def test_expand_first_dim(self):
-        """tensor<1x8xf32> → tensor<4x8xf32>  (broadcast dim 0)"""
+        """tensor<1x8xf32> → tensor<4x8xf32>  (broadcast dim 0)
+
+        Triton source pattern:
+
+        ```python
+        row = tl.load(row_ptr + tl.arange(0, N))  # tensor<N x f32>
+        row = tl.expand_dims(row, axis=0)          # tensor<1 x N x f32>
+        mat = tl.broadcast_to(row, [M, N])         # tensor<M x N x f32>
+        ```
+        """
         self.run("""
         module {
           tt.func @k(%t: tensor<1x8xf32>) -> tensor<4x8xf32> {
@@ -350,11 +366,14 @@ class TestTrans(LowerComputeOpsTester):
     # test_2d_transpose — swap rows and columns
     # test_3d_permute   — 3-D permutation [2, 0, 1]
 
-    @pattern("transpose", category="compute", example=[
-        "a = tl.load(a_desc, [m * BM, k * BK])     # tensor<BM x BK x f32>",
-        "a_t = tl.trans(a)                          # tensor<BK x BM x f32>",
-    ])
     def test_2d_transpose(self):
+        """Triton source pattern:
+
+        ```python
+        a = tl.load(a_desc, [m * BM, k * BK])     # tensor<BM x BK x f32>
+        a_t = tl.trans(a)                          # tensor<BK x BM x f32>
+        ```
+        """
         self.run("""
         module {
           tt.func @k(%t: tensor<4x8xf32>) -> tensor<8x4xf32> {
@@ -392,12 +411,15 @@ class TestJoin(LowerComputeOpsTester):
     # test_1d — two 1-D tensors → 2-D result
     # test_2d — two 2-D tensors → 3-D result
 
-    @pattern("join", category="compute", example=[
-        "real = tl.load(real_ptr + offsets)   # tensor<BLOCK x f32>",
-        "imag = tl.load(imag_ptr + offsets)   # tensor<BLOCK x f32>",
-        "pair = tl.join(real, imag)           # tensor<BLOCK x 2 x f32>",
-    ])
     def test_1d(self):
+        """Triton source pattern:
+
+        ```python
+        real = tl.load(real_ptr + offsets)   # tensor<BLOCK x f32>
+        imag = tl.load(imag_ptr + offsets)   # tensor<BLOCK x f32>
+        pair = tl.join(real, imag)           # tensor<BLOCK x 2 x f32>
+        ```
+        """
         self.run("""
         module {
           tt.func @k(%a: tensor<8xf32>, %b: tensor<8xf32>) -> tensor<8x2xf32> {
@@ -435,11 +457,14 @@ class TestSplit(LowerComputeOpsTester):
     # test_2d — tensor<8x2> → two tensor<8>
     # test_3d — tensor<4x8x2> → two tensor<4x8>
 
-    @pattern("split", category="compute", example=[
-        "pair = tl.load(pair_desc, [pid * BLOCK])  # tensor<BLOCK x 2 x f32>",
-        "real, imag = tl.split(pair)               # two tensor<BLOCK x f32>",
-    ])
     def test_2d(self):
+        """Triton source pattern:
+
+        ```python
+        pair = tl.load(pair_desc, [pid * BLOCK])  # tensor<BLOCK x 2 x f32>
+        real, imag = tl.split(pair)               # two tensor<BLOCK x f32>
+        ```
+        """
         self.run("""
         module {
           tt.func @k(%t: tensor<8x2xf32>) -> (tensor<8xf32>, tensor<8xf32>) {
@@ -493,12 +518,6 @@ class TestMakeRange(LowerComputeOpsTester):
     # this by pushing per-lane masking decisions into the wrapper rather
     # than computing them in-kernel from a tl.arange-derived index vector.
 
-    @pattern("make-range", category="compute", negative=True, example=[
-        "# NOT supported: tl.arange used in pure tensor arithmetic",
-        "# (no descriptor consumer to fold it away)",
-        "bh_idx    = bh_offset + tl.arange(0, BLOCK_BH)   # tt.make_range survives",
-        "bh_active = bh_idx < BH                          # ... into arith.cmpi",
-    ])
     def test_make_range_in_arithmetic_survives(self):
         """tt.make_range in pure arithmetic is left untouched by LowerComputeOps.
 
@@ -509,8 +528,17 @@ class TestMakeRange(LowerComputeOpsTester):
 
         When a lowering for tt.make_range is added (likely as A8 in
         LowerComputeOps.cpp, rewriting to arith.constant dense<...>),
-        flip this assertion to assert_absent and update the @pattern
-        decorator to drop negative=True.
+        flip this assertion to assert_absent and rename this test to say
+        the op is lowered away rather than that it survives.
+
+        Triton source pattern:
+
+        ```python
+        # NOT supported: tl.arange used in pure tensor arithmetic
+        # (no descriptor consumer to fold it away)
+        bh_idx    = bh_offset + tl.arange(0, BLOCK_BH)   # tt.make_range survives
+        bh_active = bh_idx < BH                          # ... into arith.cmpi
+        ```
         """
         self.run("""
         module {
@@ -558,15 +586,18 @@ class TestReduce(LowerComputeOpsTester):
         self.assert_absent("tt.reduce")
         self.assert_result_type("linalg.reduce", "tensor<8xf32>")
 
-    @pattern("reduce", category="compute", example=[
-        "x = tl.load(x_ptr + offsets)       # tensor<BLOCK_M x BLOCK_N x f32>",
-        "row_sum = tl.sum(x, axis=1)        # tensor<BLOCK_M x f32>",
-    ])
     def test_sum_f32(self):
         """Sum-reduce a 2-D tensor along an axis using ``arith.addf``.
 
         ``tt.reduce`` with an ``addf`` combiner lowers to ``linalg.reduce``
         with identity ``0.0``.  The output rank is one less than the input.
+
+        Triton source pattern:
+
+        ```python
+        x = tl.load(x_ptr + offsets)       # tensor<BLOCK_M x BLOCK_N x f32>
+        row_sum = tl.sum(x, axis=1)        # tensor<BLOCK_M x f32>
+        ```
         """
         self.run("""
         module {
@@ -584,16 +615,19 @@ class TestReduce(LowerComputeOpsTester):
         self.assert_absent("tt.reduce")
         self.assert_result_type("linalg.reduce", "tensor<4xf32>")
 
-    @pattern("reduce", category="compute", example=[
-        "x = tl.load(x_ptr + offsets)       # tensor<BLOCK_M x BLOCK_N x f32>",
-        "row_max = tl.max(x, axis=1)        # tensor<BLOCK_M x f32>",
-    ])
     def test_max_f32(self):
         """Max-reduce a 2-D tensor along an axis using ``arith.maxnumf``.
 
         ``tt.reduce`` with a ``maxnumf`` combiner lowers to ``linalg.reduce``
         with identity ``-inf``.  NaN-handling follows ``arith.maxnumf``
         semantics (NaN propagates from the right operand only).
+
+        Triton source pattern:
+
+        ```python
+        x = tl.load(x_ptr + offsets)       # tensor<BLOCK_M x BLOCK_N x f32>
+        row_max = tl.max(x, axis=1)        # tensor<BLOCK_M x f32>
+        ```
         """
         self.run("""
         module {
@@ -611,10 +645,6 @@ class TestReduce(LowerComputeOpsTester):
         self.assert_absent("tt.reduce")
         self.assert_result_type("linalg.reduce", "tensor<4xf32>")
 
-    @pattern("reduce", category="compute", negative=True, example=[
-        "# arith.subf has no neutral element — tl.reduce with subtraction is not supported",
-        "result = tl.reduce(x, axis=1, combine_fn=lambda a, b: a - b)",
-    ])
     def test_subf_combiner_fails(self, capfd):
         """arith.subf has no neutral element → pattern returns failure().
 
@@ -622,6 +652,13 @@ class TestReduce(LowerComputeOpsTester):
         (e.g. 0.0 for addf, -inf for maxnumf).  arith.subf has no
         neutral element — arith::getNeutralElement returns nullopt —
         so ConvertTTReduce returns failure() and the op stays illegal.
+
+        Triton source pattern:
+
+        ```python
+        # arith.subf has no neutral element — tl.reduce with subtraction is not supported
+        result = tl.reduce(x, axis=1, combine_fn=lambda a, b: a - b)
+        ```
         """
         import pytest
         with pytest.raises(RuntimeError, match="PassManager::run failed"):
@@ -677,11 +714,6 @@ class TestReduce(LowerComputeOpsTester):
         self.assert_present("linalg.reduce")
         self.assert_absent("tt.reduce")
 
-    @pattern("reduce", category="compute", example=[
-        "values, indices = tl.argmax(x, axis=1, return_indices=True)",
-        "# lowers to linalg.reduce with two inputs (f32 values + i32 indices)",
-        "# index lane initialised with -1 as an invalid-index sentinel",
-    ])
     def test_multi_operand_reduce(self):
         """Multi-operand ``tt.reduce`` (e.g. argmax) lowers to a single ``linalg.reduce``.
 
@@ -689,6 +721,14 @@ class TestReduce(LowerComputeOpsTester):
         (identity -inf) and the index lane uses ``arith.select`` (identity -1).
         Both are passed as inputs to one ``linalg.reduce`` op whose combiner
         region is cloned directly from the ``tt.reduce`` combiner.
+
+        Triton source pattern:
+
+        ```python
+        values, indices = tl.argmax(x, axis=1, return_indices=True)
+        # lowers to linalg.reduce with two inputs (f32 values + i32 indices)
+        # index lane initialised with -1 as an invalid-index sentinel
+        ```
         """
         self.run("""
         module {
@@ -722,14 +762,17 @@ class TestDot(LowerComputeOpsTester):
     # test_large       — larger tile sizes (2D)
     # test_batch_matmul — 3D tt.dot → linalg.batch_matmul
 
-    @pattern("dot", category="compute", example=[
-        "acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)",
-        "for k in range(k_tiles):",
-        "    a = a_desc.load([m * BM, k * BK])  # tensor<BM x BK x f32>",
-        "    b = b_desc.load([k * BK, n * BN])  # tensor<BK x BN x f32>",
-        "    acc = tl.dot(a, b, acc)             # tensor<BM x BN x f32>",
-    ])
     def test_f32(self):
+        """Triton source pattern:
+
+        ```python
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for k in range(k_tiles):
+            a = a_desc.load([m * BM, k * BK])  # tensor<BM x BK x f32>
+            b = b_desc.load([k * BK, n * BN])  # tensor<BK x BN x f32>
+            acc = tl.dot(a, b, acc)             # tensor<BM x BN x f32>
+        ```
+        """
         self.run("""
         module {
           tt.func @k(%a: tensor<16x32xf32>, %b: tensor<32x8xf32>,
@@ -785,19 +828,6 @@ class TestDot(LowerComputeOpsTester):
         self.assert_absent("tt.dot")
         self.assert_result_type("linalg.batch_matmul", "tensor<4x16x8xf32>")
 
-    @pattern("dot", category="compute", negative=True, example=[
-        "# REJECTED: rank-4 tt.dot — verifier accepts only rank 2 or 3.",
-        "# An N-D indirect-access gather produces rank-4 (or rank-5",
-        "# stickified) tiles; those must be reshaped down to rank-2",
-        "# BEFORE tl.dot — the dot op does not flatten its inputs.",
-        "a4 = tl.descriptor_gather(a_desc, idx, y)   # tensor<NUM_BLOCKS x NUM_GROUPS x BLOCK x INNER xf32>",
-        "b4 = tl.descriptor_gather(b_desc, idx, y)   # same rank-4 shape",
-        "out = tl.dot(a4, b4)                         # 'tt.dot op expected operands to be 2d or 3d'",
-        "# Workaround: collapse leading dims first.",
-        "a2 = tl.reshape(a4, [OUT_LEN, INNER])       # rank-2",
-        "b2 = tl.reshape(b4, [INNER, OUT_LEN])",
-        "out = tl.dot(a2, b2)                         # accepted",
-    ])
     def test_dot_4d_rejected(self, capfd):
         """Rank ≥ 4 ``tt.dot`` is rejected by the upstream Triton verifier.
 
@@ -836,6 +866,22 @@ class TestDot(LowerComputeOpsTester):
         TODO: tighten ``ConvertTTDot`` to either handle rank ≥ 4 or
         explicitly emit ``failure()`` with a diagnostic, then add a
         positive test for the rejected-with-diagnostic path.
+
+        Triton source pattern:
+
+        ```python
+        # REJECTED: rank-4 tt.dot — verifier accepts only rank 2 or 3.
+        # An N-D indirect-access gather produces rank-4 (or rank-5
+        # stickified) tiles; those must be reshaped down to rank-2
+        # BEFORE tl.dot — the dot op does not flatten its inputs.
+        a4 = tl.descriptor_gather(a_desc, idx, y)   # tensor<NUM_BLOCKS x NUM_GROUPS x BLOCK x INNER xf32>
+        b4 = tl.descriptor_gather(b_desc, idx, y)   # same rank-4 shape
+        out = tl.dot(a4, b4)                         # 'tt.dot op expected operands to be 2d or 3d'
+        # Workaround: collapse leading dims first.
+        a2 = tl.reshape(a4, [OUT_LEN, INNER])       # rank-2
+        b2 = tl.reshape(b4, [INNER, OUT_LEN])
+        out = tl.dot(a2, b2)                         # accepted
+        ```
         """
         with pytest.raises(RuntimeError, match="Parse MLIR file failed"):
             self.run("""

@@ -16,7 +16,6 @@ both ``tt.func`` (pre-ConvertFunctions) and ``func.func`` (post).
 
 import pytest
 from conftest import SinglePassTester
-from utils_pattern import pattern
 
 
 class DistributeWorkTester(SinglePassTester):
@@ -66,11 +65,6 @@ class TestReplacePidOnly(DistributeWorkTester):
         }
         """)
 
-    @pattern("program-id-1d", category="distribution", example=[
-        "pid = tl.program_id(0)",
-        "# use pid to compute this core's slice of work",
-        "offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)",
-    ])
     def test_no_scf_for_synthesized(self):
         """Replace a 1-D ``tt.get_program_id`` with a compute tile id.
 
@@ -78,6 +72,14 @@ class TestReplacePidOnly(DistributeWorkTester):
         ``ktdp.get_compute_tile_id`` and one ``arith.index_cast`` (index → i32).
         The pass does **not** synthesize a wrapping ``scf.for`` — kernels must
         express their own per-core work loop.
+
+        Triton source pattern:
+
+        ```python
+        pid = tl.program_id(0)
+        # use pid to compute this core's slice of work
+        offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        ```
         """
         self.assert_absent("scf.for")
 
@@ -248,13 +250,6 @@ class TestMultiAxisPid(DistributeWorkTester):
         }
         """)
 
-    @pattern("program-id-2d", category="distribution", example=[
-        "pid_x = tl.program_id(0)",
-        "pid_y = tl.program_id(1)",
-        "# both axes share one underlying tile-id op after lowering",
-        "row_offset = pid_x * BLOCK_M",
-        "col_offset = pid_y * BLOCK_N",
-    ])
     def test_single_ktdp_op(self):
         """Replace 2-D ``tt.get_program_id`` (x and y) with a single tile id op.
 
@@ -262,6 +257,16 @@ class TestMultiAxisPid(DistributeWorkTester):
         pass emits one variadic ``ktdp.get_compute_tile_id`` that returns two
         index values — one per grid dimension — and one ``arith.index_cast``
         per axis to recover the i32 program id.
+
+        Triton source pattern:
+
+        ```python
+        pid_x = tl.program_id(0)
+        pid_y = tl.program_id(1)
+        # both axes share one underlying tile-id op after lowering
+        row_offset = pid_x * BLOCK_M
+        col_offset = pid_y * BLOCK_N
+        ```
         """
         self.assert_count("ktdp.get_compute_tile_id", 1, cmp="eq")
 
@@ -581,19 +586,22 @@ class TestNumProgramsFold1D(DistributeWorkTester):
     def test_num_programs_removed(self):
         self.assert_absent("tt.get_num_programs")
 
-    @pattern("num-programs-fold", category="distribution", example=[
-        "pid = tl.program_id(0)",
-        "num_cores = tl.num_programs(0)  # folded to grid size constant at compile time",
-        "num_tiles = tl.cdiv(N, BLOCK_SIZE)",
-        "tiles_per_core = tl.cdiv(num_tiles, num_cores)",
-        "start = pid * tiles_per_core",
-    ])
     def test_addi_rhs_is_constant_32(self):
         """``tt.get_num_programs`` is folded to the grid size constant.
 
         ``tt.get_num_programs x`` returns the number of cores on axis 0.
         With a 1-D grid of 32, the pass folds the op away and replaces
         every use with ``arith.constant 32 : i32``.
+
+        Triton source pattern:
+
+        ```python
+        pid = tl.program_id(0)
+        num_cores = tl.num_programs(0)  # folded to grid size constant at compile time
+        num_tiles = tl.cdiv(N, BLOCK_SIZE)
+        tiles_per_core = tl.cdiv(num_tiles, num_cores)
+        start = pid * tiles_per_core
+        ```
         """
         self.assert_operand("arith.addi", 1, value=32,
                             defined_by="arith.constant")
@@ -652,11 +660,6 @@ class TestNumProgramsFold2D(DistributeWorkTester):
 class TestNumProgramsWithoutPidErrors(DistributeWorkTester):
     GRID = [32]
 
-    @pattern("num-programs-fold", category="distribution", negative=True, example=[
-        "# Missing tl.program_id — tl.num_programs alone has nothing to act on",
-        "num_cores = tl.num_programs(0)",
-        "result = do_something(num_cores)  # per-core location is unknown",
-    ])
     def test_errors(self, capfd):
         """Kernel reads `tt.get_num_programs` without any `tt.program_id`.
 
@@ -664,6 +667,14 @@ class TestNumProgramsWithoutPidErrors(DistributeWorkTester):
         locates itself in the grid has nothing to do with the answer —
         no per-core branch can use it. The pass flags this as a likely
         bug rather than silently generating unreachable code.
+
+        Triton source pattern:
+
+        ```python
+        # Missing tl.program_id — tl.num_programs alone has nothing to act on
+        num_cores = tl.num_programs(0)
+        result = do_something(num_cores)  # per-core location is unknown
+        ```
         """
         with pytest.raises(RuntimeError, match="PassManager::run failed"):
             self.run("""

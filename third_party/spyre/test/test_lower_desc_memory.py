@@ -22,7 +22,6 @@ import re
 
 import pytest
 from conftest import SinglePassTester
-from utils_pattern import pattern
 
 
 def _parse_indirect_subscripts(text: str):
@@ -115,10 +114,6 @@ class TestDescriptorLoad(LowerDescMemoryTester):
     # test_dynamic_shape_1d            — 1-D, runtime shape → memref<?xf16>
     # test_dynamic_shape_2d            — 2-D, both dims runtime → memref<?x?xf16>
 
-    @pattern("descriptor-load-static", category="memory", example=[
-        "desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])",
-        "tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>",
-    ])
     @pytest.mark.parametrize("N", [512, 1024, 4096])
     def test_static_shape_1d(self, N):
         """Load a 1-D tile from a statically-shaped tensor descriptor.
@@ -128,6 +123,13 @@ class TestDescriptorLoad(LowerDescMemoryTester):
         ``ktdp.construct_access_tile`` (block-sized tile positioned by the load
         index) + ``ktdp.load``.  The block shape (e.g. 64) lives only on the
         access tile; the memory view always carries the full tensor size.
+
+        Triton source pattern:
+
+        ```python
+        desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])
+        tile = tl.descriptor_load(desc, [pid * BLOCK])  # loads tensor<BLOCKxf16>
+        ```
         """
         # 1-D load.  %N is an arith.constant — known at compile time.
         # The memory view gets shape [N]; the access tile is positioned by %off.
@@ -233,11 +235,6 @@ class TestDescriptorLoad(LowerDescMemoryTester):
         self.assert_result("ktdp.construct_memory_view", shape=[1024], elem_type=elem)
         self.assert_result("ktdp.load", shape=[64], elem_type=elem)
 
-    @pattern("descriptor-load-dynamic", category="memory", example=[
-        "# N is a runtime kernel argument — descriptor emits memref<?xf16>",
-        "desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])",
-        "tile = tl.descriptor_load(desc, [pid * BLOCK])",
-    ])
     def test_dynamic_shape_1d(self):
         """Load from a 1-D descriptor whose shape is a runtime argument.
 
@@ -246,6 +243,14 @@ class TestDescriptorLoad(LowerDescMemoryTester):
         ``kDynamic`` for that dimension — producing ``memref<?xf16>``.  The
         ``coordinate_set`` gains an ``IntegerSet`` symbol bound to ``%N`` at
         runtime so the range constraint remains correct.
+
+        Triton source pattern:
+
+        ```python
+        # N is a runtime kernel argument — descriptor emits memref<?xf16>
+        desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])
+        tile = tl.descriptor_load(desc, [pid * BLOCK])
+        ```
         """
         # %N is a tt.func argument (not an arith.constant), so buildBaseMemoryView
         # cannot extract a compile-time size — it emits kDynamic, producing
@@ -277,12 +282,6 @@ class TestDescriptorLoad(LowerDescMemoryTester):
         self.assert_operand("ktdp.construct_memory_view", 1,
                             defined_by="arith.index_cast", type_substr="index")
 
-    @pattern("descriptor-load-dynamic", category="memory", example=[
-        "# M and K are runtime kernel arguments — descriptor emits memref<?x?xf16>",
-        "desc = tl.make_tensor_descriptor(ptr, shape=[M, K], strides=[K, 1],",
-        "                                 block_shape=[BLOCK_M, BLOCK_K])",
-        "tile = tl.descriptor_load(desc, [pid_m * BLOCK_M, pid_k * BLOCK_K])",
-    ])
     def test_dynamic_shape_2d(self):
         """Load from a 2-D descriptor where both dimensions are runtime arguments.
 
@@ -292,6 +291,15 @@ class TestDescriptorLoad(LowerDescMemoryTester):
         ``coordinate_set``, bound positionally to the corresponding ``dynSizes``
         operand.  The block (tile) shape in the descriptor type is always fixed
         at compile time.
+
+        Triton source pattern:
+
+        ```python
+        # M and K are runtime kernel arguments — descriptor emits memref<?x?xf16>
+        desc = tl.make_tensor_descriptor(ptr, shape=[M, K], strides=[K, 1],
+                                         block_shape=[BLOCK_M, BLOCK_K])
+        tile = tl.descriptor_load(desc, [pid_m * BLOCK_M, pid_k * BLOCK_K])
+        ```
         """
         # %M and %K are tt.func arguments (not arith.constant), so the compiler
         # cannot see the tensor size at compile time — both dims become kDynamic,
@@ -328,14 +336,6 @@ class TestDescriptorLoad(LowerDescMemoryTester):
         self.assert_integer_set("ktdp.construct_memory_view", "coordinate_set",
                                 num_dims=2, num_symbols=2, num_constraints=4)
 
-    @pattern("descriptor-load-dynamic-from-scalar-load", category="memory", example=[
-        "# seqlen is read from memory (e.g. a per-batch sequence length),",
-        "# not a tt.func argument — descriptor still emits memref<?xf16>",
-        "seqlen = tl.load(seqlen_ptr)",
-        "desc = tl.make_tensor_descriptor(ptr, shape=[seqlen], strides=[1],",
-        "                                 block_shape=[BLOCK])",
-        "tile = tl.descriptor_load(desc, [pid * BLOCK])",
-    ])
     def test_dynamic_shape_from_scalar_load(self):
         """A shape operand fed by ``tt.load`` still yields kDynamic.
 
@@ -345,6 +345,17 @@ class TestDescriptorLoad(LowerDescMemoryTester):
         `arith.constant`, so it treats the `tt.load` result as opaque and
         falls through to `kDynamic` — pinning that this pass doesn't depend
         on `LowerScalarLoad` running first.
+
+        Triton source pattern:
+
+        ```python
+        # seqlen is read from memory (e.g. a per-batch sequence length),
+        # not a tt.func argument — descriptor still emits memref<?xf16>
+        seqlen = tl.load(seqlen_ptr)
+        desc = tl.make_tensor_descriptor(ptr, shape=[seqlen], strides=[1],
+                                         block_shape=[BLOCK])
+        tile = tl.descriptor_load(desc, [pid * BLOCK])
+        ```
         """
         self.run("""
         module {
@@ -393,12 +404,15 @@ class TestDescriptorStore(LowerDescMemoryTester):
     # test_static_shape_2d[M,K] — 2-D, parametrized over (M,K) pairs
     # test_dynamic_shape_1d     — non-constant shape produces memref<?>
 
-    @pattern("descriptor-store-static", category="memory", example=[
-        "desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])",
-        "tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>",
-    ])
     @pytest.mark.parametrize("N", [512, 1024, 4096])
     def test_static_shape_1d(self, N):
+        """Triton source pattern:
+
+        ```python
+        desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])
+        tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
+        ```
+        """
         # 1-D store.  %N is arith.constant — the memory view gets shape [N].
         # %data is the tensor<64xf16> tile to write; %off is the tile position.
         self.run(f"""
@@ -452,12 +466,15 @@ class TestDescriptorStore(LowerDescMemoryTester):
         self.assert_integer_set("ktdp.construct_access_tile", "access_tile_set",
                                 num_dims=2, num_symbols=0, num_constraints=4)
 
-    @pattern("descriptor-store-dynamic", category="memory", example=[
-        "# N is a runtime kernel argument — descriptor emits memref<?xf16>",
-        "desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])",
-        "tl.descriptor_store(desc, tile, [pid * BLOCK])",
-    ])
     def test_dynamic_shape_1d(self):
+        """Triton source pattern:
+
+        ```python
+        # N is a runtime kernel argument — descriptor emits memref<?xf16>
+        desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1], block_shape=[BLOCK])
+        tl.descriptor_store(desc, tile, [pid * BLOCK])
+        ```
+        """
         # %N is a tt.func argument (not an arith.constant), producing memref<?xf16>.
         # The coordinate_set uses an IntegerSet symbol bound to the runtime %N value.
         #
@@ -530,16 +547,19 @@ class TestRankReducedDescriptorLoad(LowerDescMemoryTester):
     rank-reduced-load test.
     """
 
-    @pattern("descriptor-rank-reduce", category="memory", negative=True, example=[
-        "# NOT supported: 3D descriptor with rank-reduced (2D) load result",
-        "# Produced by triton-combine when it folds tt.reshape(tt.descriptor_load)",
-        "# where the reshaped-away leading dims are all size 1:",
-        "a_desc = tl.make_tensor_descriptor(a_ptr,",
-        "    shape=[B, M, K], strides=[M*K, K, 1],",
-        "    block_shape=[1, BLOCK_M, BLOCK_K])  # 3D descriptor",
-        "a = tl.reshape(a_desc.load([b, m, k]), [BLOCK_M, BLOCK_K])  # rank-reduced",
-    ])
     def test_rank_reduced_load_fails(self, capfd):
+        """Triton source pattern:
+
+        ```python
+        # NOT supported: 3D descriptor with rank-reduced (2D) load result
+        # Produced by triton-combine when it folds tt.reshape(tt.descriptor_load)
+        # where the reshaped-away leading dims are all size 1:
+        a_desc = tl.make_tensor_descriptor(a_ptr,
+            shape=[B, M, K], strides=[M*K, K, 1],
+            block_shape=[1, BLOCK_M, BLOCK_K])  # 3D descriptor
+        a = tl.reshape(a_desc.load([b, m, k]), [BLOCK_M, BLOCK_K])  # rank-reduced
+        ```
+        """
         # Minimal reproducer: a 3D descriptor whose load result has
         # been rank-reduced to 2D. We hand-write the post-combine IR
         # directly because SinglePassTester runs only the named pass —
@@ -629,13 +649,16 @@ class TestDescriptorGather(LowerDescMemoryTester):
     #                                   "failed to legalize 'tt.descriptor_gather'".
     # test_descriptor_from_arg_fails — descriptor from block arg fails lowering
 
-    @pattern("descriptor-gather", category="memory", example=[
-        "# Gather 32 non-contiguous rows from a 2D tensor",
-        "result = tl.descriptor_gather(desc, x_offsets, y_offset)",
-        "# lowers to ktdp.construct_indirect_access_tile + ktdp.load",
-    ])
     @pytest.mark.parametrize("M,K", [(512, 128), (1024, 128), (2048, 256)])
     def test_gather_2d(self, M, K):
+        """Triton source pattern:
+
+        ```python
+        # Gather 32 non-contiguous rows from a 2D tensor
+        result = tl.descriptor_gather(desc, x_offsets, y_offset)
+        # lowers to ktdp.construct_indirect_access_tile + ktdp.load
+        ```
+        """
         # Row-gather: x_offsets (tensor<32xi32>) names 32 non-contiguous rows.
         # The block type <1x64xf16> means each row tile is 1×64; gather fans
         # this out to 32 separate rows → result shape tensor<32x64xf16>.
@@ -803,13 +826,16 @@ class TestDescriptorGather(LowerDescMemoryTester):
         # would bump this count to 3.
         self.assert_count("ktdp.construct_memory_view", 2, cmp="eq")
 
-    @pattern("descriptor-gather", category="memory", example=[
-        "# Non-zero load offset is captured in the indirect subscript map",
-        "idx = idx_desc.load([offset_m])             # offset propagated",
-        "result = tl.descriptor_gather(desc, idx, y_offset)",
-        "# → ind(%idx[offset_m + d0]) in construct_indirect_access_tile",
-    ])
     def test_gather_from_descriptor_load_captures_x_offset(self):
+        """Triton source pattern:
+
+        ```python
+        # Non-zero load offset is captured in the indirect subscript map
+        idx = idx_desc.load([offset_m])             # offset propagated
+        result = tl.descriptor_gather(desc, idx, y_offset)
+        # → ind(%idx[offset_m + d0]) in construct_indirect_access_tile
+        ```
+        """
         # Regression test for the embedding-fixture row-tile bug.
         #
         # When a kernel calls ``idx_desc.load([offset_m])`` inside a loop
@@ -935,17 +961,6 @@ class TestDescriptorGather(LowerDescMemoryTester):
         self.assert_present("ktdp.construct_indirect_access_tile",
                             "ktdp.load")
 
-    @pattern("descriptor-gather", category="memory", negative=True, example=[
-        "# NOT supported: x_offsets passed in as a tensor-typed kernel arg.",
-        "# Spyre kernels must stage indices via tl.make_tensor_descriptor +",
-        "# .load() from a !tt.ptr<i32> arg so the gather pattern can trace",
-        "# the index buffer's provenance.",
-        "@triton.jit",
-        "def k(ptr, x_offsets, y_offset):  # x_offsets: tensor<32xi32> arg — REJECTED",
-        "    desc = tl.make_tensor_descriptor(ptr, shape=[M, K], strides=[K, 1],",
-        "                                     block_shape=[1, 64])",
-        "    data = tl.descriptor_gather(desc, x_offsets, y_offset)",
-    ])
     def test_gather_with_x_offsets_arg_fails_to_legalize(self, capfd):
         """An ``x_offsets`` that is a tensor-typed function argument is no
         longer lowered. The gather pattern returns ``failure()`` on the
@@ -960,6 +975,20 @@ class TestDescriptorGather(LowerDescMemoryTester):
         kernels always pass index buffers as ``!tt.ptr<i32>`` +
         ``tt.descriptor_load``, so the fallback was dead code masking a
         misuse.
+
+        Triton source pattern:
+
+        ```python
+        # NOT supported: x_offsets passed in as a tensor-typed kernel arg.
+        # Spyre kernels must stage indices via tl.make_tensor_descriptor +
+        # .load() from a !tt.ptr<i32> arg so the gather pattern can trace
+        # the index buffer's provenance.
+        @triton.jit
+        def k(ptr, x_offsets, y_offset):  # x_offsets: tensor<32xi32> arg — REJECTED
+            desc = tl.make_tensor_descriptor(ptr, shape=[M, K], strides=[K, 1],
+                                             block_shape=[1, 64])
+            data = tl.descriptor_gather(desc, x_offsets, y_offset)
+        ```
         """
         with pytest.raises(RuntimeError, match="PassManager::run failed"):
             self.run("""
@@ -1059,15 +1088,6 @@ class TestDescriptorGather(LowerDescMemoryTester):
     # result, which the kernel can collapse back to 1D if needed.
     # ----------------------------------------------------------------
 
-    @pattern("descriptor-gather", category="memory", negative=True, example=[
-        "# NOT supported: rank-1 descriptor block for 1D-source gather.",
-        "# The frontend rejects this with 'descriptor must be at least 2D';",
-        "# at the IR level the op verifier emits the same diagnostic.",
-        "in_desc = tl.make_tensor_descriptor(in_ptr,",
-        "                                    shape=[K], strides=[1],",
-        "                                    block_shape=[BLOCK_COLS])  # rank-1 — REJECTED",
-        "out = tl.descriptor_gather(in_desc, idx, 0)",
-    ])
     def test_gather_rank1_block_rejected(self, capfd):
         """Rank-1 descriptor block is rejected by the gather verifier.
 
@@ -1084,6 +1104,18 @@ class TestDescriptorGather(LowerDescMemoryTester):
         :meth:`test_gather_1d_source_via_rank2_reshape_lowers`
         shows the working idiom: model the 1D source as a
         ``[K, 1]`` column matrix with ``block_shape=[1, 1]``.
+
+        Triton source pattern:
+
+        ```python
+        # NOT supported: rank-1 descriptor block for 1D-source gather.
+        # The frontend rejects this with 'descriptor must be at least 2D';
+        # at the IR level the op verifier emits the same diagnostic.
+        in_desc = tl.make_tensor_descriptor(in_ptr,
+                                            shape=[K], strides=[1],
+                                            block_shape=[BLOCK_COLS])  # rank-1 — REJECTED
+        out = tl.descriptor_gather(in_desc, idx, 0)
+        ```
         """
         with pytest.raises(RuntimeError, match="Parse MLIR file failed"):
             self.run("""
@@ -1102,16 +1134,6 @@ class TestDescriptorGather(LowerDescMemoryTester):
             """)
         self.assert_stderr(capfd, "descriptor block must be at least 2D")
 
-    @pattern("descriptor-gather", category="memory", example=[
-        "# Workaround for rank-1 source: model the 1D vector as a [K, 1]",
-        "# column matrix and gather with a [1, 1] block. The gather still",
-        "# produces a rank-2 result tensor<K_INDICES x 1 x f16>; collapse",
-        "# it to 1D in the kernel if needed.",
-        "in_desc = tl.make_tensor_descriptor(in_ptr,",
-        "                                    shape=[K, 1], strides=[1, 1],",
-        "                                    block_shape=[1, 1])",
-        "out = tl.descriptor_gather(in_desc, idx, 0)  # tensor<K_INDICES x 1 x f16>",
-    ])
     def test_gather_1d_source_via_rank2_reshape_lowers(self):
         """A 1D source vector gathered as a rank-2 ``[K, 1]`` matrix lowers.
 
@@ -1129,6 +1151,19 @@ class TestDescriptorGather(LowerDescMemoryTester):
         verifier is ever relaxed to accept rank-1 blocks, both the
         rejection and the workaround status of this idiom show up
         as XPASS together.
+
+        Triton source pattern:
+
+        ```python
+        # Workaround for rank-1 source: model the 1D vector as a [K, 1]
+        # column matrix and gather with a [1, 1] block. The gather still
+        # produces a rank-2 result tensor<K_INDICES x 1 x f16>; collapse
+        # it to 1D in the kernel if needed.
+        in_desc = tl.make_tensor_descriptor(in_ptr,
+                                            shape=[K, 1], strides=[1, 1],
+                                            block_shape=[1, 1])
+        out = tl.descriptor_gather(in_desc, idx, 0)  # tensor<K_INDICES x 1 x f16>
+        ```
         """
         self.run("""
         module {
@@ -1183,14 +1218,6 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
     #   test_gather_5d_lowered    — rank-5 block, stickified inner dim
     #   test_scatter_3d_lowered   — scatter mirror of the rank-3 case
 
-    @pattern("descriptor-gather-nd", category="memory", example=[
-        "# rank-3 N-D indirect-access gather (Spyre extension):",
-        "src_desc = tl.make_tensor_descriptor(src_ptr, [NUM_BLOCKS, BLOCK_SIZE, INNER_DIM], ...,",
-        "                                     block_shape=[1, BLOCK_SIZE, INNER_DIM])",
-        "result = tl.descriptor_gather(src_desc, indices, 0)",
-        "# → tensor<32 x BLOCK_SIZE x INNER_DIM x f16>  (3D result; one indirect axis,",
-        "#                                                two direct dims with no offset)",
-    ])
     def test_gather_3d_lowered(self):
         """Rank-3 ``tt.descriptor_gather`` lowers cleanly.
 
@@ -1205,6 +1232,17 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
           dim 2 (direct):           d_2
 
         The full iteration space is ``0 ≤ d_0 < 32, 0 ≤ d_1 < 16, 0 ≤ d_2 < 128``.
+
+        Triton source pattern:
+
+        ```python
+        # rank-3 N-D indirect-access gather (Spyre extension):
+        src_desc = tl.make_tensor_descriptor(src_ptr, [NUM_BLOCKS, BLOCK_SIZE, INNER_DIM], ...,
+                                             block_shape=[1, BLOCK_SIZE, INNER_DIM])
+        result = tl.descriptor_gather(src_desc, indices, 0)
+        # → tensor<32 x BLOCK_SIZE x INNER_DIM x f16>  (3D result; one indirect axis,
+        #                                                two direct dims with no offset)
+        ```
         """
         self.run("""
         module {
@@ -1248,15 +1286,6 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
         # Result tile is the rank-3 N-D-gather shape.
         self.assert_result("ktdp.load", shape=[32, 16, 128], elem_type="f16")
 
-    @pattern("descriptor-gather-4d", category="memory", example=[
-        "# rank-4 N-D indirect-access gather with a group dim:",
-        "src_desc = tl.make_tensor_descriptor(",
-        "    src_ptr,",
-        "    shape=[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM],   # groups at dim 1",
-        "    strides=[..., INNER_DIM, NUM_GROUPS*INNER_DIM, 1],",
-        "    block_shape=[1, 1, BLOCK_SIZE, INNER_DIM])",
-        "result = tl.descriptor_gather(src_desc, indices, group_idx)",
-    ])
     def test_gather_4d_lowered(self):
         """Rank-4 gather: indirect dim plus a group dim that takes the y_offset.
 
@@ -1266,6 +1295,18 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
         Pins that the lowering handles a rank > 3 result block where the
         indirect axis is on dim 0 and exactly one direct axis carries an
         offset.
+
+        Triton source pattern:
+
+        ```python
+        # rank-4 N-D indirect-access gather with a group dim:
+        src_desc = tl.make_tensor_descriptor(
+            src_ptr,
+            shape=[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, INNER_DIM],   # groups at dim 1
+            strides=[..., INNER_DIM, NUM_GROUPS*INNER_DIM, 1],
+            block_shape=[1, 1, BLOCK_SIZE, INNER_DIM])
+        result = tl.descriptor_gather(src_desc, indices, group_idx)
+        ```
         """
         self.run("""
         module {
@@ -1311,14 +1352,6 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
                                 num_dims=4, num_symbols=0, num_constraints=8)
         self.assert_result("ktdp.load", shape=[32, 1, 16, 128], elem_type="f16")
 
-    @pattern("descriptor-gather-5d", category="memory", example=[
-        "# rank-5 N-D indirect-access gather with a stickified inner dim:",
-        "src_desc = tl.make_tensor_descriptor(",
-        "    src_ptr,",
-        "    shape=[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, NUM_STICKS, STICK_SIZE],",
-        "    block_shape=[1, 1, BLOCK_SIZE, NUM_STICKS, STICK_SIZE])",
-        "result = tl.descriptor_gather(src_desc, indices, group_idx)",
-    ])
     def test_gather_5d_lowered(self):
         """Rank-5 gather: indirect dim, group dim, and a split (stickified) inner dim.
 
@@ -1328,6 +1361,17 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
         (``STICK_SIZE``, the within-stick offset). Endpoint coverage for
         the relaxed rank range — a regression that silently dropped
         trailing dims would surface here.
+
+        Triton source pattern:
+
+        ```python
+        # rank-5 N-D indirect-access gather with a stickified inner dim:
+        src_desc = tl.make_tensor_descriptor(
+            src_ptr,
+            shape=[NUM_BLOCKS, NUM_GROUPS, BLOCK_SIZE, NUM_STICKS, STICK_SIZE],
+            block_shape=[1, 1, BLOCK_SIZE, NUM_STICKS, STICK_SIZE])
+        result = tl.descriptor_gather(src_desc, indices, group_idx)
+        ```
         """
         self.run("""
         module {
@@ -1371,15 +1415,18 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
                                 num_dims=5, num_symbols=0, num_constraints=10)
         self.assert_result("ktdp.load", shape=[32, 1, 16, 2, 64], elem_type="f16")
 
-    @pattern("descriptor-scatter-nd", category="memory", example=[
-        "# rank-3 scatter mirror of test_gather_3d_lowered.",
-        "tl.descriptor_scatter(dst_desc, indices, y_offset, value)",
-    ])
     def test_scatter_3d_lowered(self):
         """Rank-3 scatter mirror — same machinery via ``ConvertDescriptorScatter``.
 
         Confirms the lowering's N-D generalisation applies symmetrically
         to writes.
+
+        Triton source pattern:
+
+        ```python
+        # rank-3 scatter mirror of test_gather_3d_lowered.
+        tl.descriptor_scatter(dst_desc, indices, y_offset, value)
+        ```
         """
         self.run("""
         module {
@@ -1416,14 +1463,6 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
                                 "variables_space_set",
                                 num_dims=3, num_symbols=0, num_constraints=6)
 
-    @pattern("descriptor-gather-nd-subscripts", category="memory", example=[
-        "# Rank-3 subscript role split: dim 0 indirect, dim 1 y_offset, dim 2 full",
-        "# desc block shape <1 x TOKEN_DIM x HEAD_DIM>",
-        "result = tl.descriptor_gather(desc, x_offsets, y_offset)",
-        "# lowers to: ind(idx[c_x + d0]), (c_y + d1), (d2)",
-        "# Trailing dim 2 (HEAD_DIM): no offset — full block extent always read.",
-        "# To slice dim 2, reshape the result after the gather.",
-    ])
     def test_gather_3d_subscript_kinds_pin_offset_axis(self):
         """Pin the dim 0 / dim 1 / dim ≥ 2 role split — the headline N-D limitation.
 
@@ -1445,6 +1484,17 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
         would slip past the existing rank-3 structural counts (which
         only check ``num_dims`` / ``num_constraints`` on
         ``variables_space_set``).
+
+        Triton source pattern:
+
+        ```python
+        # Rank-3 subscript role split: dim 0 indirect, dim 1 y_offset, dim 2 full
+        # desc block shape <1 x TOKEN_DIM x HEAD_DIM>
+        result = tl.descriptor_gather(desc, x_offsets, y_offset)
+        # lowers to: ind(idx[c_x + d0]), (c_y + d1), (d2)
+        # Trailing dim 2 (HEAD_DIM): no offset — full block extent always read.
+        # To slice dim 2, reshape the result after the gather.
+        ```
         """
         self.run("""
         module {
@@ -1520,16 +1570,6 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
             f"`{subscripts[2]}`"
         )
 
-    @pattern("descriptor-gather-nd-permuted-strides", category="memory", example=[
-        "# Physical layout: [BLOCK_SIZE, NUM_BLOCKS, INNER_DIM] — block id is NOT dim 0.",
-        "# Declare descriptor shape with the gathered axis at dim 0, fix up via strides:",
-        "desc = tl.make_tensor_descriptor(",
-        "    ptr,",
-        "    shape=[NUM_BLOCKS, BLOCK_SIZE, INNER_DIM],",
-        "    strides=[INNER_DIM, NUM_BLOCKS * INNER_DIM, 1],  # inverted stride order",
-        "    block_shape=[1, BLOCK_SIZE, INNER_DIM])",
-        "result = tl.descriptor_gather(desc, block_ids, y_offset)",
-    ])
     def test_gather_3d_inner_axis_via_stride_permutation(self):
         """Gathering a 'logically inner' physical axis via stride permutation.
 
@@ -1559,6 +1599,19 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
         matches the gathered shape.  A regression that re-derived the
         memory view from anything other than the descriptor's shape
         operands would surface as a wrong view shape here.
+
+        Triton source pattern:
+
+        ```python
+        # Physical layout: [BLOCK_SIZE, NUM_BLOCKS, INNER_DIM] — block id is NOT dim 0.
+        # Declare descriptor shape with the gathered axis at dim 0, fix up via strides:
+        desc = tl.make_tensor_descriptor(
+            ptr,
+            shape=[NUM_BLOCKS, BLOCK_SIZE, INNER_DIM],
+            strides=[INNER_DIM, NUM_BLOCKS * INNER_DIM, 1],  # inverted stride order
+            block_shape=[1, BLOCK_SIZE, INNER_DIM])
+        result = tl.descriptor_gather(desc, block_ids, y_offset)
+        ```
         """
         self.run("""
         module {
@@ -1605,13 +1658,6 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
                            shape=[1024, 16, 128], elem_type="f16")
         self.assert_result("ktdp.load", shape=[32, 16, 128], elem_type="f16")
 
-    @pattern("descriptor-gather-nd-trailing-one", category="memory", example=[
-        "# Block <1x1x128>: trailing dim 1 = 1 — newly legal.",
-        "# Pre-relaxation rejected two ways: rank != 2 and",
-        "# block.shape[1] < min_cols (TMA rule). Both gone.",
-        "src_desc = tl.make_tensor_descriptor(src_ptr, ..., block_shape=[1, 1, 128])",
-        "result = tl.descriptor_gather(src_desc, indices, y_offset)",
-    ])
     def test_gather_3d_inner_dim_one_lowered(self):
         """Block ``<1x1x128>``: a singleton at dim 1 is now legal.
 
@@ -1636,6 +1682,16 @@ class TestDescriptorGatherND(LowerDescMemoryTester):
         tests already cover the structural shape of N-D gather; this
         test specifically probes the *boundary* where dim 1 = 1, which
         the old verifier would have rejected.
+
+        Triton source pattern:
+
+        ```python
+        # Block <1x1x128>: trailing dim 1 = 1 — newly legal.
+        # Pre-relaxation rejected two ways: rank != 2 and
+        # block.shape[1] < min_cols (TMA rule). Both gone.
+        src_desc = tl.make_tensor_descriptor(src_ptr, ..., block_shape=[1, 1, 128])
+        result = tl.descriptor_gather(src_desc, indices, y_offset)
+        ```
         """
         self.run("""
         module {
@@ -1722,14 +1778,6 @@ class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
       test_gather_2d_indices_3d_block         — 2-D grid × rank-3 block (rank-4 result)
     """
 
-    @pattern("descriptor-gather-2d-indices", category="memory", example=[
-        "# Gather a 2-D grid of pages — one page per (seq, head) index pair:",
-        "idx_desc = tl.make_tensor_descriptor(idx_ptr, [SEQ, HEADS], [HEADS, 1],",
-        "                                     block_shape=[8, 4])",
-        "x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>",
-        "data = tl.descriptor_gather(desc, x_offsets, y_offset)",
-        "# → tensor<8 x 4 x BLOCK_COLS x f16>  (two indirect axes, then block cols)",
-    ])
     def test_gather_2d_indices_lowered(self):
         """A rank-2 ``x_offsets`` (``tensor<8x4xi32>``) gathers an 8×4 grid of
         rows from a ``<1x64>`` block, producing ``tensor<8x4x64xf16>``.
@@ -1738,6 +1786,17 @@ class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
         grid — and the trailing 64 is the block-column extent.  Lowers to one
         ``ktdp.construct_indirect_access_tile`` over the 2-D index view plus a
         ``ktdp.load`` of the rank-3 result tile.
+
+        Triton source pattern:
+
+        ```python
+        # Gather a 2-D grid of pages — one page per (seq, head) index pair:
+        idx_desc = tl.make_tensor_descriptor(idx_ptr, [SEQ, HEADS], [HEADS, 1],
+                                             block_shape=[8, 4])
+        x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>
+        data = tl.descriptor_gather(desc, x_offsets, y_offset)
+        # → tensor<8 x 4 x BLOCK_COLS x f16>  (two indirect axes, then block cols)
+        ```
         """
         self.run("""
         module {
@@ -1787,13 +1846,6 @@ class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
         # Gather load result = [*index_grid, block_cols] = [8, 4, 64].
         self.assert_result("ktdp.load", shape=[8, 4, 64], elem_type="f16")
 
-    @pattern("descriptor-gather-2d-indices-subscripts", category="memory", example=[
-        "# 2-D x_offsets → ONE indirect base dim with a 2-D index address:",
-        "x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>",
-        "data = tl.descriptor_gather(desc, x_offsets, y_offset)",
-        "# lowers to: ind(idx[c_x0 + d0, c_x1 + d1]), (c_y + d2)",
-        "# Contrast rank-1 x_offsets, where the index address is 1-D.",
-    ])
     def test_gather_2d_indices_two_indirect_axes(self):
         """Pin that the indirect base dim carries a 2-D index address for a
         rank-2 ``x_offsets``.
@@ -1810,6 +1862,16 @@ class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
         direct ``(c_y + d2)`` — with both index-grid coordinates inside the
         first.  A regression that dropped an index axis would shrink the inner
         address, so inspect it textually.
+
+        Triton source pattern:
+
+        ```python
+        # 2-D x_offsets → ONE indirect base dim with a 2-D index address:
+        x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>
+        data = tl.descriptor_gather(desc, x_offsets, y_offset)
+        # lowers to: ind(idx[c_x0 + d0, c_x1 + d1]), (c_y + d2)
+        # Contrast rank-1 x_offsets, where the index address is 1-D.
+        ```
         """
         self.run("""
         module {
@@ -1915,11 +1977,6 @@ class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
         self.assert_absent("tt.descriptor_gather")
         self.assert_result("ktdp.load", shape=[R, C, COLS], elem_type="f16")
 
-    @pattern("descriptor-scatter-2d-indices", category="memory", example=[
-        "# Scatter a 2-D grid of pages — mirror of the 2-D-index gather:",
-        "x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>",
-        "tl.descriptor_scatter(desc, x_offsets, y_offset, value)  # value: <8x4x64xf16>",
-    ])
     def test_scatter_2d_indices_lowered(self):
         """Scatter mirror of ``test_gather_2d_indices_lowered``.
 
@@ -1927,6 +1984,14 @@ class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
         the ``tensor<8x4x64xf16>`` payload.  Lowers via
         ``ConvertDescriptorScatter`` to ``ktdp.store`` over the same
         two-indirect-axis access tile.
+
+        Triton source pattern:
+
+        ```python
+        # Scatter a 2-D grid of pages — mirror of the 2-D-index gather:
+        x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>
+        tl.descriptor_scatter(desc, x_offsets, y_offset, value)  # value: <8x4x64xf16>
+        ```
         """
         self.run("""
         module {
@@ -1968,12 +2033,6 @@ class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
                                 "variables_space_set",
                                 num_dims=3, num_symbols=0, num_constraints=6)
 
-    @pattern("descriptor-gather-2d-indices-3d-block", category="memory", example=[
-        "# 2-D index grid combined with a rank-3 block (block_shape=[1, B, D]):",
-        "x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>",
-        "data = tl.descriptor_gather(desc, x_offsets, y_offset)",
-        "# → tensor<8 x 4 x B x D x f16>  (2 indirect axes + block[1:] = 2 trailing)",
-    ])
     def test_gather_2d_indices_3d_block(self):
         """Rank-2 ``x_offsets`` × rank-3 descriptor block → rank-4 result.
 
@@ -1982,6 +2041,15 @@ class TestDescriptorGatherScatter2DIndices(LowerDescMemoryTester):
         trailing inner dim (``block_shape[2]``) is a direct, no-offset dim 3.
         Pins that the two generalisations compose: K indirect axes (K=2) plus
         the existing rank-N trailing-dim handling.
+
+        Triton source pattern:
+
+        ```python
+        # 2-D index grid combined with a rank-3 block (block_shape=[1, B, D]):
+        x_offsets = tl.descriptor_load(idx_desc, [0, 0])   # tensor<8x4xi32>
+        data = tl.descriptor_gather(desc, x_offsets, y_offset)
+        # → tensor<8 x 4 x B x D x f16>  (2 indirect axes + block[1:] = 2 trailing)
+        ```
         """
         self.run("""
         module {
@@ -2053,20 +2121,6 @@ class TestDescriptorGatherNDLimits(LowerDescMemoryTester):
     ``"Parse MLIR file failed"`` rather than ``"PassManager::run failed"``.
     """
 
-    @pattern("descriptor-gather-nd-block-dim0", category="memory", negative=True,
-             example=[
-                 "# REJECTED: leading dim of block_shape is not 1.",
-                 "# The N-D relaxation widened the rank rule but kept the",
-                 "# leading-1 rule — dim 0 specifically must be 1.",
-                 "desc = tl.make_tensor_descriptor(ptr, shape=[P, B, D],",
-                 "                                 strides=[B*D, D, 1],",
-                 "                                 block_shape=[2, 16, 128])  # leading 2 — REJECTED",
-                 "data = tl.descriptor_gather(desc, x_offsets, y_offset)",
-                 "# 'descriptor block must have exactly 1 row'",
-                 "# Workaround: keep block_shape[0]=1; pair blocks via",
-                 "# block_shape=[1, 2*16, 128] with a paired index buffer,",
-                 "# OR issue two gathers and concatenate.",
-             ])
     def test_gather_3d_block_dim0_not_one_fails(self, capfd):
         """Rank-3 block ``<2x16x128>``: the leading-1 rule still applies.
 
@@ -2077,6 +2131,22 @@ class TestDescriptorGatherNDLimits(LowerDescMemoryTester):
         is likely to assume the relaxation also widened *which* dim
         must be 1 (e.g. "any dim that's 1 is fine") — it didn't.  Dim
         0 specifically.
+
+        Triton source pattern:
+
+        ```python
+        # REJECTED: leading dim of block_shape is not 1.
+        # The N-D relaxation widened the rank rule but kept the
+        # leading-1 rule — dim 0 specifically must be 1.
+        desc = tl.make_tensor_descriptor(ptr, shape=[P, B, D],
+                                         strides=[B*D, D, 1],
+                                         block_shape=[2, 16, 128])  # leading 2 — REJECTED
+        data = tl.descriptor_gather(desc, x_offsets, y_offset)
+        # 'descriptor block must have exactly 1 row'
+        # Workaround: keep block_shape[0]=1; pair blocks via
+        # block_shape=[1, 2*16, 128] with a paired index buffer,
+        # OR issue two gathers and concatenate.
+        ```
         """
         with pytest.raises(RuntimeError, match="Parse MLIR file failed"):
             self.run("""
@@ -2287,12 +2357,6 @@ class TestDescriptorPlacement(LowerDescMemoryTester):
       is only built when the branch is taken.
     """
 
-    @pattern("descriptor-placement-top-level", category="memory", example=[
-        "desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1],",
-        "                                 block_shape=[BLOCK])  # at function top",
-        "for off in range(0, N, BLOCK):",
-        "    tile = tl.descriptor_load(desc, [off])  # inside the loop",
-    ])
     def test_top_level_descriptor_view_outside_loop(self):
         """Descriptor at function top, load inside ``scf.for`` → view at function top.
 
@@ -2308,6 +2372,15 @@ class TestDescriptorPlacement(LowerDescMemoryTester):
         * the per-tile ops (``ktdp.construct_access_tile``,
           ``ktdp.load``) do live inside the loop, since they depend
           on the loop variable.
+
+        Triton source pattern:
+
+        ```python
+        desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1],
+                                         block_shape=[BLOCK])  # at function top
+        for off in range(0, N, BLOCK):
+            tile = tl.descriptor_load(desc, [off])  # inside the loop
+        ```
         """
         self.run("""
         module {
@@ -2342,12 +2415,6 @@ class TestDescriptorPlacement(LowerDescMemoryTester):
         self.assert_present("ktdp.construct_access_tile", parent="scf.for")
         self.assert_present("ktdp.load", parent="scf.for")
 
-    @pattern("descriptor-placement-nested", category="memory", example=[
-        "for i in range(0, N, BLOCK):",
-        "    desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1],",
-        "                                     block_shape=[BLOCK])  # inside loop",
-        "    tile = tl.descriptor_load(desc, [i])",
-    ])
     def test_nested_descriptor_view_inside_loop(self):
         """Descriptor written inside ``scf.for`` is lowered correctly.
 
@@ -2362,6 +2429,15 @@ class TestDescriptorPlacement(LowerDescMemoryTester):
         * the new ``ktdp.construct_memory_view`` is placed inside the
           ``scf.for`` body — same region as the descriptor it replaces
           — and not lifted out to function top.
+
+        Triton source pattern:
+
+        ```python
+        for i in range(0, N, BLOCK):
+            desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1],
+                                             block_shape=[BLOCK])  # inside loop
+            tile = tl.descriptor_load(desc, [i])
+        ```
         """
         self.run("""
         module {
@@ -2393,12 +2469,6 @@ class TestDescriptorPlacement(LowerDescMemoryTester):
         self.assert_count("ktdp.construct_memory_view", 0, cmp="eq",
                           parent="tt.func")
 
-    @pattern("descriptor-placement-conditional", category="memory", example=[
-        "if cond:",
-        "    desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1],",
-        "                                     block_shape=[BLOCK])  # inside if",
-        "    tile = tl.descriptor_load(desc, [off])",
-    ])
     def test_descriptor_inside_scf_if_view_inside_branch(self):
         """Descriptor written inside ``scf.if`` is lowered correctly.
 
@@ -2420,6 +2490,15 @@ class TestDescriptorPlacement(LowerDescMemoryTester):
         ``%cond`` is a function argument; the test never binds it to a
         concrete value because this is a structural check on where the
         view lands in the IR, not an execution test.
+
+        Triton source pattern:
+
+        ```python
+        if cond:
+            desc = tl.make_tensor_descriptor(ptr, shape=[N], strides=[1],
+                                             block_shape=[BLOCK])  # inside if
+            tile = tl.descriptor_load(desc, [off])
+        ```
         """
         self.run("""
         module {
@@ -2487,12 +2566,6 @@ class TestAddptrIntoDescriptor(LowerDescMemoryTester):
         spyre.passes.ttir_to_ktdp.add_lower_descriptor_memory(pm)
         spyre.passes.ttir_to_ktdp.add_convert_functions(pm)
 
-    @pattern("descriptor-offset-base", category="memory", negative=True, example=[
-        "# NOT supported: tt.addptr result as descriptor base (e.g. batched matmul)",
-        "base = a_ptr + b_idx * stride_batch   # tt.addptr",
-        "desc = tl.make_tensor_descriptor(base, shape=[M, K], strides=[K, 1],",
-        "                                 block_shape=[BLOCK_M, BLOCK_K])",
-    ])
     def test_addptr_into_descriptor_fails(self, capfd):
         """`tt.addptr` result feeding `tt.make_tensor_descriptor`.
 
@@ -2506,6 +2579,15 @@ class TestAddptrIntoDescriptor(LowerDescMemoryTester):
         underlying reason batched matmul is currently disabled: each batch
         step wants to offset the base pointer before constructing the
         descriptor.
+
+        Triton source pattern:
+
+        ```python
+        # NOT supported: tt.addptr result as descriptor base (e.g. batched matmul)
+        base = a_ptr + b_idx * stride_batch   # tt.addptr
+        desc = tl.make_tensor_descriptor(base, shape=[M, K], strides=[K, 1],
+                                         block_shape=[BLOCK_M, BLOCK_K])
+        ```
         """
         with pytest.raises(RuntimeError, match="PassManager::run failed"):
             self.run("""

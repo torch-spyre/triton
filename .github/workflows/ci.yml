@@ -124,34 +124,3 @@ jobs:
                 \"summary\": \"Tests passed using ktir-cpu ref '${{ inputs.ktir_cpu_ref }}' instead of the pinned version. See run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
               }
             }"
-
-  docs-patterns:
-    name: docs/patterns up to date
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    # The pattern-doc generator imports the fixture/test modules to read their
-    # static metadata, but it stubs Triton (and gluon_ir) when the compiled
-    # extension is absent — so this runs WITHOUT the Spyre build. It needs only
-    # the Triton Python package on PYTHONPATH plus numpy + pytest (the fixtures
-    # import numpy; the single-pass test files import pytest at module scope).
-    # Regenerate locally with gen_patterns_docs.py and commit if this fails.
-    env:
-      PYTHONPATH: python
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-
-      - name: Check docs/patterns up to date
-        run: |
-          uv run --no-project --with numpy --with pytest \
-            python third_party/spyre/scripts/gen_patterns_docs.py --check

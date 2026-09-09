@@ -81,12 +81,59 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import textwrap
 from pathlib import Path
 
-# IR cleaning and docstring helpers from the shared lib.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _patterns import clean_ir, split_docstring  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# IR cleaning — strip loc(...) / #loc noise, add section-break blank lines.
+# ---------------------------------------------------------------------------
+
+# Match ``loc(...)`` including one level of nesting (e.g. ``loc("x"(#loc))``).
+_LOC_CALL = re.compile(r"\s*loc\((?:[^()]|\([^()]*\))*\)")
+
+# Ops that mark a new logical section; a blank line is inserted before the
+# first occurrence of each in a run.
+_SECTION_BREAK_OPS = (
+    "tt.get_program_id",
+    "tt.make_tensor_descriptor",
+    "ktdp.construct_memory_view",
+    "ktdp.construct_access_tile",
+    "ktdp.construct_indirect_access_tile",
+    "ktdp.get_compute_tile_id",
+    "scf.for",
+    "tt.return",
+    "func.return",
+)
+
+
+def _match_section_op(line: str) -> str | None:
+    stripped = line.lstrip()
+    op_part = re.sub(r"^%\S+\s*=\s*", "", stripped)
+    for op in _SECTION_BREAK_OPS:
+        if op_part.startswith(op):
+            return op
+    return None
+
+
+def _add_section_breaks(lines: list[str]) -> str:
+    out: list[str] = []
+    last_section_op: str | None = None
+    for line in lines:
+        op = _match_section_op(line)
+        if op is not None and op != last_section_op:
+            if out and out[-1].strip() and not out[-1].rstrip().endswith("{"):
+                out.append("")
+        if line.strip():
+            last_section_op = op
+        out.append(line)
+    return "\n".join(out)
+
+
+def clean_ir(text: str) -> str:
+    """Strip ``loc(...)`` / ``#loc`` noise and add section-break blank lines."""
+    text = _LOC_CALL.sub("", text)
+    lines = [l for l in text.split("\n") if not l.strip().startswith("#loc")]
+    return _add_section_breaks(lines)
 
 
 _HERE = Path(__file__).resolve().parent

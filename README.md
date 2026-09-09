@@ -46,8 +46,6 @@ Key Spyre-specific areas:
   lowering path.
 - `third_party/spyre/test/fixtures/`: Triton kernel fixtures used by the test
   framework.
-- `third_party/spyre/docs/patterns/`: generated pattern reference for supported
-  and intentionally unsupported lowering cases.
 - `third_party/spyre/ktir-mlir-frontend/`: KTIR MLIR frontend submodule.
 
 ## Install
@@ -292,8 +290,6 @@ Current upstream-file touch points include:
 
 ## Related Documentation
 
-- `third_party/spyre/docs/patterns/index.md`: generated KTIR lowering pattern
-  reference.
 - `third_party/spyre/docs/ttir_only_build.md`: details of the TTIR-only build
   mode used by Spyre-only builds.
 - `third_party/spyre/test/fixtures/README.md`: fixture framework for kernel
