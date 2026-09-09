@@ -57,16 +57,19 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // ConvertFunctions would rewrite).
   m.def(
       "add_convert_ttir_to_ktdp",
-      [](mlir::PassManager &pm, const std::string &data_layout) {
+      [](mlir::PassManager &pm, const std::string &data_layout,
+         const std::string &inter_tile_lowering) {
         pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
         pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
         pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
         pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
             mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
-        pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
+        pm.addPass(mlir::triton::ktdp::createLowerInterTilePass(
+            mlir::triton::ktdp::LowerInterTileOptions{inter_tile_lowering}));
         pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
       },
-      py::arg("pm"), py::arg("data_layout") = "device");
+      py::arg("pm"), py::arg("data_layout") = "device",
+      py::arg("inter_tile_lowering") = "delivery");
   // Individual pass bindings. add_convert_ttir_to_ktdp above is the default
   // order, but a caller that needs a different one — a subset of the passes,
   // a repeat, or an extra pass slotted between two of them — builds the
@@ -102,9 +105,13 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   m.def("add_drop_reduction_init_fill", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createDropReductionInitFillPass());
   });
-  m.def("add_lower_inter_tile", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
-  });
+  m.def(
+      "add_lower_inter_tile",
+      [](mlir::PassManager &pm, const std::string &inter_tile_lowering) {
+        pm.addPass(mlir::triton::ktdp::createLowerInterTilePass(
+            mlir::triton::ktdp::LowerInterTileOptions{inter_tile_lowering}));
+      },
+      py::arg("pm"), py::arg("inter_tile_lowering") = "delivery");
   m.def("add_lower_descriptor_memory", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
   });

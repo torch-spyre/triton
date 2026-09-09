@@ -21,11 +21,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/KTDP/Transforms/Passes.h"
+#include "InterTile/Grouping.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "ktir/Dialect/KTDP/KTDPTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineExpr.h"
@@ -34,7 +36,6 @@
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
-#include <map>
 
 using namespace mlir;
 
@@ -43,252 +44,16 @@ namespace mlir::triton::ktdp {
 #include "Dialect/KTDP/Transforms/Passes.h.inc"
 } // namespace mlir::triton::ktdp
 
+// The shared inter-tile grouping helpers, so the pass body below reads the same
+// as it did when they were file-local.
+using mlir::triton::ktdp::buildGroupSets;
+using mlir::triton::ktdp::buildPick0Set;
+using mlir::triton::ktdp::combinerEmitOp;
+using mlir::triton::ktdp::GroupSets;
+using mlir::triton::ktdp::readWorkSliceAttrs;
+using mlir::triton::ktdp::WorkSliceAttrs;
+
 namespace {
-
-//===----------------------------------------------------------------------===//
-// Attribute key constants
-//===----------------------------------------------------------------------===//
-
-static constexpr StringRef kNumWkSlicesPerDim = "numWkSlicesPerDim";
-static constexpr StringRef kCoreIdToWkSlice   = "coreIdToWkSlice";
-static constexpr StringRef kDepWkSlices        = "depWkSlices";
-
-//===----------------------------------------------------------------------===//
-// readWorkSliceAttrs — read W, C, D from the op's own attributes
-//===----------------------------------------------------------------------===//
-
-struct WorkSliceAttrs {
-  // W: axis name → slice count.
-  DictionaryAttr numWkSlicesPerDim;  // StringAttr → IntegerAttr
-  // C: list of per-tile maps (each map: axis name → slice index i64).
-  // We store it as the raw ArrayAttr of DictionaryAttrs.
-  ArrayAttr coreIdToWkSlice;
-  // D (optional): dictionary consumer-local-index → list-of-producer-local-idx.
-  DictionaryAttr depWkSlices;  // nullptr if absent.
-};
-
-static FailureOr<WorkSliceAttrs>
-readWorkSliceAttrs(triton::InterTileReduceOp op) {
-  auto W = op->getAttrOfType<DictionaryAttr>(kNumWkSlicesPerDim);
-  if (!W)
-    return op.emitError("missing '") << kNumWkSlicesPerDim << "' op attribute";
-  auto C = op->getAttrOfType<ArrayAttr>(kCoreIdToWkSlice);
-  if (!C)
-    return op.emitError("missing '") << kCoreIdToWkSlice << "' op attribute";
-  // D is optional.
-  auto D = op->getAttrOfType<DictionaryAttr>(kDepWkSlices);
-  return WorkSliceAttrs{W, C, D};
-}
-
-//===----------------------------------------------------------------------===//
-// GroupSets — affine_set attributes for producer_tiles_per_group and groups
-//===----------------------------------------------------------------------===//
-
-struct GroupSets {
-  IntegerSet producerTilesPerGroup;  // (i)[g] : membership predicate
-  IntegerSet groups;                  // (g) : range [0, ngroups)
-  int64_t gsize;
-  int64_t stride;  // groupStep (= gsize for contiguous groups)
-  SmallVector<int64_t> pick0TileIds;  // pick0TileIds[g] = tile-id with axis_value==0 in group g
-};
-
-// Build the GroupSets for the given reduction axis.
-//
-// Grouping semantics (coop_α): two tiles cooperate iff they agree on every
-// dim except `axis`.  `axis` is the *reduction* dim — the dim that varies
-// within a group.  Tiles with the same non-axis slice-index tuple form one
-// group; `gsize = W[axis]` is the number of cooperating tiles per group, and
-// `ngroups = numTiles / gsize`.
-//
-// Current scope: members of each group must be contiguous tile ids
-// {g*gsize .. (g+1)*gsize - 1}.
-static FailureOr<GroupSets>
-buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
-               StringRef axis, Operation *loc) {
-  auto gsizeAttr = attrs.numWkSlicesPerDim.getAs<IntegerAttr>(axis);
-  if (!gsizeAttr)
-    return loc->emitError("axis '") << axis
-           << "' not found in numWkSlicesPerDim";
-  int64_t gsize = gsizeAttr.getInt();
-
-  int64_t numTiles = (int64_t)attrs.coreIdToWkSlice.size();
-  if (numTiles == 0)
-    return loc->emitError("coreIdToWkSlice is empty");
-
-  if (numTiles % gsize != 0)
-    return loc->emitError("tile count ") << numTiles
-           << " does not divide evenly by gsize=" << gsize
-           << " for axis '" << axis << "'";
-  int64_t ngroups = numTiles / gsize;
-
-  // --- partition tiles by non-axis slice-index tuple (coop_α) ---
-  // Two tiles are in the same group iff their slice dicts agree on all dims
-  // except `axis`.  We encode the non-axis tuple as a sorted string key for
-  // map lookup.
-  std::map<std::string, SmallVector<int64_t>> tupleToTiles;
-  SmallVector<std::string> tupleOrder;
-
-  for (int64_t t = 0; t < numTiles; ++t) {
-    auto tileMap = dyn_cast<DictionaryAttr>(attrs.coreIdToWkSlice[t]);
-    if (!tileMap)
-      return loc->emitError("coreIdToWkSlice entry ") << t
-             << " is not a DictionaryAttr";
-    // Validate axis key present.
-    if (!tileMap.getAs<IntegerAttr>(axis))
-      return loc->emitError("coreIdToWkSlice entry ") << t
-             << " has no key '" << axis << "'";
-    // Build non-axis tuple key (sorted by attr name for determinism).
-    std::string key;
-    llvm::raw_string_ostream os(key);
-    SmallVector<std::pair<StringRef, int64_t>> nonAxisPairs;
-    for (auto namedAttr : tileMap) {
-      if (namedAttr.getName().strref() == axis) continue;
-      auto intAttr = dyn_cast<IntegerAttr>(namedAttr.getValue());
-      if (!intAttr)
-        return loc->emitError("coreIdToWkSlice entry ") << t
-               << ": value for key '" << namedAttr.getName() << "' is not i64";
-      nonAxisPairs.push_back({namedAttr.getName().strref(), intAttr.getInt()});
-    }
-    llvm::sort(nonAxisPairs, [](auto &a, auto &b) { return a.first < b.first; });
-    for (auto &[k, v] : nonAxisPairs)
-      os << k << "=" << v << ";";
-    os.flush();
-    if (!tupleToTiles.count(key))
-      tupleOrder.push_back(key);
-    tupleToTiles[key].push_back(t);
-  }
-
-  // Sort group keys for deterministic group-index assignment.
-  llvm::sort(tupleOrder);
-
-  if ((int64_t)tupleOrder.size() != ngroups)
-    return loc->emitError("expected ") << ngroups
-           << " groups (numTiles/W[axis]=" << numTiles << "/" << gsize
-           << ") but found " << tupleOrder.size()
-           << " distinct non-axis tuples";
-
-  // Verify uniform group size and contiguous membership.
-  for (int64_t g = 0; g < ngroups; ++g) {
-    auto &members = tupleToTiles[tupleOrder[g]];
-    if ((int64_t)members.size() != gsize)
-      return loc->emitError("group ") << g << " has " << members.size()
-             << " tiles, expected gsize=" << gsize;
-    llvm::sort(members);
-    for (int64_t j = 0; j < gsize; ++j) {
-      int64_t expected = g * gsize + j;
-      if (members[j] != expected)
-        return loc->emitError("group ") << g
-               << " is not contiguous: expected tile " << expected
-               << " at position " << j << ", got " << members[j]
-               << " (non-contiguous groups not yet supported)";
-    }
-  }
-
-  // Find pick0 tile per group: the tile with axis_value==0 in each group.
-  SmallVector<int64_t> pick0TileIds(ngroups, -1);
-  for (int64_t g = 0; g < ngroups; ++g) {
-    auto &members = tupleToTiles[tupleOrder[g]];
-    for (int64_t j = 0; j < gsize; ++j) {
-      auto tileMap = dyn_cast<DictionaryAttr>(attrs.coreIdToWkSlice[members[j]]);
-      int64_t axVal = tileMap.getAs<IntegerAttr>(axis).getInt();
-      if (axVal == 0) {
-        if (pick0TileIds[g] != -1)
-          return loc->emitError("group ") << g
-                 << " has more than one tile with " << axis << "=0";
-        pick0TileIds[g] = members[j];
-      }
-    }
-    if (pick0TileIds[g] == -1)
-      return loc->emitError("group ") << g
-             << " has no tile with " << axis << "=0";
-  }
-
-  // --- emit affine sets ---
-  // groups = { (g) : g >= 0, ngroups-1-g >= 0 }
-  // g must be a DIM (not a symbol) — ktdp.inter_tile_produce verifier
-  // requires groups to have no symbols (dimCount=1, symCount=0).
-  auto gDim = getAffineDimExpr(0, ctx);
-  SmallVector<AffineExpr> groupConstraints = {
-      gDim,                                              // g >= 0
-      getAffineConstantExpr(ngroups - 1, ctx) - gDim    // ngroups-1-g >= 0
-  };
-  IntegerSet groupsSet = IntegerSet::get(
-      /*dimCount=*/1, /*symCount=*/0, groupConstraints,
-      /*eqFlags=*/{false, false});
-
-  // producer_tiles_per_group = { (i)[g] : g*gsize <= i <= g*gsize + gsize-1 }
-  auto iExpr = getAffineDimExpr(0, ctx);
-  auto gSym  = getAffineSymbolExpr(0, ctx);
-  AffineExpr base = gSym * getAffineConstantExpr(gsize, ctx);
-  SmallVector<AffineExpr> cons = {
-      iExpr - base,                                           // i - g*gsize >= 0
-      base + getAffineConstantExpr(gsize - 1, ctx) - iExpr   // g*gsize+gsize-1-i >= 0
-  };
-  IntegerSet producerSet = IntegerSet::get(1, 1, cons, {false, false});
-
-  return GroupSets{producerSet, groupsSet, gsize, /*stride=*/gsize, pick0TileIds};
-}
-
-//===----------------------------------------------------------------------===//
-// buildPick0 — find the reduced-axis slice-0 tile in group g
-//===----------------------------------------------------------------------===//
-
-// Build the pick₀ consumer set from gs.pick0TileIds.
-// pick0TileIds[g] is the tile-id with axis_value==0 in group g, scanned from
-// coreIdToWkSlice in buildGroupSets. The ids must form an arithmetic sequence
-// base + g*stride so the predicate can be expressed as the single affine
-// equality i == base + g*stride.
-static FailureOr<IntegerSet> buildPick0Set(MLIRContext *ctx,
-                                            const GroupSets &gs,
-                                            Operation *loc) {
-  int64_t ngroups = (int64_t)gs.pick0TileIds.size();
-  if (ngroups == 0)
-    return IntegerSet::getEmptySet(1, 1, ctx);
-
-  int64_t base   = gs.pick0TileIds[0];
-  int64_t stride = (ngroups > 1) ? (gs.pick0TileIds[1] - base) : 0;
-
-  for (int64_t g = 0; g < ngroups; ++g) {
-    if (gs.pick0TileIds[g] != base + g * stride)
-      return loc->emitError(
-          "reduce_to_one: pick0 tile-ids are not an arithmetic sequence "
-          "(non-uniform pick0 layouts are not yet supported)");
-  }
-
-  // Emit i == base + g*stride.
-  auto iExpr = getAffineDimExpr(0, ctx);
-  auto gSym  = getAffineSymbolExpr(0, ctx);
-  AffineExpr rhs = getAffineConstantExpr(base, ctx)
-                   + gSym * getAffineConstantExpr(stride, ctx);
-  SmallVector<AffineExpr> cons = {iExpr - rhs};
-  return IntegerSet::get(1, 1, cons, {true});
-}
-
-//===----------------------------------------------------------------------===//
-// CombinerSpec — dispatch helpers for shorthand combiners
-//===----------------------------------------------------------------------===//
-
-// Returns the identity TypedAttr for (combiner, elemType), or failure() if
-// unsupported.
-
-// Emits the reduction op for one (lhs, rhs, out) triple.
-// Returns the scalar/tensor result Value, or failure() if unsupported.
-// only used when the reducer region is not provided
-static FailureOr<Value> combinerEmitOp(OpBuilder &b, Location loc,
-                                        StringRef combiner,
-                                        Value lhs, Value rhs, Value out) {
-  if (combiner == "add")
-    return linalg::AddOp::create(b, loc, ValueRange{lhs, rhs}, ValueRange{out})
-               .getResult(0);
-  if (combiner == "max")
-    return linalg::MaxOp::create(b, loc, ValueRange{lhs, rhs}, ValueRange{out})
-               .getResult(0);
-  if (combiner == "mul")
-    return linalg::MulOp::create(b, loc, ValueRange{lhs, rhs}, ValueRange{out})
-               .getResult(0);
-  return failure();  // caller emits error
-}
-
 
 //===----------------------------------------------------------------------===//
 // The pass
@@ -297,9 +62,23 @@ static FailureOr<Value> combinerEmitOp(OpBuilder &b, Location loc,
 struct LowerInterTilePass
     : public mlir::triton::ktdp::impl::LowerInterTileBase<LowerInterTilePass> {
 
+  using LowerInterTileBase::LowerInterTileBase;
+
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     IRRewriter rewriter(&getContext());
+
+    // The DMV lowering is selected but not yet implemented, so refuse rather
+    // than silently emitting the delivery pair the caller did not ask for.
+    if (interTileLowering == "dmv") {
+      mod.emitError("inter-tile-lowering='dmv' is not yet implemented");
+      return signalPassFailure();
+    }
+    if (interTileLowering != "delivery") {
+      mod.emitError("inter-tile-lowering must be 'delivery' or 'dmv', got '")
+          << interTileLowering << "'";
+      return signalPassFailure();
+    }
 
     // Collect all inter_tile_reduce ops first (collect-then-rewrite).
     SmallVector<triton::InterTileReduceOp> ops;
@@ -445,7 +224,6 @@ struct LowerInterTilePass
     return success();
   }
 
-  // Build the reducer region of the ktdp.inter_tile_reduce op.
   LogicalResult buildReducerRegion(IRRewriter &rewriter, Location loc,
                                    ktdp::InterTileReduceOp dstOp,
                                    ArrayRef<Type> partialTypes,
@@ -554,8 +332,9 @@ struct LowerInterTilePass
 
 namespace mlir::triton::ktdp {
 
-std::unique_ptr<OperationPass<ModuleOp>> createLowerInterTilePass() {
-  return std::make_unique<LowerInterTilePass>();
+std::unique_ptr<OperationPass<ModuleOp>>
+createLowerInterTilePass(LowerInterTileOptions options) {
+  return std::make_unique<LowerInterTilePass>(options);
 }
 
 } // namespace mlir::triton::ktdp

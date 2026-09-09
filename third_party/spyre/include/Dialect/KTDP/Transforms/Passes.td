@@ -261,6 +261,14 @@ def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
         inter_tile_reduce pairs are introduced; the tile_future is single-use.
     }];
 
+    let options = [
+        Option<"interTileLowering", "inter-tile-lowering", "std::string",
+               /*default=*/"\"delivery\"",
+               "Lowering for tt.inter_tile_reduce: \"delivery\" (ktdp "
+               "inter_tile_produce/reduce pair) or \"dmv\" (distributed "
+               "memory view; not yet implemented)">
+    ];
+
     let dependentDialects = [
         "mlir::ktdp::KtdpDialect",
         "mlir::arith::ArithDialect",

@@ -150,7 +150,8 @@ _PASS_OPTIONS = {
     "distribute_work": ("grid",),
     "materialize_base_addresses": ("base_addresses",),
     "rewrite_descriptor_layout": ("data_layout",),
-    "convert_ttir_to_ktdp": ("data_layout",),
+    "lower_inter_tile": ("inter_tile_lowering",),
+    "convert_ttir_to_ktdp": ("data_layout", "inter_tile_lowering"),
 }
 
 
@@ -288,6 +289,11 @@ class SpyreOptions:
     # "host" (strides derived from logical strides via the coordinate map).
     data_layout: str = "device"
 
+    # Which pass lowers tt.inter_tile_reduce: "delivery" (the default --
+    # LowerInterTile, emitting the ktdp.inter_tile_produce/reduce pair) or "dmv"
+    # (a distributed memory view over the per-tile partitions)
+    inter_tile_lowering: str = "delivery"
+
     # ---- Required by Triton code generator -----
     sanitize_overflow: bool = False
     debug: bool = False
@@ -328,6 +334,12 @@ class SpyreOptions:
         if self.data_layout not in ("device", "host"):
             raise ValueError(
                 f"data_layout must be 'device' or 'host', got {self.data_layout!r}")
+        # The C++ binding treats anything but "dmv" as "delivery", so an
+        # unrecognized value would silently mean "delivery" if not caught here.
+        if self.inter_tile_lowering not in ("delivery", "dmv"):
+            raise ValueError(
+                "inter_tile_lowering must be 'delivery' or 'dmv', got "
+                f"{self.inter_tile_lowering!r}")
         # Symbolic mode leaves the pointer arguments un-materialized, so there is
         # nothing for supplied addresses to be baked into. Silently honouring one
         # and dropping the other would pick a mode the caller did not ask for.

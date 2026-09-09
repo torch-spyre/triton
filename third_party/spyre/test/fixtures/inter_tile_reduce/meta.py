@@ -24,12 +24,12 @@ splitk (reduce_to_one, f32):
   handles arbitrary M for the fixed grid.
 
 No tt.spyre_tensor_layout variant: RewriteDescriptorLayout physicalizes the
-loaded partial (and, via retypeChain, the tt.inter_tile result), but the
-``identities`` operand stays at logical rank -- it is a sibling operand of the
-op, not a successor in the retype chain, so the forward walk never reaches it.
-LowerInterTile then forwards that stale value verbatim
-(``LowerInterTile.cpp:417``) while deriving ``resultTypes`` from the
-physicalized partials (``:413``), so the op fails its own verifier:
+loaded partial, but the ``identities`` operand stays at logical rank -- it is a
+sibling operand of the op, materialized by ``semantic.py`` from ``tl.full`` and
+downstream of nothing, so the pass's forward walk (which propagates along
+def->use edges from the descriptor op) never reaches it. LowerInterTile then
+forwards that stale value verbatim while deriving ``resultTypes`` from the
+physicalized partials, so the op fails its own verifier:
 
     'ktdp.inter_tile_reduce' op failed to verify that identity types must
     match result types

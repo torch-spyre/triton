@@ -14,7 +14,8 @@ namespace mlir::triton::ktdp {
 #define GEN_PASS_REGISTRATION
 #include "Dialect/KTDP/Transforms/Passes.h.inc"
 
-std::unique_ptr<OperationPass<ModuleOp>> createLowerInterTilePass();
+std::unique_ptr<OperationPass<ModuleOp>> createLowerInterTilePass(
+    LowerInterTileOptions options = {});
 std::unique_ptr<OperationPass<ModuleOp>> createConvertFunctionsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerDescriptorMemoryPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerScalarLoadPass();
