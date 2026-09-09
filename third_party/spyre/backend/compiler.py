@@ -137,8 +137,8 @@ _CORE_PIPELINE_PASSES = (
     "lower_descriptor_memory",
     "lower_scalar_load",
     "lower_compute_ops",
-    "rewrite_descriptor_layout",
     "lower_inter_tile",
+    "rewrite_descriptor_layout",
     "convert_functions",
 )
 
@@ -289,9 +289,11 @@ class SpyreOptions:
     # "host" (strides derived from logical strides via the coordinate map).
     data_layout: str = "device"
 
-    # Which pass lowers tt.inter_tile_reduce: "delivery" (the default --
-    # LowerInterTile, emitting the ktdp.inter_tile_produce/reduce pair) or "dmv"
-    # (a distributed memory view over the per-tile partitions)
+    # How tt.inter_tile_reduce expresses the cross-tile transfer: "delivery"
+    # (the default -- an op that moves the data, the
+    # ktdp.inter_tile_produce/reduce pair) or "addressing" (a distributed memory
+    # view over the per-tile partitions, where a load at a global coordinate
+    # *is* the transfer)
     inter_tile_lowering: str = "delivery"
 
     # ---- Required by Triton code generator -----
@@ -334,11 +336,11 @@ class SpyreOptions:
         if self.data_layout not in ("device", "host"):
             raise ValueError(
                 f"data_layout must be 'device' or 'host', got {self.data_layout!r}")
-        # The C++ binding treats anything but "dmv" as "delivery", so an
+        # The C++ binding treats anything but "addressing" as "delivery", so an
         # unrecognized value would silently mean "delivery" if not caught here.
-        if self.inter_tile_lowering not in ("delivery", "dmv"):
+        if self.inter_tile_lowering not in ("delivery", "addressing"):
             raise ValueError(
-                "inter_tile_lowering must be 'delivery' or 'dmv', got "
+                "inter_tile_lowering must be 'delivery' or 'addressing', got "
                 f"{self.inter_tile_lowering!r}")
         # Symbolic mode leaves the pointer arguments un-materialized, so there is
         # nothing for supplied addresses to be baked into. Silently honouring one

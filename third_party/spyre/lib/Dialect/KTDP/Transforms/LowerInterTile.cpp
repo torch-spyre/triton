@@ -68,14 +68,15 @@ struct LowerInterTilePass
     ModuleOp mod = getOperation();
     IRRewriter rewriter(&getContext());
 
-    // The DMV lowering is selected but not yet implemented, so refuse rather
-    // than silently emitting the delivery pair the caller did not ask for.
-    if (interTileLowering == "dmv") {
-      mod.emitError("inter-tile-lowering='dmv' is not yet implemented");
+    // The addressing lowering is selected but not yet implemented, so refuse
+    // rather than silently emitting the delivery pair the caller did not ask for.
+    if (interTileLowering == "addressing") {
+      mod.emitError("inter-tile-lowering='addressing' is not yet implemented");
       return signalPassFailure();
     }
     if (interTileLowering != "delivery") {
-      mod.emitError("inter-tile-lowering must be 'delivery' or 'dmv', got '")
+      mod.emitError(
+          "inter-tile-lowering must be 'delivery' or 'addressing', got '")
           << interTileLowering << "'";
       return signalPassFailure();
     }
@@ -83,6 +84,35 @@ struct LowerInterTilePass
     // Collect all inter_tile_reduce ops first (collect-then-rewrite).
     SmallVector<triton::InterTileReduceOp> ops;
     mod.walk([&](triton::InterTileReduceOp op) { ops.push_back(op); });
+
+    // Layouts and the *delivery* lowering do not compose yet. This pass now runs
+    // before RewriteDescriptorLayout, and RDL cannot carry a physical type
+    // through the produce/reduce pair: its forward walk follows RankedTensorType
+    // results, and the pair communicates through a !ktdp.tile_future whose
+    // tensor types are nested inside the type. Reaching RDL that way fails later
+    // with an opaque type mismatch, so refuse here, where both facts are still
+    // visible. The check is deliberately delivery-only: the addressing lowering
+    // emits no tile_future -- its results are plain memrefs and tensors -- so it
+    // has no structural reason to hit the same wall and must not inherit this
+    // refusal.
+    if (!ops.empty() && interTileLowering == "delivery") {
+      triton::SpyreTensorLayoutOp marker;
+      mod.walk([&](triton::SpyreTensorLayoutOp op) {
+        marker = op;
+        return WalkResult::interrupt();
+      });
+      if (marker) {
+        InFlightDiagnostic diag = ops.front().emitError(
+            "this kernel has both a tt.spyre_tensor_layout annotation and a "
+            "tt.inter_tile_reduce; that combination is not yet supported by the "
+            "'delivery' inter-tile lowering, because RewriteDescriptorLayout has "
+            "no physical-type propagation pattern for the produce/reduce pair "
+            "and cannot propagate through its !ktdp.tile_future. Drop the layout "
+            "annotation, or the inter-tile reduction");
+        diag.attachNote(marker.getLoc()) << "layout annotation here";
+        return signalPassFailure();
+      }
+    }
 
     for (auto op : ops) {
       if (failed(lowerOne(op, rewriter)))

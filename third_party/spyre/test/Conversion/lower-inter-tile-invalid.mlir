@@ -279,3 +279,29 @@ tt.func @missing_num_wk_slices(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<
          -> (tensor<8xf32>)
   tt.return %0 : tensor<8xf32>
 }
+
+// -----
+
+// A layout annotation plus an inter-tile reduction is not yet supported by the
+// 'delivery' lowering: RewriteDescriptorLayout, which now runs after this pass,
+// has no propagation pattern for the produce/reduce pair. Refused here rather
+// than downstream as a type mismatch.
+
+tt.func @layout_plus_inter_tile(%desc: !tt.tensordesc<64x64xf32>,
+                                %p: tensor<8xf32>, %id: tensor<8xf32>)
+    -> tensor<8xf32> {
+  // expected-note @+1 {{layout annotation here}}
+  tt.spyre_tensor_layout %desc
+    {phys_src = array<i64: 1, 0, 1>,
+     phys_op = array<i64: 1, 0, 2>,
+     phys_arg = array<i64: 64, 0, 64>} : <64x64xf32>
+  // expected-error @+1 {{this kernel has both a tt.spyre_tensor_layout annotation and a tt.inter_tile_reduce; that combination is not yet supported by the 'delivery' inter-tile lowering, because RewriteDescriptorLayout has no physical-type propagation pattern for the produce/reduce pair and cannot propagate through its !ktdp.tile_future. Drop the layout annotation, or the inter-tile reduction}}
+  %0 = tt.inter_tile_reduce
+         partials(%p : tensor<8xf32>)
+         identities(%id : tensor<8xf32>)
+         axis = "x" mode = "all_reduce" combiner = "add"
+         {numWkSlicesPerDim = {x = 2 : i64},
+          coreIdToWkSlice = [{x = 0 : i64}, {x = 1 : i64}]}
+         -> (tensor<8xf32>)
+  tt.return %0 : tensor<8xf32>
+}
