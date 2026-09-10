@@ -27,6 +27,7 @@
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
 #include "RewriteDescriptorLayout/IndexDomain.h"
 #include "RewriteDescriptorLayout/PhysicalTypeAnalysis.h"
+#include "RewriteDescriptorLayout/RequirementAnalysis.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
@@ -568,8 +569,8 @@ struct RewriteDescriptorLayoutPass
     ld.erase();
     // Seed Phase 2's reachability map: this is a physicalized load result,
     // the root of every forward elementwise chain Phase 2 will retype, and
-    // carries this descriptor's marker for dispatchSource/findMarkerForStore
-    // to read directly (no backward walk needed).
+    // carries this descriptor's marker for dispatchSource/findMarkerForOperand
+    // to read directly (no walk needed).
     physicalValues[newLd.getResult()] =
         mlir::triton::ktdp::PhysicalValueInfo{marker, {}};
   }
@@ -893,11 +894,22 @@ struct RewriteDescriptorLayoutPass
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 1 complete, "
                             << "entering Phase 2 (contraction synthesis)\n");
 
-    // Phase 2A: decide, for every value reachable from Phase 1's roots, the
-    // final physical type it will carry -- before Phase 2 rewrites anything.
-    // Mutates no IR, creates no ops (see PhysicalTypeAnalysis.h).
     PassContext ctx{physMemViewToMarker, physicalValues};
-    PhysicalTypeMap physicalTypeMap = runPhysicalTypeAnalysis(module, ctx);
+
+    // Phase 2A, backward: what layout is WANTED of each value, seeded from the
+    // stores Phase 1 physicalized. Runs BEFORE the forward analysis because the
+    // forward analysis consumes it -- ReducePropagation compares what its
+    // operand's layout induces against the requirement at its result. Not a
+    // cycle: no backward rule reads a forward fact (the seeds are Phase 1's
+    // physicalized stores, the elementwise match is structural, and the reduce
+    // rule propagates nothing). Mutates no IR.
+    RequirementAnalysis requirements = runRequirementAnalysis(module, ctx);
+
+    // Phase 2A, forward: decide, for every value reachable from Phase 1's roots,
+    // the final physical type it will carry -- before Phase 2 rewrites anything.
+    // Mutates no IR, creates no ops (see PhysicalTypeAnalysis.h).
+    PhysicalTypeMap physicalTypeMap =
+        runPhysicalTypeAnalysis(module, ctx, requirements.requirements);
     ctx.physicalTypeAnalysis = &physicalTypeMap;
     // Phase 2B reads that map through the const pointer above and writes it
     // through this handle, which grants exactly one operation -- see
@@ -913,12 +925,10 @@ struct RewriteDescriptorLayoutPass
       // linalg.transpose) so Phase 2 decides them too, rather than Phase 1
       // retyping/erasing them in passing.
       //
-      // The elementwise membership test here is deliberately not
-      // isSingleTensorElementwiseOp (see its comment): that predicate would
-      // silently exclude multi-tensor-operand elementwise ops like arith.addf
-      // from ever being retyped by RewriteElementwisePattern. This test only
-      // needs to be a superset of what that pattern's own local rule
-      // matches: any single-result op with at least one tensor operand.
+      // The elementwise membership test only needs to be a SUPERSET of what
+      // RewriteElementwisePattern's own local rule matches: any single-result op
+      // with at least one tensor operand. Narrowing it to one tensor operand
+      // would silently exclude arith.addf and select from ever being retyped.
       SmallVector<Operation *> candidates;
       module.walk([&](Operation *op) {
         if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, linalg::ReduceOp,

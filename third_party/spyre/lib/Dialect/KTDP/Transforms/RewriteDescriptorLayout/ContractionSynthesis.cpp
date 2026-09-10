@@ -42,29 +42,6 @@ using namespace mlir;
 
 namespace mlir::triton::ktdp {
 
-// True iff op is a single-result elementwise op with exactly one
-// RankedTensor operand.
-//
-// Not a general elementwise predicate. It is scoped to findMarkerForStore's
-// chain walk, where the single-tensor-operand restriction is load-bearing:
-// rejecting two or more tensor operands is what stops that walk crossing a
-// matmul (3 tensor operands) or a reduce (2) into an unrelated chain.
-// Widening it requires re-proving that walk cannot leave the chain it started
-// on.
-//
-// Forward retyping (deciding an op's own result type) must NOT reuse this --
-// it would exclude multi-tensor-operand elementwise ops like arith.addf and
-// select. See RewriteElementwisePattern, which uses its own local shape rule.
-bool isSingleTensorElementwiseOp(Operation *op) {
-  if (op->getNumResults() != 1 || op->getNumOperands() == 0)
-    return false;
-  int tensorOps = 0;
-  for (auto operand : op->getOperands())
-    if (isa<RankedTensorType>(operand.getType()))
-      ++tensorOps;
-  return tensorOps == 1;
-}
-
 // Rebuild a DPS init at `accTy`, or null when its producer is one this cannot
 // reproduce.
 //
@@ -83,20 +60,59 @@ bool isSingleTensorElementwiseOp(Operation *op) {
 //
 // Anything else — a loaded tensor carrying incoming data, say — holds values a
 // rebuild would silently drop, so it is refused rather than guessed at.
-static Value rebuildPhysicalInit(OpBuilder &b, Location loc, Value init,
-                                 RankedTensorType accTy) {
+// The accumulator at `accTy`, from the init the op arrived with at the logical
+// shape. Retyped in place where that is sound, so the pass leaves no dead op
+// behind; minted otherwise. Only a tensor.empty, or a linalg.fill over one,
+// qualifies either way -- anything else holds values a rebuild would drop, which
+// is what canRebuildPhysicalInit gates in Phase 2A.
+//
+// accTy comes from the operand plans, not from the init, so nothing has to reach
+// the init to know its shape -- the init is read only for its element type.
+//
+// Retyping needs the rewriter rather than a plain builder: changing a result type
+// without notifying the driver would leave the users it should re-enqueue
+// unvisited. A shared producer is minted for instead of retyped, since retyping
+// would change the type under its other users. ConvertTTReduce gives every
+// reduction its own init and no CSE runs before this pass, so the fallback is for
+// hand-written IR rather than anything the pipeline emits.
+static Value rebuildPhysicalInit(PatternRewriter &rewriter, Location loc,
+                                 Value init, RankedTensorType accTy) {
   if (init.getType() == accTy)
     return init;
-  auto empty = [&] {
-    return tensor::EmptyOp::create(b, loc, accTy.getShape(),
+
+  auto mintEmpty = [&] {
+    return tensor::EmptyOp::create(rewriter, loc, accTy.getShape(),
                                    accTy.getElementType())
         .getResult();
   };
-  if (auto fill = init.getDefiningOp<linalg::FillOp>())
-    return linalg::FillOp::create(b, loc, fill.getInputs()[0], empty())
+  // A dynamic size is one operand per dynamic dim, so a retype would leave the
+  // operand list describing a different rank.
+  auto retypeable = [](tensor::EmptyOp e) {
+    return e && e.getDynamicSizes().empty() && e.getResult().hasOneUse();
+  };
+
+  if (auto fill = init.getDefiningOp<linalg::FillOp>()) {
+    auto empty = fill.getOutputs()[0].getDefiningOp<tensor::EmptyOp>();
+    if (init.hasOneUse() && retypeable(empty)) {
+      rewriter.modifyOpInPlace(
+          empty, [&] { empty.getResult().setType(accTy); });
+      rewriter.modifyOpInPlace(
+          fill, [&] { fill.getResult(0).setType(accTy); });
+      return fill.getResult(0);
+    }
+    return linalg::FillOp::create(rewriter, loc, fill.getInputs()[0],
+                                  mintEmpty())
         .getResult(0);
-  if (init.getDefiningOp<tensor::EmptyOp>())
-    return empty();
+  }
+
+  if (auto empty = init.getDefiningOp<tensor::EmptyOp>()) {
+    if (retypeable(empty)) {
+      rewriter.modifyOpInPlace(
+          empty, [&] { empty.getResult().setType(accTy); });
+      return init;
+    }
+    return mintEmpty();
+  }
   return {};
 }
 
@@ -298,7 +314,13 @@ Value extractOpSlice(OpBuilder &b, Location loc,
 // Returns the replacement value for the original op's result.
 Value emitNarrowStage(
     linalg::LinalgOp op,
+    // Two builders on purpose. `b` emits new ops and is swapped by value as the
+    // loop nest descends (see the emitCountedLoop bodies below), which a
+    // PatternRewriter reference cannot be. `rewriter` is only for retyping an op
+    // that already exists -- a mutation the driver has to be told about so it
+    // re-enqueues that op's users.
     OpBuilder &b,
+    PatternRewriter &rewriter,
     const SourceOpSpec &spec,
     llvm::ArrayRef<OperandPlan> plans,
     const OperandSetTripCounts &tripCounts) {
@@ -344,7 +366,7 @@ Value emitNarrowStage(
   // Phase 2A only puts a reduce in this space when canRebuildPhysicalInit holds
   // for the same init, so a null here means those two have drifted apart.
   if (spec.outputAxes == OutputAxisSpace::Physical) {
-    cVal = rebuildPhysicalInit(b, loc, cVal, accTy);
+    cVal = rebuildPhysicalInit(rewriter, loc, cVal, accTy);
     if (!cVal)
       return {};
   }
@@ -572,7 +594,7 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
         "two independent scatter loops (not supported)");
 
   OpBuilder b(op.getOperation());
-  Value result = emitNarrowStage(op, b, spec, plans, tripCounts);
+  Value result = emitNarrowStage(op, b, rewriter, spec, plans, tripCounts);
   if (!result)
     return emitFatalError(op, ctx,
         "spyre_tensor_layout: the op's output is to be physicalized but its "
@@ -599,15 +621,6 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
 //===----------------------------------------------------------------------===//
 // Sink stage (store scatter)
 //===----------------------------------------------------------------------===//
-
-// The marker half of findStoreDestination: the layout of the store this value
-// ultimately feeds, ignoring that store's tile shape. Named separately because
-// the store pattern only ever asks "is the output annotated", where a shape it
-// already has in hand would be noise.
-triton::SpyreTensorLayoutOp findMarkerForStore(Value value,
-                                               const PassContext &ctx) {
-  return findStoreDestination(value, ctx.physMemViewToMarker).marker;
-}
 
 // Which side of a store's widening conversion is the physical one. The other
 // side is always logical -- one op-tile, one physical container -- so naming
@@ -1038,13 +1051,12 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
 // An elementwise op's output can always be physicalized: it is rank-agnostic,
 // so the physical type of its tensor operand(s) propagates unchanged.
 //
-// Deliberately local, and deliberately not isSingleTensorElementwiseOp (see
-// the comment there): by the time Phase 2 runs, Phase 1 has already made
+// Deliberately local: by the time Phase 2 runs, Phase 1 has already made
 // every load's result physical, so the decision for an elementwise op is
-// local to that op's own operand/result shapes, not a backward walk. That
-// also covers multi-tensor-operand elementwise ops (addf, mulf, select, ...)
-// for free -- it just requires every tensor operand to already agree on a
-// shape before retyping the result to match.
+// local to that op's own operand/result shapes, not a walk. Note it does NOT
+// require a single tensor operand -- that would exclude multi-tensor-operand
+// elementwise ops (addf, mulf, select, ...) from ever being retyped. It only
+// requires every tensor operand to already agree on a shape.
 //
 // The shape-mismatch test alone is not sufficient to scope this pattern: it
 // also matches ops that are not elementwise at all but happen to have one
@@ -1216,7 +1228,13 @@ struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
       return failure();
     if (dataTy.getRank() == (int)tileTy.getShape().size())
       return failure();
-    auto marker = findMarkerForStore(st.getDataTile(), ctx);
+    // Whether the output is annotated is a LOCAL question about the store in
+    // hand: its own access tile either resolves to a marker or it does not. It
+    // used to be asked by walking forward from the data tile to a store, which
+    // returned the marker of whichever store came first among that tile's users
+    // -- not necessarily this one.
+    auto marker =
+        lookupMarkerFromTile(st.getAccessTile(), ctx.physMemViewToMarker);
     if (!marker) {
       // No destination marker to physicalize into: the access tile stays
       // logical. If the data tile is physical (source-side marker known),
@@ -1308,34 +1326,6 @@ struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
 } // namespace
 
 namespace mlir::triton::ktdp {
-
-//===----------------------------------------------------------------------===//
-// Store destination lookup
-//===----------------------------------------------------------------------===//
-
-StoreDestination findStoreDestination(Value value,
-                                     const MarkerByMemView &markers) {
-  llvm::SmallVector<Value> worklist = {value};
-  while (!worklist.empty()) {
-    Value v = worklist.pop_back_val();
-    for (auto *user : v.getUsers()) {
-      if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
-        auto marker = lookupMarkerFromTile(st.getAccessTile(), markers);
-        if (!marker)
-          continue;
-        auto tileTy =
-            dyn_cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
-        if (!tileTy)
-          continue;
-        return {marker, llvm::SmallVector<int64_t>(tileTy.getShape())};
-      }
-      if (!isSingleTensorElementwiseOp(user))
-        continue;
-      worklist.push_back(user->getResult(0));
-    }
-  }
-  return {};
-}
 
 //===----------------------------------------------------------------------===//
 // Entry point

@@ -529,10 +529,11 @@ def _load_examples():
 
             # Disabled variants: one entry, no expansion.
             if merged.get("disabled"):
-                # Which means the raw ``params`` survive into the registry, and
-                # gen_patterns_docs.py renders them as ``f"{k}={vals[0]!r}"`` --
-                # so a tuple key would print as a tuple against a row. Refused
-                # here rather than left to produce nonsense in the docs.
+                # Which means the raw ``params`` survive into the registry
+                # un-expanded. The group form only has meaning once expansion
+                # zips its names together, so a tuple key here would reach every
+                # consumer as an uninterpreted tuple. Refused at the source
+                # rather than left to be mis-read downstream.
                 grouped = [k for k in merged.get("params", {})
                            if isinstance(k, tuple)]
                 if grouped:
