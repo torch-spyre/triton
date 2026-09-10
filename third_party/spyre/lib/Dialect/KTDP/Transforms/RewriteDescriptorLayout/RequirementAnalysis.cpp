@@ -81,19 +81,21 @@ struct ElementwiseRequirement : RequirementBackwardPattern {
     if (op->getNumResults() != 1 ||
         !isa<RankedTensorType>(op->getResult(0).getType()))
       return false;
-    ArrayRef<int64_t> commonShape;
+    // Deliberately does NOT compare operand shapes to each other. Mid-analysis
+    // the IR is half-retyped -- Phase 1 physicalizes loads and stops -- so a
+    // sibling operand being a different shape is the state this pass exists to
+    // resolve, not evidence that the op is unknown. An elementwise op's
+    // requirement is the same on every operand regardless (induce is `return
+    // req`), so the comparison gates nothing it needs.
+    //
+    // Shape-changing ops are excluded by KIND; isShapeChangingOp (Types.h) is
+    // the one list all three elementwise predicates share, and states why.
+    if (isShapeChangingOp(op))
+      return false;
     bool sawTensorOperand = false;
-    for (Value o : op->getOperands()) {
-      auto t = dyn_cast<RankedTensorType>(o.getType());
-      if (!t)
-        continue;
-      if (!sawTensorOperand) {
-        commonShape = t.getShape();
+    for (Value o : op->getOperands())
+      if (isa<RankedTensorType>(o.getType()))
         sawTensorOperand = true;
-      } else if (t.getShape() != commonShape) {
-        return false;
-      }
-    }
     return sawTensorOperand;
   }
 
@@ -167,13 +169,29 @@ struct MatmulRequirement : RequirementBackwardPattern {
   }
 };
 
-/// tensor.expand_shape / collapse_shape / reshape: the requirement terminates.
-/// The physical dim count changes across a reassociation map, so a
-/// per-physical-dim requirement on the result says nothing about the operand --
-/// the mirror of why ReshapePropagation declines forward.
+/// tensor.expand_shape / collapse_shape / reshape: the requirement crosses only
+/// a reshape that adds or removes SIZE-1 dims, and terminates otherwise.
 ///
-/// Registered ahead of the structural elementwise rule; see
-/// populateRequirementBackwardPatterns.
+/// The general case cannot cross, for the reason the forward rule states: a
+/// requirement is indexed per PHYSICAL dim, and a reassociation that fuses two
+/// real axes leaves no dim for one of them to map to. Collapsing physical
+/// [1, 64, 64] under phys_op = [floor, id, mod] via [[0, 1], [2]] fuses the
+/// stick index with the row, and no coordinate map describes the result.
+///
+/// A reshape that only inserts or drops size-1 dims is different: it touches no
+/// real axis, and a size-1 dim carries no coordinate information. So the
+/// requirement crosses with phys_src renumbered. That narrow class is what
+/// LowerComputeOps emits between a reduce and a broadcast -- rules A3 and A4
+/// lower tt.expand_dims and tt.broadcast independently, so A3 expands 1 -> 1x1
+/// and A4 immediately collapses it back.
+///
+/// The reassociation groups always index the HIGHER-rank side: the result for
+/// expand_shape, the operand for collapse_shape. So the two directions are not
+/// symmetric and are handled separately below.
+///
+/// The safety condition is on the marker, not on extents: a stick index can
+/// itself have extent 1 while still carrying coordinate meaning, so a group of
+/// size > 1 must contain no floordiv or mod dim.
 struct ReshapeRequirement : RequirementBackwardPattern {
   bool match(Operation *op) const override {
     return isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp,
@@ -183,14 +201,148 @@ struct ReshapeRequirement : RequirementBackwardPattern {
   llvm::FailureOr<LayoutRequirement>
   induce(Operation *op, Value result, Value operand,
          const LayoutRequirement &req) const override {
-    return failure();
+    // tensor.reshape takes a runtime shape operand, so there is no static
+    // reassociation to reason about.
+    auto expand = dyn_cast<tensor::ExpandShapeOp>(op);
+    auto collapse = dyn_cast<tensor::CollapseShapeOp>(op);
+    if (!expand && !collapse)
+      return failure();
+
+    auto inTy = dyn_cast<RankedTensorType>(operand.getType());
+    auto resTy = dyn_cast<RankedTensorType>(result.getType());
+    if (!inTy || !resTy)
+      return failure();
+
+    // The requirement is stated over the RESULT's logical dims.
+    unsigned logicalRank = 0;
+    for (int64_t d : req.physSrc)
+      logicalRank = std::max(logicalRank, (unsigned)(d + 1));
+    if (logicalRank != (unsigned)resTy.getRank())
+      return failure();
+
+    auto reassoc = expand ? expand.getReassociationIndices()
+                          : collapse.getReassociationIndices();
+    // Groups index the higher-rank side. Verify that side's rank matches, so a
+    // malformed pairing is refused rather than mis-indexed.
+    llvm::ArrayRef<int64_t> bigShape =
+        expand ? resTy.getShape() : inTy.getShape();
+    if (reassoc.size() != (unsigned)(expand ? inTy.getRank()
+                                            : resTy.getRank()))
+      return failure();
+
+    // remap[result dim] -> operand dim, or -1 when the dim disappears.
+    llvm::SmallVector<int64_t> remap(logicalRank, -1);
+    for (unsigned g = 0; g < reassoc.size(); ++g) {
+      // Within a group, at most one dim of the higher-rank side may be
+      // non-unit; it is the one the lower-rank side's dim corresponds to.
+      int64_t nonUnit = -1;
+      for (int64_t d : reassoc[g]) {
+        if (d < 0 || d >= (int64_t)bigShape.size())
+          return failure();
+        if (bigShape[d] != 1) {
+          if (nonUnit >= 0)
+            return failure();     // two real axes in one group: cannot cross
+          nonUnit = d;
+        }
+      }
+      // A floordiv/mod dim inside a multi-dim group would be fused or split.
+      if (reassoc[g].size() > 1)
+        for (int64_t d : reassoc[g]) {
+          int64_t reqDim = expand ? d : (int64_t)g;
+          for (unsigned p = 0; p < req.physSrc.size(); ++p)
+            if (req.physSrc[p] == reqDim &&
+                static_cast<CoordOp>(req.physOp[p]) != CoordOp::Identity)
+              return failure();
+        }
+
+      if (expand) {
+        // Groups index the RESULT. Group g corresponds to operand dim g, and
+        // the surviving result dim within it is the non-unit one (or the first).
+        int64_t keep = nonUnit >= 0 ? nonUnit : reassoc[g].front();
+        remap[keep] = (int64_t)g;
+      } else {
+        // Groups index the OPERAND. Result dim g corresponds to the group's
+        // non-unit operand dim (or its first).
+        int64_t keep = nonUnit >= 0 ? nonUnit : reassoc[g].front();
+        if ((unsigned)g >= logicalRank)
+          return failure();
+        remap[g] = keep;
+      }
+    }
+
+    // Build the operand-side requirement. The two directions differ in whether
+    // entries are dropped or added:
+    //
+    //   expand_shape   the operand has FEWER dims, so a requirement entry whose
+    //                  logical dim is a newly inserted size-1 dim is dropped.
+    //   collapse_shape the operand has MORE dims, so an entry must be ADDED for
+    //                  each size-1 operand dim the collapse removed. Such a dim
+    //                  is Identity with extent 1 -- it carries no coordinate
+    //                  information, which is exactly why crossing is sound.
+    //
+    // Either way the result is indexed per operand dim, so it is assembled by
+    // walking the operand's dims rather than the requirement's.
+    LayoutRequirement out;
+    out.marker = req.marker;
+    llvm::SmallVector<int64_t> reqDimForOperandDim(inTy.getRank(), -1);
+    for (unsigned d = 0; d < logicalRank; ++d)
+      if (remap[d] >= 0 && remap[d] < inTy.getRank())
+        reqDimForOperandDim[remap[d]] = (int64_t)d;
+
+    for (int64_t od = 0; od < inTy.getRank(); ++od) {
+      int64_t reqDim = reqDimForOperandDim[od];
+      if (reqDim < 0) {
+        // A size-1 operand dim the reshape removed. Only sound because it is
+        // size 1; refuse anything else rather than invent a coordinate for it.
+        if (inTy.getDimSize(od) != 1)
+          return failure();
+        out.physSrc.push_back(od);
+        out.physOp.push_back((int64_t)CoordOp::Identity);
+        out.physArg.push_back(0);
+        out.physExtents.push_back(1);
+        continue;
+      }
+      // Carry every requirement entry naming this logical dim.
+      bool found = false;
+      for (unsigned p = 0; p < req.physSrc.size(); ++p) {
+        if (req.physSrc[p] != reqDim)
+          continue;
+        out.physSrc.push_back(od);
+        out.physOp.push_back(req.physOp[p]);
+        out.physArg.push_back(req.physArg[p]);
+        out.physExtents.push_back(req.physExtents[p]);
+        found = true;
+      }
+      if (!found)
+        return failure();
+    }
+    if ((int64_t)out.physSrc.size() != inTy.getRank())
+      return failure();
+    return out;
   }
 };
 
-/// linalg.broadcast: the requirement terminates. The result has dims the operand
-/// does not, so no per-dim requirement on it constrains the operand. This is
-/// also what keeps softmax's and layernorm's reduce results out of the map: they
-/// reach their store only through a broadcast.
+/// linalg.broadcast: the requirement PROJECTS onto the carried axes.
+///
+/// The result has dims the operand does not -- that is what a broadcast is --
+/// so the requirement cannot cross unchanged. But it does project: keep the
+/// physical dims whose phys_src names a logical axis the operand CARRIES, drop
+/// those naming an axis the broadcast ADDS. What survives is a requirement of
+/// exactly the operand's logical rank.
+///
+/// For softmax that projection is trivial -- the surviving dim is Identity, so
+/// it asks nothing a rank-1 logical value does not already satisfy. It is still
+/// load-bearing: it is what carries the requirement past this op to the reduce,
+/// which needs `want` non-null to take the Physical space. Once the reduce's
+/// result is in the forward map, the reshapes and then this broadcast acquire a
+/// physical operand, which is what lets BroadcastPropagation be asked at all.
+/// The real shape work happens there, from the store's marker.
+///
+/// Declines when a CARRIED axis is split across two physical dims. Projecting
+/// would then demand an operand of higher rank than it has -- linalg.broadcast
+/// matches its input against the non-broadcast init dims positionally -- so
+/// there is no requirement the operand could satisfy. That is the case the
+/// consuming elementwise op has to repair instead.
 struct BroadcastRequirement : RequirementBackwardPattern {
   bool match(Operation *op) const override {
     return isa<linalg::BroadcastOp>(op);
@@ -199,7 +351,61 @@ struct BroadcastRequirement : RequirementBackwardPattern {
   llvm::FailureOr<LayoutRequirement>
   induce(Operation *op, Value result, Value operand,
          const LayoutRequirement &req) const override {
-    return failure();
+    auto bc = cast<linalg::BroadcastOp>(op);
+    // The init carries the RESULT's shape, so it gets the requirement whole --
+    // the same split TransposeRequirement makes for its own init.
+    if (operand == bc.getInit())
+      return req;
+    if (operand != bc.getInput())
+      return failure();
+
+    // `dimensions` names the added LOGICAL output axes, so the requirement's
+    // logical rank must be the result's rank for the two to be comparable.
+    unsigned logicalRank = 0;
+    for (int64_t d : req.physSrc)
+      logicalRank = std::max(logicalRank, (unsigned)(d + 1));
+    auto resTy = dyn_cast<RankedTensorType>(result.getType());
+    if (!resTy || logicalRank != (unsigned)resTy.getRank())
+      return failure();
+
+    llvm::SmallDenseSet<int64_t> added;
+    for (int64_t d : bc.getDimensions()) {
+      if (d < 0 || d >= (int64_t)logicalRank)
+        return failure();
+      added.insert(d);
+    }
+
+    // A carried axis split across two physical dims cannot be projected: the
+    // operand would need a rank it does not have.
+    for (unsigned p = 0; p < req.physSrc.size(); ++p)
+      if (!added.contains(req.physSrc[p]) &&
+          static_cast<CoordOp>(req.physOp[p]) != CoordOp::Identity)
+        return failure();
+
+    // Renumber the carried logical axes down, since the added ones are gone.
+    llvm::SmallVector<int64_t> logicalRemap(logicalRank, -1);
+    int64_t next = 0;
+    for (unsigned d = 0; d < logicalRank; ++d)
+      if (!added.contains((int64_t)d))
+        logicalRemap[d] = next++;
+
+    LayoutRequirement out;
+    out.marker = req.marker;
+    for (unsigned p = 0; p < req.physSrc.size(); ++p) {
+      int64_t mapped = logicalRemap[req.physSrc[p]];
+      if (mapped < 0)
+        continue;                       // a dim of an added axis: dropped
+      out.physSrc.push_back(mapped);
+      out.physOp.push_back(req.physOp[p]);
+      out.physArg.push_back(req.physArg[p]);
+      out.physExtents.push_back(req.physExtents[p]);
+    }
+    // The projection must have the operand's own rank, or it describes a
+    // different value than the one it is about.
+    auto inTy = dyn_cast<RankedTensorType>(operand.getType());
+    if (!inTy || (int64_t)out.physSrc.size() != inTy.getRank())
+      return failure();
+    return out;
   }
 };
 

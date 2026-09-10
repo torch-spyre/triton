@@ -22,6 +22,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/Debug.h"
@@ -51,19 +52,25 @@ struct ElementwisePropagation : PhysicalPropagationPattern {
     if (op->getNumResults() != 1 ||
         !isa<RankedTensorType>(op->getResult(0).getType()))
       return false;
-    ArrayRef<int64_t> commonShape;
+    // Ops with a rule of their own, excluded by KIND. The shape test below is
+    // satisfied vacuously by a single-operand op, so a reshape or a broadcast
+    // would otherwise be claimed here as though it preserved shape.
+    if (isShapeChangingOp(op))
+      return false;
+
+    // Operands are NOT compared to each other. Mid-analysis they routinely
+    // disagree: Phase 1 physicalizes loads and stops, so an op with one
+    // load-fed operand and one not is guaranteed to see a mismatch. That state
+    // is what this pass exists to resolve, not evidence the op is unknown --
+    // and `propagate` never reads a sibling's shape, so the comparison gated
+    // nothing it needed. Requiring agreement here made an arith.subf whose
+    // operands straddle the split an untaught op, so its result was never
+    // predicted and verifyPhysicalTypeAgreement reported the analysis as
+    // under-claiming once Phase 2B retyped it.
     bool sawTensorOperand = false;
-    for (Value o : op->getOperands()) {
-      auto t = dyn_cast<RankedTensorType>(o.getType());
-      if (!t)
-        continue;
-      if (!sawTensorOperand) {
-        commonShape = t.getShape();
+    for (Value o : op->getOperands())
+      if (isa<RankedTensorType>(o.getType()))
         sawTensorOperand = true;
-      } else if (t.getShape() != commonShape) {
-        return false;
-      }
-    }
     return sawTensorOperand;
   }
 
@@ -267,25 +274,63 @@ struct ReshapePropagation : PhysicalPropagationPattern {
   propagate(Operation *op, Value result, Value src,
             const PhysicalTypeInfo &srcInfo,
             const LayoutRequirement *want) const override {
-    return failure();
+    // The general case declines, for the reason above: a reassociation that
+    // fuses two real axes leaves no physical dim for one of them.
+    //
+    // One narrow case does carry, and it is the one that matters here. When the
+    // value being reshaped is ALREADY at its physical shape -- srcInfo.type
+    // equals the operand's own type -- then physical and logical coincide on
+    // this value, nothing about it is stick-split, and the reshape's own result
+    // type is the physical type. The marker rides along unchanged.
+    //
+    // The test is on the VALUE, not on the marker. The marker a reduce result
+    // carries is the STORE's, which is typically split (phys_op = id/floordiv/
+    // mod); that says nothing about whether this rank-1 value is split. Testing
+    // the marker's ops would reject exactly the case this exists to allow.
+    //
+    // This is what carries a reduce's result past the expand_shape/collapse_shape
+    // pair LowerComputeOps emits between a reduce and a broadcast (rules A3 and
+    // A4 lower tt.expand_dims and tt.broadcast independently, so A3 expands
+    // 1 -> 1x1 and A4 immediately collapses it back). Without it the forward
+    // walk stops there and the broadcast is never asked.
+    auto marker = srcInfo.marker;
+    if (!marker)
+      return failure();
+    if (!srcInfo.transposePerm.empty())
+      return failure();
+
+    auto srcTy = dyn_cast<RankedTensorType>(srcInfo.type);
+    auto operandTy = dyn_cast<RankedTensorType>(src.getType());
+    auto resTy = dyn_cast<RankedTensorType>(result.getType());
+    if (!srcTy || !operandTy || !resTy)
+      return failure();
+    // Physical == logical for this value, or there is a split to rewrite and
+    // no coordinate map can express it across a reassociation.
+    if (srcTy != operandTy)
+      return failure();
+    return PhysicalTypeInfo{resTy, marker, {}};
   }
 };
 
-/// linalg.broadcast: no physical result, for a different reason than the reshape
-/// family above.
+/// linalg.broadcast: recompute the target shape against the physical rank.
 ///
-/// A broadcast's result shape is not derived from its operand at all: it is a
-/// target shape fixed when the op was built, which LowerComputeOps builds from
+/// A broadcast's result shape is not derived from its operand: it is a target
+/// shape fixed when the op was built, which LowerComputeOps builds from
 /// tt.broadcast against the operand's LOGICAL rank. Given a physical operand
-/// that target shape is simply stale -- it describes a tensor of the wrong rank,
-/// and a consuming elementwise op then fails its same-type constraint.
+/// that shape is stale -- it describes a tensor of the wrong rank, so a
+/// consuming elementwise op fails its same-type constraint. That is the failure
+/// a reduce -> broadcast -> elementwise chain hits, the shape softmax and
+/// layernorm are written in.
 ///
-/// Unlike a reshape's coordinate map, this is recoverable in principle:
-/// recomputing the target shape and `dimensions` against the physical rank would
-/// let the op work on physical operands directly, which is what a reduce ->
-/// broadcast -> elementwise chain needs -- the shape softmax and layernorm are
-/// written in. Until that exists, declining is the safe answer and such an
-/// operand is rejected downstream rather than guessed at.
+/// This rule recomputes the shape by pushing the result's logical extents
+/// through the marker's coordinate map, and the paired rewrite pattern
+/// renumbers `dimensions` to name the new physical positions.
+///
+/// It handles the case where every axis the broadcast CARRIES is unsplit; an
+/// added axis may split freely, since it is new in the output and so changes
+/// only `outs` and `dimensions`, never the input. A split carried axis needs the
+/// INPUT retyped too, which a rule producing only a result type cannot express,
+/// so that case declines and is repaired at the consuming op instead.
 struct BroadcastPropagation : PhysicalPropagationPattern {
   bool match(Operation *op) const override {
     return isa<linalg::BroadcastOp>(op);
@@ -295,7 +340,106 @@ struct BroadcastPropagation : PhysicalPropagationPattern {
   propagate(Operation *op, Value result, Value src,
             const PhysicalTypeInfo &srcInfo,
             const LayoutRequirement *want) const override {
-    return failure();
+    auto bc = cast<linalg::BroadcastOp>(op);
+
+    // The rule reads `srcInfo` as the INPUT's layout, so it must actually be
+    // the input. findPhysicalTensorOperand returns the first physical tensor
+    // operand in operand order, and a broadcast's operands are (input, init) --
+    // so a physicalized init would otherwise be read as though it were the
+    // input, taking its marker and its transposePerm from the wrong chain.
+    // BroadcastRequirement::induce deliberately hands the init the requirement
+    // whole, which is exactly what makes the init a candidate here.
+    // ReducePropagation guards the same way against its own inits.
+    if (src != bc.getInput())
+      return failure();
+
+    // The emission rebuilds the broadcast's init, and rebuildPhysicalInit only
+    // handles a tensor.empty or a fill over one. Gate on the same predicate the
+    // emission uses so this decision and that one cannot disagree: claiming a
+    // physical result the rewrite then declines to produce would leave the value
+    // logical while its consumers were predicted physical.
+    if (!canRebuildPhysicalInit(bc.getInit()))
+      return failure();
+
+    auto marker = srcInfo.marker;
+    if (!marker)
+      return failure();
+    // An erased transpose reorders the marker's dims relative to the tile, so
+    // "the physical dims in the marker's order" is not the order the op sees.
+    if (!srcInfo.transposePerm.empty())
+      return failure();
+
+    auto resTy = dyn_cast<RankedTensorType>(result.getType());
+    if (!resTy)
+      return failure();
+
+    auto physSrc = marker.getPhysSrc();
+    auto physOp = marker.getPhysOp();
+    auto physArg = marker.getPhysArg();
+
+    // The marker describes the RESULT's layout, so its logical rank must be the
+    // result's rank -- `dimensions` indexes logical output positions.
+    unsigned logicalRank = 0;
+    for (int64_t d : physSrc)
+      logicalRank = std::max(logicalRank, (unsigned)(d + 1));
+    if (logicalRank != (unsigned)resTy.getRank())
+      return failure();
+
+    // A maximum is not a set cover: `phys_src = [0, 2]` on a rank-3 result has
+    // logicalRank 3 and passes the check above while logical dim 1 is
+    // unrepresented. applyCoordMap would then silently return a rank-2 shape,
+    // dropping dim 1's extent. Require every logical dim to be named.
+    {
+      llvm::SmallVector<bool> covered(logicalRank, false);
+      for (int64_t d : physSrc)
+        covered[d] = true;
+      if (llvm::is_contained(covered, false))
+        return failure();
+    }
+
+    // Which logical output axes does the broadcast ADD, and which does it CARRY
+    // from its input? `dimensions` names the added ones.
+    llvm::SmallDenseSet<int64_t> added;
+    for (int64_t d : bc.getDimensions()) {
+      if (d < 0 || d >= (int64_t)logicalRank)
+        return failure();
+      added.insert(d);
+    }
+
+    // A CARRIED axis that is stick-split would need the INPUT retyped too --
+    // linalg.broadcast matches its input against the non-broadcast init dims
+    // positionally, so a split carried axis demands a higher-rank input. A
+    // propagation rule produces a type for the RESULT only, so decline. The
+    // consuming elementwise op is where that case has to be repaired.
+    for (unsigned p = 0; p < physSrc.size(); ++p)
+      if (!added.contains(physSrc[p]) &&
+          static_cast<CoordOp>(physOp[p]) != CoordOp::Identity)
+        return failure();
+
+    // The emission renumbers `dimensions` by scanning physical dims in
+    // ascending order, which only names the input's axes correctly when the
+    // CARRIED axes appear in the same relative order physically as logically.
+    // A permuting marker (e.g. phys_src = [2, 0, 1], every op Identity) passes
+    // every check above -- the marker verifier does not require monotonicity --
+    // and would transpose the carried data while still satisfying the broadcast
+    // verifier. Nothing downstream can catch that, so reject it here.
+    int64_t prevCarried = -1;
+    for (unsigned p = 0; p < physSrc.size(); ++p) {
+      if (added.contains(physSrc[p]))
+        continue;
+      if (physSrc[p] <= prevCarried)
+        return failure();
+      prevCarried = physSrc[p];
+    }
+
+    // Every added axis may split freely: it is new in the output, so splitting
+    // it changes only `outs` and `dimensions`, never the input.
+    llvm::SmallVector<int64_t> physShape;
+    if (!applyCoordMap(resTy.getShape(), physSrc, physOp, physArg, physShape))
+      return failure();
+
+    return PhysicalTypeInfo{
+        RankedTensorType::get(physShape, resTy.getElementType()), marker, {}};
   }
 };
 

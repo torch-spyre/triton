@@ -3,6 +3,8 @@
 
 #include "RewriteDescriptorLayout/PermutationUtils.h"
 
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
@@ -12,6 +14,35 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 namespace mlir::triton::ktdp {
+
+/// True when `op` changes tensor shape and therefore has (or needs) a layout
+/// rule of its own, rather than being treated as shape-preserving.
+///
+/// The three "elementwise" predicates -- ElementwiseRequirement::match,
+/// ElementwisePropagation::match and RewriteElementwisePattern -- each ask this
+/// question, and they must agree: if the analysis treats an op as elementwise
+/// and the rewrite does not (or vice versa), one claims a value the other never
+/// predicted and verifyPhysicalTypeAgreement reports the disagreement.
+///
+/// Excluding by KIND rather than by comparing operand shapes is deliberate.
+/// Phase 1 physicalizes loads and stops, so mid-pass the IR is half-retyped by
+/// design; an operand disagreeing with its sibling is the state this pass exists
+/// to resolve, not evidence the op is unknown. And a shape comparison is
+/// satisfied VACUOUSLY by a single-operand op, so a reshape or a broadcast would
+/// pass it while being exactly what it is meant to catch.
+///
+/// Add an op here whenever a shape-changing op is added to the pipeline. Ops
+/// with a rule of their own are belt-and-braces (a named rule is asked first);
+/// the load-bearing entries are the ones with NO rule, such as tensor::PadOp and
+/// tensor::ConcatOp, which would otherwise be crossed as shape-preserving and
+/// silently retyped.
+inline bool isShapeChangingOp(Operation *op) {
+  return isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp, tensor::ReshapeOp,
+             tensor::ConcatOp, tensor::ExtractSliceOp, tensor::InsertSliceOp,
+             tensor::PadOp, linalg::BroadcastOp, linalg::TransposeOp,
+             linalg::ReduceOp, linalg::MatmulOp, linalg::BatchMatmulOp>(op);
+}
+
 
 /// What is known about one physical value (a physicalized ktdp.load result,
 /// or a value retyped to physical by Phase 2's elementwise pattern).

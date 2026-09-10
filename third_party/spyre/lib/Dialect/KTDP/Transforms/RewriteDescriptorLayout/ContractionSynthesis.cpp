@@ -27,6 +27,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -1068,6 +1069,88 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
 // retypes, so membership IS the "reachable from a physicalized load" answer.
 // An op on an unannotated path is simply never in the set, so tt.expand_dims
 // in softmax (zero tt.spyre_tensor_layout markers) is never retyped.
+//===----------------------------------------------------------------------===//
+// seedSplatOperands
+//===----------------------------------------------------------------------===//
+
+/// Retype an all-same-value ("splat") constant operand onto `target`'s shape.
+///
+/// A Triton kernel that divides by its reduction length emits that length as a
+/// whole tensor of one repeated value -- `tl.splat` becomes
+/// `arith.constant dense<1.28e2> : tensor<64x128xf32>`. Such a constant has NO
+/// operands, and the forward layout analysis walks along operands: it asks
+/// "given this physical operand, what type does the result take?". An op with
+/// no operands is therefore unreachable by construction, and no analysis rule
+/// can claim a physical type for it. Left alone it stays logical while its
+/// sibling operand goes physical, and the consuming arithmetic fails its
+/// same-type verifier.
+///
+/// Rewriting one is sound because every element is identical: the physical form
+/// is the same constant at the physical shape, so there is no data to move and
+/// no coordinate map to rewrite. `dense<1.28e2> : tensor<64x128xf32>` becomes
+/// `dense<1.28e2> : tensor<64x2x64xf32>`. Note this holds even when the split
+/// does not divide evenly -- 130 columns become 3 sticks of 64, and the 62
+/// padding lanes get the same value as every real lane, which is exactly what a
+/// splat means.
+///
+/// Only a splat qualifies. A general `dense<[...]>` constant has per-element
+/// data whose stick-tiled placement is a real layout question, so it is left
+/// alone for the analysis to reject.
+///
+/// In:  the op being physicalized, and the shape its physical operands agree on
+///      (e.g. `[64, 2, 64]`).
+/// Out: true if at least one operand was retyped. Rewrites in place via
+///      `rewriter`; a non-splat or already-matching operand is skipped.
+static bool seedSplatOperands(Operation *op, ArrayRef<int64_t> target,
+                              PatternRewriter &rewriter) {
+  bool changed = false;
+  for (Value o : op->getOperands()) {
+    auto ty = dyn_cast<RankedTensorType>(o.getType());
+    if (!ty || ty.getShape() == target)
+      continue;
+    // Only a constant whose value is one repeated element.
+    auto cst = o.getDefiningOp<arith::ConstantOp>();
+    if (!cst)
+      continue;
+    auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
+    if (!dense || !dense.isSplat())
+      continue;
+    auto newTy = RankedTensorType::get(target, ty.getElementType());
+
+    // Retype in place when this constant feeds only this op, and mint a fresh
+    // one otherwise. The distinction is not cosmetic in either direction: a
+    // constant shared with a consumer that still wants the logical shape must
+    // NOT be retyped, or that consumer breaks; and retyping the single-use case
+    // rather than always minting is what keeps the pass from leaving a dead
+    // logical constant behind for the canonicalizer to sweep. Same
+    // retype-if-you-can, mint-if-you-must rule rebuildPhysicalInit follows for a
+    // DPS init.
+    Value seeded;
+    if (cst.getResult().hasOneUse()) {
+      rewriter.modifyOpInPlace(cst, [&]() {
+        cst.setValueAttr(dense.resizeSplat(newTy));
+        cst.getResult().setType(newTy);
+      });
+      seeded = cst.getResult();
+    } else {
+      // Scoped so the caller's insertion point survives: this helper runs
+      // partway through a pattern that goes on to build more IR.
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(cst);
+      seeded = arith::ConstantOp::create(rewriter, cst.getLoc(), newTy,
+                                        dense.resizeSplat(newTy))
+                   .getResult();
+    }
+    rewriter.modifyOpInPlace(op, [&]() {
+      for (OpOperand &use : op->getOpOperands())
+        if (use.get() == o)
+          use.set(seeded);
+    });
+    changed = true;
+  }
+  return changed;
+}
+
 struct RewriteElementwisePattern : RewritePattern {
   const PassContext &ctx;
   RewriteElementwisePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
@@ -1076,11 +1159,41 @@ struct RewriteElementwisePattern : RewritePattern {
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
+    // Ops that have a rule of their own, excluded by KIND rather than inferred
+    // from shape. This pattern's shape test -- every tensor operand agrees with
+    // the others -- is satisfied VACUOUSLY by a single-operand op, so a reshape
+    // or a broadcast would otherwise be retyped here as though it preserved
+    // shape, which is precisely what it does not do. Retyping a
+    // tensor.expand_shape's result to its operand's shape turns the expand into
+    // a no-op and produces a type Phase 2A never predicted, which
+    // verifyPhysicalTypeAgreement then reports as the analysis under-claiming.
+    //
+    // Structural inference is the wrong instrument here: "elementwise" means
+    // shape-preserving, and no count of operands or results establishes that.
+    // Same reasoning that removed isSingleTensorElementwiseOp.
+    // Excluded by KIND via the shared isShapeChangingOp (Types.h): the analysis
+    // and the rewrite must agree on which ops are "elementwise".
+    if (isShapeChangingOp(op))
+      return failure();
     if (op->getNumResults() != 1)
       return failure();
     auto resTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
     if (!resTy)
       return failure();
+
+    // A splat constant operand cannot be reached by the operand-driven forward
+    // analysis (it has no operands), so it arrives here still logical while its
+    // sibling is physical. Retype it up to the physical shape BEFORE the
+    // agreement check below, which would otherwise read the disagreement as
+    // "one side is a guess" and decline. The target comes from an operand the
+    // analysis actually physicalized, never from another logical operand.
+    if (auto physIt = llvm::find_if(op->getOperands(), [&](Value o) {
+          return ctx.physicalValues.contains(o) &&
+                 isa<RankedTensorType>(o.getType());
+        });
+        physIt != op->getOperands().end())
+      seedSplatOperands(
+          op, cast<RankedTensorType>((*physIt).getType()).getShape(), rewriter);
 
     // Every tensor operand must be a RankedTensorType, and they must all
     // agree on shape -- that agreement is the safety condition: if one
@@ -1151,6 +1264,87 @@ struct RewriteElementwisePattern : RewritePattern {
 //===----------------------------------------------------------------------===//
 // Pattern: linalg.transpose (erase and record permutation)
 //===----------------------------------------------------------------------===//
+
+// Physicalize a linalg.broadcast whose result Phase 2A decided is physical.
+//
+// A broadcast holds its target shape in two places -- the `outs` operand (a
+// tensor.empty) and the `dimensions` attribute naming which OUTPUT positions
+// are new -- so retyping its result alone is not enough. Both are rewritten
+// here, and both follow mechanically from the marker:
+//
+//   dimensions   each added LOGICAL axis contributes one entry per physical dim
+//                sourced from it: [1] -> [1, 2] when logical axis 1 splits.
+//   outs         applyCoordMap over the logical result shape.
+//
+// The gate is the analysis, not the operand: unlike RewriteTransposePattern,
+// a broadcast's own input is typically logical (its producer is a reduce whose
+// result a reshape leaves logical), so gating on physicalValues.contains(input)
+// would never fire. Phase 2A already decided this result is physical, and only
+// does so when every CARRIED axis is unsplit -- see BroadcastPropagation.
+struct RewriteBroadcastPattern : OpRewritePattern<linalg::BroadcastOp> {
+  const PassContext &ctx;
+  RewriteBroadcastPattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
+      : OpRewritePattern(mlirCtx, /*benefit=*/1), ctx(layoutCtx) {}
+
+  LogicalResult matchAndRewrite(linalg::BroadcastOp bc,
+                                PatternRewriter &rewriter) const override {
+    if (!ctx.physicalTypeAnalysis)
+      return failure();
+    auto it = ctx.physicalTypeAnalysis->find(bc.getResult()[0]);
+    if (it == ctx.physicalTypeAnalysis->end())
+      return failure();
+    auto physTy = dyn_cast<RankedTensorType>(it->second.type);
+    if (!physTy)
+      return failure();
+
+    // Idempotence: once the result carries the physical type, stop matching, so
+    // the greedy driver's re-enqueue cannot re-fire this.
+    auto resTy = cast<RankedTensorType>(bc.getResult()[0].getType());
+    if (resTy.getShape() == physTy.getShape())
+      return failure();
+
+    auto marker = it->second.marker;
+    if (!marker)
+      return failure();
+    auto physSrc = marker.getPhysSrc();
+
+    // Renumber `dimensions` from logical output positions to physical ones. An
+    // added logical axis that splits contributes every physical dim sourced
+    // from it, which is what keeps linalg.broadcast's rank arithmetic
+    // (input_rank + |dimensions| == init_rank) true by construction.
+    llvm::SmallDenseSet<int64_t> addedLogical(bc.getDimensions().begin(),
+                                              bc.getDimensions().end());
+    llvm::SmallVector<int64_t> newDims;
+    for (unsigned p = 0; p < physSrc.size(); ++p)
+      if (addedLogical.contains(physSrc[p]))
+        newDims.push_back(p);
+
+    Location loc = bc.getLoc();
+    Value newInit = rebuildPhysicalInit(rewriter, loc, bc.getInit(), physTy);
+    if (!newInit)
+      return failure();
+
+    auto newBc = linalg::BroadcastOp::create(rewriter, loc, bc.getInput(),
+                                            newInit, newDims);
+    Value newResult = newBc.getResult()[0];
+
+    // This result IS physical now, under the layout Phase 2A paired it with.
+    // Record it so a consumer sees a physical value, and carry the analysis's
+    // decision onto the value that replaces the one it was made about.
+    ctx.physicalValues[newResult] = PhysicalValueInfo{marker, {}};
+    ctx.physicalTypes.carryForward(bc.getResult()[0], newResult);
+
+    rewriter.replaceOp(bc, newResult);
+
+    // REQUIRED, as in RewriteElementwisePattern: the result type its users read
+    // just changed, and the greedy driver re-enqueues the modified op but not
+    // its users. A consuming arith.subf whose other operand is already physical
+    // must be revisited so its own match condition sees agreeing shapes.
+    for (Operation *user : llvm::make_early_inc_range(newResult.getUsers()))
+      rewriter.modifyOpInPlace(user, [] {});
+    return success();
+  }
+};
 
 // The transpose permutation is recorded in ctx.physicalValues (against
 // `input`, which must already be an entry -- see PhysicalValueInfo) because
@@ -1337,6 +1531,7 @@ void populateContractionPatterns(RewritePatternSet &patterns,
   patterns.add<RewriteMatmulPattern, RewriteBatchMatmulPattern,
                RewriteReducePattern>(mlirCtx, ctx);
   patterns.add<RewriteTransposePattern>(mlirCtx, ctx);
+  patterns.add<RewriteBroadcastPattern>(mlirCtx, ctx);
   patterns.add<RewriteElementwisePattern>(mlirCtx, ctx);
   patterns.add<RewriteStorePattern>(mlirCtx, ctx);
 }
