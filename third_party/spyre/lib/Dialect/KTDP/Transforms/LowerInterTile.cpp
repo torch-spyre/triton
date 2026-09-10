@@ -158,8 +158,10 @@ buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
     tupleToTiles[key].push_back(t);
   }
 
-  // Sort group keys for deterministic group-index assignment.
-  llvm::sort(tupleOrder);
+  // Do not sort tupleOrder.  It is already in first-appearance (= minimum tile
+  // id) order, which is the block order the contiguity check below requires.
+  // Sorting by the key assumes the slice label ascends with tile id; nothing
+  // requires that, and where it does not, valid IR is rejected.
 
   if ((int64_t)tupleOrder.size() != ngroups)
     return loc->emitError("expected ") << ngroups
@@ -173,7 +175,7 @@ buildGroupSets(MLIRContext *ctx, const WorkSliceAttrs &attrs,
     if ((int64_t)members.size() != gsize)
       return loc->emitError("group ") << g << " has " << members.size()
              << " tiles, expected gsize=" << gsize;
-    llvm::sort(members);
+    // members is already ascending -- push_back ran with `t` ascending.
     for (int64_t j = 0; j < gsize; ++j) {
       int64_t expected = g * gsize + j;
       if (members[j] != expected)
