@@ -307,6 +307,34 @@ struct LowerInterTilePass
     SmallVector<triton::InterTileReduceOp> ops;
     mod.walk([&](triton::InterTileReduceOp op) { ops.push_back(op); });
 
+    // Layouts and inter-tile reductions do not compose yet.  This pass runs
+    // before RewriteDescriptorLayout, and RDL cannot carry a physical type
+    // through the produce/reduce pair: its forward walk follows
+    // RankedTensorType results, and the pair communicates through a
+    // !ktdp.tile_future whose tensor types are nested inside the type.
+    // Reaching RDL that way fails later with an opaque type mismatch, so refuse
+    // here, where both facts are still visible in the form the user wrote them
+    // -- the markers are live (RDL erases them in Phase 3) and the reduction is
+    // still tt.-form.
+    if (!ops.empty()) {
+      triton::SpyreTensorLayoutOp marker;
+      mod.walk([&](triton::SpyreTensorLayoutOp op) {
+        marker = op;
+        return WalkResult::interrupt();
+      });
+      if (marker) {
+        InFlightDiagnostic diag = ops.front().emitError(
+            "this kernel has both a tt.spyre_tensor_layout annotation and a "
+            "tt.inter_tile_reduce; that combination is not yet supported, "
+            "because RewriteDescriptorLayout has no physical-type propagation "
+            "pattern for the produce/reduce pair and cannot propagate through "
+            "its !ktdp.tile_future. Drop the layout annotation, or the "
+            "inter-tile reduction");
+        diag.attachNote(marker.getLoc()) << "layout annotation here";
+        return signalPassFailure();
+      }
+    }
+
     for (auto op : ops) {
       if (failed(lowerOne(op, rewriter)))
         return signalPassFailure();

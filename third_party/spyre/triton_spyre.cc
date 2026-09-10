@@ -37,11 +37,13 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   //              ↓
   //       LowerComputeOps
   //              ↓
+  //        LowerInterTile          [runs before RewriteDescriptorLayout so the
+  //              │                  layout pass never sees a
+  //              │                  tt.inter_tile_reduce]
+  //              ↓
   //   RewriteDescriptorLayout      [runs after LowerComputeOps so tt.dot is
   //              │                  already linalg.matmul before its operands
   //              │                  are physicalized]
-  //              ↓
-  //        LowerInterTile
   //              ↓
   //       ConvertFunctions
   //
@@ -52,8 +54,10 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // Ordering constraints (each pass also states its own in Passes.td):
   // ConvertFunctions runs last because it replaces !tt.ptr args with index;
   // memory passes must consume !tt.ptr via getBasePtrAsIndex/ptrToIndex first.
-  // LowerInterTile runs after LowerComputeOps (partials are linalg/tensor)
-  // and before ConvertFunctions (reads work-slice function attributes that
+  // LowerInterTile runs after LowerComputeOps (partials are linalg/tensor),
+  // before RewriteDescriptorLayout (which has no propagation pattern for
+  // tt.inter_tile_reduce, so it must not be reached with one live) and before
+  // ConvertFunctions (reads work-slice function attributes that
   // ConvertFunctions would rewrite).
   m.def(
       "add_convert_ttir_to_ktdp",
@@ -61,9 +65,9 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
         pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
         pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
         pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
+        pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
         pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
             mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
-        pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
         pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
       },
       py::arg("pm"), py::arg("data_layout") = "device");

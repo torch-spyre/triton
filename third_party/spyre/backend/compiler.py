@@ -137,8 +137,8 @@ _CORE_PIPELINE_PASSES = (
     "lower_descriptor_memory",
     "lower_scalar_load",
     "lower_compute_ops",
-    "rewrite_descriptor_layout",
     "lower_inter_tile",
+    "rewrite_descriptor_layout",
     "convert_functions",
 )
 
