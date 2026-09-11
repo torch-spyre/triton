@@ -373,3 +373,67 @@ tt.func @future_single_use(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf3
 tt.func @no_op(%a: tensor<16xf32>) -> tensor<16xf32> {
   tt.return %a : tensor<16xf32>
 }
+
+// -----
+
+// 16 groups: group index must come from first-tile order, not from sorting the
+// group keys.  A lexicographic sort of the encoded keys puts "out=10;" before
+// "out=1;" (';' 0x3B beats every digit), so group 1 would resolve to tiles
+// {20, 21} and the contiguity check would reject valid IR.  Two-digit labels
+// first appear at 11 groups; this is the shape matmul_splitk_kernel takes at
+// SENCORES=32 with K split two ways.
+
+// CHECK:       #[[$PROD_16:.*]] = affine_set<(d0)[s0] : (d0 - s0 * 2 >= 0, -d0 + s0 * 2 + 1 >= 0)>
+// CHECK:       #[[$GROUPS_16:.*]] = affine_set<(d0) : (d0 >= 0, -d0 + 15 >= 0)>
+// CHECK:       #[[$PICK0_16:.*]] = affine_set<(d0)[s0] : (d0 - s0 * 2 == 0)>
+// CHECK-LABEL: tt.func @groups_16_two_digit_labels
+// CHECK-NOT:     tt.inter_tile_reduce
+// CHECK:         ktdp.inter_tile_produce producer_tiles_per_group = #[[$PROD_16]] -> <(tensor<16xf32>), groups = #[[$GROUPS_16]]>
+// CHECK:         ktdp.inter_tile_reduce({{.*}}) consumer_tiles_per_group = #[[$PICK0_16]],
+tt.func @groups_16_two_digit_labels(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor<16xf32> {
+  %0 = tt.inter_tile_reduce
+         partials(%p : tensor<16xf32>)
+         identities(%id : tensor<16xf32>)
+         axis = "k" mode = "reduce_to_one" combiner = "add"
+         {numWkSlicesPerDim = {out = 16 : i64, k = 2 : i64},
+          coreIdToWkSlice = [{out = 0 : i64, k = 0 : i64}, {out = 0 : i64, k = 1 : i64}, {out = 1 : i64, k = 0 : i64}, 
+                             {out = 1 : i64, k = 1 : i64}, {out = 2 : i64, k = 0 : i64}, {out = 2 : i64, k = 1 : i64}, 
+                             {out = 3 : i64, k = 0 : i64}, {out = 3 : i64, k = 1 : i64}, {out = 4 : i64, k = 0 : i64}, 
+                             {out = 4 : i64, k = 1 : i64}, {out = 5 : i64, k = 0 : i64}, {out = 5 : i64, k = 1 : i64}, 
+                             {out = 6 : i64, k = 0 : i64}, {out = 6 : i64, k = 1 : i64}, {out = 7 : i64, k = 0 : i64}, 
+                             {out = 7 : i64, k = 1 : i64}, {out = 8 : i64, k = 0 : i64}, {out = 8 : i64, k = 1 : i64}, 
+                             {out = 9 : i64, k = 0 : i64}, {out = 9 : i64, k = 1 : i64}, {out = 10 : i64, k = 0 : i64}, 
+                             {out = 10 : i64, k = 1 : i64}, {out = 11 : i64, k = 0 : i64}, {out = 11 : i64, k = 1 : i64}, 
+                             {out = 12 : i64, k = 0 : i64}, {out = 12 : i64, k = 1 : i64}, {out = 13 : i64, k = 0 : i64}, 
+                             {out = 13 : i64, k = 1 : i64}, {out = 14 : i64, k = 0 : i64}, {out = 14 : i64, k = 1 : i64}, 
+                             {out = 15 : i64, k = 0 : i64}, {out = 15 : i64, k = 1 : i64}]}
+         -> (tensor<16xf32>)
+  tt.return %0 : tensor<16xf32>
+}
+
+// -----
+
+// Labels need not ascend with tile id.  m appears as 0,0,2,2,1,1, so the groups
+// are m=0 -> {0,1}, m=2 -> {2,3}, m=1 -> {4,5} -- all contiguous blocks, valid
+// IR.  Ordering groups by the label, lexicographically *or* numerically, puts
+// m=1 at index 1 with members {4,5} where {2,3} is expected, and rejects it.
+// Only first-tile order accepts this, which is why the fix is to drop the sort
+// rather than to compare the keys differently.
+
+// CHECK:       #[[$PROD_P:.*]] = affine_set<(d0)[s0] : (d0 - s0 * 2 >= 0, -d0 + s0 * 2 + 1 >= 0)>
+// CHECK:       #[[$GROUPS_P:.*]] = affine_set<(d0) : (d0 >= 0, -d0 + 2 >= 0)>
+// CHECK-LABEL: tt.func @groups_labels_not_ascending
+// CHECK-NOT:     tt.inter_tile_reduce
+// CHECK:         ktdp.inter_tile_produce producer_tiles_per_group = #[[$PROD_P]] -> <(tensor<8xf32>), groups = #[[$GROUPS_P]]>
+tt.func @groups_labels_not_ascending(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
+  %0 = tt.inter_tile_reduce
+         partials(%p : tensor<8xf32>)
+         identities(%id : tensor<8xf32>)
+         axis = "k" mode = "all_reduce" combiner = "add"
+         {numWkSlicesPerDim = {m = 3 : i64, k = 2 : i64},
+          coreIdToWkSlice = [{m = 0 : i64, k = 0 : i64}, {m = 0 : i64, k = 1 : i64},
+                             {m = 2 : i64, k = 0 : i64}, {m = 2 : i64, k = 1 : i64},
+                             {m = 1 : i64, k = 0 : i64}, {m = 1 : i64, k = 1 : i64}]}
+         -> (tensor<8xf32>)
+  tt.return %0 : tensor<8xf32>
+}

@@ -67,6 +67,10 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
         Phase 3 — erase the tt.spyre_tensor_layout markers and the now-dead
         UnrealizedConversionCast bridges.
 
+        Runs after LowerInterTile, so every inter-tile reduction is already in
+        ktdp form; LowerInterTile rejects a kernel that combines a layout marker
+        with an inter-tile reduction, since no propagation pattern covers it.
+
         Output: physical ktdp.construct_memory_view + access_tile + load/store;
         no tt.spyre_tensor_layout ops remain. Descriptors without an
         annotation are left untouched. A pure pointwise kernel exercises only
@@ -253,9 +257,13 @@ def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
         - depWkSlices present → producer_dependency_per_consumer affine set;
             absent → full-barrier (attribute omitted).
 
-        Must run after LowerComputeOps (partials must be linalg/tensor) and
-        before ConvertFunctions (reads function attributes ConvertFunctions
-        would rewrite).
+        Must run after LowerComputeOps (partials must be linalg/tensor),
+        before RewriteDescriptorLayout (that pass has no physical-type
+        propagation pattern for tt.inter_tile_reduce, so no inter-tile op may
+        still be live when it runs; a kernel carrying both a
+        tt.spyre_tensor_layout marker and a tt.inter_tile_reduce is rejected
+        here), and before ConvertFunctions (reads function attributes
+        ConvertFunctions would rewrite).
 
         Output: no tt.inter_tile_reduce ops remain; ktdp.inter_tile_produce /
         inter_tile_reduce pairs are introduced; the tile_future is single-use.
