@@ -127,6 +127,9 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   m.def("add_convert_functions", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
   });
+  m.def("add_hbm_roundtrip", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::ktdp::createHbmRoundtripPass());
+  });
   m.def(
       "add_distribute_work",
       [](mlir::PassManager &pm, const std::vector<int64_t> &grid) {
@@ -200,6 +203,37 @@ void init_triton_spyre_ir_utils(py::module &&m) {
           }
           return d;
         });
+
+  // The spill buffers HbmRoundtrip created, in the order of the `index`
+  // arguments it appended, read off the `ktdp.hbm_roundtrip_buffers` module
+  // attribute it writes. Each entry is
+  //   {"shape": [12, 64, 64], "elem_type": "f32"}
+  // and the list is empty when the pass did not run or found nothing to spill.
+  // A dedicated getter rather than a generic one because the attribute is an
+  // array of dictionaries, which none of the typed getters on ir.operation
+  // covers, and because the caller needs it as data rather than as printed IR.
+  m.def("get_hbm_roundtrip_buffers", [](mlir::ModuleOp &self) -> py::list {
+    py::list buffers;
+    auto attr =
+        self->getAttrOfType<mlir::ArrayAttr>("ktdp.hbm_roundtrip_buffers");
+    if (!attr)
+      return buffers;
+    for (mlir::Attribute entry : attr) {
+      auto fields = mlir::cast<mlir::DictionaryAttr>(entry);
+      py::dict buffer;
+      auto shape =
+          mlir::cast<mlir::DenseI64ArrayAttr>(fields.get("shape")).asArrayRef();
+      buffer["shape"] = std::vector<int64_t>(shape.begin(), shape.end());
+      mlir::Type elemType =
+          mlir::cast<mlir::TypeAttr>(fields.get("element_type")).getValue();
+      std::string elemStr;
+      llvm::raw_string_ostream elemOs(elemStr);
+      elemType.print(elemOs);
+      buffer["elem_type"] = elemStr;
+      buffers.append(buffer);
+    }
+    return buffers;
+  });
 }
 
 void init_triton_spyre(py::module &&m) {

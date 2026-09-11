@@ -202,6 +202,30 @@ def _add_ktdp_pass(pm, name, options, **overrides):
 # does this one. It is (a) validity for every kernel and (b) preserving the KTIR
 # contract.
 _SPYRECODE_STAGE_PASSES = (
+    # UnaliasLinalgOuts. Replaces an `outs` operand that also appears in `ins`
+    # with a fresh tensor.empty. ConvertElementwiseToLinalg is the source of that
+    # aliasing: it reuses the first type-matching operand as `outs`, with no flag
+    # to suppress it.
+    #
+    # It fails the first half of the rule above: aliased `outs` is perfectly
+    # well-formed in tensor semantics, and it is dbo-opt that cannot take it --
+    # the scheduler maps each operand of a compute to a freshly loaded value, so a
+    # value in both roles is mapped twice, and until a linalg consumer pins the
+    # layout the memref keeps a dynamic `strided<..., offset: ?>` and the
+    # `ktdp.load` operand is rejected. A compile that stops at KTIR has no need of
+    # any of that.
+    #
+    # Ordering: after ConvertElementwiseToLinalg (in required_fixes), which is what
+    # introduces the aliasing, and before DropReductionInitFill -- the order those
+    # two have always had, when this pass ran in the KTIR stage. They touch the
+    # same `outs` operands from opposite directions, and DropReductionInitFill
+    # documents itself as a narrow exception to the rule this pass enforces, so it
+    # is stated against a module this pass has already been through.
+    #
+    # Being here rather than in _make_ktir also means it runs *after* that stage's
+    # closing canonicalize/CSE. It creates one tensor.empty per linalg op
+    "unalias_linalg_outs",
+
     # DropReductionInitFill. LowerComputeOps gives every reduction a zero
     # `linalg.fill` on its `outs` per upstream linalg semantics; the scheduler's
     # allowlist is add/mul/sub/reduce and the fill is none of those, so a
@@ -231,10 +255,9 @@ _SPYRECODE_STAGE_PASSES = (
     # which has no MLIRTypeAdapter handler for spyreop.* ops yet (#107) --
     # so a rewrite only dbo-opt can consume does not belong in that artifact.
     #
-    # Ordering: after convert_elementwise_to_linalg / unalias_linalg_outs,
-    # which already ran as required_fixes during _make_ktir, so the scalar
-    # math/arith op it matches is already inside the linalg.generic body
-    # those produced. A scalar op on a type spyreop has no intrinsic for
+    # Ordering: after convert_elementwise_to_linalg, which ran as a required_fix
+    # during _make_ktir, so the scalar math/arith op it matches is already
+    # inside the linalg.generic body that pass produced. A scalar op on a type spyreop has no intrinsic for
     # (f64, bf16, ...) is reported as illegal rather than left alone -- see
     # LowerSpyreOps.cpp and Passes.td.
     "lower_spyre_ops",
@@ -506,17 +529,15 @@ class SpyreBackend(BaseBackend):
         # disagree and the pipeline aborts.  rewrite_descriptor_layout runs after
         # that physicalization, so the fixes see consistent types.
         #
-        # convert_elementwise_to_linalg and unalias_linalg_outs are what the
-        # scheduler inside dbo-opt requires of every kernel it will lower to a
-        # binary. lower_spyre_ops is NOT here -- it also depends on
-        # convert_elementwise_to_linalg's scalarization, but it belongs to
-        # dbo-opt rather than to the IR every compile produces, and it can
-        # reject a scalar type spyreop has no intrinsic for (f64, bf16, ...),
-        # so it runs later, only for compiles that reach the spyrecode stage.
-        # See _SPYRECODE_STAGE_PASSES.
+        # convert_elementwise_to_linalg is here because it creates the linalg ops
+        # everything downstream is written against, so every compile needs it
+        # whether or not it reaches a binary. unalias_linalg_outs and
+        # lower_spyre_ops are NOT: both depend on this pass, and both are things
+        # dbo-opt requires rather than things the IR does, so they run later and
+        # only for compiles that reach the spyrecode stage. See
+        # _SPYRECODE_STAGE_PASSES.
         parsed["required_fixes"] = {
             "convert_elementwise_to_linalg": "rewrite_descriptor_layout",
-            "unalias_linalg_outs":           "rewrite_descriptor_layout",
             **parsed.get("required_fixes", {}),
         }
         return SpyreOptions(**parsed)
@@ -703,45 +724,64 @@ class SpyreBackend(BaseBackend):
            admits a pass to it.
         2. Resolve the entry function's arguments, which is where
            ``options.symbolic_args`` is honoured — the one place in the backend
-           that branches on the mode. With it False (the default),
-           ``MaterializeBaseAddresses`` replaces the pointer arguments with
-           ``arith.constant`` and drops them from the signature, because the
-           dataflow scheduler requires a zero-argument entry function. It uses
+           that branches on the mode, and the branch ``HbmRoundtrip`` shares.
+
+           Baked instead replaces the pointer arguments with ``arith.constant`` via
+           ``MaterializeBaseAddresses`` and drops them from the signature, because
+           the dataflow scheduler requires a zero-argument entry function. It uses
            ``options.base_addresses`` if the caller set them and the addresses
            ``_make_ktir`` derived otherwise, and it is skipped when
            ``required_fixes`` already ran it. Running here rather than in
            ``_make_ktir`` is what lets the cached ``.ktir`` artifact keep the
-           argument-passing calling convention.
+           argument-passing calling convention. 
         3. ``dbo-opt --from-ktir --kEmitSpyreCode``, whose scheduler +
            codegen stages write the spyreCodeDir. ``--kEmitSpyreCode`` is a pass
            pipeline that has to be requested explicitly; ``--export-dir`` alone
            makes dbo-opt exit 0 having written nothing.
 
-        The scheduler additionally requires the compute to be a ``linalg`` op
-        with an unaliased ``outs``, which this stage does not arrange: it is a
-        property of the KTIR handed to it, produced by the
-        ``convert_elementwise_to_linalg`` / ``unalias_linalg_outs`` entries of
-        ``SpyreOptions.required_fixes``. Without them dbo-opt rejects the
-        ``ktdp.load`` operand, because the memref keeps a dynamic
-        ``strided<..., offset: ?>`` layout until a ``linalg`` consumer pins it.
+        The scheduler additionally requires the compute to be a ``linalg`` op with
+        an unaliased ``outs``. Half of that is a property of the KTIR handed to this
+        stage — ``convert_elementwise_to_linalg`` runs as a
+        ``SpyreOptions.required_fixes`` entry, since the ``linalg`` ops it creates
+        are what everything downstream is written against. Unaliasing the ``outs``
+        those leave behind is ``unalias_linalg_outs``, the first entry of
+        ``_SPYRECODE_STAGE_PASSES``: it is dbo-opt that cannot take an aliased
+        ``outs``, rejecting the ``ktdp.load`` operand because the memref keeps a
+        dynamic ``strided<..., offset: ?>`` layout until a ``linalg`` consumer pins
+        it, so it does not belong in the cached ``.ktir`` every compile produces.
         """
-        from triton._C.libtriton import ir, passes
+        from triton._C.libtriton import ir, passes, spyre
 
         # The always-on set, whose admission rule is documented on it, then the
-        # one pass that is genuinely a choice: MaterializeBaseAddresses is
-        # guarded because `symbolic_args` and `base_addresses` pick between real
-        # argument-passing modes. So the stage is a list plus a conditional, not
-        # one flat list.
+        # one pass that is genuinely a choice: the two argument-passing modes want
+        # different things done to the base addresses. So the stage is a list plus
+        # a conditional, not one flat list.
         pm = ir.pass_manager(mod.context)
         for stage_pass in _SPYRECODE_STAGE_PASSES:
             _add_ktdp_pass(pm, stage_pass, options)
 
         if options.symbolic_args:
-            # Symbolic mode: leave the pointer arguments alone. The addresses are
-            # not known at compile time -- dbo-opt records a correction table in
-            # the artifact and the runtime patches the real ones in at launch.
-            # Nothing to install; the stage set above is all this pass manager runs.
-            pass
+            # Symbolic mode: the addresses are not known at compile time, so
+            # dbo-opt records a correction table in the artifact and the runtime
+            # patches the real ones in at launch. Nothing to materialize.
+            #
+            # This is also the only mode HbmRoundtrip can run in, and the reason is
+            # the same fact: it appends an `index` argument per spill buffer, and a
+            # correction table will happily patch those too, from the tensors
+            # SpyreLauncher appends after the kernel's own. Baked mode has no such
+            # channel
+            #
+            # Nothing may be appended after it on this branch, and CSE least of
+            # all. The pass gives each compute group its own copy of everything it
+            # reads (an access tile per store and per load even where two are
+            # identical operand-for-operand, a tensor.empty and a linalg.fill per
+            # compute) because the scheduler asserts on a shared one; all of those
+            # are Pure, so a CSE would merge them straight back and reinstate the
+            # assertions, and canonicalize folds the same way. What guarantees that
+            # today is position: the pass is the last thing installed here, and the
+            # only canonicalize/CSE in this stage is on the other arm of this same
+            # conditional, so the two can never co-occur.
+            _add_ktdp_pass(pm, "hbm_roundtrip", options)
         # required_fixes may have installed MaterializeBaseAddresses already, at
         # the anchor the caller chose, in which case the pointer arguments are
         # gone. Installing it a second time would hand the pass more addresses
@@ -763,14 +803,23 @@ class SpyreBackend(BaseBackend):
 
             _add_ktdp_pass(pm, "materialize_base_addresses", options,
                            base_addresses=list(base_addresses))
-            # Part of the materialization, not of the stage: they fold the
-            # arith.constant addresses it just introduced into their users.
-            # Symbolic mode has no constants to fold, so they stay inside this
-            # branch rather than running for every binary compile.
+
+            # Cosmetic, and belonging to this branch only: it folds the
+            # `arith.constant` addresses the pass just introduced into their
+            # users. Reference KTIR states those constants explicitly and dbo-opt
+            # consumes them either way.
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
 
         pm.run(mod, "make_spyrecode")
+
+        # The spill buffers HbmRoundtrip created, for the launcher to allocate and
+        # append. Reported whether or not there are any, so a consumer can tell
+        # "no spills" from "compiled before spills existed".
+        metadata["spill_buffers"] = tuple(
+            {"shape": tuple(buffer["shape"]), "elem_type": buffer["elem_type"]}
+            for buffer in spyre.ir_utils.get_hbm_roundtrip_buffers(mod)
+        )
 
         dbo_opt = resolve_dbo_opt()
         device = resolve_device()

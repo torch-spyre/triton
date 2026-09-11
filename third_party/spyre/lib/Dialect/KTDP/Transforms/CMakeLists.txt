@@ -12,6 +12,7 @@ add_triton_library(KTDPTransforms
   RewriteDescriptorLayout/PhysicalTypeAnalysis.cpp
   UnaliasLinalgOuts.cpp
   DropReductionInitFill.cpp
+  HbmRoundtrip.cpp
   DistributeWork.cpp
   MaterializeBaseAddresses.cpp
   Utility.cpp

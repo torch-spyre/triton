@@ -174,6 +174,32 @@ def make_inputs_2d_scalar_dim(N, M=32, DTYPE="fp32", **_unused) -> dict:
     return inputs
 
 
+# The chained-compute kernels take one input pointer, not two, so they get their
+# own maker and their own oracles rather than a mode of the pair above. A ramp
+# over [0.1, 1.1): away from 0, where sqrt's relative error grows fastest, and
+# small enough that exp applied twice stays well inside fp32.
+
+def make_inputs_chain(n_elements, DTYPE="fp32", **_unused) -> dict:
+    np_dtype = DTYPE_MAP[DTYPE]
+    total = int(n_elements)
+    x = (np.arange(total, dtype=np.float32) / total + 0.1).astype(np_dtype)
+    return {"x_ptr": x, "output_ptr": np.zeros(total, dtype=np_dtype)}
+
+
+def run_chain(inputs: dict) -> np.ndarray:
+    return np.sqrt(np.exp(inputs["x_ptr"]))
+
+
+def run_chain3(inputs: dict) -> np.ndarray:
+    return np.exp(np.sqrt(np.exp(inputs["x_ptr"])))
+
+
+def run_dag(inputs: dict) -> np.ndarray:
+    x = inputs["x_ptr"]
+    e = np.exp(x)
+    return e * np.sqrt(e) + np.sqrt(x)
+
+
 # ---------------------------------------------------------------------------
 # Level B factory — Elementwise(VariantFactory)
 # ---------------------------------------------------------------------------
@@ -365,6 +391,15 @@ _SIG_1D_SCALAR = {
     "seqlen_ptr": "*i32",
     "BLOCK_SIZE": "i32",
 }
+
+_SIG_1D_CHAIN = {
+    "x_ptr":      "*fp32",
+    "output_ptr": "*fp32",
+    "n_elements": "i32",
+    "BLOCK_SIZE": "i32",
+    "LAYOUT":     "constexpr",
+}
+
 
 _SIG_2D_SCALAR = {
     "x_ptr":      "*fp32",
@@ -937,6 +972,132 @@ VARIANTS = {
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
+        "extra_checks": None,
+    },
+
+    # The chained-compute arm of Level D: the same single-tile, loop-free shape as
+    # 1d_device, but each compute reading the previous one's result instead of one
+    # compute standing alone. Unary, so one input pointer and no OP sweep -- what
+    # distinguishes these variants from each other is the chain length and the core
+    # count, not the arithmetic.
+    #
+    # fp32 only: tl.sqrt/tl.exp are each @_check_dtype(dtypes=["fp32", "fp64"])
+    # upstream and reject fp16 at compile time.
+    "1d_device_chain": {
+        "base": None,   # prevent inheriting reference/inputs from default
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "1D `out = sqrt(exp(x))` over a single tile, no distribution loop. "
+            "Two chained computes."
+        ),
+        "doc": (
+            "Takes one 1D input vector `x` of length `n_elements` and writes "
+            "`out = sqrt(exp(x))`. One tile, one core, no loop.\n\n"
+            "Two chained computes: the `sqrt` reads what the `exp` produced. The "
+            "vector is one `BLOCK_SIZE`-wide tile that is the whole tensor, so "
+            "there is no distribution loop."
+        ),
+        "kernel_fn":    kernel.chain_1d_device,
+        "SIGNATURE":    _SIG_1D_CHAIN,
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT"],
+        "params": {
+            "n_elements": [128], "BLOCK_SIZE": [128], "DTYPE": ["fp32"],
+            "LAYOUT": [_stick_1d("fp32")],
+        },
+        "grid":         [1],
+        # No tl.program_id distribution loop, so DistributeWork has nothing to
+        # place and the presence check would fail on a correct kernel.
+        "parallel":     False,
+        "compiles_to_binary": True,
+        "reference":    run_chain,
+        "inputs":       make_inputs_chain,
+        "output_key":   "output_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+        # Nothing shape-specific to assert beyond the shared structural suite; the
+        # numbers are what these check, on ktir_cpu and on the device.
+        "extra_checks": None,
+    },
+    "1d_device_chain_grid2": {
+        # The multi-core counterpart, the way 1d_device_grid2 is 1d_device's: two
+        # cores, one tile each, still no loop. Dividing a chain across cores is its
+        # own thing to cover -- each core runs the whole chain over its own tile,
+        # at its own offset into the vector.
+        "base": "1d_device_chain",
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "program-id-1d", "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "1D `out = sqrt(exp(x))` across two cores, one fp32 stick each. "
+            "Two chained computes, one tile per core, no distribution loop."
+        ),
+        "grid":         [2],
+        "params": {
+            # 128 elements over BLOCK_SIZE=64 is exactly two fp32 sticks, one
+            # per core, so core i owns stick i.
+            "n_elements": [128], "BLOCK_SIZE": [64], "DTYPE": ["fp32"],
+            "LAYOUT": [_stick_1d("fp32")],
+        },
+        # Inherits parallel=False from the base and means it: two cores each run
+        # one tile, so there is still no scf.for for DistributeWork to place.
+    },
+    "1d_device_chain3": {
+        # A longer chain: three computes rather than two, so the middle one both
+        # reads a result and produces one, which neither of the pair above does.
+        "base": "1d_device_chain",
+        "summary": (
+            "1D `out = exp(sqrt(exp(x)))` over a single tile, no distribution "
+            "loop. Three chained computes."
+        ),
+        "kernel_fn":    kernel.chain3_1d_device,
+        "reference":    run_chain3,
+    },
+    "1d_device_dag": {
+        # Not a chain: `exp(x)` is read twice, the multiply reads two results
+        # computed at different points, and `x` is read twice as well, so the
+        # computes form a DAG rather than a line.
+        "base": None,   # prevent inheriting reference/inputs from default
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "1D `out = exp(x) * sqrt(exp(x)) + sqrt(x)` over a single tile, no "
+            "distribution loop. The computes form a DAG, not a chain."
+        ),
+        "doc": (
+            "Takes one 1D input vector `x` of length `n_elements` and writes "
+            "`out = exp(x) * sqrt(exp(x)) + sqrt(x)`. One tile, one core, no "
+            "loop.\n\n"
+            "The computes are not a chain. `exp(x)` is read twice -- by its own "
+            "`sqrt` and by the multiply -- the multiply reads two results computed "
+            "at different points, and `x` is read twice, by the `exp` and by the "
+            "other `sqrt`. The vector is one `BLOCK_SIZE`-wide tile that is the "
+            "whole tensor, so there is no distribution loop."
+        ),
+        "kernel_fn":    kernel.dag_1d_device,
+        "SIGNATURE":    _SIG_1D_CHAIN,
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT"],
+        "params": {
+            "n_elements": [128], "BLOCK_SIZE": [128], "DTYPE": ["fp32"],
+            "LAYOUT": [_stick_1d("fp32")],
+        },
+        "grid":         [1],
+        # No tl.program_id distribution loop, so DistributeWork has nothing to
+        # place and the presence check would fail on a correct kernel.
+        "parallel":     False,
+        "compiles_to_binary": True,
+        "reference":    run_dag,
+        "inputs":       make_inputs_chain,
+        "output_key":   "output_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+        # Nothing shape-specific to assert beyond the shared structural suite; the
+        # numbers are what this checks, on ktir_cpu and on the device.
         "extra_checks": None,
     },
 
