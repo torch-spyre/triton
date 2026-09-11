@@ -185,6 +185,62 @@ def LowerComputeOps : Pass<"lower-compute-ops", "mlir::ModuleOp"> {
     ];
 }
 
+def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
+    let summary = "Lower scalar math/arith ops to spyreop dialect intrinsics.";
+    let description = [{
+        Input: any IR containing scalar math/arith ops — typically the body
+        of a linalg.generic after ConvertElementwiseToLinalg has scalarized
+        a tensor-level op. spyreop's intrinsics are scalar-only
+        (f16/df16/f32, or i32/i64 for the integer ops), so an op still on a
+        tensor or vector is left alone rather than matched — this pass is
+        not the one that will eventually convert it.
+
+        Lowering:
+        - math.sqrt  (operand f16 or f32)        → spyreop.sqrt
+        - math.exp   (operand f16 or f32)        → spyreop.exp
+        - math.rsqrt (operand f16 or f32)        → spyreop.rsqrt
+        - arith.divf (operand f16 or f32)        → spyreop.realdiv
+        - arith.addi (i32, inside linalg.generic) → spyreop.addi32toi32
+        - arith.addi (i64, inside linalg.generic) → spyreop.addi64toi64
+        - arith.muli (i32, inside linalg.generic) → spyreop.muli32toi32
+
+        math.sqrt/exp/rsqrt and arith.divf are matched unconditionally on
+        scalar type: those ops only ever appear in real floating-point
+        compute, never in address/index arithmetic, so a scalar occurrence
+        still on an unsupported type (f64, bf16, ...) has no spyreop
+        intrinsic to lower to and is left illegal, reported with a
+        diagnostic rather than silently skipped. Still on a tensor/vector,
+        they are left legal, quietly, since ConvertElementwiseToLinalg (not
+        this pass) is what will eventually scalarize them.
+
+        arith.addi/arith.muli are different: plain scalar integer add/mul is
+        also used throughout a kernel for loop indices, offsets, and tile
+        addressing, not just scalarized tensor compute. So these two are
+        only matched inside a linalg.generic body (the structural signal
+        that this is scalarized elementwise compute, not address math), and
+        only at the specific bit-widths spyreop has an intrinsic for --
+        anything else (other widths, or outside a linalg.generic) is left
+        legal rather than reported.
+
+        Ordering: must run after ConvertElementwiseToLinalg for a kernel
+        that computes over a tensor -- anchored earlier, the op is still
+        tensor-typed and left alone, never reaching its spyreop intrinsic.
+
+        Output: no math.sqrt/exp/rsqrt or arith.divf remains on a supported
+        scalar type; no arith.addi/muli at a supported bit-width remains
+        inside a linalg.generic. The corresponding spyreop intrinsic is
+        introduced in its place. Everything else -- unsupported types or
+        widths, tensor/vector operands, or index arithmetic outside a
+        linalg.generic -- passes through unchanged.
+    }];
+
+    let dependentDialects = [
+        "mlir::spyreop::SpyreOpDialect",
+        "mlir::math::MathDialect",
+        "mlir::arith::ArithDialect"
+    ];
+}
+
 def UnaliasLinalgOuts : Pass<"unalias-linalg-outs", "mlir::ModuleOp"> {
     let summary = "Replace a linalg 'outs' operand that aliases an 'ins' operand "
                   "with a fresh tensor.empty.";
@@ -473,6 +529,102 @@ def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
     let dependentDialects = [
         "mlir::linalg::LinalgDialect",
         "mlir::tensor::TensorDialect"
+    ];
+}
+
+def HbmRoundtrip : Pass<"hbm-roundtrip", "mlir::ModuleOp"> {
+    let summary = "Break compute-to-compute tensor edges by storing the value "
+                  "to HBM and loading it back.";
+    let description = [{
+        Input: KTIR after ConvertFunctions and DistributeWork — a `func.func`
+        whose base addresses are `index` arguments, whose compute is `linalg`
+        ops on tensors, and which carries a `grid` attribute.
+
+        Why: the scheduler forms one local schedule per connected region of
+        compute, and a compute occupies the whole local register file of the
+        functional unit it lands on. One compute per schedule, so a compute's
+        result reaches another compute through memory rather than as a value — a
+        `ktdp.store` ending one schedule and a `ktdp.load` beginning the next, the
+        way hand-written reference KTIR for a chained normalisation is built.
+
+        Lowering: each tensor value produced by a compute `linalg` op in the entry
+        block and consumed by another one gets a spill buffer of its own, added as
+        a new `index` argument, with a `ktdp.store` after the producer and a
+        `ktdp.load` before each consumer. One buffer per value, never shared or
+        reused: a value that is both a kernel output and a later compute's input is
+        written twice, which costs a store and buys a uniform rule.
+
+        A buffer holds one slab per compute tile — the tile shape with dimension 0
+        multiplied by the grid extent, dense row-major, the access tile anchored at
+        `tile_id * tile_shape[0]`. Same rank as the tile, so no reshape either way;
+        a grid of one tile gives a buffer that is exactly the tile, anchored at
+        zero.
+
+        Splitting the compute is half of it. Each group is extracted into a
+        schedule of its own, so an operation two groups read belongs to neither,
+        and the pass therefore gives each group its own copy of everything it
+        reads: an access tile per store and per load even where two would be
+        identical, a clone of the `linalg.fill` on `outs` and of any `ktdp.load` a
+        second compute reads, and a rebuilt address cone per memory operation down
+        to the base address. Index arithmetic is not exempt — a descriptor offset
+        read by two access tiles is shared just as a tensor would be.
+
+        Those copies are Pure, so **CSE must not run after this pass** or it merges
+        them back together. In the spyrecode stage that holds by position: this
+        pass is installed last on its branch, and that stage's only
+        canonicalize/CSE is on the other arm of the same conditional.
+
+        Scope: `linalg.generic`, `linalg.fill` and `linalg.reduce`, on a grid of
+        rank 1. The op set follows the scheduler's own named-op allowlist for
+        compute, `linalg.{add,mul,sub,max,min,reduce,generic,yield}`: `reduce` is
+        in it and is a compute like any other, while `broadcast` (which
+        LowerComputeOps emits for `tt.broadcast` / `tt.expand_dims`), `transpose`
+        and `matmul` are not. The gate says nothing about what a compute does — a
+        generic carrying reduction iterators is in scope. Rank 1 only because
+        `ktdp.get_compute_tile_id` yields one index per grid dimension and reducing
+        several to the single slab index a buffer is addressed by is work this
+        temporary pass does not do.
+
+        A function outside that scope is *reported* — but only once it has an edge
+        to route. Without one there is nothing to do and the function is left
+        exactly as it arrived, which is what keeps a single-compute kernel built
+        from an out-of-scope named op compiling as it does today. Same for a tensor
+        read by a compute that is none of `tensor.empty`, `linalg.fill` or
+        `ktdp.load`: reported, since the pass cannot place it, and only reachable
+        on a kernel that has an edge at all.
+
+        A `linalg.fill` is a `linalg` op but not a compute, so it is neither a
+        spilled producer nor a consumer whose operands get rewritten. It is cloned
+        into each group that reads it, like the `tensor.empty` it writes into.
+
+        Ordering: after ConvertFunctions (the arguments it adds are `index`, the
+        type that pass leaves base addresses as) and after DistributeWork (it reads
+        `grid` and the compute-tile id). The arguments it appends can only be
+        filled in by a correction table, so the backend runs it in
+        symbolic-argument mode — the default — and not where
+        MaterializeBaseAddresses bakes addresses instead: there is no address to
+        bake for a buffer the caller never declared.
+
+        The buffers created are reported on the module as
+        `ktdp.hbm_roundtrip_buffers`, an array of `{shape, element_type}`
+        dictionaries in argument order, so the launcher can allocate one each and
+        pass them after the kernel's own pointers. No element *width*: the backend
+        already derives one from an element type's spelling for the kernel's own
+        pointers. Only one public function per module may need buffers, since the
+        list is per module and consumed positionally.
+
+        Output: KTIR in which no compute `linalg` op reads a value produced by
+        another, so each compute becomes its own local schedule. A no-op on any
+        kernel with no compute-to-compute edge, whatever its `linalg` ops or grid
+        rank. `--debug-only=hbm-roundtrip` traces the edges found, the buffers
+        created and any reason for skipping.
+    }];
+
+    let dependentDialects = [
+        "mlir::ktdp::KtdpDialect",
+        "mlir::func::FuncDialect",
+        "mlir::arith::ArithDialect",
+        "mlir::linalg::LinalgDialect"
     ];
 }
 

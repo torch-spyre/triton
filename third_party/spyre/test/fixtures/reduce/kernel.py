@@ -219,3 +219,55 @@ def reduce_one_tile(
     else:
         reduced = tl.min(a_tile, AXIS)
     out_desc.store([0], reduced)
+
+
+@triton.jit
+def reduce_then_sqrt_one_tile(
+    in_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    IN_LAYOUT: tl.constexpr,
+    OUT_LAYOUT: tl.constexpr,
+):
+    """``out[n] = sqrt(sum(in[:, n]))`` in one tile: no ``tl.program_id``, no loop.
+
+    ``reduce_one_tile`` at ``AXIS=0``, with an elementwise op applied to the
+    reduced tensor. Two computes rather than one, the second reading what the
+    first produced.
+
+    The ``sqrt`` consumes the reduced tensor at *its* shape, ``[N]``. It does not
+    combine it with the ``[M, N]`` input, which would need the reduced tensor
+    widened back to the input's rank -- a different kernel, and one that does not
+    lower today.
+
+    ``sqrt`` and not ``exp``: the sums here reach ~24 and ``exp(24)`` is far past
+    the fp16 maximum, so the comparison against the oracle would be a comparison
+    of two infinities.
+
+    Only the axis that works: folding M leaves the stick structure of a
+    stick-on-N input untouched, so the reduce is emitted at physical shape with
+    the surviving stick index as a batch dimension. Folding N instead stops in the
+    scheduler -- see ``reduce_one_tile`` for that whole story.
+    """
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[M, N],
+    )
+    if IN_LAYOUT is not None:
+        tl.spyre_tensor_layout(in_desc, IN_LAYOUT)
+
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[N],
+        strides=[1],
+        block_shape=[N],
+    )
+    if OUT_LAYOUT is not None:
+        tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
+
+    a_tile = in_desc.load([0, 0])
+    reduced = a_tile.sum(0)
+    out_desc.store([0], tl.sqrt(reduced))

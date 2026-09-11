@@ -9,6 +9,7 @@
 
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
@@ -118,8 +119,20 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   m.def("add_lower_compute_ops", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
   });
+  // Not in add_convert_ttir_to_ktdp above: spyreop's scalar intrinsics only
+  // accept scalar f16/df16/f32 operands, so this can only fire on a math op
+  // that is already scalar -- typically inside a linalg.generic body after
+  // convert_elementwise_to_linalg. Reachable individually for now; folding it
+  // into the default pipeline is a later ordering decision (anchor on
+  // convert_elementwise_to_linalg, same as unalias_linalg_outs).
+  m.def("add_lower_spyre_ops", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::ktdp::createLowerSpyreOpsPass());
+  });
   m.def("add_convert_functions", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
+  });
+  m.def("add_hbm_roundtrip", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::ktdp::createHbmRoundtripPass());
   });
   m.def(
       "add_distribute_work",
@@ -194,6 +207,37 @@ void init_triton_spyre_ir_utils(py::module &&m) {
           }
           return d;
         });
+
+  // The spill buffers HbmRoundtrip created, in the order of the `index`
+  // arguments it appended, read off the `ktdp.hbm_roundtrip_buffers` module
+  // attribute it writes. Each entry is
+  //   {"shape": [12, 64, 64], "elem_type": "f32"}
+  // and the list is empty when the pass did not run or found nothing to spill.
+  // A dedicated getter rather than a generic one because the attribute is an
+  // array of dictionaries, which none of the typed getters on ir.operation
+  // covers, and because the caller needs it as data rather than as printed IR.
+  m.def("get_hbm_roundtrip_buffers", [](mlir::ModuleOp &self) -> py::list {
+    py::list buffers;
+    auto attr =
+        self->getAttrOfType<mlir::ArrayAttr>("ktdp.hbm_roundtrip_buffers");
+    if (!attr)
+      return buffers;
+    for (mlir::Attribute entry : attr) {
+      auto fields = mlir::cast<mlir::DictionaryAttr>(entry);
+      py::dict buffer;
+      auto shape =
+          mlir::cast<mlir::DenseI64ArrayAttr>(fields.get("shape")).asArrayRef();
+      buffer["shape"] = std::vector<int64_t>(shape.begin(), shape.end());
+      mlir::Type elemType =
+          mlir::cast<mlir::TypeAttr>(fields.get("element_type")).getValue();
+      std::string elemStr;
+      llvm::raw_string_ostream elemOs(elemStr);
+      elemType.print(elemOs);
+      buffer["elem_type"] = elemStr;
+      buffers.append(buffer);
+    }
+    return buffers;
+  });
 }
 
 void init_triton_spyre(py::module &&m) {
@@ -209,6 +253,7 @@ void init_triton_spyre(py::module &&m) {
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::ktdp::KtdpDialect>();
+    registry.insert<mlir::spyreop::SpyreOpDialect>();
     registry.insert<mlir::linalg::LinalgDialect>();
     registry.insert<mlir::tensor::TensorDialect>();
     registry.insert<mlir::math::MathDialect>();

@@ -3,6 +3,7 @@ add_triton_library(KTDPTransforms
   LowerDescriptorMemory.cpp
   LowerScalarLoad.cpp
   LowerComputeOps.cpp
+  LowerSpyreOps.cpp
   LowerInterTile.cpp
   RewriteDescriptorLayout.cpp
   RewriteDescriptorLayout/Classify.cpp
@@ -12,6 +13,7 @@ add_triton_library(KTDPTransforms
   RewriteDescriptorLayout/RequirementAnalysis.cpp
   UnaliasLinalgOuts.cpp
   DropReductionInitFill.cpp
+  HbmRoundtrip.cpp
   DistributeWork.cpp
   MaterializeBaseAddresses.cpp
   Utility.cpp
@@ -21,6 +23,7 @@ add_triton_library(KTDPTransforms
 
   LINK_LIBS PUBLIC
   KTIR::KtdpDialect
+  KTIR::SpyreOpDialect
   TritonIR
   MLIRIR
   MLIRPass
