@@ -30,9 +30,15 @@
 
 // CHECK-LABEL:   tt.func @dot_f32(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<16x32xf32>, %[[VAL_1:.*]]: tensor<32x8xf32>, %[[VAL_2:.*]]: tensor<16x8xf32>) -> tensor<16x8xf32> {
+// The tensor.empty guard sits ABOVE the matmul, not below it. A lowering that
+// materialized a fresh destination instead of threading the accumulator would
+// emit its tensor.empty *before* the matmul that consumes it, and a guard placed
+// after the matmul line never sees it -- the preceding CHECK simply scans past
+// any intervening lines. Verified: with the guard below, output of the form
+// "tensor.empty / linalg.matmul outs(%0)" passes; above, it fires.
+// CHECK-NOT:       tensor.empty
 // CHECK:           %[[VAL_3:.*]] = linalg.matmul ins(%[[VAL_0]], %[[VAL_1]] : tensor<16x32xf32>, tensor<32x8xf32>) outs(%[[VAL_2]] : tensor<16x8xf32>) -> tensor<16x8xf32>
 // CHECK-NOT:       tt.dot
-// CHECK-NOT:       tensor.empty
 // CHECK:           tt.return %[[VAL_3]] : tensor<16x8xf32>
 // CHECK:         }
 tt.func @dot_f32(%a: tensor<16x32xf32>, %b: tensor<32x8xf32>,
@@ -68,8 +74,16 @@ tt.func @dot_large(%a: tensor<128x64xf32>, %b: tensor<64x128xf32>,
 
 // CHECK-LABEL:   tt.func @dot_batch_matmul(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<4x16x32xf32>, %[[VAL_1:.*]]: tensor<4x32x8xf32>, %[[VAL_2:.*]]: tensor<4x16x8xf32>) -> tensor<4x16x8xf32> {
+// On the guard the prose above calls "the real content": a fallthrough to the
+// rank-2 branch would emit linalg.matmul *instead of* linalg.batch_matmul, and the
+// positive CHECK below already catches that -- verified, it fires on output where
+// the batch_matmul is replaced by a matmul. So the rank dispatch is pinned; the
+// CHECK-NOT below adds the narrower claim that no second, rank-2 matmul appears
+// alongside the batch_matmul. A leading CHECK-NOT would sit in a zero-length
+// window (nothing precedes the batch_matmul in real output) and add nothing.
 // CHECK:           %[[VAL_3:.*]] = linalg.batch_matmul ins(%[[VAL_0]], %[[VAL_1]] : tensor<4x16x32xf32>, tensor<4x32x8xf32>) outs(%[[VAL_2]] : tensor<4x16x8xf32>) -> tensor<4x16x8xf32>
 // CHECK-NOT:       tt.dot
+// CHECK-NOT:       linalg.matmul
 // CHECK:           tt.return %[[VAL_3]] : tensor<4x16x8xf32>
 // CHECK:         }
 tt.func @dot_batch_matmul(%a: tensor<4x16x32xf32>, %b: tensor<4x32x8xf32>,

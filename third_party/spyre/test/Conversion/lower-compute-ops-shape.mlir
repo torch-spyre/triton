@@ -95,6 +95,11 @@ tt.func @reshape_2d_to_3d(%t: tensor<4x16xi32>) -> tensor<2x2x16xi32> {
 // CHECK:           %[[VAL_1:.*]] = arith.constant 16 : index
 // CHECK:           %[[VAL_2:.*]] = arith.constant 32 : index
 // CHECK:           %[[VAL_3:.*]] = tensor.from_elements %[[VAL_1]], %[[VAL_2]] : tensor<2xindex>
+// Guarded on both sides of the reshape. The window after it (below) is the one the
+// prose above describes; this one covers a lowering that honoured allow_reorder by
+// transposing *first*, which would emit above the reshape where a trailing guard
+// never looks.
+// CHECK-NOT:       linalg.transpose
 // CHECK:           %[[VAL_4:.*]] = tensor.reshape %[[VAL_0]](%[[VAL_3]]) : (tensor<512xf32>, tensor<2xindex>) -> tensor<16x32xf32>
 // CHECK-NOT:       tt.reshape
 // CHECK-NOT:       linalg.transpose
