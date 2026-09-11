@@ -159,7 +159,6 @@ uv run pytest third_party/spyre/test -s --tb=short -k "not numerical"
 Useful narrower commands:
 
 ```bash
-uv run pytest third_party/spyre/test/test_lower_desc_memory.py -s --tb=short
 uv run pytest third_party/spyre/test/test_ktir_examples.py -s --tb=short
 ```
 
