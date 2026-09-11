@@ -7,9 +7,14 @@ Everything here runs without a working ``dbo-opt``, so this file carries no
 which does.
 
 Two tests do run a compile, and still belong here: they point
-``knobs.spyre.dbo_opt`` at a tool that exists and exits 1 (``/bin/false``, and a
-one-line script), because what they assert is the *failure* message. A working
-compiler would defeat them.
+``knobs.spyre.dbo_opt`` at a one-line script that exits 1, because what they
+assert is the *failure* message. A working compiler would defeat them.
+
+Both write that script into ``tmp_path`` rather than borrowing a system binary.
+Nothing here depends on what is installed on the machine: a hardcoded
+``/bin/false`` used to serve this purpose and does not exist on macOS, which sent
+``resolve_dbo_opt`` down its *not-found* branch and left the test asserting
+against a message it was not written for.
 """
 
 import pytest
@@ -75,14 +80,23 @@ class TestAFailingTool:
     """
 
     def test_reported_with_its_origin(self, binary_source, spyrecode_options,
-                                      monkeypatch):
-        monkeypatch.setattr(knobs.spyre, "dbo_opt", "/bin/false")
+                                      monkeypatch, tmp_path):
+        # The failing tool is written here rather than borrowed from the system
+        # (this used to be a hardcoded /bin/false, which does not exist on macOS
+        # -- so resolve_dbo_opt took its *not-found* branch and this test silently
+        # asserted against the wrong message). An absolute path also exercises the
+        # os.sep branch of the origin string, which is the half this test is for;
+        # the bare-name/PATH half is the test below.
+        failing = tmp_path / "dbo-opt"
+        failing.write_text("#!/bin/sh\nexit 1\n")
+        failing.chmod(0o755)
+        monkeypatch.setattr(knobs.spyre, "dbo_opt", str(failing))
         with pytest.raises(RuntimeError) as excinfo:
             triton_compile(binary_source, target=spyre_target(),
                            options=spyrecode_options)
         message = str(excinfo.value)
-        assert "/bin/false" in message
-        assert "knobs.spyre.dbo_opt='/bin/false'" in message
+        assert str(failing) in message
+        assert f"knobs.spyre.dbo_opt={str(failing)!r}" in message
         assert "TRITON_SPYRE_DBO_OPT" in message
 
     def test_a_bare_name_is_reported_as_coming_from_path(self, binary_source,
