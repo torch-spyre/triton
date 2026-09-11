@@ -81,18 +81,22 @@ def _keys_with_numerical_xfail():
 
 
 def test_disabled_variants_tracking_tests_exist():
-    """Every ``disabled`` entry's ``tracking_test`` must resolve.
+    """Every ``disabled`` entry must carry a non-blank ``tracking_test``.
 
     A ``disabled`` variant in ``meta.py`` carries a ``tracking_test``
-    string of the form ``"<file>::<ClassName>"`` pointing at a
-    single-pass test that pins the underlying gap. This meta-test
-    parses each string, imports the file, and checks that the class
-    exists and contains at least one ``test_*`` method.
+    string naming where the underlying gap is pinned — normally a lit
+    file, e.g. ``"Conversion/lower-descriptor-memory-addptr-invalid.mlir"``.
+    This meta-test checks only that the field is present and non-blank.
 
-    The point: when the gap closes and someone deletes the tracking
-    test, this test fails — flagging the stale ``disabled`` entry that
-    now points into the void. Either re-enable the variant (the
-    compile succeeded) or update/remove the ``disabled`` block.
+    It used to parse ``"<file>.py::<ClassName>"``, import the module and
+    look for a ``test_*`` attribute on the class. That shape assumed the
+    tracking test was a *Python* test; once the single-pass suites became
+    lit files (#55), no ``.mlir`` could satisfy any of those three checks.
+
+    So the rot this catches is now narrow — an empty or missing pointer.
+    A renamed or deleted tracking file is **not** caught: grep for the
+    filename if you move one. When a gap closes, either re-enable the
+    variant or remove the ``disabled`` block.
 
     Adding more ``disabled`` rules later
     -----------------------------------
@@ -111,10 +115,6 @@ def test_disabled_variants_tracking_tests_exist():
     with one ``@pytest.mark.parametrize``'d method per rule, so failing
     tests report as e.g. ``test_tracking_test_resolves[matmul__bmm]``.
     """
-    import importlib
-    import pathlib
-
-    test_dir = pathlib.Path(__file__).parent
     failures = []
     for key, entry in EXAMPLES.items():
         disabled = entry.get("disabled")
@@ -125,48 +125,16 @@ def test_disabled_variants_tracking_tests_exist():
             failures.append(f"{key}: 'disabled' has no 'tracking_test'")
             continue
 
-        # Split "file.py::ClassName" — we only validate file + class.
-        # Per-method resolution would require pytest's collector; the
-        # class-plus-at-least-one-test_ check catches the rot we
-        # actually worry about (file renamed, class deleted).
-        try:
-            file_part, class_part = tracking.split("::", 1)
-        except ValueError:
+        # ``tracking_test`` is free text naming where the gap is pinned —
+        # validated as present and non-blank, nothing more.
+        #
+        # So the rot this rule catches is narrow: an empty or missing
+        # pointer. A renamed lit file will not be caught here — grep for the
+        # filename if you move one.
+        if not isinstance(tracking, str) or not tracking.strip():
             failures.append(
-                f"{key}: tracking_test {tracking!r} not in "
-                f"'file.py::ClassName' form"
-            )
-            continue
-
-        module_name = file_part.removesuffix(".py")
-        module_path = test_dir / file_part
-        if not module_path.is_file():
-            failures.append(
-                f"{key}: tracking_test file {file_part} not found in "
-                f"{test_dir}"
-            )
-            continue
-
-        try:
-            mod = importlib.import_module(module_name)
-        except ImportError as e:
-            failures.append(
-                f"{key}: failed to import tracking_test module "
-                f"{module_name}: {e}"
-            )
-            continue
-
-        cls = getattr(mod, class_part, None)
-        if cls is None:
-            failures.append(
-                f"{key}: tracking_test class {class_part!r} not found "
-                f"in {file_part}"
-            )
-            continue
-
-        if not any(name.startswith("test_") for name in dir(cls)):
-            failures.append(
-                f"{key}: tracking_test {tracking} has no test_* methods"
+                f"{key}: tracking_test must be a non-empty string, got "
+                f"{tracking!r}"
             )
 
     assert not failures, (

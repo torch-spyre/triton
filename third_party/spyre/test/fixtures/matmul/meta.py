@@ -489,8 +489,11 @@ VARIANTS = {
         "disabled": {
             "reason":        "tt.addptr into tt.make_tensor_descriptor not "
                              "yet lowered by LowerDescriptorMemory",
-            "tracking_test": "test_lower_desc_memory.py::"
-                             "TestAddptrIntoDescriptor",
+            # Free text: names where the gap is pinned. Was a
+            # file.py::ClassName pointer resolved by import; the tracking
+            # test is now a lit file, which no import can reach.
+            "tracking_test": "Conversion/"
+                             "lower-descriptor-memory-addptr-invalid.mlir",
         },
     },
     "bmm_addptr_dynamic": {
