@@ -181,6 +181,62 @@ def LowerComputeOps : Pass<"lower-compute-ops", "mlir::ModuleOp"> {
     ];
 }
 
+def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
+    let summary = "Lower scalar math/arith ops to spyreop dialect intrinsics.";
+    let description = [{
+        Input: any IR containing scalar math/arith ops — typically the body
+        of a linalg.generic after ConvertElementwiseToLinalg has scalarized
+        a tensor-level op. spyreop's intrinsics are scalar-only
+        (f16/df16/f32, or i32/i64 for the integer ops), so an op still on a
+        tensor or vector is left alone rather than matched — this pass is
+        not the one that will eventually convert it.
+
+        Lowering:
+        - math.sqrt  (operand f16 or f32)        → spyreop.sqrt
+        - math.exp   (operand f16 or f32)        → spyreop.exp
+        - math.rsqrt (operand f16 or f32)        → spyreop.rsqrt
+        - arith.divf (operand f16 or f32)        → spyreop.realdiv
+        - arith.addi (i32, inside linalg.generic) → spyreop.addi32toi32
+        - arith.addi (i64, inside linalg.generic) → spyreop.addi64toi64
+        - arith.muli (i32, inside linalg.generic) → spyreop.muli32toi32
+
+        math.sqrt/exp/rsqrt and arith.divf are matched unconditionally on
+        scalar type: those ops only ever appear in real floating-point
+        compute, never in address/index arithmetic, so a scalar occurrence
+        still on an unsupported type (f64, bf16, ...) has no spyreop
+        intrinsic to lower to and is left illegal, reported with a
+        diagnostic rather than silently skipped. Still on a tensor/vector,
+        they are left legal, quietly, since ConvertElementwiseToLinalg (not
+        this pass) is what will eventually scalarize them.
+
+        arith.addi/arith.muli are different: plain scalar integer add/mul is
+        also used throughout a kernel for loop indices, offsets, and tile
+        addressing, not just scalarized tensor compute. So these two are
+        only matched inside a linalg.generic body (the structural signal
+        that this is scalarized elementwise compute, not address math), and
+        only at the specific bit-widths spyreop has an intrinsic for --
+        anything else (other widths, or outside a linalg.generic) is left
+        legal rather than reported.
+
+        Ordering: must run after ConvertElementwiseToLinalg for a kernel
+        that computes over a tensor -- anchored earlier, the op is still
+        tensor-typed and left alone, never reaching its spyreop intrinsic.
+
+        Output: no math.sqrt/exp/rsqrt or arith.divf remains on a supported
+        scalar type; no arith.addi/muli at a supported bit-width remains
+        inside a linalg.generic. The corresponding spyreop intrinsic is
+        introduced in its place. Everything else -- unsupported types or
+        widths, tensor/vector operands, or index arithmetic outside a
+        linalg.generic -- passes through unchanged.
+    }];
+
+    let dependentDialects = [
+        "mlir::spyreop::SpyreOpDialect",
+        "mlir::math::MathDialect",
+        "mlir::arith::ArithDialect"
+    ];
+}
+
 def UnaliasLinalgOuts : Pass<"unalias-linalg-outs", "mlir::ModuleOp"> {
     let summary = "Replace a linalg 'outs' operand that aliases an 'ins' operand "
                   "with a fresh tensor.empty.";

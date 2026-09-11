@@ -726,8 +726,10 @@ VARIANTS = {
     #
     # The op x dtype product on ktir_cpu. Deliberately the simplest shape in
     # the file -- 1D, static, one tile, no layout -- so arithmetic is the only
-    # thing that differs between its entries. div and every i32 arm stop here:
-    # dbo-opt wants the spyreop spellings this repo does not yet emit.
+    # thing that differs between its entries. LowerSpyreOps (#107) only runs
+    # at the spyrecode stage (_SPYRECODE_STAGE_PASSES), after ktir_cpu's own
+    # module is already built, so this variant's math/arith ops stay in their
+    # plain dialect spelling and every combo is reachable end to end.
     # -----------------------------------------------------------------------
     "1d_compute": {
         # No base: prevent inheriting `reference` and `inputs` from `default`
@@ -738,8 +740,7 @@ VARIANTS = {
                  "program-id-1d", "elementwise-compute"],
         "summary": (
             "1D elementwise op across fp16/fp32/i32 and add/sub/mul/div. "
-            "Sweeps the OP × DTYPE product to cover ktir_cpu correctness; "
-            "div and i32 stop here pending #107."
+            "Sweeps the OP × DTYPE product to cover ktir_cpu correctness."
         ),
         "kernel_fn":    kernel.elementwise_1d,
         "factory":      Elementwise(rank=1),

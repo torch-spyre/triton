@@ -219,6 +219,18 @@ _SPYRECODE_STAGE_PASSES = (
     # reduction iterator, so the other producer of linalg.fill in this pipeline
     # (tt.splat) is out of scope.
     "drop_reduction_init_fill",
+
+    # LowerSpyreOps. Rewrites a scalar math/arith op (math.sqrt/exp/rsqrt,
+    # arith.divf, and arith.addi/muli inside a linalg.generic body) to the
+    # spyreop dialect spelling dbo-opt's scheduler expects.
+    #
+    # Ordering: after convert_elementwise_to_linalg / unalias_linalg_outs,
+    # which already ran as required_fixes during _make_ktir, so the scalar
+    # math/arith op it matches is already inside the linalg.generic body
+    # those produced. A scalar op on a type spyreop has no intrinsic for
+    # (f64, bf16, ...) is reported as illegal rather than left alone -- see
+    # LowerSpyreOps.cpp and Passes.td.
+    "lower_spyre_ops",
 )
 
 
@@ -477,10 +489,9 @@ class SpyreBackend(BaseBackend):
         if parsed.get("base_addresses") and "symbolic_args" not in options:
             parsed["symbolic_args"] = False
 
-        # The two fix passes the scheduler inside dbo-opt requires of every kernel
-        # it will lower to a binary.  Merged under the caller's own entries so an
-        # explicit override of a specific anchor still wins, but a caller that
-        # passes nothing still gets them.
+        # The fix passes every kernel gets by default. Merged under the caller's
+        # own entries so an explicit override of a specific anchor still wins, but
+        # a caller that passes nothing still gets them.
         #
         # The anchor is rewrite_descriptor_layout, not lower_compute_ops.
         # lower_compute_ops builds a linalg.generic with logical types before the

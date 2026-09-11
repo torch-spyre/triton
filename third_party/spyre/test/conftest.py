@@ -959,10 +959,12 @@ def compilable_example(request):
 def spyrecode_options(compilable_example):
     """Compile options for the variant under test.
 
-    The grid alone. The fix passes the scheduler inside dbo-opt requires
-    (``convert_elementwise_to_linalg`` and ``unalias_linalg_outs``, anchored on
-    ``rewrite_descriptor_layout``) are now injected by ``parse_options`` so no
-    caller has to name them.
+    The grid alone. The default fixes (``convert_elementwise_to_linalg`` and
+    ``unalias_linalg_outs``, anchored on ``rewrite_descriptor_layout``) are
+    injected by ``parse_options`` so no caller has to name them, and
+    ``lower_spyre_ops`` runs automatically at the spyrecode stage (see
+    ``_SPYRECODE_STAGE_PASSES``) since this fixture is only used by compiles
+    that reach it.
     """
     entry = EXAMPLES[compilable_example]
     return {"grid": tuple(entry["grid"])}
