@@ -6,6 +6,7 @@ add_triton_library(KTDPTransforms
   LowerSpyreOps.cpp
   LowerInterTile.cpp
   RewriteDescriptorLayout.cpp
+  RewriteDescriptorLayoutGeneric.cpp
   RewriteDescriptorLayout/Classify.cpp
   RewriteDescriptorLayout/ContractionSynthesis.cpp
   RewriteDescriptorLayout/IndexDomain.cpp

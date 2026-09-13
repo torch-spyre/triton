@@ -92,6 +92,67 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
     ];
 }
 
+def RewriteDescriptorLayoutGeneric
+    : Pass<"rewrite-descriptor-layout-generic", "mlir::ModuleOp"> {
+    let summary = "Rewrite logical tensor descriptors to physical (stick-tiled) "
+                  "layout, retyping compute ops spelled as linalg.generic.";
+    let description = [{
+        Input: the same lowered KTDP IR RewriteDescriptorLayout takes (after
+        LowerDescriptorMemory + LowerComputeOps), with every compute op spelled
+        as a `linalg.generic`. The physical layout is carried on the
+        `tt.spyre_tensor_layout` marker as the OpSpec `device_coordinates` form
+        (phys_src / phys_op / phys_arg i64 arrays, one entry per physical dim;
+        op 0=identity, 1=floordiv, 2=mod).
+
+        Phase 1 — physicalize each annotated descriptor: the memory view, its
+        access tiles, and the loads reading them. Each op is CLONED from the
+        original and only its shape-carrying fields are changed, so a field
+        added to one of those ops later is carried without this pass being
+        touched.
+
+        Phase 2 — one rewrite, applied greedily to every `linalg.generic` and
+        `ktdp.store`, until no op on a physicalized chain is left inconsistent.
+        A generic states in its `indexing_maps` exactly what each operand
+        reads, so the rewrite needs no knowledge of what the op *is*: it
+        retypes operands and result to the physical shapes their own markers
+        prescribe and rebuilds `indexing_maps` and `iterator_types` at the
+        physical rank. A logical loop dim split by any operand contributes two
+        loop dims (stick, elem); an operand that splits that dim names them
+        directly, one that holds it whole addresses it as `stick * arg + elem`.
+        Elementwise, broadcast, transpose, reduce and contraction differ only
+        in what their maps already say, and the rebuild reads that.
+
+        The rewrite fires only on an op that is *inconsistent* — some operand or
+        result does not carry the physical type its marker prescribes — which is
+        also exactly what the rewrite makes true, so it cannot re-fire on its
+        own output. An op that stays inconsistent (its operands' physical
+        shapes cannot be connected to its result's) is reported as an error
+        naming the op, not left silent.
+
+        Phase 3 — erase the markers and the now-dead bridge casts. A second run
+        therefore finds no markers, no roots, and changes nothing.
+
+        Output: physical ktdp.construct_memory_view + access_tile + load/store,
+        and generics stated at physical rank; no tt.spyre_tensor_layout ops
+        remain. Descriptors without an annotation are left untouched, as is
+        every op that reads only unannotated values.
+    }];
+
+    let options = [
+        Option<"dataLayout", "data-layout", "std::string",
+               /*default=*/"\"device\"",
+               "Format of tensors: \"device\" (stickified) or \"host\" (row-major)">
+    ];
+
+    let dependentDialects = [
+        "mlir::arith::ArithDialect",
+        "mlir::ktdp::KtdpDialect",
+        "mlir::linalg::LinalgDialect",
+        "mlir::scf::SCFDialect",
+        "mlir::tensor::TensorDialect"
+    ];
+}
+
 def LowerDescriptorMemory : Pass<"lower-descriptor-memory", "mlir::ModuleOp"> {
     let summary = "Lower tt.descriptor_* ops to ktdp memory ops.";
     let description = [{
