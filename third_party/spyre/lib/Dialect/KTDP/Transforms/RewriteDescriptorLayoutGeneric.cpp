@@ -1063,14 +1063,20 @@ struct RewriteDescriptorLayoutGenericPass
         }
         return;
       }
-      // Any other op reading or producing a physicalized value is outside what
-      // one generic rewrite covers, and saying so beats emitting IR that only
-      // fails later in the pipeline.
+      // Any other op reading a value the rewrite retyped is outside what one
+      // generic rewrite covers, and saying so beats leaving IR whose only
+      // complaint comes from a verifier that names neither this pass nor the op.
+      //
+      // The test is on the CONSUMER, not on the value: by the time this runs the
+      // value has already been retyped, so asking whether it is at physical rank
+      // would answer yes and let the op through.
+      if (isa<mlir::ktdp::StoreOp, mlir::ktdp::LoadOp>(op))
+        return;
       for (Value v : op->getOperands())
-        if (layoutFor(v) && !atPhysicalRank(v)) {
-          op->emitError("rewrite-descriptor-layout-generic: this op consumes a "
-                        "value on a physicalized chain but is not a "
-                        "linalg.generic, so the rewrite cannot restate it");
+        if (layoutFor(v)) {
+          op->emitError("rewrite-descriptor-layout-generic: this op reads a "
+                        "value the rewrite retyped, but the rewrite restates "
+                        "only linalg.generic; spell this op as one");
           result = failure();
           return;
         }
