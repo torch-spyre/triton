@@ -150,6 +150,21 @@ FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
   return cm;
 }
 
+/// The composite that recovers logical dim `d`'s index from the two physical
+/// dims a stick split gave it: the stick index counts whole sticks of `width`
+/// elements, and the element offset picks one out of the stick it lands in.
+///
+/// This is the *only* arithmetic either carrier introduces, and both introduce
+/// the same one. Phase 2 names its two halves after loop dims of the rebuilt
+/// linalg domain; the indirect access tile names them after intermediate
+/// variables of its own variable space. Different numbering, identical algebra —
+/// so the algebra lives here once and each carrier passes in the exprs it
+/// numbers the halves with.
+inline AffineExpr composeStickSplit(AffineExpr stick, int64_t width,
+                                    AffineExpr elem) {
+  return stick * width + elem;
+}
+
 /// The physical tensor type `cm` prescribes for a logical shape.
 /// Fails when a physical extent cannot be stated statically.
 FailureOr<RankedTensorType> physicalTensorType(const CoordMap &cm,
@@ -322,10 +337,11 @@ AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
       // This operand holds the dim whole. If the domain split it — because some
       // other operand does — the two halves must be recombined here, and that
       // composite is the rule's only arithmetic.
-      results.push_back(dom.isSplit(loop)
-                            ? loopExpr(dom.stickDim[loop]) * dom.width[loop] +
-                                  loopExpr(dom.elemDim[loop])
-                            : loopExpr(dom.stickDim[loop]));
+      results.push_back(
+          dom.isSplit(loop)
+              ? composeStickSplit(loopExpr(dom.stickDim[loop]),
+                                  dom.width[loop], loopExpr(dom.elemDim[loop]))
+              : loopExpr(dom.stickDim[loop]));
       break;
     }
   }
@@ -757,6 +773,219 @@ struct RewriteDescriptorLayoutGenericPass
     return success();
   }
 
+  /// Physicalize one INDIRECT access tile over the already-physical
+  /// `physMemView`.
+  ///
+  /// Same shape of job as physicalizeAccessTile, different carrier. A direct
+  /// tile carries one SSA index per base dim, so its physicalization is SSA
+  /// arithmetic. An indirect tile carries one affine *subscript map* per base
+  /// dim, stated over `(captured_variables..., intermediate_variables...)` —
+  /// the canonical ordering the op's own verifier enforces — so its
+  /// physicalization is a substitution on those maps.
+  ///
+  /// The substitution is the same one Phase 2 performs. Refining the variable
+  /// space splits every logical variable a stick split touches into a (stick,
+  /// elem) pair, and a subscript stated over the whole logical variable must
+  /// recover it as `stick * width + elem`: composeStickSplit, shared with
+  /// rebuildMap. Only the numbering differs — loop dims there, captured-then-
+  /// intermediate variables here.
+  LogicalResult
+  physicalizeIndirectAccessTile(mlir::ktdp::ConstructIndirectAccessTilesOp tileOp,
+                                Value physMemView, const CoordMap &cm) {
+    OpBuilder b(tileOp);
+    MLIRContext *ctx = b.getContext();
+
+    ArrayRef<int64_t> logBlock = tileOp.getResult().getType().getShape();
+    unsigned logRank = logBlock.size();
+    unsigned physRank = cm.physRank();
+
+    auto oldKinds = tileOp.getPerDimSubscriptKinds();
+    auto oldMaps = tileOp.getPerDimSubscriptMaps();
+    unsigned numCaptured = tileOp.getCapturedVariables().size();
+
+    // The one gate that is a representational limit rather than missing work.
+    //
+    // An indirect subscript `ind(IDX[expr])` does not compute the base
+    // coordinate — it computes an index INTO `IDX`, and the coordinate is the
+    // value loaded from there. `floordiv`/`mod` of a stick split would have to
+    // apply to that loaded value, and an affine subscript expression cannot
+    // reference the result of a load. So the split has nowhere to be written:
+    // splitting `expr` instead would split the wrong quantity, the position in
+    // the index array rather than the coordinate it yields.
+    //
+    // Stated against the kinds rather than against dim 0, so it holds wherever
+    // the indirect dims sit and however many there are.
+    for (unsigned p = 0; p < physRank; ++p) {
+      if (cm.opAt(p) == CoordOp::Identity)
+        continue;
+      int64_t logDim = cm.src[p];
+      if (!cast<BoolAttr>(oldKinds[logDim]).getValue())
+        continue;
+      return tileOp.emitError(
+                 "spyre_tensor_layout: logical dim ")
+             << logDim
+             << " is an indirect (gather) subscript, so it cannot be "
+                "stick-split: the coordinate is loaded from the index memref "
+                "and an affine subscript cannot do arithmetic on a loaded value";
+    }
+
+    SmallVector<int64_t> physBlock;
+    if (!applyCoordMap(logBlock, cm.src, cm.op, cm.arg, physBlock))
+      return tileOp.emitError("spyre_tensor_layout: cannot derive a static "
+                              "physical block shape for this indirect access "
+                              "tile");
+
+    // The rebuilt tile states its order and its set over the PHYSICAL variable
+    // space, so both are recomputed below. Anything the input said beyond "the
+    // dense range, in order" would be overwritten, so reject it rather than lose
+    // it silently — the same contract physicalizeAccessTile states for its own
+    // order and set.
+    if (!tileOp.getVariablesSpaceOrder().isIdentity())
+      return tileOp.emitError(
+          "spyre_tensor_layout: variables_space_order must be the identity to "
+          "physicalize this tile; a permuted order would be overwritten");
+    if (tileOp.getVariablesSpaceSetAttr().getValue() !=
+        buildRangeSetND(ctx, logBlock))
+      return tileOp.emitError(
+          "spyre_tensor_layout: variables_space_set must be the dense range of "
+          "the tile shape to physicalize this tile; a non-dense set would be "
+          "overwritten");
+
+    // The physical variable space has one variable per physical dim, numbered
+    // after the captured ones — the ordering the verifier requires.
+    auto physVar = [&](unsigned p) {
+      return getAffineDimExpr(numCaptured + p, ctx);
+    };
+
+    // Recover each logical variable from the physical ones. This is the same
+    // per-physical-dim walk rebuildMap does, reading the same three coord ops
+    // off the same marker; it accumulates into the logical variable instead of
+    // emitting a result, because here the logical variables are what the old
+    // subscripts are stated over.
+    SmallVector<AffineExpr> logicalFromPhysical(logRank);
+    SmallVector<int64_t> width(logRank, 0);
+    SmallVector<AffineExpr> stickHalf(logRank), elemHalf(logRank);
+    for (unsigned p = 0; p < physRank; ++p) {
+      int64_t logDim = cm.src[p];
+      switch (cm.opAt(p)) {
+      case CoordOp::Identity:
+        logicalFromPhysical[logDim] = physVar(p);
+        break;
+      case CoordOp::FloorDiv:
+        stickHalf[logDim] = physVar(p);
+        break;
+      case CoordOp::Mod:
+        elemHalf[logDim] = physVar(p);
+        width[logDim] = cm.arg[p];
+        break;
+      case CoordOp::Broadcast:
+        // A broadcast axis addresses no element of the logical dim, so it
+        // contributes nothing to recovering it — the identity dim beside it
+        // does, and readCoordMap has already required that dim to exist.
+        break;
+      }
+    }
+    for (unsigned d = 0; d < logRank; ++d)
+      if (width[d])
+        logicalFromPhysical[d] =
+            composeStickSplit(stickHalf[d], width[d], elemHalf[d]);
+
+    // Substitute into every subscript map: captured variables keep their slots,
+    // logical variables become the recovered composites.
+    SmallVector<AffineExpr> oldToNew(numCaptured + logRank);
+    for (unsigned c = 0; c < numCaptured; ++c)
+      oldToNew[c] = getAffineDimExpr(c, ctx);
+    for (unsigned d = 0; d < logRank; ++d) {
+      if (!logicalFromPhysical[d])
+        return tileOp.emitError("spyre_tensor_layout: logical dim ")
+               << d << " is named by no physical dim, so its subscript cannot "
+                       "be restated";
+      oldToNew[numCaptured + d] = logicalFromPhysical[d];
+    }
+
+    unsigned newNumDims = numCaptured + physRank;
+    SmallVector<Attribute> newKinds, newMaps;
+    for (unsigned p = 0; p < physRank; ++p) {
+      int64_t logDim = cm.src[p];
+      AffineMap oldMap = cast<AffineMapAttr>(oldMaps[logDim]).getValue();
+
+      // An indirect subscript keeps every result (they index the index memref,
+      // whose rank the verifier checks); a direct one has exactly one, and it is
+      // the coordinate the coord op applies to. The gate above has already
+      // established that only a direct dim reaches a non-identity coord op, so
+      // this loop needs no per-kind branch beyond that.
+      SmallVector<AffineExpr> results;
+      for (AffineExpr r : oldMap.getResults()) {
+        AffineExpr e = r.replaceDims(oldToNew);
+        switch (cm.opAt(p)) {
+        case CoordOp::Identity:
+          break;
+        case CoordOp::FloorDiv:
+          e = e.floorDiv(cm.arg[p]);
+          break;
+        case CoordOp::Mod:
+          e = e % cm.arg[p];
+          break;
+        case CoordOp::Broadcast:
+          // The replication axis's own origin, not a function of the logical
+          // subscript — the same answer physicalizeAccessTile gives by pushing a
+          // constant 0.
+          e = getAffineConstantExpr(0, ctx);
+          break;
+        }
+        results.push_back(e);
+      }
+
+      newKinds.push_back(cast<BoolAttr>(oldKinds[logDim]));
+      newMaps.push_back(AffineMapAttr::get(
+          AffineMap::get(newNumDims, /*symbolCount=*/0, results, ctx)));
+    }
+
+    // An indirect memref is listed once per indirect dim, in dim order, so the
+    // list has to be rebuilt in the PHYSICAL dim order the new kinds are stated
+    // in — the verifier pairs the two positionally.
+    SmallVector<Value> newIndirect;
+    for (unsigned p = 0; p < physRank; ++p) {
+      int64_t logDim = cm.src[p];
+      if (!cast<BoolAttr>(oldKinds[logDim]).getValue())
+        continue;
+      unsigned oldIndirectIdx = 0;
+      for (int64_t d = 0; d < logDim; ++d)
+        if (cast<BoolAttr>(oldKinds[d]).getValue())
+          ++oldIndirectIdx;
+      newIndirect.push_back(tileOp.getIndirectMemrefs()[oldIndirectIdx]);
+    }
+
+    auto physTile = mlir::ktdp::ConstructIndirectAccessTilesOp::create(
+        b, tileOp.getLoc(),
+        mlir::ktdp::AccessTileType::get(physBlock, b.getIndexType()),
+        physMemView, ArrayAttr::get(ctx, newKinds),
+        ArrayAttr::get(ctx, newMaps), newIndirect,
+        tileOp.getCapturedVariables(), tileOp.getSymbolOperands(),
+        buildRangeSetND(ctx, physBlock),
+        AffineMap::getMultiDimIdentityMap(physRank, ctx));
+
+    for (Operation *user :
+         llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
+      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
+        ld.getAccessTileMutable().assign(physTile.getResult());
+        auto logResTy = cast<RankedTensorType>(ld.getResult().getType());
+        ld.getResult().setType(
+            RankedTensorType::get(physBlock, logResTy.getElementType()));
+        layoutOf.try_emplace(ld.getResult(), cm);
+      } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
+        st.getAccessTileMutable().assign(physTile.getResult());
+        layoutOf.try_emplace(st.getAccessTile(), cm);
+      } else {
+        return user->emitError(
+            "spyre_tensor_layout: unexpected user of an indirect access tile");
+      }
+    }
+
+    tileOp.erase();
+    return success();
+  }
+
   LogicalResult physicalizeDescriptor(triton::SpyreTensorLayoutOp marker) {
     Value desc = marker.getDesc();
     if (!isLoweredDescriptor(desc))
@@ -776,13 +1005,13 @@ struct RewriteDescriptorLayoutGenericPass
     // Read the tiles before mutating anything: physicalizing the view does not
     // move them, but erasing one invalidates a walk over the users.
     SmallVector<mlir::ktdp::ConstructAccessTilesOp> tiles;
+    SmallVector<mlir::ktdp::ConstructIndirectAccessTilesOp> indirectTiles;
     for (Operation *user : memView.getUsers())
       if (auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(user))
         tiles.push_back(tile);
-      else if (isa<mlir::ktdp::ConstructIndirectAccessTilesOp>(user))
-        return user->emitError(
-            "spyre_tensor_layout: physicalizing an indirect access tile is not "
-            "supported by rewrite-descriptor-layout-generic");
+      else if (auto indirect =
+                   dyn_cast<mlir::ktdp::ConstructIndirectAccessTilesOp>(user))
+        indirectTiles.push_back(indirect);
 
     auto physMemView = physicalizeMemView(memViewOp, *cm, marker);
     if (failed(physMemView))
@@ -790,6 +1019,9 @@ struct RewriteDescriptorLayoutGenericPass
 
     for (auto tile : tiles)
       if (failed(physicalizeAccessTile(tile, *physMemView, *cm, marker)))
+        return failure();
+    for (auto tile : indirectTiles)
+      if (failed(physicalizeIndirectAccessTile(tile, *physMemView, *cm)))
         return failure();
 
     deadLogicalMemViews.push_back(memViewOp);
