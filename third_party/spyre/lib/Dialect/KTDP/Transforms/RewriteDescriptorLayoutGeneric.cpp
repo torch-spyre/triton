@@ -1155,7 +1155,8 @@ struct RewriteDescriptorLayoutGenericPass
         if (layoutFor(v)) {
           op->emitError("rewrite-descriptor-layout-generic: this op reads a "
                         "value the rewrite retyped, but the rewrite restates "
-                        "only linalg.generic; spell this op as one");
+                        "only linalg.generic, so this op still names the "
+                        "logical type");
           result = failure();
           return;
         }
