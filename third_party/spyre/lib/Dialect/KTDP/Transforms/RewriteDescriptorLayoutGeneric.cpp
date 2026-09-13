@@ -236,52 +236,45 @@ AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
                      MLIRContext *ctx) {
   auto loopExpr = [&](int loopDim) { return getAffineDimExpr(loopDim, ctx); };
 
-  SmallVector<AffineExpr> results;
   // A physicalized operand's map is stated over its PHYSICAL dims, so it is
-  // built by walking those; an unphysicalized one keeps its logical results.
-  if (o.layout) {
-    for (unsigned p = 0, e = o.layout->physRank(); p < e; ++p) {
-      int64_t logDim = o.layout->src[p];
-      AffineExpr logResult = o.logicalMap.getResult(logDim);
-      auto dimExpr = dyn_cast<AffineDimExpr>(logResult);
-      if (!dimExpr) {
-        // A constant survives every physical dim it is named by: the operand
-        // does not vary along this loop dim, whatever the layout does to it.
-        results.push_back(logResult);
-        continue;
-      }
-      unsigned loop = dimExpr.getPosition();
-      switch (o.layout->opAt(p)) {
-      case CoordOp::FloorDiv:
-        results.push_back(loopExpr(dom.stickDim[loop]));
-        break;
-      case CoordOp::Mod:
-        results.push_back(loopExpr(dom.elemDim[loop]));
-        break;
-      case CoordOp::Identity:
-        // This operand holds the dim whole. If the domain split it — because
-        // another operand does — the two halves have to be recombined here;
-        // that composite is the rule's only arithmetic.
-        results.push_back(dom.isSplit(loop)
-                              ? loopExpr(dom.stickDim[loop]) * dom.width[loop] +
-                                    loopExpr(dom.elemDim[loop])
-                              : loopExpr(dom.stickDim[loop]));
-        break;
-      }
+  // built by walking those, each naming the logical dim it came from and the
+  // coord op that made it. An operand with no layout walks its own logical dims,
+  // every one of them held whole — which is the same walk with an identity
+  // layout, so the substitution below is shared rather than restated.
+  unsigned numResults =
+      o.layout ? o.layout->physRank() : o.logicalMap.getNumResults();
+
+  SmallVector<AffineExpr> results;
+  for (unsigned p = 0; p < numResults; ++p) {
+    int64_t logDim = o.layout ? o.layout->src[p] : p;
+    CoordOp coordOp = o.layout ? o.layout->opAt(p) : CoordOp::Identity;
+
+    AffineExpr logResult = o.logicalMap.getResult(logDim);
+    auto dimExpr = dyn_cast<AffineDimExpr>(logResult);
+    if (!dimExpr) {
+      // A constant survives every physical dim it is named by: the operand does
+      // not vary along this loop dim, whatever the layout does to it.
+      results.push_back(logResult);
+      continue;
     }
-  } else {
-    for (unsigned r = 0, e = o.logicalMap.getNumResults(); r < e; ++r) {
-      AffineExpr logResult = o.logicalMap.getResult(r);
-      auto dimExpr = dyn_cast<AffineDimExpr>(logResult);
-      if (!dimExpr) {
-        results.push_back(logResult);
-        continue;
-      }
-      unsigned loop = dimExpr.getPosition();
+    unsigned loop = dimExpr.getPosition();
+
+    switch (coordOp) {
+    case CoordOp::FloorDiv:
+      results.push_back(loopExpr(dom.stickDim[loop]));
+      break;
+    case CoordOp::Mod:
+      results.push_back(loopExpr(dom.elemDim[loop]));
+      break;
+    case CoordOp::Identity:
+      // This operand holds the dim whole. If the domain split it — because some
+      // other operand does — the two halves must be recombined here, and that
+      // composite is the rule's only arithmetic.
       results.push_back(dom.isSplit(loop)
                             ? loopExpr(dom.stickDim[loop]) * dom.width[loop] +
                                   loopExpr(dom.elemDim[loop])
                             : loopExpr(dom.stickDim[loop]));
+      break;
     }
   }
   return AffineMap::get(dom.numLoopDims, /*symbolCount=*/0, results, ctx);
