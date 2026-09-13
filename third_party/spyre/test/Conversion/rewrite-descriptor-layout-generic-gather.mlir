@@ -8,23 +8,6 @@
 // per-dim subscript maps simply have to be restated at physical rank too, and no
 // fixture exercises that here yet. Declining by name is the honest state.
 
-// The script is designed to make adding checks to
-// a test case fast, it is *not* designed to be authoritative
-// about what constitutes a good test! The CHECK should be
-// minimized and named to reflect the test intent.
-
-
-
-// The script is designed to make adding checks to
-// a test case fast, it is *not* designed to be authoritative
-// minimized and named to reflect the test intent.
-
-
-
-// Test: Gather with layout annotation on the source descriptor.
-// The indirect access tile should be rebuilt on the physical memView,
-// with the physical block shape and remapped subscript maps.
-
 module {
 tt.func @gather_with_layout(%data_ptr: !tt.ptr<f32>, %idx_ptr: !tt.ptr<i32>, %out_ptr: !tt.ptr<f32>) {
   %c0_i32 = arith.constant 0 : i32
