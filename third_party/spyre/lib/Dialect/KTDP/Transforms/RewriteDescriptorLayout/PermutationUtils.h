@@ -9,7 +9,19 @@
 
 namespace mlir::triton::ktdp {
 
-enum class CoordOp : int64_t { Identity = 0, FloorDiv = 1, Mod = 2 };
+/// How one physical dim derives from its source logical dim.
+///
+/// Identity/FloorDiv/Mod all *partition* the logical dim's elements: the
+/// physical extent is a function of the logical extent. Broadcast does not — it
+/// replicates the logical dim across a fresh axis, so its extent is the stick
+/// width from `phys_arg` and no function of the logical extent at all. That is
+/// the one property that sets it apart, and applyStatic below is where it shows.
+enum class CoordOp : int64_t {
+  Identity = 0,
+  FloorDiv = 1,
+  Mod = 2,
+  Broadcast = 3
+};
 
 /// Where a synthesized op's OUTPUT axes live — the space a `role` (and hence
 /// `dimRoles`, `targetOrder` and the accumulator's axes) numbers positions in.
@@ -85,6 +97,12 @@ inline std::optional<int64_t> applyStatic(int64_t logical, CoordOp op,
     return arg == 0 ? std::optional<int64_t>(std::nullopt)
                     : std::optional<int64_t>((logical + arg - 1) / arg);
   case CoordOp::Mod:
+    return arg;
+  case CoordOp::Broadcast:
+    // The only coord op whose physical extent is NOT a function of the logical
+    // extent: nothing of the logical dim is partitioned, the dim is replicated
+    // across `arg` lanes. So a dynamic logical extent is still a static
+    // physical one here, unlike every case above.
     return arg;
   }
   return std::nullopt;
