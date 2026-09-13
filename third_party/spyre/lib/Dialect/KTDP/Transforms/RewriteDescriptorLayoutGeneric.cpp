@@ -7,10 +7,14 @@
 // The marker carries the physical layout as the OpSpec `device_coordinates`
 // form, three i64 arrays with one entry per physical dim:
 //   phys_src[p] : the logical dim physical dim p derives from
-//   phys_op[p]  : 0 = identity, 1 = floordiv, 2 = mod
-//   phys_arg[p] : divisor (floordiv) / modulus (mod); ignored for identity
+//   phys_op[p]  : 0 = identity, 1 = floordiv, 2 = mod, 3 = broadcast
+//   phys_arg[p] : divisor (floordiv) / modulus (mod) / lane count (broadcast);
+//                 ignored for identity
 // e.g. [M,N] stick-on-N -> phys_src=[1,0,1] phys_op=[1,0,2] phys_arg=[64,0,64]
 //   => physical size [ceil(N/64), M, 64].
+// A broadcast dim replicates its source logical dim across `phys_arg` lanes
+// instead of partitioning it, so [M] -> phys_src=[0,0] phys_op=[0,3]
+// phys_arg=[0,64] gives physical size [M, 64].
 //
 //   Phase 1  physicalize each annotated descriptor: memory view, access tiles,
 //            loads. Stores have their access tile redirected.
@@ -77,11 +81,13 @@ struct CoordMap {
   CoordOp opAt(unsigned p) const { return static_cast<CoordOp>(op[p]); }
 
   /// Is logical dim `d` split into a (stick, elem) pair by this layout?
+  ///
+  /// A broadcast names `d` too, but it partitions nothing — it replicates `d`
+  /// across a fresh axis — so it is not a split and the dim stays whole. Asking
+  /// for the floordiv half is therefore the question, not "is some dim of `d`
+  /// non-identity".
   bool splits(int64_t d) const {
-    for (unsigned p = 0, e = physRank(); p < e; ++p)
-      if (src[p] == d && opAt(p) != CoordOp::Identity)
-        return true;
-    return false;
+    return findPhys(d, CoordOp::FloorDiv) >= 0;
   }
 
   /// The physical dim carrying `wanted` for logical dim `d`, or -1.
@@ -113,9 +119,10 @@ FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
       return marker.emitError("spyre_tensor_layout: phys_src out of range for "
                               "logical rank ")
              << logicalRank;
-    if (cm.op[p] < 0 || cm.op[p] > 2)
+    if (cm.op[p] < 0 || cm.op[p] > 3)
       return marker.emitError("spyre_tensor_layout: phys_op must be 0 "
-                              "(identity), 1 (floordiv) or 2 (mod)");
+                              "(identity), 1 (floordiv), 2 (mod) or 3 "
+                              "(broadcast)");
   }
   // A split names the same logical dim twice, once floordiv and once mod. A
   // lone half would leave the rebuild unable to state where the dim's elements
@@ -129,6 +136,16 @@ FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
              << d << " has a " << (hasFloor ? "floordiv" : "mod")
              << " physical dim without the matching "
              << (hasFloor ? "mod" : "floordiv") << " half";
+    // A broadcast replicates the dim it names, so that dim must also be present
+    // whole for the replication to have something to replicate. It cannot be
+    // present as a split: the elements would then live in the floordiv/mod pair
+    // and the broadcast axis would name a third copy of them.
+    if (cm.findPhys(d, CoordOp::Broadcast) >= 0 &&
+        cm.findPhys(d, CoordOp::Identity) < 0)
+      return marker.emitError("spyre_tensor_layout: logical dim ")
+             << d
+             << " is broadcast but has no identity physical dim; a broadcast "
+                "replicates a dim that is also carried whole";
   }
   return cm;
 }
@@ -153,6 +170,11 @@ FailureOr<RankedTensorType> physicalTensorType(const CoordMap &cm,
 struct RebuildOperand {
   AffineMap logicalMap;
   const CoordMap *layout = nullptr;
+  /// Loop dim assigned to each of this operand's BROADCAST physical dims, keyed
+  /// by physical dim; -1 for every dim that is not a broadcast. Filled by
+  /// buildLoopDomain, because a broadcast axis is the one physical dim that no
+  /// logical loop dim accounts for — see LoopDomain.
+  SmallVector<int> broadcastDim;
 };
 
 /// The rebuilt loop domain: how many physical loop dims there are, and where
@@ -162,6 +184,14 @@ struct RebuildOperand {
 /// index and an element offset within the stick — and an operand that holds
 /// that dim whole addresses it as `stick * width + elem`. A dim no operand
 /// splits contributes one.
+///
+/// On top of that refinement, each BROADCAST physical dim contributes one loop
+/// dim of its own. A broadcast is not a subdivision of a logical dim, so no
+/// logical loop dim can stand for it: it replicates that dim across a fresh
+/// axis, and a fresh axis is a fresh loop. Those loops are numbered after the
+/// refinement, and recorded per operand in RebuildOperand::broadcastDim rather
+/// than here, since two operands broadcasting the same logical dim replicate it
+/// independently and so get separate loops.
 struct LoopDomain {
   /// Loop dim carrying logical dim d's stick index, or its whole extent when
   /// the dim is unsplit.
@@ -187,7 +217,8 @@ struct LoopDomain {
 /// dim whole could use, and picking either width would silently address the
 /// wrong elements.
 FailureOr<LoopDomain>
-buildLoopDomain(ArrayRef<RebuildOperand> operands, unsigned logicalNumLoops,
+buildLoopDomain(MutableArrayRef<RebuildOperand> operands,
+                unsigned logicalNumLoops,
                 llvm::function_ref<InFlightDiagnostic()> emitError) {
   LoopDomain dom;
   dom.stickDim.assign(logicalNumLoops, -1);
@@ -220,6 +251,17 @@ buildLoopDomain(ArrayRef<RebuildOperand> operands, unsigned logicalNumLoops,
     if (dom.width[d])
       dom.elemDim[d] = dom.numLoopDims++;
   }
+
+  // Then one loop per broadcast physical dim, after the refinement so that an
+  // operand carrying no broadcast keeps exactly the numbering it would have had.
+  for (RebuildOperand &o : operands) {
+    if (!o.layout)
+      continue;
+    o.broadcastDim.assign(o.layout->physRank(), -1);
+    for (unsigned p = 0, e = o.layout->physRank(); p < e; ++p)
+      if (o.layout->opAt(p) == CoordOp::Broadcast)
+        o.broadcastDim[p] = dom.numLoopDims++;
+  }
   return dom;
 }
 
@@ -232,6 +274,10 @@ buildLoopDomain(ArrayRef<RebuildOperand> operands, unsigned logicalNumLoops,
 ///   - the result is not a dim at all   -> pass it through unchanged, which is
 ///     what keeps a folded broadcast's constant a constant.
 /// A dim the domain does not split is named by its single loop dim in all three.
+///
+/// A broadcast physical dim is the fourth: it names the loop dim the domain gave
+/// it, and nothing else. No arithmetic, because it addresses no element of the
+/// logical dim — it is the replication axis itself.
 AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
                      MLIRContext *ctx) {
   auto loopExpr = [&](int loopDim) { return getAffineDimExpr(loopDim, ctx); };
@@ -266,6 +312,12 @@ AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
     case CoordOp::Mod:
       results.push_back(loopExpr(dom.elemDim[loop]));
       break;
+    case CoordOp::Broadcast:
+      // The replication axis, named by the loop the domain allocated for it. It
+      // does not enter the loop dim `logDim` maps to at all, which is what makes
+      // this loop appear in one map only.
+      results.push_back(loopExpr(o.broadcastDim[p]));
+      break;
     case CoordOp::Identity:
       // This operand holds the dim whole. If the domain split it — because some
       // other operand does — the two halves must be recombined here, and that
@@ -286,7 +338,13 @@ AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
 SmallVector<utils::IteratorType>
 rebuildIterators(ArrayRef<utils::IteratorType> logicalIterators,
                  const LoopDomain &dom) {
-  SmallVector<utils::IteratorType> out(dom.numLoopDims);
+  // Parallel is the default so that a broadcast loop gets it without being
+  // singled out: replication copies a value to each lane, and copying never
+  // accumulates, so a replication axis is parallel by what it is. Every logical
+  // dim overwrites its own entries below, so the default reaches only the loops
+  // the refinement did not cover — which are exactly the broadcast ones.
+  SmallVector<utils::IteratorType> out(dom.numLoopDims,
+                                      utils::IteratorType::parallel);
   for (unsigned d = 0, e = logicalIterators.size(); d < e; ++d) {
     out[dom.stickDim[d]] = logicalIterators[d];
     if (dom.isSplit(d))
@@ -439,6 +497,15 @@ struct RewriteDescriptorLayoutGenericPass
 
     for (unsigned p = 0; p < physRank; ++p) {
       int64_t d = cm.src[p];
+      // Host memory is row-major over the LOGICAL shape, so it has no axis a
+      // replication could stride along — a broadcast dim inherits no logical
+      // stride and 0 would claim the buffer holds the replicated copies. Say so
+      // rather than emit a stride that misdescribes the memory.
+      if (cm.opAt(p) == CoordOp::Broadcast)
+        return marker.emitError("spyre_tensor_layout: physical dim ")
+               << p
+               << " is a broadcast, which has no stride in a host row-major "
+                  "buffer; broadcast dims need data-layout=device";
       // A stick index advances by a whole stick of the logical dim.
       int64_t scale = cm.opAt(p) == CoordOp::FloorDiv ? cm.arg[p] : 1;
       if (logStatic[d] != ShapedType::kDynamic) {
@@ -612,6 +679,16 @@ struct RewriteDescriptorLayoutGenericPass
 
     SmallVector<Value> physIdx;
     for (unsigned p = 0, e = cm.physRank(); p < e; ++p) {
+      // A broadcast dim is the replication axis, not a piece of the logical dim
+      // it names, so its subscript is the axis's own origin rather than any
+      // function of the logical index. The tile covers all `phys_arg` lanes, so
+      // that origin is 0 — and this is the one physical dim whose index reads
+      // nothing off logIdx.
+      if (cm.opAt(p) == CoordOp::Broadcast) {
+        physIdx.push_back(
+            arith::ConstantOp::create(b, loc, b.getIndexAttr(0)).getResult());
+        continue;
+      }
       // The split is built here, so its input is lifted into `index` too: no
       // fixed-width arithmetic is left between a subscript and the values it
       // derives from.
@@ -634,6 +711,8 @@ struct RewriteDescriptorLayoutGenericPass
                   arith::ConstantOp::create(b, loc, b.getIndexAttr(cm.arg[p])))
                   .getResult();
         break;
+      case CoordOp::Broadcast:
+        llvm_unreachable("broadcast dims are handled before this switch");
       }
       physIdx.push_back(idx);
     }
