@@ -1023,6 +1023,41 @@ struct RewriteDescriptorLayoutGenericPass
   /// A decline is not silence: an op left inconsistent on a physicalized chain
   /// is an error naming the op, because the surviving op is exactly what could
   /// not be reconciled. This is where a shape outside the agreed cases lands.
+  /// Reject, before Phase 1 mutates anything, an op that will end up reading a
+  /// physicalized value the rewrite cannot restate.
+  ///
+  /// This has to run first. Phase 1 retypes a load in place, so a consumer left
+  /// at logical rank is invalid IR the moment that happens — and MLIR's own
+  /// verifier reports it as a rank mismatch against an indexing map, naming
+  /// neither this pass nor what it could not handle. A named linalg.matmul is
+  /// the case that matters today: LowerComputeOps still emits one for tt.dot,
+  /// and this pass rewrites only generics.
+  LogicalResult checkConsumersAreRewritable(ModuleOp module) {
+    LogicalResult result = success();
+    module.walk([&](triton::SpyreTensorLayoutOp marker) {
+      Value desc = marker.getDesc();
+      if (!isLoweredDescriptor(desc))
+        return;
+      Value memView = getDescriptorMemView(desc);
+      for (Operation *tile : memView.getUsers())
+        for (Value tileRes : tile->getResults())
+          for (Operation *user : tileRes.getUsers()) {
+            auto ld = dyn_cast<mlir::ktdp::LoadOp>(user);
+            if (!ld)
+              continue;
+            for (Operation *consumer : ld.getResult().getUsers())
+              if (!isa<linalg::GenericOp, mlir::ktdp::StoreOp>(consumer)) {
+                consumer->emitError(
+                    "rewrite-descriptor-layout-generic: this op reads a value "
+                    "on a physicalized chain, but the rewrite restates only "
+                    "linalg.generic; spell this op as one");
+                result = failure();
+              }
+          }
+    });
+    return result;
+  }
+
   LogicalResult checkAllConsistent(ModuleOp module) {
     LogicalResult result = success();
     module.walk([&](Operation *op) {
@@ -1079,6 +1114,9 @@ struct RewriteDescriptorLayoutGenericPass
 
     SmallVector<triton::SpyreTensorLayoutOp> markers;
     module.walk([&](triton::SpyreTensorLayoutOp op) { markers.push_back(op); });
+
+    if (failed(checkConsumersAreRewritable(module)))
+      return signalPassFailure();
 
     for (auto marker : markers)
       if (failed(physicalizeDescriptor(marker)))
