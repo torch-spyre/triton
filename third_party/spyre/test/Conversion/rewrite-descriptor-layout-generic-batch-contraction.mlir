@@ -1,6 +1,6 @@
 // RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic | FileCheck %s
 
-// Case 3 -- a batch contraction where K is split into two real sticks on A and
+// A batch contraction where K is split into two real sticks on A and
 // sits whole at 128 on B. The non-degenerate case, and the one that proves the
 // loop elimination.
 //
