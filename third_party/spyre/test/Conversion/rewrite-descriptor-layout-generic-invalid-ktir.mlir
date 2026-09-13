@@ -304,30 +304,3 @@ tt.func @unrestatable_producer(%a: !tt.ptr<f32>, %c: !tt.ptr<f32>) {
   tt.return
 }
 }
-
-// -----
-
-// Case 14 -- an indirect access tile.
-//
-// The gather path is not part of this rewrite. rewrite-descriptor-layout-generic-gather.mlir
-// covers the same rejection from Triton-level input; this reaches it from a
-// hand-built indirect tile, where the marker splits the direct dim rather than
-// the gathered one, so nothing but the tile's kind is at issue.
-#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 127 >= 0)>
-#id = affine_map<(d0, d1) -> (d0, d1)>
-#idxset = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
-module {
-tt.func @indirect_access_tile(%arg0: !tt.ptr<f32>, %idx_ptr: !tt.ptr<i32>) {
-  %c0 = arith.constant 0 : index
-  %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
-  %1 = ktdp.construct_memory_view %0, sizes: [32, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<32x128xf32>
-  %2 = builtin.unrealized_conversion_cast %1 : memref<32x128xf32> to !tt.tensordesc<32x128xf32>
-  tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <32x128xf32>
-  %3 = builtin.unrealized_conversion_cast %idx_ptr : !tt.ptr<i32> to index
-  %4 = ktdp.construct_memory_view %3, sizes: [32], strides: [1] {coordinate_set = #idxset, memory_space = #ktdp.memory_space<global>} : memref<32xi32>
-  // expected-error @below {{spyre_tensor_layout: physicalizing an indirect access tile is not supported by rewrite-descriptor-layout-generic}}
-  %5 = ktdp.construct_indirect_access_tile intermediate_variables(%m, %n) %1[ind(%4[%m]), (%c0 + %n)] {variables_space_order = #id, variables_space_set = #set} : memref<32x128xf32>, memref<32xi32> -> !ktdp.access_tile<32x128xindex>
-  %6 = ktdp.load %5 : !ktdp.access_tile<32x128xindex> -> tensor<32x128xf32>
-  tt.return
-}
-}
