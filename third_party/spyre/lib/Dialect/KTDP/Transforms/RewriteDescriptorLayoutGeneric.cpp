@@ -476,6 +476,9 @@ struct RewriteDescriptorLayoutGenericPass
     if (isa<mlir::ktdp::ConstructAccessTilesOp>(op))
       return name == "base_map" || name == "access_tile_set" ||
              name == "access_tile_order" || name == "operandSegmentSizes";
+    if (isa<linalg::GenericOp>(op))
+      return name == "indexing_maps" || name == "iterator_types" ||
+             name == "operandSegmentSizes";
     return false;
   }
 
@@ -725,23 +728,326 @@ struct RewriteDescriptorLayoutGenericPass
   // Phase 2 — the one rewrite
   //===--------------------------------------------------------------------===//
 
-  /// The physical type a value must carry: the one its own layout prescribes,
-  /// or its current type when it carries no layout.
-  FailureOr<Type> wantedType(Value v) {
+  /// The layout a value is physicalized under, or null when it carries none and
+  /// therefore stays logical.
+  const CoordMap *layoutFor(Value v) {
     auto it = layoutOf.find(v);
-    if (it == layoutOf.end())
-      return v.getType();
-    auto tensorTy = dyn_cast<RankedTensorType>(v.getType());
-    if (!tensorTy)
-      return v.getType();
-    // The layout is stated over LOGICAL dims, so a value already at physical
-    // rank is at its wanted type by construction.
-    if (tensorTy.getRank() == (int64_t)it->second.physRank())
-      return v.getType();
-    auto physTy = physicalTensorType(it->second, tensorTy);
-    if (failed(physTy))
+    return it == layoutOf.end() ? nullptr : &it->second;
+  }
+
+  /// Is `v` already at the physical rank its layout prescribes?
+  ///
+  /// Rank, not shape: the layout is stated over logical dims, so it is the rank
+  /// that distinguishes a value still to be retyped from one already retyped.
+  /// Testing the TYPE and not a map is the non-circular half of the guard — the
+  /// markers are ground truth and the type comes from them, whereas a map is
+  /// this pass's own arithmetic.
+  bool atPhysicalRank(Value v) {
+    const CoordMap *cm = layoutFor(v);
+    if (!cm)
+      return true; // no layout, so nothing to be at
+    auto ty = dyn_cast<RankedTensorType>(v.getType());
+    return !ty || ty.getRank() == (int64_t)cm->physRank();
+  }
+
+  /// Is this op consistent, given its inputs and outputs?
+  ///
+  /// This is simultaneously the rewrite's guard and its postcondition, which is
+  /// what makes termination structural: the rewrite's job is to make this true,
+  /// so the driver cannot re-fire an op the rewrite just finished. It is a state
+  /// predicate over the IR and the markers, not a record of what the pass has
+  /// done, so nothing can get out of sync with the IR.
+  ///
+  /// An op with one physical and one still-logical operand is simply
+  /// inconsistent, so it fires — which is the right answer and needs no
+  /// separate notion of "partially retyped".
+  /// The second conjunct is about RANK, not about map contents. Asking whether
+  /// the maps are *right* would be asking whether this pass computed them
+  /// correctly — circular, since the maps are derived from the markers by this
+  /// very rewrite. Asking whether they are stated at the right rank compares
+  /// them against the types, which come from the markers, so it is not.
+  bool isConsistent(linalg::GenericOp op) {
+    for (Value v : op->getOperands())
+      if (!atPhysicalRank(v))
+        return false;
+    for (Value v : op->getResults())
+      if (!atPhysicalRank(v))
+        return false;
+    // Every map must have one result per dim of the operand it addresses, and
+    // all of them must share one loop domain. A rank the operands have moved
+    // past is exactly the state where an operand was retyped and this op has
+    // not caught up.
+    for (auto [map, operand] :
+         llvm::zip_equal(op.getIndexingMapsArray(), op->getOperands())) {
+      auto ty = dyn_cast<RankedTensorType>(operand.getType());
+      if (ty && map.getNumResults() != (unsigned)ty.getRank())
+        return false;
+    }
+    return true;
+  }
+
+  /// Give `v` the layout `cm`, and report whether that is new information.
+  /// A value already carrying a layout keeps it: layouts come from markers, and
+  /// a second opinion about one would mean two markers disagree.
+  bool assignLayout(Value v, const CoordMap &cm) {
+    return layoutOf.try_emplace(v, cm).second;
+  }
+
+  //===--------------------------------------------------------------------===//
+  // The rewrite
+  //===--------------------------------------------------------------------===//
+
+  /// Rewrite one generic so that it is consistent: retype every operand and
+  /// result to the physical type its own layout prescribes, and restate the
+  /// indexing maps and iterator types over the rebuilt loop domain.
+  ///
+  /// Nothing here asks what the op *is*. The maps and iterators already
+  /// discriminate elementwise from broadcast from transpose from reduce from
+  /// contraction, and the rebuild reads them.
+  LogicalResult rewriteGeneric(linalg::GenericOp op) {
+    MLIRContext *ctx = op.getContext();
+    unsigned numLoops = op.getNumLoops();
+
+    // A generic's result takes its type from the `outs` operand that backs it,
+    // so a layout on the result is a layout on that operand. This is how a
+    // store's requirement reaches the accumulator it is written through: the
+    // store records the layout against the result, and the operand that
+    // supplies the result's shape inherits it here.
+    for (auto [res, init] : llvm::zip_equal(op.getResults(), op.getDpsInits()))
+      if (const CoordMap *cm = layoutFor(res))
+        assignLayout(init, *cm);
+
+    // The layouts as they stand. An operand whose type is already physical
+    // states its layout over its physical dims, so its logical map is the one
+    // on the op either way: the op's maps are never rewritten in place, only
+    // replaced, so they stay logical until this op is rebuilt.
+    SmallVector<const CoordMap *> layouts;
+    for (Value v : op->getOperands())
+      layouts.push_back(layoutFor(v));
+
+    SmallVector<RebuildOperand> rebuildOperands;
+    SmallVector<AffineMap> logicalMaps = op.getIndexingMapsArray();
+    for (auto [i, m] : llvm::enumerate(logicalMaps))
+      rebuildOperands.push_back(RebuildOperand{m, layouts[i]});
+
+    auto dom = buildLoopDomain(rebuildOperands, numLoops,
+                               [&]() { return op.emitError(); });
+    if (failed(dom))
       return failure();
-    return Type(*physTy);
+
+    // Rebuild the maps over the new domain before touching any type: a map
+    // states where an operand's dims live, so it must agree with the type the
+    // operand is about to be given.
+    SmallVector<AffineMap> physMaps;
+    for (const RebuildOperand &o : rebuildOperands)
+      physMaps.push_back(rebuildMap(o, *dom, ctx));
+
+    SmallVector<utils::IteratorType> physIterators =
+        rebuildIterators(op.getIteratorTypesArray(), *dom);
+
+    // Retype each operand that is not yet at its physical rank. A value with a
+    // layout but no producer this pass can retype is a chain the rewrite cannot
+    // complete, and says so.
+    OpBuilder b(op);
+    for (auto [i, operand] : llvm::enumerate(op->getOpOperands())) {
+      if (!layouts[i] || atPhysicalRank(operand.get()))
+        continue;
+      auto physTy = physicalTensorType(
+          *layouts[i], cast<RankedTensorType>(operand.get().getType()));
+      if (failed(physTy))
+        return op.emitError("rewrite-descriptor-layout-generic: operand ")
+               << i << " has no static physical shape under its layout";
+      if (failed(retypeToPhysical(operand.get(), *physTy, b)))
+        return failure();
+    }
+
+    // Clone rather than build: the body, the attributes, the location and
+    // anything added to linalg.generic later all ride along, and only the three
+    // things this rewrite owns are replaced.
+    auto physOp = cast<linalg::GenericOp>(b.clone(*op));
+    physOp.setIndexingMapsAttr(b.getAffineMapArrayAttr(physMaps));
+    physOp.setIteratorTypesAttr(
+        b.getArrayAttr(llvm::to_vector(llvm::map_range(
+            physIterators, [&](utils::IteratorType t) -> Attribute {
+              return linalg::IteratorTypeAttr::get(ctx, t);
+            }))));
+    // A generic's results take their types from its `outs` operands, which the
+    // loop above has already retyped.
+    for (auto [res, out] :
+         llvm::zip_equal(physOp.getResults(), physOp.getDpsInits()))
+      res.setType(out.getType());
+    for (auto [oldRes, newRes] :
+         llvm::zip_equal(op.getResults(), physOp.getResults()))
+      if (const CoordMap *cm = layoutFor(oldRes))
+        assignLayout(newRes, *cm);
+
+    if (failed(verifyNothingDropped(op, physOp)))
+      return failure();
+
+    op.getResults().replaceAllUsesWith(physOp.getResults());
+    op.erase();
+    return success();
+  }
+
+  /// Give `v` the physical type `physTy`, by retyping its producer.
+  ///
+  /// Only the producers whose result type is a pure function of their operands'
+  /// are handled here — the ones a shape change propagates cleanly through. A
+  /// generic is NOT one of them: it is retyped by the rewrite firing on it, not
+  /// from a consumer, so it is left alone and the driver reaches it next round.
+  LogicalResult retypeToPhysical(Value v, RankedTensorType physTy,
+                                 OpBuilder &b) {
+    Operation *def = v.getDefiningOp();
+    if (isa_and_nonnull<linalg::GenericOp>(def))
+      return success();
+    if (auto empty = dyn_cast_or_null<tensor::EmptyOp>(def)) {
+      // An uninitialised accumulator carries no values, so its physical form is
+      // just the same op at the physical shape.
+      if (!empty.getType().hasStaticShape())
+        return empty.emitError("rewrite-descriptor-layout-generic: cannot "
+                               "physicalize a dynamically shaped tensor.empty");
+      empty.getResult().setType(physTy);
+      return success();
+    }
+    if (auto cst = dyn_cast_or_null<arith::ConstantOp>(def)) {
+      // A splat is the one constant whose physical form is a relabelling: every
+      // element is the same, so no element moves. Any other constant would need
+      // its elements permuted into stick order, which is a data rewrite this
+      // pass does not do.
+      auto splat = dyn_cast<SplatElementsAttr>(cst.getValue());
+      if (!splat)
+        return cst.emitError("rewrite-descriptor-layout-generic: cannot "
+                             "physicalize a non-splat constant; its elements "
+                             "would have to be reordered into stick layout");
+      cst.setValueAttr(SplatElementsAttr::get(physTy,
+                                              splat.getSplatValue<Attribute>()));
+      cst.getResult().setType(physTy);
+      return success();
+    }
+    return v.getDefiningOp()
+               ? v.getDefiningOp()->emitError(
+                     "rewrite-descriptor-layout-generic: this op produces a "
+                     "value on a physicalized chain but the rewrite cannot "
+                     "restate it at physical shape")
+               : failure();
+  }
+
+  /// Rewrite one store so that it is consistent.
+  ///
+  /// The store's access tile is already physical (Phase 1 did it), and
+  /// ktdp.store requires its data tile to match the access tile's iteration
+  /// shape. So the store knows the shape its data tile must have, and gives it
+  /// that shape — which is how a requirement reaches a producer without anyone
+  /// looking one up.
+  LogicalResult rewriteStore(mlir::ktdp::StoreOp store, bool &progress) {
+    const CoordMap *cm = layoutFor(store.getAccessTile());
+    if (!cm)
+      return success();
+    auto dataTy = cast<RankedTensorType>(store.getDataTile().getType());
+    ArrayRef<int64_t> want =
+        cast<mlir::ktdp::AccessTileType>(store.getAccessTile().getType())
+            .getShape();
+    if (dataTy.getShape() == want)
+      return success();
+
+    auto physTy = physicalTensorType(*cm, dataTy);
+    if (failed(physTy))
+      return store.emitError("rewrite-descriptor-layout-generic: the store's "
+                             "data tile has no static physical shape under the "
+                             "destination's layout");
+    if ((*physTy).getShape() != want)
+      return store.emitError("rewrite-descriptor-layout-generic: the "
+                             "destination's layout gives the data tile shape ")
+             << *physTy << ", which does not match the access tile's iteration "
+             << "shape";
+
+    // The data tile's producer is what has to change; recording the layout is
+    // what makes the producer inconsistent, and so acted on next round.
+    // `progress` reports whether that record is new, since a store whose
+    // producer has not caught up yet changes nothing else and the driver must
+    // not read that as a fixpoint.
+    progress = assignLayout(store.getDataTile(), *cm) || progress;
+    OpBuilder b(store);
+    return retypeToPhysical(store.getDataTile(), *physTy, b);
+  }
+
+  /// Apply the rewrite until nothing on a physicalized chain is inconsistent.
+  ///
+  /// Both directions matter and both come for free: loads push physical types
+  /// forward as operands, stores pull them backward as results, and a generic
+  /// in the middle is reached from either end. Each round re-examines every
+  /// candidate, so a type that moved in one round is acted on in the next.
+  LogicalResult runRewrite(ModuleOp module) {
+    // One round per op on the longest chain is the worst case: each round moves
+    // physical information at least one op further along. The bound is
+    // generous, and exceeding it means the guard is not being falsified — a bug
+    // in the rewrite, reported rather than silently accepted.
+    unsigned numOps = 0;
+    module.walk([&](Operation *) { ++numOps; });
+    unsigned cap = numOps + 2;
+
+    for (unsigned round = 0; round < cap; ++round) {
+      SmallVector<mlir::ktdp::StoreOp> stores;
+      SmallVector<linalg::GenericOp> generics;
+      module.walk([&](Operation *op) {
+        if (auto st = dyn_cast<mlir::ktdp::StoreOp>(op))
+          stores.push_back(st);
+        else if (auto g = dyn_cast<linalg::GenericOp>(op))
+          generics.push_back(g);
+      });
+
+      bool changed = false;
+      // Stores first: a store is the only op that can start the backward
+      // direction, and doing it first saves a round on every chain that has
+      // one.
+      for (auto st : stores)
+        if (failed(rewriteStore(st, changed)))
+          return failure();
+      for (auto g : generics) {
+        if (isConsistent(g))
+          continue;
+        if (failed(rewriteGeneric(g)))
+          return failure();
+        changed = true;
+      }
+      if (!changed)
+        return checkAllConsistent(module);
+    }
+    return module.emitError("rewrite-descriptor-layout-generic: the rewrite did "
+                            "not reach a fixpoint; an op is not falsifying the "
+                            "consistency guard");
+  }
+
+  /// Report every op the rewrite could not make consistent.
+  ///
+  /// A decline is not silence: an op left inconsistent on a physicalized chain
+  /// is an error naming the op, because the surviving op is exactly what could
+  /// not be reconciled. This is where a shape outside the agreed cases lands.
+  LogicalResult checkAllConsistent(ModuleOp module) {
+    LogicalResult result = success();
+    module.walk([&](Operation *op) {
+      if (auto g = dyn_cast<linalg::GenericOp>(op)) {
+        if (!isConsistent(g)) {
+          g.emitError("rewrite-descriptor-layout-generic: this op is on a "
+                      "physicalized chain but could not be restated at "
+                      "physical shape");
+          result = failure();
+        }
+        return;
+      }
+      // Any other op reading or producing a physicalized value is outside what
+      // one generic rewrite covers, and saying so beats emitting IR that only
+      // fails later in the pipeline.
+      for (Value v : op->getOperands())
+        if (layoutFor(v) && !atPhysicalRank(v)) {
+          op->emitError("rewrite-descriptor-layout-generic: this op consumes a "
+                        "value on a physicalized chain but is not a "
+                        "linalg.generic, so the rewrite cannot restate it");
+          result = failure();
+          return;
+        }
+    });
+    return result;
   }
 
   //===--------------------------------------------------------------------===//
@@ -777,6 +1083,9 @@ struct RewriteDescriptorLayoutGenericPass
     for (auto marker : markers)
       if (failed(physicalizeDescriptor(marker)))
         return signalPassFailure();
+
+    if (failed(runRewrite(module)))
+      return signalPassFailure();
 
     for (auto marker : markers)
       eraseMarker(marker);

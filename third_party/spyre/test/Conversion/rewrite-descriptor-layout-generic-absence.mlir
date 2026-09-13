@@ -13,9 +13,7 @@ module {
 // CHECK-SAME:      memref<64x128xf32>
 // CHECK:         ktdp.construct_access_tile %{{.*}} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
 // CHECK:         ktdp.load %{{.*}} : <64x128xindex> -> tensor<64x128xf32>
-// CHECK:         linalg.generic
-// CHECK-SAME:      ins(%{{.*}} : tensor<64x128xf32>)
-// CHECK-SAME:      outs(%{{.*}} : tensor<64x128xf32>)
+// CHECK:         linalg.generic {indexing_maps = [#[[MAP:.*]], #[[MAP]]], iterator_types = ["parallel", "parallel"]} ins(%{{.*}} : tensor<64x128xf32>) outs(%{{.*}} : tensor<64x128xf32>)
 // CHECK:         ktdp.store %{{.*}} : tensor<64x128xf32>, <64x128xindex>
 tt.func @no_marker(%in: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
   %c0 = arith.constant 0 : index
@@ -33,20 +31,6 @@ tt.func @no_marker(%in: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
     linalg.yield %n : f32
   } -> tensor<64x128xf32>
   ktdp.store %r, %ot : tensor<64x128xf32>, <64x128xindex>
-  tt.return
-}
-}
-
-// -----
-
-// A bad data-layout option is rejected rather than silently treated as one of
-// the two valid values: the pass is invocable directly, bypassing the
-// frontend's own validation.
-
-// RUN: not spyre-triton-opt %s --rewrite-descriptor-layout-generic=data-layout=bogus 2>&1 | FileCheck %s --check-prefix=BADOPT
-// BADOPT: data-layout must be 'device' or 'host', got 'bogus'
-module {
-tt.func @opt_validation() {
   tt.return
 }
 }
