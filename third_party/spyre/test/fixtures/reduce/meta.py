@@ -291,10 +291,6 @@ VARIANTS = {
         "inputs":     make_inputs,
         "output_key": "out_ptr",
         "rtol":       1e-4,
-        "extra_checks": lambda t: (
-            t.assert_present("linalg.reduce"),
-            t.assert_absent("tt.reduce"),
-        ),
     },
     # ---- Grid variation -----------------------------------------------------
     # ``grid`` is a top-level entry field, read once per variant, so it is not
@@ -345,10 +341,6 @@ VARIANTS = {
         # linalg.reduce accumulates the 96 terms in a different order than
         # NumPy's sum, so fp32 drifts ~1e-5 absolute on a few elements.
         "atol":       1e-4,
-        "extra_checks": lambda t: (
-            t.assert_present("linalg.reduce"),
-            t.assert_absent("tt.reduce"),
-        ),
     },
     "middle_axis_grid": {
         # D0 = 16 over BLOCK_D0 = 4 gives 4 blocks, one per core at grid=[4],
@@ -417,10 +409,6 @@ VARIANTS = {
         # variants, or a tolerance hook, which is mechanism.
         "rtol":         1e-2,
         "atol":         5e-2,
-        "extra_checks": lambda t: (
-            t.assert_present("linalg.reduce"),
-            t.assert_absent("tt.reduce"),
-        ),
     },
 
 
@@ -465,10 +453,6 @@ VARIANTS = {
         "output_key":  "out_ptr",
         "rtol":        1e-2,
         "atol":        5e-2,
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.reduce"),
-        ),
     },
     "middle_axis_spyre_stick": {
         # in_ptr stick-on-D2 (fp32 stick = 32, D2 = 64 = 2 sticks exactly):
@@ -503,12 +487,6 @@ VARIANTS = {
         # linalg.reduce accumulates the 96 terms in a different order than
         # NumPy's sum, so fp32 drifts ~1e-5 absolute on a few elements.
         "atol":        1e-4,
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.reduce"),
-            # No transpose: the reduced axis is named where it sits.
-            t.assert_absent("linalg.transpose"),
-        ),
     },
 
 
@@ -577,7 +555,6 @@ VARIANTS = {
         "grid":        [1],
         # No tl.program_id, so DistributeWork has nothing to place and the
         # presence check would fail on a kernel that is correct.
-        "parallel":    False,
         "data_layout": "host",
         "compiles_to_binary": True,
         "output_key":  "out_ptr",
@@ -610,24 +587,6 @@ VARIANTS = {
         # An output that was never written is caught by test_device_launch's own
         # nonzero assertion, not by a tolerance.
         "atol":        2.5e-1,
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.reduce"),
-            # The zero init fill is still here, and that is correct at this
-            # stage: DropReductionInitFill runs in _make_spyrecode, so the KTIR a
-            # structural test sees is the KTIR before the binary path repairs it.
-            # Asserted rather than left unsaid because its absence would mean the
-            # pass had moved back into the pipeline every path crosses.
-            #
-            # It is re-emitted at the PHYSICAL shape here rather than dropped,
-            # because a reduce's `outs` is read by its payload and the neutral
-            # element is what makes that well defined.
-            t.assert_present("linalg.fill"),
-            # No stick loop -- the whole point of this variant, and what its
-            # device story turns on. `parallel: False` above says there is no
-            # distribution loop; this says there is no stick loop either.
-            t.assert_absent("scf.for"),
-        ),
     },
 
     # Folds N, the STICK axis, which stick-on-N splits across physical dims 0

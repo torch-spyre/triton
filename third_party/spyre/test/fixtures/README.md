@@ -54,21 +54,18 @@ reference oracle and input generator. Different functions
 | `inputs` | `(**param_values) -> {"arg_name": np.array, ...}` | Pointer/tensor input generator. Called with kwargs matching `params` keys; returns pointer/tensor args only. Runtime scalars (params that aren't in `constexpr`) are merged in by the framework. |
 | `output_key` | `str` | Which `inputs` key holds the output buffer compared against `reference(inputs)`. |
 | `func_name` | `str` | KTIR function name for `ktir_cpu`. Defaults to `kernel_fn.__name__`. |
-| `parallel` | `bool`, default `True` | Set `False` for single-program kernels that do not call `tl.program_id` — skips the DistributeWork-presence check in `TestExample`. |
-| `extra_checks` | `(tester) -> None` | Optional. Runs alongside the shared structural suite for variant-specific assertions (e.g. `memref<?x` only in the dynamic variant). |
 | `factory` | `VariantFactory` | Optional. Supplies the fields that vary with the swept `params` combination. Subclass `VariantFactory` (`test/conftest.py`) and override `signature()`, `reference()` or `inputs()`; each is called per combination with the combination as kwargs and returns that field's value, or `None` to leave it unset. Declaring a hook and the literal field it produces on one variant is an error. |
 | `xfail_numerical` | `str \| dict` | Optional. `str` is shorthand for `{"reason": str, "strict": True}`; `dict` is forwarded to `pytest.mark.xfail(**d)` (so `raises=ValueError` etc. work). Attached at collection time so failures show as `XFAIL`, not `SKIP`. Use this when the kernel compiles but the numerical comparison fails (e.g. `ktir_cpu` can't parse a dynamic memref shape). |
-| `disabled` | `dict` | Optional. `{"reason": str, "tracking_test": str}`. Marks a variant as unable to compile through the TTIR→KTIR pipeline today. Every structural and numerical test skips with `reason`. `tracking_test` is free text naming where the underlying gap is pinned — normally a lit file, e.g. `Conversion/lower-descriptor-memory-addptr-invalid.mlir`. The meta-test `test_disabled_variants_tracking_tests_exist` checks only that it is present and non-blank |
+| `disabled` | `dict` | Optional. `{"reason": str, "tracking_test": str}`. Marks a variant as unable to compile through the TTIR→KTIR pipeline today. `test_numerical` skips with `reason`. `tracking_test` is free text naming where the underlying gap is pinned — normally a lit file, e.g. `Conversion/lower-descriptor-memory-addptr-invalid.mlir`. The meta-test `test_disabled_variants_tracking_tests_exist` checks only that it is present and non-blank |
 
-## Test groups in `TestExample`
+## What `TestExample` runs
 
-`TestExample` (in `test/test_ktir_examples.py`) splits its methods into
-three categories. See the class docstring for details.
+`TestExample` (in `test/test_ktir_examples.py`) runs one test per variant:
+`test_numerical` compiles the kernel through the TTIR→KTIR pipeline, executes
+it on `ktir_cpu` and compares against the NumPy oracle.
 
-1. **Pipeline invariants** — kernel-agnostic KTIR properties (no `tt.*`
-   ops, `ktdp.*` ops present, memref types, DistributeWork ran). Runs
-   uniformly over every variant.
-2. **Per-variant structural hook** — `test_extra_checks` calls the
-   variant's `extra_checks` callable.
-3. **Numerical** — `test_numerical` runs the kernel on `ktir_cpu` and
-   compares to the NumPy oracle.
+Structural claims about the lowered IR are **not** made here. They live in the
+lit/FileCheck suite under `test/Conversion/*.mlir`, which pins the exact IR a
+pass emits rather than asserting op presence over a compiled fixture. A fixture
+whose numerical result is right but whose IR shape matters belongs in a `.mlir`
+carrier, not in a field on the variant.

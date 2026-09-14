@@ -22,14 +22,12 @@ Quick-reference
 ---------------
 - :data:`EXAMPLES`              — registry of example kernels discovered
                                   from ``test/fixtures/*/meta.py``
-- :class:`KTIRStructuralTester` — EXAMPLE-based setup + structural assertions
-- :class:`KTIRCpuTester`        — extends with numerical CPU execution
+- :class:`KTIRCpuTester`        — EXAMPLE-based setup + numerical CPU execution
 - :class:`SinglePassTester`     — run one pass on inline MLIR text
 
 Most shared machinery (``OpInfo``, ``walk_module``, ``make_ktir_mod``,
-``StructuralAssertions``, ``compile_to_ttir``) lives in :mod:`utils` — this
-file re-exports the names so existing test modules can keep importing them
-from ``conftest``.
+``compile_to_ttir``) lives in :mod:`utils` — this file re-exports the names
+so existing test modules can keep importing them from ``conftest``.
 
 Troubleshooting
 ---------------
@@ -92,7 +90,6 @@ _FIXTURES_DIR = _TEST_DIR / "fixtures"
 # Re-export helpers from utils so tests can still import them from conftest.
 from utils import (  # noqa: E402
     OpInfo,
-    StructuralAssertions,
     compile_to_ttir,
     make_ktir_mod,
     walk_module,
@@ -118,7 +115,6 @@ from utils import (  # noqa: E402
 #   inputs        : lambda c: {"argN": np.array, ...}
 #   output_key    : which inputs key holds the output buffer
 #   func_name     : KTIR function name (defaults to kernel_fn.__name__)
-#   extra_checks  : optional (tester) -> None for variant-specific asserts
 #   factory       : optional VariantFactory supplying the fields that vary
 #                   with the swept combination
 #   xfail_numerical : optional str | dict for the numerical-test xfail mark
@@ -420,10 +416,9 @@ class VariantFactory:
     (``Elementwise(rank=2)``) so hooks can share derivations.
 
     Hooks are ordinary methods, found by name. Nothing here inspects a
-    callable's parameters to guess whether it is a factory — the way
-    ``extra_checks`` does, which is why that rule could not be reused: an oracle
-    may legitimately declare ``**kwargs`` (``inter_tile_reduce``'s
-    ``run_element_sum``), and inspection would call it with no ``inputs``.
+    callable's parameters to guess whether it is a factory: an oracle may
+    legitimately declare ``**kwargs`` (``inter_tile_reduce``'s
+    ``run_element_sum``), so inspection would call it with no ``inputs``.
     """
 
     def signature(self, **combo):
@@ -564,21 +559,6 @@ def _load_examples():
                 suffix = _sweep_suffix(suffix_names, combo)
                 key = base_key + suffix
 
-                # extra_checks factory protocol: if the callable accepts
-                # **kwargs, call it with the combo to get the final
-                # (tester)->None. Existing lambda t: (...) lambdas have no
-                # **kwargs and pass through unchanged.
-                # TODO(#71): remove this block when extra_checks is dropped
-                # from fixtures entirely (KTIRStructuralTester removal).
-                ec = entry.get("extra_checks")
-                if ec is not None:
-                    import inspect
-                    sig = inspect.signature(ec)
-                    if any(p.kind == inspect.Parameter.VAR_KEYWORD
-                           for p in sig.parameters.values()):
-                        combo_values = {k: v[1] for k, v in combo.items()}
-                        entry["extra_checks"] = ec(**combo_values)
-
                 # Before _resolve_variant, which reads SIGNATURE and needs a
                 # plain dict by then. 'factory' needs no merge handling: it is a
                 # single value, so _resolve_base replaces it wholesale.
@@ -599,74 +579,7 @@ EXAMPLES = _load_examples()
 
 
 # ---------------------------------------------------------------------------
-# KTIRStructuralTester — EXAMPLE-based setup + structural assertions
-# ---------------------------------------------------------------------------
-
-class KTIRStructuralTester(StructuralAssertions):
-    """Pytest base class for KTIR structural checks on example kernels.
-
-    Subclass, set ``EXAMPLE`` to a key in :data:`EXAMPLES`, and write test
-    methods using the assertion helpers inherited from
-    :class:`StructuralAssertions`. ``setup_method`` builds ``self.ops``
-    automatically.
-
-    The class-level ``EXAMPLE`` is the default; parametrized tests can
-    overwrite ``self.EXAMPLE`` before calling ``self.setup_method()``
-    manually to target a specific variant.
-
-    Example::
-
-        class TestVectorAdd(KTIRStructuralTester):
-            EXAMPLE = "elementwise"
-
-            def test_ktdp_ops(self):
-                self.assert_present("ktdp.load", "ktdp.store")
-    """
-
-    EXAMPLE: str = None
-
-    def setup_method(self):
-        if self.EXAMPLE is None:
-            # Parametrized tests set self.EXAMPLE first, then call
-            # setup_method() explicitly. The implicit pytest-invoked
-            # setup_method runs before parametrize populates it, so
-            # skip until the test body re-calls us.
-            self._def_map = None
-            return
-        entry = EXAMPLES[self.EXAMPLE]
-        grid = entry.get("grid")  # None → backend default
-        # A fixture entry mixes SpyreOptions fields with test metadata
-        # (kernel_fn, tags, atol, ...), so forward only the keys that name an
-        # actual option — make_ktir_mod raises on anything it can't map.
-        # ``grid`` stays a named argument because None must mean "use the
-        # default" rather than override it.
-        from backend.compiler import SpyreOptions
-        option_fields = SpyreOptions.__dataclass_fields__
-        options = {
-            k: v for k, v in entry.items()
-            if k != "grid" and k in option_fields
-        }
-
-        if "kernel_fn" in entry:
-            ttir_text = compile_to_ttir(
-                entry["kernel_fn"],
-                entry["signature"],
-                entry.get("constexprs", {}),
-            )
-            with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".mlir", delete_on_close=False) as f:
-                f.write(ttir_text)
-                f.flush()
-                self.mod = make_ktir_mod(f.name, grid=grid, **options)
-        else:
-            self.mod = make_ktir_mod(entry["path"], grid=grid, **options)
-
-        self.ops = walk_module(self.mod)
-        self._def_map = None
-
-
-# ---------------------------------------------------------------------------
-# KTIRCpuTester — adds numerical CPU execution on top of structural checks
+# KTIRCpuTester — EXAMPLE-based setup + numerical CPU execution
 # ---------------------------------------------------------------------------
 
 # Two interchangeable KTIR parsers.
@@ -749,24 +662,66 @@ def _parse_regex(mlir_text: str):
 
 
 class KTIRCpuTester:
-    """Mixin that adds numerical CPU execution via ``ktir_cpu``.
+    """Pytest base class for numerical CPU execution of example kernels.
 
-    Designed for multiple inheritance with :class:`KTIRStructuralTester`::
+    Subclass, set ``EXAMPLE`` to a key in :data:`EXAMPLES`, and call
+    :meth:`run_cpu`. ``setup_method`` compiles the variant through the
+    TTIR→KTIR pipeline and leaves the module in ``self.mod``::
 
-        class TestVectorAdd(KTIRCpuTester, KTIRStructuralTester):
+        class TestVectorAdd(KTIRCpuTester):
             EXAMPLE = "elementwise"
 
             def test_numerical(self):
                 out = self.run_cpu("add_kernel", arg0=x, arg1=y, arg2=output)
                 np.testing.assert_allclose(out["arg2"], ref)
 
-    Requires ``self.mod`` (a live ``ir.module``) to be set by
-    ``setup_method``. If ``ktir_cpu`` is not installed, :meth:`run_cpu`
-    raises ``pytest.skip``.
+    The class-level ``EXAMPLE`` is the default; parametrized tests can
+    overwrite ``self.EXAMPLE`` before calling ``self.setup_method()``
+    manually to target a specific variant.
+
+    If ``ktir_cpu`` is not installed, :meth:`run_cpu` raises
+    ``pytest.skip``.
 
     Parsing uses ``_parse_mlir_frontend`` (MLIRFrontendParser) by default;
     ``_parse_regex`` is an unwired backup. See those helpers for details.
     """
+
+    EXAMPLE: str = None
+
+    def setup_method(self):
+        if self.EXAMPLE is None:
+            # Parametrized tests set self.EXAMPLE first, then call
+            # setup_method() explicitly. The implicit pytest-invoked
+            # setup_method runs before parametrize populates it, so
+            # skip until the test body re-calls us.
+            return
+        entry = EXAMPLES[self.EXAMPLE]
+        grid = entry.get("grid")  # None → backend default
+        # A fixture entry mixes SpyreOptions fields with test metadata
+        # (kernel_fn, tags, atol, ...), so forward only the keys that name an
+        # actual option — make_ktir_mod raises on anything it can't map.
+        # ``grid`` stays a named argument because None must mean "use the
+        # default" rather than override it.
+        from backend.compiler import SpyreOptions
+        option_fields = SpyreOptions.__dataclass_fields__
+        options = {
+            k: v for k, v in entry.items()
+            if k != "grid" and k in option_fields
+        }
+
+        if "kernel_fn" in entry:
+            ttir_text = compile_to_ttir(
+                entry["kernel_fn"],
+                entry["signature"],
+                entry.get("constexprs", {}),
+            )
+            with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".mlir", delete_on_close=False) as f:
+                f.write(ttir_text)
+                f.flush()
+                self.mod = make_ktir_mod(f.name, grid=grid, **options)
+        else:
+            self.mod = make_ktir_mod(entry["path"], grid=grid, **options)
 
     def run_cpu(self, func_name: str, *, kernel_fn, **kwargs):
         """Execute ``self.mod`` via the ``ktir_cpu`` interpreter.
@@ -840,7 +795,7 @@ class KTIRCpuTester:
 # SinglePassTester — run one pass on inline MLIR text
 # ---------------------------------------------------------------------------
 
-class SinglePassTester(StructuralAssertions):
+class SinglePassTester:
     """Base class for unit-testing individual lowering passes.
 
     Subclass, set ``PASS`` to a pass-adder function name under

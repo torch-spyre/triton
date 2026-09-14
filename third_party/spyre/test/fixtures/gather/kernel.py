@@ -362,7 +362,8 @@ def gather_1d_kernel(
     to be at least rank-2 with a leading-1 dim (the indirect axis). A
     rank-1 descriptor like ``<BLOCK_ROWS x f32>`` is rejected by the
     op verifier (see
-    ``test_lower_desc_memory.py::test_gather_rank1_block_rejected``).
+    ``Conversion/lower-descriptor-memory-invalid.mlir``,
+    ``@gather_rank1_block_rejected``).
     Modelling the same K elements as ``[K, 1]`` with ``block_shape=[1, 1]``
     satisfies the verifier: dim 0 (size K) is the indirect axis and dim 1
     (size 1) is the per-row scalar payload. The gather result is rank-2
@@ -657,7 +658,8 @@ def gather_3d_partial_kernel(
     region with its ``c_y`` operand captured from a loop-variant value.
     The descriptor's ``ktdp.construct_memory_view`` stays at function top —
     same hoisting rule as ``descriptor-placement-top-level``, but for the
-    gather path. The fixture pins both placements via ``extra_checks``.
+    gather path. Both placements are pinned by
+    ``Conversion/lower-descriptor-memory-placement.mlir``.
 
     What this variant pins beyond ``3d`` (full block extent on dim 1) and
     ``3d_group`` (block dim 1 = 1):

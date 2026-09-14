@@ -88,9 +88,9 @@ def run_element_sum(inputs: dict, BLOCK_M: int, BLOCK_N: int, NUM_N_TILES: int, 
     written back to each tile's own ``BLOCK_M × BLOCK_N`` output region.
 
     If the ``tl.inter_tile`` API or the fixture grid changes this oracle must
-    be updated to match.  Use ``extra_checks`` in VARIANTS to pin the exact
-    KTIR structure (affine sets, combiner op) so regressions surface there
-    before the numerical oracle becomes the only signal.
+    be updated to match.  The exact KTIR structure (affine sets, combiner op)
+    is pinned by ``Conversion/lower-inter-tile.mlir``, so a lowering
+    regression surfaces there before this oracle becomes the only signal.
     """
     x = inputs["x_ptr"]
     M, N = x.shape
@@ -101,160 +101,6 @@ def run_element_sum(inputs: dict, BLOCK_M: int, BLOCK_N: int, NUM_N_TILES: int, 
     x4 = x.reshape(NMG, BLOCK_M, NUM_N_TILES, BLOCK_N)
     col_sum = x4.sum(axis=2)
     return np.tile(col_sum, (1, 1, NUM_N_TILES)).reshape(M, N)
-
-def assert_tile_future_groups(tester, op_name: str, *,
-    num_symbols: int = None, num_dims: int = None,
-    num_constraints: int = None, parent: str = None):
-
-    """Assert properties of the `groups` integer set carried by an inter-tile op's
-    associated `!ktdp.tile_future` type.
-
-    The `groups` integer set lives as a type parameter of
-    `!ktdp.tile_future<(...), groups = #set>` — on the produce op's result type
-    (single tile_future result) or the reduce op's operand 0 type (its future
-    input). This helper looks in the correct place based on *op_name*.
-
-    Parameters
-    ----------
-    op_name          : `"ktdp.inter_tile_produce"` or `"ktdp.inter_tile_reduce"`
-    num_symbols, num_dims, num_constraints
-                        : same semantics as :meth:`assert_integer_set` —
-                        parsed from the affine_set text.
-    parent           : optional parent op filter (see :meth:`_find`).
-    """
-    matches = tester._find(op_name, parent)
-    assert matches, f"Op '{op_name}' not found in KTIR"
-
-    if op_name == "ktdp.inter_tile_produce":
-        # groups lives in the op's single result type (a tile_future).
-        def _type_str(op):
-            if op._op.get_num_results() == 0:
-                return None
-            return str(op._op.get_result(0).get_type())
-    elif op_name == "ktdp.inter_tile_reduce":
-        # groups lives in the type of operand 0 (the future).
-        def _type_str(op):
-            if op._op.get_num_operands() == 0:
-                return None
-            return str(op._op.get_operand(0).get_type())
-    else:
-        raise ValueError(
-            f"assert_tile_future_groups: expected 'ktdp.inter_tile_produce' "
-            f"or 'ktdp.inter_tile_reduce', got '{op_name}'"
-        )
-
-    def _parse(op):
-        ty = _type_str(op)
-        if ty is None or "tile_future" not in ty:
-            return None
-        # Match: groups = affine_set<(d1, d2)[s1, s2] : (c1, c2, c3)>
-        m = re.search(
-            r"groups\s*=\s*affine_set<\s*\(([^)]*)\)\s*(?:\[([^\]]*)\])?\s*:\s*\(([^)]*)\)\s*>",
-            ty,
-        )
-        if not m:
-            return None
-        dims_txt, syms_txt, cons_txt = m.group(1), m.group(2) or "", m.group(3)
-        dims = len(dims_txt.split(",")) if dims_txt.strip() else 0
-        syms = len(syms_txt.split(",")) if syms_txt.strip() else 0
-        cons = len(cons_txt.split(",")) if cons_txt.strip() else 0
-        return {"dims": dims, "syms": syms, "cons": cons}
-
-    parsed = [p for p in (_parse(o) for o in matches) if p is not None]
-    assert parsed, (
-        f"Op '{op_name}' has no !ktdp.tile_future<..., groups = ...> "
-        f"in its associated type (looked at "
-        f"{'result 0' if op_name == 'ktdp.inter_tile_produce' else 'operand 0'})"
-    )
-
-    def _matches(p):
-        if num_symbols is not None and p["syms"] != num_symbols:
-            return False
-        if num_dims is not None and p["dims"] != num_dims:
-            return False
-        if num_constraints is not None and p["cons"] != num_constraints:
-            return False
-        return True
-
-    assert any(_matches(p) for p in parsed), (
-        f"Op '{op_name}' tile_future groups: no match for "
-        f"num_symbols={num_symbols}, num_dims={num_dims}, "
-        f"num_constraints={num_constraints}; got {parsed}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# extra_checks: pin the exact KTIR lowering structure
-# ---------------------------------------------------------------------------
-
-def _extra_checks_default(tester) -> None:
-    """Pin the KTIR structure emitted by LowerInterTile for this fixture.
-
-    Asserts the exact op pattern that ``tl.inter_tile(..., combiner="add",
-    mode="all_reduce")`` lowers to, given:
-      - partial shape  BLOCK_M × BLOCK_N
-      - 4 groups of 2 tiles  (ngroups=4, gsize=2)
-      - reduce-then-fold with linalg.add combiner
-
-    The delivery op preserves shape: ``result_type == partial_type``;
-    grouping lives in the affine sets, not in a tensor axis.  If the
-    lowering changes (different combiner, different affine-set shape, or
-    rank drift), this check will fail and prompt a review of both the
-    pass and this oracle.
-    """
-    # Both produce and reduce ops must be present.
-    tester.assert_present("ktdp.inter_tile_produce")
-    tester.assert_present("ktdp.inter_tile_reduce")
-
-    # Produce op: producer_tiles_per_group is (i)[g] with 1 symbol, 1 dim,
-    # 2 constraints (lower + upper bound: g*gsize <= i <= g*gsize + gsize - 1).
-    tester.assert_integer_set(
-        "ktdp.inter_tile_produce", "producer_tiles_per_group",
-        num_dims=1, num_symbols=1, num_constraints=2,
-    )
-    # groups set: (g) with 1 dim, 0 symbols, 2 constraints (0<=g<=ngroups-1).
-    # groups lives on the !ktdp.tile_future type, not on the op.
-    assert_tile_future_groups(
-        tester, 
-        "ktdp.inter_tile_produce",
-        num_dims=1, num_symbols=0, num_constraints=2,
-    )
-
-    # Produce result type: tile_future carrying the 16×16 partial. The
-    # tile_future syntax wraps the partial types in parens:
-    # !ktdp.tile_future<(tensor<...>), groups=...>.
-    tester.assert_result_type(
-        "ktdp.inter_tile_produce", "ktdp.tile_future<(tensor<16x16x",
-    )
-
-    # Reduce op: still carries consumer_tiles_per_group; groups is inferred
-    # from its !tile_future operand type.
-    tester.assert_integer_set(
-        "ktdp.inter_tile_reduce", "consumer_tiles_per_group",
-        num_dims=1, num_symbols=1, num_constraints=2,
-    )
-    assert_tile_future_groups(
-        tester, 
-        "ktdp.inter_tile_reduce",
-        num_dims=1, num_symbols=0, num_constraints=2,
-    )
-
-    # Reduce result type equals the partial type (16×16), no rank reduction.
-    tester.assert_result_type("ktdp.inter_tile_reduce", "tensor<16x16x")
-    tester.assert_result(
-        "ktdp.inter_tile_reduce", shape=[16, 16],
-    )
-
-    # Combiner region: linalg.add inside the reduce op's region.
-    tester.assert_present("linalg.add", parent="ktdp.inter_tile_reduce")
-
-    # yield_partial inside produce region; yield_reduced inside reduce region.
-    tester.assert_present("ktdp.yield_partial", parent="ktdp.inter_tile_produce")
-    tester.assert_present("ktdp.yield_reduced", parent="ktdp.inter_tile_reduce")
-
-    # No raw inter_tile tt ops remain.
-    tester.assert_absent("tt.inter_tile_reduce")
-
 
 # ---------------------------------------------------------------------------
 # SIGNATURE
@@ -306,11 +152,9 @@ VARIANTS = {
             "WORK_SLICES": [_WORK_SLICES],
         },
         "grid":          [_NUM_TILES],
-        "parallel":      False,  # one block per tile, no distribution loop
         "reference":     functools.partial(run_element_sum, BLOCK_M=16, BLOCK_N=16, NUM_N_TILES=_NUM_N_TILES),
         "inputs":        make_inputs,
         "output_key":    "output_ptr",
-        "extra_checks":  _extra_checks_default,
     },
 }
 
@@ -346,40 +190,6 @@ def run_splitk(inputs: dict) -> np.ndarray:
     return inputs["a_ptr"] @ inputs["b_ptr"]
 
 
-def _extra_checks_splitk(tester) -> None:
-    tester.assert_present("ktdp.inter_tile_produce")
-    tester.assert_present("ktdp.inter_tile_reduce")
-    tester.assert_integer_set(
-        "ktdp.inter_tile_produce", "producer_tiles_per_group",
-        num_dims=1, num_symbols=1, num_constraints=2,
-    )
-
-    assert_tile_future_groups(
-        tester,
-        "ktdp.inter_tile_produce",
-        num_dims=1, num_symbols=0, num_constraints=2,
-    )
-    tester.assert_result_type(
-        "ktdp.inter_tile_produce", "ktdp.tile_future<(tensor<16x16x",
-    )
-    # reduce_to_one: single equality constraint — only pick₀ consumes
-    tester.assert_integer_set(
-        "ktdp.inter_tile_reduce", "consumer_tiles_per_group",
-        num_dims=1, num_symbols=1, num_constraints=1,
-    )
-    assert_tile_future_groups(
-        tester, 
-        "ktdp.inter_tile_reduce",
-        num_dims=1, num_symbols=0, num_constraints=2,
-    )
-    tester.assert_result_type("ktdp.inter_tile_reduce", "tensor<16x16x")
-    tester.assert_result("ktdp.inter_tile_reduce", shape=[16, 16])
-    tester.assert_present("linalg.add", parent="ktdp.inter_tile_reduce")
-    tester.assert_present("ktdp.yield_partial", parent="ktdp.inter_tile_produce")
-    tester.assert_present("ktdp.yield_reduced", parent="ktdp.inter_tile_reduce")
-    tester.assert_absent("tt.inter_tile_reduce")
-
-
 # ---------------------------------------------------------------------------
 # softmax variant — two all-reduces (rowmax + rowsum) across mb-cohort
 # ---------------------------------------------------------------------------
@@ -408,24 +218,6 @@ def run_softmax(inputs: dict) -> np.ndarray:
     x_shifted = x - x.max(axis=1, keepdims=True)
     num = np.exp(x_shifted)
     return (num / num.sum(axis=1, keepdims=True)).astype(np.float16)
-
-
-def _extra_checks_softmax(tester) -> None:
-    tester.assert_present("ktdp.inter_tile_produce")
-    tester.assert_present("ktdp.inter_tile_reduce")
-    tester.assert_count("ktdp.inter_tile_produce", 2)
-    tester.assert_count("ktdp.inter_tile_reduce", 2)
-    tester.assert_integer_set(
-        "ktdp.inter_tile_reduce", "consumer_tiles_per_group",
-        num_dims=1, num_symbols=1, num_constraints=2,
-    )
-    assert_tile_future_groups(
-        tester, 
-        "ktdp.inter_tile_reduce",
-        num_dims=1, num_symbols=0, num_constraints=2,
-    )
-    tester.assert_result_type("ktdp.inter_tile_reduce", "tensor<256x")
-    tester.assert_absent("tt.inter_tile_reduce")
 
 
 VARIANTS["softmax"] = {
@@ -461,12 +253,10 @@ VARIANTS["softmax"] = {
         "WORK_SLICES":  [_SM_WORK_SLICES],
     },
     "grid":        [_SM_NUM_TILES],
-    "parallel":    False,
     "reference":   run_softmax,
     "inputs":      make_inputs_softmax,
     "output_key":  "output_ptr",
     "rtol":        1e-2,
-    "extra_checks": _extra_checks_softmax,
 }
 
 
@@ -517,10 +307,8 @@ VARIANTS["splitk"] = {
         "WORK_SLICES":   [_SK_WORK_SLICES],
     },
     "grid":         [_SK_NUM_TILES],
-    "parallel":     True,
     "reference":    run_splitk,
     "inputs":       make_inputs_splitk,
     "output_key":   "c_ptr",
     "rtol":         1e-3,
-    "extra_checks": _extra_checks_splitk,
 }

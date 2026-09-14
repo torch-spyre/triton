@@ -24,7 +24,7 @@ Pointer-arithmetic descriptor variants — per-batch descriptors built on a
 ``tt.addptr``-advanced base pointer instead of directly on the argument.
 Both are currently ``disabled``: ``tt.addptr`` into
 ``tt.make_tensor_descriptor`` is not yet lowered by ``LowerDescriptorMemory``
-(pinned by ``test_lower_desc_memory.py::TestAddptrIntoDescriptor``).
+(pinned by ``Conversion/lower-descriptor-memory-addptr-invalid.mlir``).
 - ``bmm_addptr``         -- batched addptr descriptors, static
 - ``bmm_addptr_dynamic`` -- batched addptr descriptors, dynamic
 
@@ -37,27 +37,6 @@ import numpy as np
 
 from . import kernel
 from utils import sticksize
-
-
-# ---------------------------------------------------------------------------
-# extra_checks factories (for variants with multi-value params that contain
-# shapes in the check).  Each factory accepts **combo and returns a
-# (tester)->None function.
-# ---------------------------------------------------------------------------
-
-def _make_default_checks(M, K, **_):
-    def checks(t):
-        t.assert_present("linalg.matmul")
-        t.assert_absent("tt.dot")
-        t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{K}xf32>")
-    return checks
-
-
-def _make_2d_grid_checks(M, K, **_):
-    def checks(t):
-        t.assert_present("linalg.matmul")
-        t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{K}xf32>")
-    return checks
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +267,6 @@ VARIANTS = {
         # fp32 matmul accumulation order differs from NumPy's @ — allow ~1% drift.
         "rtol":         1e-2,
         "atol":         1e-3,
-        "extra_checks": _make_default_checks,
     },
     "dynamic": {
         # Dynamic: M, K, N are runtime i32 → memref<?x?xf32>.
@@ -316,10 +294,6 @@ VARIANTS = {
             "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
             "A_LAYOUT": [None], "B_LAYOUT": [None], "C_LAYOUT": [None],
         },
-        "extra_checks": lambda t: (
-            t.assert_present("linalg.matmul"),
-            t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
-        ),
     },
     # --- BMM (batched) variants ---
     "bmm": {
@@ -340,10 +314,6 @@ VARIANTS = {
         "inputs":       make_inputs_bmm,
         "output_key":   "c_ptr",
         "rtol":         1e-2,
-        "extra_checks": lambda t: (
-            t.assert_present("linalg.batch_matmul"),
-            t.assert_absent("tt.dot"),
-        ),
     },
     "bmm_dynamic": {
         # BMM dynamic: B, M, K, N are runtime i32.
@@ -391,7 +361,6 @@ VARIANTS = {
         "inputs":       make_inputs,
         "output_key":   "c_ptr",
         "rtol":         1e-2,
-        "extra_checks": _make_2d_grid_checks,
     },
     "2d_grid_dynamic": {
         "base":      "2d_grid",
@@ -405,10 +374,6 @@ VARIANTS = {
             "arguments. Descriptors lower to `memref<?x?xf32>`."
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N"],
-        "extra_checks": lambda t: (
-            t.assert_present("linalg.matmul"),
-            t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
-        ),
     },
     "2d_grid_both_axes": {
         # N=256 with grid=[4,4]: n_blocks=16, n_blocks_per_core=4.
@@ -419,10 +384,6 @@ VARIANTS = {
             "BLOCK_M": [16], "BLOCK_K": [16], "BLOCK_N": [16],
         },
         "grid":         [4, 4],
-        "extra_checks": lambda t: (
-            t.assert_present("linalg.matmul"),
-            t.assert_result_type("ktdp.construct_memory_view", "memref<256x64xf32>"),
-        ),
     },
     # --- BMM 3D grid variants ---
     "bmm_3d_grid": {
@@ -453,10 +414,6 @@ VARIANTS = {
         "output_key":   "c_ptr",
         "rtol":         1e-2,
         "atol":         1e-4,
-        "extra_checks": lambda t: (
-            t.assert_present("linalg.batch_matmul"),
-            t.assert_absent("tt.dot"),
-        ),
     },
     "bmm_3d_grid_dynamic": {
         "base":      "bmm_3d_grid",
@@ -554,12 +511,6 @@ VARIANTS = {
         "output_key":   "c_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.matmul"),
-            t.assert_present("scf.for"),
-            t.assert_present("tensor.insert_slice"),
-        ),
     },
     "spyre_stick_parallel": {
         # Case 1: parallel sticks. A stick-on-M, B & C stick-on-N. No K
@@ -582,11 +533,6 @@ VARIANTS = {
             # C[M,N] stick-on-N: [N//_S, M, N%_S]
             "C_LAYOUT": [[(1, "floordiv", _SS("c_ptr")), 0, (1, "mod", _SS("c_ptr"))]],
         },
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.matmul"),
-            t.assert_present("tensor.insert_slice"),  # store sink stage
-        ),
     },
     "spyre_stick_parallel_dynamic": {
         # Dynamic-shape variant of spyre_stick_parallel: A stick-on-M, B/C
@@ -683,11 +629,6 @@ VARIANTS = {
         "data_layout":  "host",
         "inputs":       functools.partial(make_inputs_bmm, dtype=np.float16),
         "atol":         5e-2,
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.batch_matmul"),
-            t.assert_absent("tt.dot"),
-        ),
     },
     # BMM with Spyre activation/weight layouts: A/C use S x D/64 x B x 64
     # (M leading, B sandwiched between floor and lane), B_op uses N/64 x B x K x 64.
@@ -736,15 +677,6 @@ VARIANTS = {
             "B_LAYOUT": [[(1, "floordiv", _SB("b_ptr")), 0, (1, "mod", _SB("b_ptr")), 2]],
             "C_LAYOUT": [None],
         },
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.batch_matmul"),
-            # A physicalizes to the rank-5 view [M/S, K/S, B, M%S, K%S].
-            t.assert_result_type("ktdp.construct_memory_view", "2x2x2x64x64xf16"),
-            # Nested scf.for: outer M-stick scatter, inner K-stick reduction.
-            t.assert_present("scf.for"),
-            t.assert_present("tensor.insert_slice"),
-        ),
     },
     # --- Chained matmul: D = A @ (B @ C) with physical annotations ---
     # A[M,K1] stick-on-M, B[K1,K2] stick-on-K2, C[K2,N] stick-on-N,
@@ -790,10 +722,5 @@ VARIANTS = {
         # variants accordingly.
         "rtol":         5e-2,
         "atol":         5e-1,
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.matmul"),
-            t.assert_present("tensor.insert_slice"),  # store sink stage
-        ),
     },
 }

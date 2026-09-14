@@ -19,8 +19,8 @@ Vocabulary (matches ``kernel.py``):
 Two kernel families share this fixture:
 
   - **single-program** (``gather_kernel``) — one kernel invocation
-    consumes the whole index array. ``parallel: False`` — no
-    ``tl.program_id``, DistributeWork is a no-op. Variants:
+    consumes the whole index array. No ``tl.program_id``, so
+    DistributeWork is a no-op. Variants:
       - ``default`` — sanity case with non-zero ``y_offset``.
       - **edge-case set** — six variants that each pin a specific
         edge-case bug class (zero offset, full row, minimum legal sizes,
@@ -856,39 +856,6 @@ _SIG_1D = {
 # VARIANTS
 # ---------------------------------------------------------------------------
 
-# Structural check shared across all variants: the traced-memory-view
-# path in LowerDescriptorMemory must not emit an unrealized_conversion_cast
-# for descriptor-loaded indices (the presence of the cast would block
-# ktir_cpu execution). This pins the behaviour at the fixture level
-# in addition to the single-pass test
-# ``test_lower_desc_memory.py::TestDescriptorGather::test_gather_from_descriptor_load_emits_no_cast``.
-_EXTRA_CHECKS = lambda t: (
-    t.assert_absent("unrealized_conversion_cast"),
-    t.assert_present("ktdp.construct_indirect_access_tile"),
-)
-
-
-# Partial-extent variants: layered on top of _EXTRA_CHECKS to pin the in-loop
-# y_offset capture. The kernel computes ``y_offset = b * TOKEN_BLOCK`` inside
-# an ``scf.for``, so the lowered ``ktdp.construct_indirect_access_tile``
-# (whose ``c_y`` operand SSA-depends on the loop-variant ``arith.muli``) must
-# land inside the loop body. The descriptor itself is built outside the loop,
-# so its ``ktdp.construct_memory_view`` should stay at function top — same
-# hoisting rule as ``descriptor-placement-top-level``, but for the gather/
-# scatter path.
-#
-# A regression that hoisted the access tile out of the loop would either
-# constant-fold y_offset to a single window (numerical mismatch) or fail
-# to build at all.
-_PARTIAL_EXTRA_CHECKS = lambda t: (
-    t.assert_absent("unrealized_conversion_cast"),
-    t.assert_present("ktdp.construct_indirect_access_tile", parent="scf.for"),
-    t.assert_present("ktdp.construct_memory_view", parent="func.func"),
-    t.assert_count("ktdp.construct_indirect_access_tile", 0, cmp="eq",
-                   parent="func.func"),
-)
-
-
 VARIANTS = {
     "default": {
         # Sanity case: small source matrix, unique indices, non-zero
@@ -913,11 +880,9 @@ VARIANTS = {
         },
         "tags":       ["descriptor-gather"],
         "grid":       [32],
-        "parallel":   False,
         "reference":  run,
         "inputs":     make_inputs,
         "output_key": "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
     },
     # ------------------------------------------------------------------
     # Edge-case variants.  Each pins one specific bug class that the
@@ -1060,8 +1025,8 @@ VARIANTS = {
     #
     # Axis partition is picked so each core owns an integer number of
     # tiles along each axis (one tile-column per core on N, two
-    # row-tiles per core on M — keeps an scf.for inner loop in the IR,
-    # which ``test_work_distribution`` requires for parallel kernels).
+    # row-tiles per core on M — which keeps an scf.for inner loop in the
+    # lowered IR rather than a single straight-line tile).
     #
     # Shape picked so every tile is in-bounds without masking:
     #   m_blocks  = cdiv(K_INDICES, BLOCK_ROWS) = grid[0] * rows_per_core
@@ -1077,11 +1042,10 @@ VARIANTS = {
         # the ``x_offsets.shape[0] >= 8`` assertion), so BLOCK_ROWS >= 8
         # here.
         #
-        # ``parallel: True`` overrides the inherited ``False`` from the
-        # ``default`` variant (variants do a shallow {**default, **delta}
-        # merge in conftest._build_registry, so unset keys here would
-        # otherwise inherit single-program flags). The 2D kernel is
-        # multi-program, so test_work_distribution must run.
+        # Unlike ``default``, this kernel is multi-program: it reads
+        # ``tl.program_id`` on both axes, so DistributeWork lowers it to
+        # ``ktdp.get_compute_tile_id`` plus a distribution loop. That
+        # lowering is pinned by ``Conversion/distribute-work-multi-axis.mlir``.
         "kernel_fn":    kernel.gather_2d_kernel,
         "SIGNATURE":    _SIG_2D,
         "constexpr":    [
@@ -1097,28 +1061,23 @@ VARIANTS = {
         },
         "tags":         ["descriptor-gather", "program-id-2d", "num-programs-fold"],
         "grid":         [4, 8],
-        "parallel":     True,
         "reference":    run_2d,
         "inputs":       make_inputs_2d,
         "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
     },
     "2d_serial": {
         # Same kernel source as ``2d`` but on a 1-core grid. With
         # grid=[1, 1] the kernel's tiling math degenerates: a single
         # program covers all m_blocks * n_blocks output tiles via the
         # inner ``scf.for`` loops (rows_per_core = m_blocks,
-        # cols_per_core = n_blocks). ``parallel: False`` skips
-        # ``test_work_distribution`` (no multi-program lowering to pin),
-        # but ``test_numerical`` still runs and pins that the degenerate
-        # tiling path produces the correct output.
+        # cols_per_core = n_blocks). ``test_numerical`` pins that this
+        # degenerate tiling path still produces the correct output.
         #
         # Same data shape as ``2d`` so the numerical comparison reuses
         # the same NumPy oracle without per-variant plumbing.
         "base":     "2d",
         "tags":     ["descriptor-gather"],
         "grid":     [1, 1],
-        "parallel": False,
     },
     "2d_large_table": {
         # Same distribution at larger source dims: 64 indices x 256 cols,
@@ -1145,10 +1104,12 @@ VARIANTS = {
         # verifier minimum (semantic.py: x_offsets.shape[0] >= 8).
         #
         # Internally the kernel describes the 1D source as [K, 1] with
-        # block_shape=[1, 1] — see gather_1d_kernel docstring and the
-        # paired test_lower_desc_memory.py negative+positive pair
-        # (test_gather_rank1_block_rejected /
-        #  test_gather_1d_source_via_rank2_reshape_lowers).
+        # block_shape=[1, 1] — see gather_1d_kernel docstring and the paired
+        # lit negative+positive pair:
+        # Conversion/lower-descriptor-memory-invalid.mlir
+        # (@gather_rank1_block_rejected) and
+        # Conversion/lower-descriptor-memory-gather.mlir
+        # (@gather_1d_source_as_column).
         "kernel_fn":    kernel.gather_1d_kernel,
         "SIGNATURE":    _SIG_1D,
         "constexpr":    ["K", "K_INDICES", "BLOCK_ROWS"],
@@ -1159,11 +1120,9 @@ VARIANTS = {
         },
         "tags":         ["descriptor-gather", "1d-source"],
         "grid":         [32],
-        "parallel":     True,
         "reference":    run_1d,
         "inputs":       make_inputs_1d,
         "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
     },
     "2d_large_table_serial": {
         # ``2d_large_table`` data shape on a 1-core grid. Same intent
@@ -1172,7 +1131,6 @@ VARIANTS = {
         "base":     "2d_large_table",
         "tags":     ["descriptor-gather"],
         "grid":     [1, 1],
-        "parallel": False,
     },
     # ------------------------------------------------------------------
     # Rank-N (N ≥ 3) gather / scatter variants.
@@ -1197,11 +1155,9 @@ VARIANTS = {
         },
         "tags":         ["descriptor-gather-nd"],
         "grid":         [32],
-        "parallel":     False,
         "reference":    run_3d,
         "inputs":       make_inputs_3d,
         "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
     },
     "3d_group": {
         # Rank-3 with non-trivial y_offset: source [M, NUM_GROUPS, HEAD_DIM],
@@ -1229,11 +1185,9 @@ VARIANTS = {
         },
         "tags":         ["descriptor-gather-nd"],
         "grid":         [32],
-        "parallel":     False,
         "reference":    run_3d_group,
         "inputs":       make_inputs_3d_group,
         "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
     },
     "3d_group_end": {
         # group_idx at the last group (7 of 8) — boundary condition for the
@@ -1269,11 +1223,9 @@ VARIANTS = {
         },
         "tags":         ["descriptor-gather-4d"],
         "grid":         [32],
-        "parallel":     False,
         "reference":    run_4d,
         "inputs":       make_inputs_4d,
         "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
     },
     "3d_large_k": {
         # Same 3D block-fetch path as "3d" but K_INDICES=128 (4x the base).
@@ -1338,18 +1290,6 @@ VARIANTS = {
         "inputs":    functools.partial(make_inputs_4d, dtype=np.float16),
         "rtol":      1e-2,
         "atol":      5e-2,
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            # Source stays logical rank-4 (indirect physicalization is gated
-            # to rank 2), so the gather tile keeps the [32, 1, 16, 64] block.
-            t.assert_result_type("ktdp.construct_memory_view", "64x4x16x64xf16"),
-            t.assert_result(
-                "ktdp.construct_indirect_access_tile", shape=[32, 1, 16, 64]),
-            # Output physicalizes to rank-5 [INNER/64, K, 1, BLOCK, INNER%64]
-            # = [1, 32, 1, 16, 64]; insert_slice bridges rank-4 -> rank-5.
-            t.assert_result_type("ktdp.construct_memory_view", "1x32x1x16x64xf16"),
-            t.assert_present("tensor.insert_slice"),
-        ),
     },
     "scatter_3d": {
         # Write-back mirror of the "3d" variant.  Reads K_INDICES blocks from
@@ -1383,8 +1323,8 @@ VARIANTS = {
     # The full sweep reconstructs ``in[idx, :, :]`` numerically, so the
     # oracle is the same as the ``3d`` variant. The partial-extent + in-
     # loop y_offset capture properties live in IR — pinned by
-    # ``_PARTIAL_EXTRA_CHECKS`` (access tile inside ``scf.for``, view at
-    # function top).
+    # ``Conversion/lower-descriptor-memory-placement.mlir`` (access tile
+    # inside ``scf.for``, memory view hoisted to function top).
     #
     # Sizes: NUM_TOKENS=64, TOKEN_BLOCK=16 → 4 windows. K_INDICES=32 keeps
     # the per-iteration gather identical in shape to the ``3d`` variant
@@ -1403,17 +1343,16 @@ VARIANTS = {
         },
         "tags":         ["descriptor-gather-nd"],
         "grid":         [32],
-        "parallel":     False,
         "reference":    run_3d_partial,
         "inputs":       make_inputs_3d_partial,
         "output_key":   "out_ptr",
-        "extra_checks": _PARTIAL_EXTRA_CHECKS,
     },
     "scatter_3d_partial": {
         # Write-back mirror of "3d_partial": same shape and sweep
         # structure, so gather/scatter exercise symmetric partial-extent
-        # windowed access. Mirror's _PARTIAL_EXTRA_CHECKS pins that the
-        # scatter's indirect access tile also lands inside the scf.for.
+        # windowed access. The scatter's indirect access tile also lands
+        # inside the scf.for; pinned by
+        # ``Conversion/lower-descriptor-memory-placement.mlir``.
         "base":       "3d_partial",
         "kernel_fn":  kernel.scatter_3d_partial_kernel,
         "SIGNATURE":  _SIG_SCATTER_3D_PARTIAL,
@@ -1448,11 +1387,9 @@ VARIANTS = {
         },
         "tags":         ["descriptor-gather", "descriptor-gather-2d-indices"],
         "grid":         [32],
-        "parallel":     False,
         "reference":    run_2d_index_gather,
         "inputs":       make_inputs_2d_index_gather,
         "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
     },
     "2d_index_roundtrip": {
         # Gather→scatter round-trip over a shared 8x4 index grid. Full-row
@@ -1473,7 +1410,6 @@ VARIANTS = {
         },
         "tags":         ["descriptor-gather", "descriptor-scatter-2d-indices"],
         "grid":         [32],
-        "parallel":     False,
         # All memory ops are indirect (gather load + scatter store); the index
         # descriptor_load's direct tile is traced away, so no direct
         # construct_access_tile survives. See test_ktdp_ops_present.
@@ -1481,7 +1417,6 @@ VARIANTS = {
         "reference":    run_2d_index_roundtrip,
         "inputs":       make_inputs_2d_index_roundtrip,
         "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
     },
     # ------------------------------------------------------------------
     # rank-2 index grid x rank-3 source block -> rank-4 output.  Both
@@ -1510,11 +1445,9 @@ VARIANTS = {
         },
         "tags":         ["descriptor-gather", "descriptor-gather-2d-indices-3d-block"],
         "grid":         [32],
-        "parallel":     False,
         "reference":    functools.partial(run_2d_index_3d_block, BLOCK_B=2, BLOCK_L=4, BLOCK_H=2),
         "inputs":       make_inputs_2d_index_3d_block,
         "output_key":   "out_ptr",
-        "extra_checks": _EXTRA_CHECKS,
     },
     "2d_index_3d_block_large": {
         # Paged-KV scale: 2x64 index grid into a [32768, 32, 128] page pool,
@@ -1570,24 +1503,9 @@ VARIANTS = {
         "tags":       ["descriptor-gather", "spyre-tensor-layout"],
         "grid":       [1],
         "data_layout": "host",
-        "parallel":   False,
         "reference":  run_spyre,
         "inputs":     make_inputs_spyre,
         "output_key": "out_ptr",
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            # in_desc is physicalized stick-on-N -> rank-3 [N//stick, M, stick]
-            # view = [4, 256, 64] (4 source N-sticks).
-            t.assert_result_type(
-                "ktdp.construct_memory_view", "4x256x64xf16"),
-            # Each gather reads BLOCK_COLS=128 (2 sticks) for K_INDICES=32
-            # rows, so the indirect access tile is rank-3 [2, 32, 64].
-            t.assert_result(
-                "ktdp.construct_indirect_access_tile", shape=[2, 32, 64]),
-            # The rank-3 load result flows straight into the rank-3 store sink,
-            # so no insert_slice is synthesized (ranks already match).
-            t.assert_absent("tensor.insert_slice"),
-        ),
     },
     # Annotation asymmetry: gather_kernel_spyre guards IN_LAYOUT and
     # OUT_LAYOUT independently, so each can be annotated alone. Only the
@@ -1615,14 +1533,5 @@ VARIANTS = {
             "IN_LAYOUT":  [None],
             "OUT_LAYOUT": [[(1, "floordiv", _SS("out_ptr")), 0, (1, "mod", _SS("out_ptr"))]],
         },
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            # out_ptr [K_INDICES, N] stick-on-N -> rank-3 [N//64, 32, 64]
-            # = [4, 32, 64]; the store sink consumes it.
-            t.assert_result_type("ktdp.construct_memory_view", "4x32x64xf16"),
-            # Source is logical, so the gather tile is rank-2 [32, 128].
-            t.assert_result(
-                "ktdp.construct_indirect_access_tile", shape=[32, 128]),
-        ),
     },
 }

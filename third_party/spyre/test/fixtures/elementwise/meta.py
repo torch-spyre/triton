@@ -18,81 +18,6 @@ from utils import sticksize, DTYPE_MAP
 
 
 # ---------------------------------------------------------------------------
-# extra_checks factories (for variants with multi-value params that contain
-# shapes in the check).  Each factory accepts **combo and returns a
-# (tester)->None function.
-# ---------------------------------------------------------------------------
-
-def _make_1d_checks(n_elements, BLOCK_SIZE, **_):
-    def checks(t):
-        if n_elements != BLOCK_SIZE:
-            t.assert_result("ktdp.construct_memory_view", shape_not=[BLOCK_SIZE])
-    return checks
-
-
-def _make_2d_checks(M, N, **_):
-    def checks(t):
-        t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{N}xf32>")
-    return checks
-
-def _make_3d_checks(M, N, P, **_):
-    def checks(t):
-        t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{N}x{P}xf32>")
-    return checks
-
-def _make_1d_scalar_dim_checks(**_):
-    def checks(t):
-        # Single-element 1-D scalar-read chain: construct_memory_view
-        # <memref<1xi32>> -> construct_access_tile<1xindex> -> ktdp.load
-        # -> tensor.extract.
-        t.assert_result_type("ktdp.construct_memory_view", "memref<1xi32>")
-        t.assert_result_type("ktdp.construct_access_tile", "<1xindex>")
-        t.assert_present("tensor.extract")
-        # arith.index_cast bridges the extracted i32 to index before it
-        # feeds the descriptor's dynamic size operand.
-        t.assert_operand("ktdp.construct_memory_view", 1,
-                         defined_by="arith.index_cast", type_substr="index")
-        # The descriptor shape lowers to a dynamic memref.
-        t.assert_result_type("ktdp.construct_memory_view", "memref<?xf32>")
-    return checks
-
-
-def _make_spyre_stick_checks(M, N, DTYPE, **_):
-    """Level C: the marker is gone and every operand shares one physical view.
-
-    Stick-on-N turns ``[M, N]`` into ``[ceil(N/stick), M, stick]``. All three
-    operands physicalize identically, so the add stays pure elementwise on rank-3
-    tiles and no transpose or reduction loop is synthesized -- asserting the view
-    is what pins that.
-    """
-    stick = _stick_of(DTYPE)
-    elem = {"fp16": "f16", "fp32": "f32", "i32": "i32"}[DTYPE]
-    view = f"{-(-N // stick)}x{M}x{stick}x{elem}"
-
-    def checks(t):
-        t.assert_absent("tt.spyre_tensor_layout")
-        t.assert_result_type("ktdp.construct_memory_view", view)
-    return checks
-
-
-def _make_2d_scalar_dim_checks(N, **_):
-    def checks(t):
-        # Single-element 1-D scalar-read chain: construct_memory_view
-        # <memref<1xi32>> -> construct_access_tile<1xindex> -> ktdp.load
-        # -> tensor.extract.
-        t.assert_result_type("ktdp.construct_memory_view", "memref<1xi32>")
-        t.assert_result_type("ktdp.construct_access_tile", "<1xindex>")
-        t.assert_present("tensor.extract")
-        # arith.index_cast bridges the extracted i32 to index before it
-        # feeds the descriptor's dynamic size operand.
-        t.assert_operand("ktdp.construct_memory_view", 1,
-                         defined_by="arith.index_cast", type_substr="index")
-        # The descriptor shape lowers to a dynamic memref.
-        t.assert_result_type("ktdp.construct_memory_view", f"memref<?x{N}xf32>")
-    return checks
-
-
-# ---------------------------------------------------------------------------
 # Reference (NumPy oracle) + input makers
 #
 # One generator. The named makers below only give it a shape: the framework
@@ -420,7 +345,6 @@ VARIANTS = {
         "reference":    run,
         "inputs":       make_inputs,
         "output_key":   "output_ptr",
-        "extra_checks": _make_1d_checks,
     },
     "dynamic": {
         # PR #86: flip n_elements from constexpr to runtime i32. Produces
@@ -441,13 +365,6 @@ VARIANTS = {
             "value."
         ),
         "constexpr":    ["BLOCK_SIZE", "OP"],
-        "extra_checks": lambda t: (
-            # Dynamic path: construct_memory_view must carry a dynamic
-            # dimension (memref<?x...>) — the whole point of this variant
-            # is exercising the dynamic-shape lowering through
-            # LowerDescriptorMemory.
-            t.assert_result_type("ktdp.construct_memory_view", "memref<?x"),
-        ),
     },
     "dynamic_small": {
         # Different shape: verifies the compiled dynamic kernel runs at a
@@ -484,7 +401,6 @@ VARIANTS = {
             "bridge, producing `memref<?xf32>`. Reuses the same oracle "
             "as `dynamic` (via `make_inputs_scalar_dim`)."
         ),
-        "extra_checks": _make_1d_scalar_dim_checks,
     },
 
     # 2D
@@ -516,7 +432,6 @@ VARIANTS = {
             "DTYPE": ["fp32"], "OP": ["add"],
         },
         "inputs":       make_inputs_2d,
-        "extra_checks": _make_2d_checks,
     },
     "2d_dynamic": {
         "base":      "2d",
@@ -533,10 +448,6 @@ VARIANTS = {
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_N",
                          "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<?x?xf32>"),
-        ),
     },
     "2d_dynamic_alt": {
         # Different N than the static 2d sibling: confirms the compiled
@@ -584,7 +495,6 @@ VARIANTS = {
             "`memref<?x32xf32>`. Reuses the same `x + y` oracle as `2d` "
             "(via `make_inputs_2d_scalar_dim`)."
         ),
-        "extra_checks": _make_2d_scalar_dim_checks,
     },
 
     # 3D
@@ -613,7 +523,6 @@ VARIANTS = {
             "OP": ["add"],
         },
         "inputs":       make_inputs_3d,
-        "extra_checks": _make_3d_checks,
     },
     "3d_dynamic": {
         "base":      "3d",
@@ -628,10 +537,6 @@ VARIANTS = {
             "descriptor lowers to `memref<?x?x?xf32>`."
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<?x?x?xf32>"),
-        ),
     },
 
     # multi-axis grid
@@ -653,10 +558,6 @@ VARIANTS = {
         "params":       {"M": [256], "N": [128], "BLOCK_M": [16], "BLOCK_N": [16], "OP": ["add"]},
         "grid":         [4, 8],
         "inputs":       make_inputs_2d,
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<256x128xf32>"),
-        ),
     },
     "2d_grid_dynamic": {
         "base":      "2d_grid",
@@ -670,10 +571,6 @@ VARIANTS = {
             "Descriptors lower to `memref<?x?xf32>`."
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_N", "OP"],
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<?x?xf32>"),
-        ),
     },
     "3d_grid": {
         "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-3d", "num-programs-fold"],
@@ -697,10 +594,6 @@ VARIANTS = {
         },
         "grid":         [2, 4, 4],
         "inputs":       make_inputs_3d,
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<64x32x16xf32>"),
-        ),
     },
     "3d_grid_dynamic": {
         "base":      "3d_grid",
@@ -714,10 +607,6 @@ VARIANTS = {
             "Descriptors lower to `memref<?x?x?xf32>`."
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_N", "BLOCK_P", "OP"],
-        "extra_checks": lambda t: (
-            t.assert_result_type("ktdp.construct_memory_view",
-                                 "memref<?x?x?xf32>"),
-        ),
     },
 
 
@@ -752,7 +641,6 @@ VARIANTS = {
             "BLOCK_SIZE": [128],
         },
         "grid":         [1],
-        "parallel":     False,
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
@@ -790,7 +678,6 @@ VARIANTS = {
         "data_layout": "host",
         "rtol":        1e-2,
         "atol":        5e-2,
-        "extra_checks": _make_spyre_stick_checks,
     },
     "2d_spyre_stick_fp32": {
         # The same layout path one stick width down: fp32 sticks are 32 lanes, so
@@ -868,12 +755,10 @@ VARIANTS = {
             "BLOCK_SIZE": [128],
         },
         "grid":         [1],
-        "parallel":     False,
         "compiles_to_binary": True,
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
-        "extra_checks": None,
     },
     "1d_device_grid2": {
         # The multi-core counterpart of 1d_device: still one tile per core and
@@ -932,12 +817,10 @@ VARIANTS = {
             "BLOCK_M":  [64],
         },
         "grid":         [1],
-        "parallel":     False,
         "compiles_to_binary": True,
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
-        "extra_checks": None,
     },
 
 }

@@ -118,28 +118,27 @@ the degenerate path where `rows_per_core = m_blocks` and
 | `wide_slice`       |  128 | 256 | 16        | 128        | 64       | 192         | no   | larger `BLOCK_COLS` (size-dependent bugs)       |
 | `large_k`          |  512 | 64  | 128       | 32         | 16       | 48          | yes  | larger fan-out + duplicate indices              |
 
-All seven set `parallel: False` — `DistributeWork` is a no-op, so
-`test_work_distribution` is skipped. The whole index array is consumed
-in one `descriptor_gather`, so `K_INDICES` is the *total* number of
-rows gathered (not a tile size).
+None of the seven reads `tl.program_id`, so `DistributeWork` is a no-op
+on all of them. The whole index array is consumed in one
+`descriptor_gather`, so `K_INDICES` is the *total* number of rows
+gathered (not a tile size).
 
 ### 2D-tiled (`gather_2d_kernel`)
 
-| Variant                 | M    | N   | K_INDICES | BLOCK_ROWS × BLOCK_COLS | grid   | parallel | What it pins                                       |
-|-------------------------|------|-----|-----------|--------------------------|--------|----------|----------------------------------------------------|
-| `2d`                    | 1024 | 128 | 64        | 8 × 16                   | [4, 8] | True     | 2D `program_id` path, multi-tile-per-core loop     |
-| `2d_serial`             | 1024 | 128 | 64        | 8 × 16                   | [1, 1] | False    | degenerate 1-core path of the same kernel          |
-| `2d_large_table`        | 4096 | 256 | 64        | 8 × 32                   | [4, 8] | True     | same distribution at ~4× larger M and 2× wider N   |
-| `2d_large_table_serial` | 4096 | 256 | 64        | 8 × 32                   | [1, 1] | False    | degenerate 1-core path at large source dims        |
+| Variant                 | M    | N   | K_INDICES | BLOCK_ROWS × BLOCK_COLS | grid   | What it pins                                       |
+|-------------------------|------|-----|-----------|--------------------------|--------|----------------------------------------------------|
+| `2d`                    | 1024 | 128 | 64        | 8 × 16                   | [4, 8] | 2D `program_id` path, multi-tile-per-core loop     |
+| `2d_serial`             | 1024 | 128 | 64        | 8 × 16                   | [1, 1] | degenerate 1-core path of the same kernel          |
+| `2d_large_table`        | 4096 | 256 | 64        | 8 × 32                   | [4, 8] | same distribution at ~4× larger M and 2× wider N   |
+| `2d_large_table_serial` | 4096 | 256 | 64        | 8 × 32                   | [1, 1] | degenerate 1-core path at large source dims        |
 
-The two `parallel: True` variants run on all 32 Spyre cores
+The two multi-core variants run on all 32 Spyre cores
 (`prod(grid) = 32`); per-core work is identical (2 row tiles ×
 1 column tile). `2d_large_table` is a scale-up sanity check —
 per-core *tile count* is unchanged, only the data dimensions grow.
-The two `_serial` flavours skip `test_work_distribution` (no
-multi-program lowering to pin) but still run `test_numerical` against
-the NumPy oracle, and reuse the data shape + input generator of the
-corresponding parallel variant.
+The two `_serial` flavours drop to `grid = [1, 1]`; they run
+`test_numerical` against the NumPy oracle and reuse the data shape +
+input generator of the corresponding multi-core variant.
 
 ## Descriptor-based index loading
 

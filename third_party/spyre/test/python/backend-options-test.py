@@ -16,7 +16,7 @@ on the ``dbo-opt`` lit feature; the stage's tool-free surface is in
 The kernel these lower comes from the example registry the rest of the suite uses
 (``conftest.EXAMPLES``, discovered from ``test/fixtures/*/meta.py``), and the
 lowering itself is ``utils.compile_to_ttir`` + ``utils.make_ktir_mod`` — the same
-two calls ``KTIRStructuralTester`` makes. There is deliberately no local kernel and
+two calls ``KTIRCpuTester`` makes. There is deliberately no local kernel and
 no local lowering helper.
 """
 

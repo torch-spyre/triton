@@ -118,13 +118,6 @@ VARIANTS = {
         # f16 softmax: computation is f32 internally but the result
         # round-trips through f16 for store and oracle — leave room.
         "rtol":         1e-3,
-        "extra_checks": lambda t: (
-            # In-tile reduce + broadcast: max and sum each emit one
-            # linalg.reduce; the row_max - row subtraction emits a
-            # broadcast from [1] to [1, BLOCK_SIZE].
-            t.assert_count("linalg.reduce", 2),
-            t.assert_present("linalg.broadcast"),
-        ),
     },
     "multi_tile": {
         # 3-pass over n_tiles = N / BLOCK_N. Redeclares SIGNATURE because
@@ -163,11 +156,6 @@ VARIANTS = {
             # BLOCK_N=[32,64]: absorbs multi_tile_small_block (BLOCK_N=32).
             "M": [1000, 1024], "N": [1024], "BLOCK_N": [32, 64],
         },
-        "extra_checks": lambda t: (
-            # Three nested scf.for in the kernel body: outer rows-per-core,
-            # three inner N-tile passes (max, denom, normalize).
-            t.assert_count("scf.for", 4, cmp="ge"),
-        ),
     },
     "2pass": {
         # Online softmax: 2-pass, BLOCK_M × BLOCK_N tiled. Redeclares
@@ -206,12 +194,5 @@ VARIANTS = {
         # `%denom:2 = scf.for ... -> (T, T)` to a single value, so downstream
         # refs to %denom#0 / %denom#1 KeyError'd. MLIRFrontendParser exposes
         # per-result names and resolves them, so this now passes numerically.
-        "extra_checks": lambda t: (
-            # Pass 1 carries row_max + denom as iter_args through the
-            # N-loop; pass 2 is a plain N-loop. The fused pattern emits
-            # arith.mulf alongside the exp / sum that also appear in the
-            # other variants.
-            t.assert_present("math.exp", "arith.mulf", "arith.addf"),
-        ),
     },
 }
