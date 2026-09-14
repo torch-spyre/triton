@@ -13,8 +13,8 @@ view** (§3). The view itself is the target, not the subject — where the desig
 change it, §8 says so.
 
 It is **one lowering target, not the whole subject**. `LowerInterTile` gains a second mode
-and the existing `tt.inter_tile_reduce` path stays exactly as it is; §11 says what that
-path is and why it is not the design.
+and the existing `tt.inter_tile_reduce` path is left alone for now; §11 says how the two differ
+and why that one is expected to be deprecated.
 
 The communication in question is a **scratchpad relayout**: a tensor moving between
 two ownership arrangements while it stays resident in the scratchpad. Both sides are
@@ -61,35 +61,40 @@ extent there is replaced by the union over partitions. A share holding 128 rows 
 tensor composes to 512 rows, and a gathered 512×128 is still 512×128. The rank is never
 changed, and the composed domain is a true statement of where data lives.
 
-A **work slice table** is a list of dicts. Each dict holds one grid coordinate: one key
-per dimension the work was divided along, mapping to a slice index on it. Every element
-carries the same keys. It is what `tl.inter_tile` already accepts as `work_slices`.
-
-The same kind of list appears in **two roles**, and they differ in length:
-
-| Role | Indexed by | Length | Read by |
-|---|---|---|---|
-| tile → coordinate | tile id | `prod(grid)` | `tl.wk_slice_coord` |
-| partition → region | partition number | number of partitions | the compose |
-
-The first says where each tile sits in the grid; every tile needs an element, so its length
-is a launch obligation. The second says which regions a view is composed from — one element
-per **region**, not per tile. A tensor held by 8 of 32 cores gives a list of 8, and a
-broadcast source gives a list of 1. Conflating the two would force every source
-distribution to span the whole grid, which is the case broadcast is not.
-
-A partition's **holder** is found by matching the two: the tile whose coordinate dict equals
-the partition's dict is the core whose scratchpad holds it. So both lists are in play even
-though only the second is passed to the compose.
-
-The slice count along a dimension is not declared alongside the table; it is one more than
-the largest index appearing for that key anywhere in the list. That count is what turns a
-coordinate into a region.
-
-Eight tiles, work divided four ways on `x` and two ways on `n`:
+**`work_slices`** is a map from tile id to the region that tile holds. Each value is one
+coordinate: one key per dimension the work was divided along, mapping to a slice index on it.
+Every value carries the same keys.
 
 ```python
-work_slices = [{"x": t // 2, "n": t % 2} for t in range(8)]
+work_slices = {k:     {"out": k} for k in range(8)}    # region k on tile k
+work_slices = {2 * k: {"mb": k}  for k in range(16)}   # region k on tile 2k
+```
+
+**Tile ids need not be contiguous**, and nothing derives them — they are the keys. The values
+plus `axes` give each region's coordinates but say nothing about where a region lives, while
+the compose must emit one view per region with a distinct `ct_id`.
+
+The second case is a measured one, and it is what forces this. A `{mb: 512, in: 4096}` tensor is
+held as sixteen regions of `{mb: 32}`, one owner each, and the owners are the **even** tiles:
+`0, 2, 4 … 30`. The odd tiles hold no region of it at all — several of them receive without ever
+producing. Neither positional form reaches that. Sixteen entries would claim the holders are
+`0 .. 15`, wrong for every entry but the first; thirty-two entries would need sixteen holes, and
+since every value carries the same keys there is no spelling for "nothing".
+
+This is what KTDP's attribute has always been called — `coreIdToWkSlice`, tile id to work
+slice — now meant literally rather than implied by position.
+
+**Dim ids are the opposite: dense from 0.** Every index under a division key runs from 0 with
+no gaps, which is what lets the slice count be read off rather than declared — it is one more
+than the largest index appearing for that key anywhere in the map. That count does two things:
+with the extents it turns a coordinate into a region, and with the share's own extent it gives
+the composed domain, `count × share extent` on each divided dimension, which is how the
+composed shape is known without being passed.
+
+Eight regions, divided four ways on `x` and two ways on `n`, one region per tile:
+
+```python
+work_slices = {t: {"x": t // 2, "n": t % 2} for t in range(8)}
 
 # tile 0 -> {"x": 0, "n": 0}     tile 4 -> {"x": 2, "n": 0}
 # tile 1 -> {"x": 0, "n": 1}     tile 5 -> {"x": 2, "n": 1}
@@ -98,12 +103,12 @@ work_slices = [{"x": t // 2, "n": t % 2} for t in range(8)]
 ```
 
 `x` has four slices and `n` has two — one more than the largest index under each key, and
-neither count written down. With extents `{x: 512, n: 128}` the slices are 128 and 64 wide,
-so tile 5, at `{x: 2, n: 1}`, owns `x[256:384]` by `n[64:128]`. That projection is all the
-lowering needs from the table, and §3 does exactly it.
+neither count written down. With extents `{x: 512, n: 128}` the shares are 128 and 64 wide, so
+tile 5, at `{x: 2, n: 1}`, holds `x[256:384]` by `n[64:128]`. That projection is all the
+lowering needs, and §3 does exactly it.
 
-A redistribution needs only the **source** list. The destination arrangement is the offsets
-each instance passes when it reads — see §2.
+Only the **source** side has a map. The destination arrangement is the offsets each instance
+passes when it reads — see §2.
 
 The **stick** is the hardware's contiguous innermost unit, 128 bytes, so `S = 128 /
 itemsize` — 64 for fp16. Written `S` throughout, as in
@@ -130,7 +135,7 @@ itemsize` — 64 for fp16. Written `S` throughout, as in
    index is impractical.
 7. **The participant set is statically known.** Every instance that contributes must reach
    the constructor with a value. Unconditional is fine, and so is a predicate on
-   `tl.wk_slice_coord`; a data-dependent predicate is not.
+   the tile id; a data-dependent predicate is not.
 
 ## 2. What the kernel provides
 
@@ -148,22 +153,33 @@ mine       = whole_desc.load([dest_offset_m, dest_offset_n])   # my share under 
 | Piece | Where it lives | What it carries |
 |---|---|---|
 | my **share** | `partial`, a value | the data this instance contributes |
-| partition → **region** | `work_slices` | which regions the view is composed from |
+| tile id → **region** | `work_slices` | which tile holds which region |
 | dim → **key** | `axes` | which tensor dimension each partition key indexes |
 | **extent** of one access | `block_shape` | what I take per `.load()` |
 | memory-space **kind** | `tl.spyre_tensor_layout` | `global` \| `ct_local` |
 | the N **views** | the lowering | `construct_memory_view` + `ct_id`, then the compose |
 
-The kernel body needs **no** `ct_id` and no knowledge of the grid. Holder identities are
-derived during lowering by matching partition coordinates against the launch table (§1),
-which is what keeps the global vantage out of a kernel that only knows its own
-`program_id`.
+The kernel body names holders but never enumerates the grid: it states which tile holds each
+region and nothing more — no branching on tile id, no grid shape, no knowledge of what any
+other instance does. The lowering turns those statements into one `construct_memory_view` per
+region with its `ct_id` (§3), which is what keeps the global vantage out of a kernel that
+otherwise knows only its own `program_id`.
 
-**There is no destination table.** The destination arrangement is the offset each instance
-passes to `.load()`, computed from its own `tl.wk_slice_coord`. Every instance reads a
-different region of the same composed descriptor, and that difference *is* the relayout.
-This is not a convenience: `construct_access_tile` takes **runtime** base indices, so the
-lowering passes the offset straight through and never has to recover a table from it.
+**There is no destination table.** Two things state that side, and neither is an input to the
+compose or a verification target.
+
+The **set** — which instances end up holding a copy — is stated by a guard: no guard means
+every instance, and a guard on the tile id names a subset. The **arrangement** — which region
+each of them holds — is the offset that instance passes to `.load()`, computed however the
+kernel likes, whether plain arithmetic like `pid // 4` or a lookup of its own. That a kernel
+may use a table does not make one part of this interface.
+
+`construct_access_tile` takes **runtime** base indices, so the lowering passes the offset
+straight through and never has to recover a table from it.
+
+**Replication is not expressed at all**, and that is the point: the factor *is* the number of
+instances that pass the same offset. Four instances resolving to one region means that region
+has four holders. Nothing declares it, and irregular replication needs nothing either.
 
 **Each pattern is a use, not a mode.** Gather reads the assembled region; scatter indexes a
 slice; broadcast indexes the same region on every instance; a fold reduces over the
@@ -211,15 +227,15 @@ constrains the signature, not the body.
 ## 3. Phases
 
 The lowering runs in three phases, stated as a contract per phase. Its inputs are the
-partition list, `axes`, `block_shape`, the tensor's extents and the memory-space attribute;
+source map, `axes`, `block_shape`, the tensor's extents and the memory-space attribute;
 its output is the redistributed data resident in each consumer's own scratchpad.
 
 **Phase 1 — build the source view.**
-Input: the partition list, `axes`, the extents, and the memory space.
+Input: the source map, `axes`, the extents, and the memory space.
 Lowering: turn each partition's coordinate into the region it owns, exactly as the §1
 example does — slice width is the extent divided by the slice count, and the coordinate
-picks which slice, with `axes` saying which tensor dimension each key indexes. Resolve the
-holder by matching that coordinate against the launch table. Emit one
+picks which slice, with `axes` saying which tensor dimension each key indexes. Read the
+holder off the entry's key (§1). Emit one
 `construct_memory_view` per partition with the region as `coordinate_set` and the holder as
 `ct_id`, then compose them with `construct_distributed_memory_view`.
 Output: one distributed view whose domain is the composed whole, and which knows for every
@@ -254,7 +270,7 @@ reduction, a value.
 Worked example for phase 1. Eight partitions, `out` divided eight ways, `x` uncut:
 
 ```
-partition list        [{"out": 0}, {"out": 1}, ..., {"out": 7}]
+source map            {0: {"out": 0}, 1: {"out": 1}, ..., 7: {"out": 7}}
 extents               {out: 512, x: 64}
 slice width           512 / 8 = 64 on out; x is whole
 => partition 3 owns   out[192:256] by x[0:64], held by the tile at {"out": 3}
@@ -263,7 +279,7 @@ slice width           512 / 8 = 64 on out; x is whole
 ### Where the phases live
 
 `LowerInterTile` gains a second mode. The existing path — `tt.inter_tile_reduce` to
-`ktdp.inter_tile_produce` plus a delivery op — is not removed. §11.
+`ktdp.inter_tile_produce` plus a delivery op — is not removed yet; §11 says when it should be.
 
 ## 4. The pull model
 
@@ -335,10 +351,10 @@ holder on the read side: no source region lists more than one owner, and no two 
 regions overlap. Replication appears on the destination side — 97 of 130 records, up to 32
 holders — where each holder writes and reads its own copy locally.
 
-## 6. Why the partition list stays a table
+## 6. Why ownership stays tabulated
 
 What the measured patterns rule out is deriving ownership from **axis counts** — an axis
-name and a slice count, which is the form `tl.inter_tile`'s `axis` parameter has. Ownership
+name and a slice count, which is the form a named collective takes (§11). Ownership
 is frequently strided rather than contiguous. In the measured records the cores feeding one
 destination region sit two apart (cores 0 and 2, then 4 and 6, and so on), or eight apart
 (0, 8, 16 and 24), or are drawn only from the even-numbered cores. No axis count reproduces
@@ -447,10 +463,10 @@ The kernel states it with a guard, and one mechanism spans the whole lattice:
 ```python
 total = tl.sum(grp.load([0, 0, 0]), axis=0)          # all: every instance holds it
 
-if tl.wk_slice_coord(WS, "p") == 0:                  # one
+if tl.program_id(0) == 0:                            # one
     total = tl.sum(grp.load([0, 0, 0]), axis=0)
 
-if tl.wk_slice_coord(WS, "p") < 4:                   # a subset -- no mode spells this
+if tl.program_id(0) < 4:                             # a subset
     total = tl.sum(grp.load([0, 0, 0]), axis=0)
 ```
 
@@ -520,8 +536,8 @@ reduction that splits the reduction dimension.
    meant as reduce-to-one. Proposed: sink the fold and its load into the guard wherever the
    value has that single conditional use, and diagnose where sinking is blocked, because a
    missed sink is silent, correct, and pays all-reduce cost. Sinking is legal when the
-   predicate is analyzable — `tl.wk_slice_coord`'s column is `constexpr`, so the surviving
-   instances are derivable — and nothing writes the source between the load and the guard.
+   predicate is analyzable — a comparison on the tile id, so the surviving instances are
+   derivable — and nothing writes the source between the load and the guard.
 
 ## 9. Designs rejected
 
@@ -547,42 +563,52 @@ The lowering should refuse, rather than guess:
 
 - **A tile → coordinate table whose length does not match the launch grid.** `prod(grid)
   == len(work_slices)` is a launch obligation the kernel body cannot enforce. It binds that
-  role only — a partition → region list is as long as there are regions, which may be
-  fewer than the grid.
+  role only — the source map has one entry per region, which may be far fewer than the
+  grid.
 - **A work slice table with differing key sets** across its elements — every element of a
   `work_slices` list must have identical keys.
 - **An `axes` entry naming a key no partition dict carries**, or a partition key that
   `axes` never places. The two have to agree, and neither can be inferred from the other.
-- **A partition coordinate matching no tile.** The holder is found by matching against the
-  launch table (§1); an unmatched coordinate names a share nobody holds.
+- **A source key outside the launch grid.** The key is the holder (§1), and a tile the launch
+  never creates names a share nobody holds.
+- **A gap in a dimension's indices.** Dim ids are dense from 0 (§1); a missing index leaves a
+  region with no holder and makes the slice count wrong.
 - **A `ct_id` on a `global` memory space.** `ct_id` is meaningful only for `ct_local`.
 - **A reducer region that is not known to be commutative**, where the reduction is over a
   distributed view. This is decision 2's residual case: order-freedom needs commutativity
   as well as associativity, and a custom region can supply neither. With no order to
   promise, the lowering should say so rather than quietly pick one.
 
-## 11. `tl.inter_tile`, the alternative
+## 11. How this differs from `tl.inter_tile`, which it supersedes
 
-`tl.inter_tile(x, axis, combiner, mode, work_slices=...)` is the shipped surface: one named
-collective call, a `mode` enum, one work-slice table, and a tensor result.
+`tl.inter_tile(x, axis, combiner, mode, work_slices=...)` is the shipped surface for cross-core
+reduction: one named collective call, a `mode` enum, and a tensor result. It is expected to be
+**deprecated**, because every mode it offers is a use of the descriptor (§7) while the copy
+family is not expressible through it at all.
 
-**What lowers today.** `all_reduce` and `reduce_to_one`. `reduce_scatter` and `broadcast`
+**Its `work_slices` is a different shape, and that is the difference to keep straight.** There
+it is a positional list with one element per tile, dense over the grid, so
+`len(work_slices) == prod(grid)` is a launch obligation and position carries the tile id;
+`tl.wk_slice_coord` reads it at `program_id`, letting a kernel recover its own coordinate
+without hand-coding a radix. That form works because the list is **complete** — every tile
+appears, so nothing is left implicit. The map of §1 is never complete: only holders appear, and
+they need not be contiguous. A complete enumeration may use position; a partial one must name
+its keys, which is why the two have different shapes rather than this being a matter of taste.
+
+**What lowers there today.** `all_reduce` and `reduce_to_one`. `reduce_scatter` and `broadcast`
 are accepted by the Python surface and rejected by the pass
 ([`LowerInterTile.cpp:340-346`](../lib/Dialect/KTDP/Transforms/LowerInterTile.cpp)), as are
 custom combiner regions (`:356`), non-contiguous groups (`:180-183`) and non-uniform `pick0`
-layouts for `reduce_to_one` (`:253-255`).
+layouts for `reduce_to_one` (`:253-255`). Two of the four modes it declares do not work.
 
-**Its advantage.** It names the collective, so nothing has to be recognized: `mode` maps
-directly onto the produce/delivery pair, and the K-split matmul reduce ring is validated
-through it at `SENCORES` 4 and 8.
+**What naming the collective buys, and does not.** It buys directness: `mode` maps onto the
+produce/delivery pair with nothing to recognize, and the K-split matmul reduce ring is validated
+through it at `SENCORES` 4 and 8. It does not buy expressiveness. Provenance already identifies
+a fold (§7) without committing to one lowering — a mode picks the delivery pair, where
+provenance leaves ring, tree and direct transfer available — and a mode per pattern does not
+scale to the copy family, where gather, scatter, all-to-all, relocation and broadcast would each
+need one while the descriptor needs none.
 
-**Why it is not the design.** Naming buys less than it appears to, because provenance
-already identifies the fold (§7) and does so without committing to one lowering — a mode
-picks the delivery pair, where provenance leaves ring, tree and direct transfer all
-available. And naming does not scale to the copy family: gather, scatter, all-to-all,
-relocation and broadcast would each need a mode, where a descriptor needs none. Two of the
-four modes already declared do not lower.
-
-**Why it stays anyway.** Sequencing, not design. It works and is validated; the descriptor
-path lowers not at all. Retire it when the descriptor path passes the same tests — not
-before, and without extending it in the meantime.
+**When to retire it.** When the descriptor path passes the tests `tl.inter_tile` passes now —
+not before, and without extending it in the meantime. It works today and the descriptor path
+lowers not at all, so sequencing is the only argument for keeping it.
