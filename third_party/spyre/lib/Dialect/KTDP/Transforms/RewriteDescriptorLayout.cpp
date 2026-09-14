@@ -83,6 +83,8 @@ Value applyCoordOp(OpBuilder &b, Location loc, Value logicalIdx,
     Value c = arith::ConstantOp::create(b, loc, b.getIndexAttr(arg));
     return arith::RemSIOp::create(b, loc, logicalIdx, c).getResult();
   }
+  case CoordOp::Broadcast:
+    llvm_unreachable("planPhysicalization rejects broadcast markers");
   }
   llvm_unreachable("invalid CoordOp");
 }
@@ -93,6 +95,8 @@ AffineExpr applyCoordOpExpr(AffineExpr expr, CoordOp op, int64_t arg) {
   case CoordOp::Identity: return expr;
   case CoordOp::FloorDiv: return expr.floorDiv(arg);
   case CoordOp::Mod:      return expr % arg;
+  case CoordOp::Broadcast:
+    llvm_unreachable("planPhysicalization rejects broadcast markers");
   }
   llvm_unreachable("invalid CoordOp");
 }
@@ -478,6 +482,8 @@ struct RewriteDescriptorLayoutPass
       case CoordOp::Identity: piece = v;       break;
       case CoordOp::FloorDiv: piece = v * arg; break;
       case CoordOp::Mod:      piece = v;       break;
+      case CoordOp::Broadcast:
+        llvm_unreachable("planPhysicalization rejects broadcast markers");
       }
 
       logicalFromPhysical[L] =
@@ -643,6 +649,18 @@ struct RewriteDescriptorLayoutPass
     plan.physRank = plan.physSrc.size();
     plan.memViewOp = memViewOp;
     plan.memView = memView;
+
+    // This pass predates CoordOp::Broadcast and handles only the three ops that
+    // partition a logical dim. Its coord-op switches are exhaustive over those
+    // three with no default, so a Broadcast marker would reach an unreachable or
+    // leave a coordinate expression unset. Reject it here — the one place every
+    // marker this pass acts on passes through — rather than at each switch.
+    for (unsigned k = 0; k < plan.physRank; ++k)
+      if (static_cast<CoordOp>(plan.physOp[k]) == CoordOp::Broadcast)
+        return marker.emitError("spyre_tensor_layout: physical dim ")
+               << k
+               << " is a broadcast; rewrite-descriptor-layout does not support "
+                  "broadcast dims (use rewrite-descriptor-layout-generic)";
 
     LLVM_DEBUG({
       llvm::dbgs() << "[rewrite-descriptor-layout] physicalizing: physRank="
