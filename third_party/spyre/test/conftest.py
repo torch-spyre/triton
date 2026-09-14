@@ -23,7 +23,6 @@ Quick-reference
 - :data:`EXAMPLES`              — registry of example kernels discovered
                                   from ``test/fixtures/*/meta.py``
 - :class:`KTIRCpuTester`        — EXAMPLE-based setup + numerical CPU execution
-- :class:`SinglePassTester`     — run one pass on inline MLIR text
 
 Most shared machinery (``OpInfo``, ``walk_module``, ``make_ktir_mod``,
 ``compile_to_ttir``) lives in :mod:`utils` — this file re-exports the names
@@ -792,92 +791,11 @@ class KTIRCpuTester:
 
 
 # ---------------------------------------------------------------------------
-# SinglePassTester — run one pass on inline MLIR text
-# ---------------------------------------------------------------------------
-
-class SinglePassTester:
-    """Base class for unit-testing individual lowering passes.
-
-    Subclass, set ``PASS`` to a pass-adder function name under
-    ``spyre.passes.ttir_to_ktdp``, and call :meth:`run` with inline MLIR.
-
-    Example::
-
-        class TestSplat(SinglePassTester):
-            PASS = "add_lower_compute_ops"
-
-            def test_f32(self):
-                self.run('''
-                module {
-                  tt.func @k(%s: f32) {
-                    %0 = tt.splat %s : f32 -> tensor<4xf32>
-                    tt.return
-                  }
-                }
-                ''')
-                self.assert_present("linalg.fill")
-                self.assert_absent("tt.splat")
-    """
-
-    PASS: str = None
-
-    def _build_passes(self, pm):
-        """Install the passes to run on the test module.
-
-        Default behaviour is to add the single pass named by ``self.PASS``.
-        Subclasses needing a multi-pass pipeline (e.g. DistributeWork,
-        which requires ``add_convert_functions`` first) override this and
-        install whatever sequence of passes they need on *pm*.
-        """
-        from triton._C.libtriton import spyre
-        getattr(spyre.passes.ttir_to_ktdp, self.PASS)(pm)
-
-    def _setup_pass(self, mlir_text: str):
-        """Parse *mlir_text* and prepare a pass manager. Returns ``(mod, pm)``.
-
-        Subclasses should not need to override this. Override
-        :meth:`_build_passes` to customise the pass pipeline.
-        """
-        from triton._C.libtriton import ir
-        from triton.backends.compiler import GPUTarget
-        from backend.compiler import SpyreBackend
-
-        target = GPUTarget(backend="spyre", arch=1, warp_size=1)
-        backend = SpyreBackend(target)
-
-        ctx = ir.context()
-        ir.load_dialects(ctx)
-        backend.load_dialects(ctx)
-
-        with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".mlir", delete_on_close=False) as f:
-            f.write(mlir_text)
-            f.flush()
-            mod = ir.parse_mlir_module(f.name, ctx)
-
-        mod.context = ctx
-
-        pm = ir.pass_manager(ctx)
-        self._build_passes(pm)
-        return mod, pm
-
-    def run(self, mlir_text: str):
-        """Parse *mlir_text*, run the configured passes, populate ``self.ops``."""
-        mod, pm = self._setup_pass(mlir_text)
-        pm.run(mod, self.PASS or type(self).__name__)
-
-        self.mod = mod
-        self.ops = walk_module(self.mod)
-        self._def_map = None
-        return self.ops
-
-
-# ---------------------------------------------------------------------------
 # Fixtures for the spyrecode stage (a compiled Spyre binary)
 # ---------------------------------------------------------------------------
 
 #: Variants that reach a Spyre *binary*, not just KTIR -- declared per variant in
-#: meta.py as ``compiles_to_binary``, the same way ``parallel`` is. Most kernels
+#: meta.py as ``compiles_to_binary``, alongside the other per-variant keys. Most kernels
 #: distribute tiles with an scf.for over the program id and dbo-opt refuses the
 #: loop it outlines from that, so today exactly one qualifies. The fixtures below
 #: parametrize over whatever is declared, so adding a second extends the
