@@ -106,6 +106,40 @@ struct CoordMap {
   }
 };
 
+/// Name of a coord op, for the trace.
+const char *coordOpName(CoordOp op) {
+  switch (op) {
+  case CoordOp::Identity:
+    return "id";
+  case CoordOp::FloorDiv:
+    return "stick";
+  case CoordOp::Mod:
+    return "lane";
+  case CoordOp::Broadcast:
+    return "bcast";
+  }
+  return "?";
+}
+
+/// Print a coord map as one physical dim per entry, each naming the logical dim
+/// it came from, the coord op that made it, and the op's argument where the
+/// argument means something. This is the whole layout in one line, which is what
+/// lets a reader check the marker against the shape derived from it below.
+///
+/// Reached only from an LLVM_DEBUG body, so a release build has no caller left;
+/// [[maybe_unused]] keeps that from warning.
+[[maybe_unused]] void printCoordMap(llvm::raw_ostream &os, const CoordMap &cm) {
+  os << "logical rank " << cm.logicalRank << " -> phys [";
+  for (unsigned p = 0, e = cm.physRank(); p < e; ++p) {
+    if (p)
+      os << ", ";
+    os << "d" << cm.src[p] << ":" << coordOpName(cm.opAt(p));
+    if (cm.opAt(p) != CoordOp::Identity)
+      os << "(" << cm.arg[p] << ")";
+  }
+  os << "]";
+}
+
 /// Read the coord map off a marker, checking phys_src against `logicalRank`.
 FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
                                  unsigned logicalRank) {
@@ -748,6 +782,10 @@ struct RewriteDescriptorLayoutGenericPass
     if (failed(verifyNothingDropped(tileOp, physTile)))
       return failure();
 
+    LLVM_DEBUG(llvm::dbgs()
+               << "    access tile " << tileOp.getResult().getType() << " -> "
+               << physTile.getResult().getType() << "\n");
+
     for (Operation *user :
          llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
       if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
@@ -965,6 +1003,22 @@ struct RewriteDescriptorLayoutGenericPass
         buildRangeSetND(ctx, physBlock),
         AffineMap::getMultiDimIdentityMap(physRank, ctx));
 
+    // The subscript maps are what the substitution rewrote, and they are stated
+    // over the refined variable space, so they are the output worth reading:
+    // everything else about an indirect tile carries across unchanged.
+    LLVM_DEBUG({
+      llvm::dbgs() << "    indirect tile " << tileOp.getResult().getType()
+                   << " -> " << physTile.getResult().getType() << ", "
+                   << numCaptured << " captured + " << physRank
+                   << " intermediate variable(s)\n";
+      for (unsigned p = 0; p < physRank; ++p)
+        llvm::dbgs() << "      phys dim " << p << " (from d" << cm.src[p] << ":"
+                     << coordOpName(cm.opAt(p)) << ")"
+                     << (cast<BoolAttr>(newKinds[p]).getValue() ? " ind" : "")
+                     << " subscript "
+                     << cast<AffineMapAttr>(newMaps[p]).getValue() << "\n";
+    });
+
     for (Operation *user :
          llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
       if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
@@ -1002,6 +1056,12 @@ struct RewriteDescriptorLayoutGenericPass
     if (failed(cm))
       return failure();
 
+    LLVM_DEBUG({
+      llvm::dbgs() << "  descriptor at " << marker.getLoc() << ": ";
+      printCoordMap(llvm::dbgs(), *cm);
+      llvm::dbgs() << "\n";
+    });
+
     // Read the tiles before mutating anything: physicalizing the view does not
     // move them, but erasing one invalidates a walk over the users.
     SmallVector<mlir::ktdp::ConstructAccessTilesOp> tiles;
@@ -1016,6 +1076,12 @@ struct RewriteDescriptorLayoutGenericPass
     auto physMemView = physicalizeMemView(memViewOp, *cm, marker);
     if (failed(physMemView))
       return failure();
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "    view " << memViewOp.getResult().getType() << " -> "
+               << physMemView->getType() << ", " << tiles.size()
+               << " direct tile(s), " << indirectTiles.size()
+               << " indirect tile(s)\n");
 
     for (auto tile : tiles)
       if (failed(physicalizeAccessTile(tile, *physMemView, *cm, marker)))
@@ -1054,6 +1120,44 @@ struct RewriteDescriptorLayoutGenericPass
     return !ty || ty.getRank() == (int64_t)cm->physRank();
   }
 
+  /// Why `op` is inconsistent, or an empty string when it is not — so this is
+  /// both the consistency test and its explanation.
+  ///
+  /// One function rather than two so the two cannot drift: an op the guard
+  /// rejects always has a reason to print, and a reason printed is always the
+  /// one the guard acted on.
+  std::string inconsistencyReason(linalg::GenericOp op) {
+    std::string reason;
+    llvm::raw_string_ostream os(reason);
+    for (auto [i, v] : llvm::enumerate(op->getOperands()))
+      if (!atPhysicalRank(v)) {
+        os << "operand " << i << " is " << v.getType() << " but its layout "
+           << "prescribes physical rank " << layoutFor(v)->physRank();
+        return reason;
+      }
+    for (auto [i, v] : llvm::enumerate(op->getResults()))
+      if (!atPhysicalRank(v)) {
+        os << "result " << i << " is " << v.getType() << " but its layout "
+           << "prescribes physical rank " << layoutFor(v)->physRank();
+        return reason;
+      }
+    // Every map must have one result per dim of the operand it addresses, and
+    // all of them must share one loop domain. A rank the operands have moved
+    // past is exactly the state where an operand was retyped and this op has
+    // not caught up.
+    for (auto [i, map, operand] :
+         llvm::enumerate(op.getIndexingMapsArray(), op->getOperands())) {
+      auto ty = dyn_cast<RankedTensorType>(operand.getType());
+      if (ty && map.getNumResults() != (unsigned)ty.getRank()) {
+        os << "indexing map " << i << " (" << map << ") has "
+           << map.getNumResults() << " result(s) but operand " << i << " is "
+           << ty;
+        return reason;
+      }
+    }
+    return reason;
+  }
+
   /// Is this op consistent, given its inputs and outputs?
   ///
   /// This is simultaneously the rewrite's guard and its postcondition, which is
@@ -1071,23 +1175,7 @@ struct RewriteDescriptorLayoutGenericPass
   /// very rewrite. Asking whether they are stated at the right rank compares
   /// them against the types, which come from the markers, so it is not.
   bool isConsistent(linalg::GenericOp op) {
-    for (Value v : op->getOperands())
-      if (!atPhysicalRank(v))
-        return false;
-    for (Value v : op->getResults())
-      if (!atPhysicalRank(v))
-        return false;
-    // Every map must have one result per dim of the operand it addresses, and
-    // all of them must share one loop domain. A rank the operands have moved
-    // past is exactly the state where an operand was retyped and this op has
-    // not caught up.
-    for (auto [map, operand] :
-         llvm::zip_equal(op.getIndexingMapsArray(), op->getOperands())) {
-      auto ty = dyn_cast<RankedTensorType>(operand.getType());
-      if (ty && map.getNumResults() != (unsigned)ty.getRank())
-        return false;
-    }
-    return true;
+    return inconsistencyReason(op).empty();
   }
 
   /// Give `v` the layout `cm`, and report whether that is new information.
@@ -1148,6 +1236,41 @@ struct RewriteDescriptorLayoutGenericPass
 
     SmallVector<utils::IteratorType> physIterators =
         rebuildIterators(op.getIteratorTypesArray(), *dom);
+
+    // The rebuild is where a wrong answer would originate, so the trace shows
+    // all three of its parts together: the domain each logical dim expanded
+    // into, and every operand's map before and after. Read side by side they say
+    // whether a map result landed on the loop dim the domain assigned it.
+    LLVM_DEBUG({
+      llvm::dbgs() << "    rebuilding at " << op.getLoc() << ": " << numLoops
+                   << " logical loop dim(s) -> " << dom->numLoopDims << "\n";
+      for (unsigned d = 0; d < numLoops; ++d) {
+        llvm::dbgs() << "      logical d" << d << " -> ";
+        if (dom->isSplit(d))
+          llvm::dbgs() << "stick d" << dom->stickDim[d] << " + lane d"
+                       << dom->elemDim[d] << " at width " << dom->width[d];
+        else
+          llvm::dbgs() << "whole d" << dom->stickDim[d];
+        llvm::dbgs() << "\n";
+      }
+      for (auto [i, o] : llvm::enumerate(rebuildOperands)) {
+        for (unsigned p = 0, e = o.broadcastDim.size(); p < e; ++p)
+          if (o.broadcastDim[p] >= 0)
+            llvm::dbgs() << "      operand " << i << " broadcast phys dim " << p
+                         << " -> fresh loop d" << o.broadcastDim[p] << "\n";
+        llvm::dbgs() << "      operand " << i << " " << o.logicalMap << " -> "
+                     << physMaps[i];
+        if (!o.layout)
+          llvm::dbgs() << " (no layout, stays logical)";
+        llvm::dbgs() << "\n";
+      }
+      llvm::dbgs() << "      iterators [";
+      llvm::interleaveComma(physIterators, llvm::dbgs(),
+                            [&](utils::IteratorType t) {
+                              llvm::dbgs() << utils::stringifyIteratorType(t);
+                            });
+      llvm::dbgs() << "]\n";
+    });
 
     // Retype each operand that is not yet at its physical rank. A value with a
     // layout but no producer this pass can retype is a chain the rewrite cannot
@@ -1228,6 +1351,14 @@ struct RewriteDescriptorLayoutGenericPass
       cst.getResult().setType(physTy);
       return success();
     }
+    LLVM_DEBUG({
+      llvm::dbgs() << "    decline: cannot restate ";
+      if (Operation *d = v.getDefiningOp())
+        llvm::dbgs() << d->getName() << " at " << d->getLoc();
+      else
+        llvm::dbgs() << "block argument " << v;
+      llvm::dbgs() << " as " << physTy << "\n";
+    });
     return v.getDefiningOp()
                ? v.getDefiningOp()->emitError(
                      "rewrite-descriptor-layout-generic: this op produces a "
@@ -1271,6 +1402,10 @@ struct RewriteDescriptorLayoutGenericPass
     // producer has not caught up yet changes nothing else and the driver must
     // not read that as a fixpoint.
     progress = assignLayout(store.getDataTile(), *cm) || progress;
+    LLVM_DEBUG(llvm::dbgs()
+               << "    store at " << store.getLoc() << ": data tile " << dataTy
+               << " -> " << *physTy
+               << ", pulled from the access tile's iteration shape\n");
     OpBuilder b(store);
     return retypeToPhysical(store.getDataTile(), *physTy, b);
   }
@@ -1304,19 +1439,47 @@ struct RewriteDescriptorLayoutGenericPass
       // Stores first: a store is the only op that can start the backward
       // direction, and doing it first saves a round on every chain that has
       // one.
-      for (auto st : stores)
-        if (failed(rewriteStore(st, changed)))
+      // Split out per store rather than accumulating into `changed` directly,
+      // so the trace can say how many stores contributed rather than only that
+      // one did. `changed` ends up the same disjunction either way.
+      unsigned storesProgressed = 0, genericsFired = 0;
+      for (auto st : stores) {
+        bool storeProgress = false;
+        if (failed(rewriteStore(st, storeProgress)))
           return failure();
+        changed |= storeProgress;
+        storesProgressed += storeProgress;
+      }
       for (auto g : generics) {
         if (isConsistent(g))
           continue;
+        LLVM_DEBUG(llvm::dbgs() << "  round " << round
+                                << ": generic inconsistent at " << g.getLoc()
+                                << ": " << inconsistencyReason(g) << "\n");
         if (failed(rewriteGeneric(g)))
           return failure();
         changed = true;
+        ++genericsFired;
       }
+      LLVM_DEBUG(llvm::dbgs()
+                 << "  round " << round << ": " << storesProgressed << " of "
+                 << stores.size() << " store(s) recorded new layout, "
+                 << genericsFired << " of " << generics.size()
+                 << " generic(s) rewritten\n");
       if (!changed)
         return checkAllConsistent(module);
     }
+    // Naming the condition is not enough to act on: the culprit is whichever op
+    // the guard still rejects after the cap, so list those before the error.
+    LLVM_DEBUG({
+      llvm::dbgs() << "  cap of " << cap << " round(s) exhausted; still "
+                   << "inconsistent:\n";
+      module.walk([&](linalg::GenericOp g) {
+        std::string reason = inconsistencyReason(g);
+        if (!reason.empty())
+          llvm::dbgs() << "    " << g.getLoc() << ": " << reason << "\n";
+      });
+    });
     return module.emitError("rewrite-descriptor-layout-generic: the rewrite did "
                             "not reach a fixpoint; an op is not falsifying the "
                             "consistency guard");
@@ -1336,6 +1499,23 @@ struct RewriteDescriptorLayoutGenericPass
   /// neither this pass nor what it could not handle. A named linalg.matmul is
   /// the case that matters today: LowerComputeOps still emits one for tt.dot,
   /// and this pass rewrites only generics.
+  ///
+  /// TODO: this looks redundant against checkAllConsistent's non-generic branch —
+  /// near-identical wording, and both reject a non-generic reading a
+  /// physicalized value — but the two ask different questions and cannot simply
+  /// be merged. This one is STRUCTURAL: is the consumer a kind the rewrite knows
+  /// how to restate, which is answerable at any time. checkAllConsistent is
+  /// about STATE: has this op been brought to physical rank, which is only
+  /// meaningful once the rewrite has run, because before Phase 1 nothing is at
+  /// physical rank and the state test therefore reports every ordinary kernel as
+  /// an error. What is genuinely duplicated is the TRAVERSAL, not the predicate:
+  /// this check needs its own marker -> memview -> tile -> load walk only because
+  /// `layoutOf` is seeded during Phase 1's mutation and so is empty beforehand.
+  /// Two ways to remove that, neither collapsing to one function: seed
+  /// `layoutOf` in a pre-pass sharing physicalizeDescriptor's pure-analysis part
+  /// (separable — its first mutation is physicalizeMemView) and let this check
+  /// use layoutFor; or split checkAllConsistent into structural and state
+  /// halves, calling the structural half at both points.
   LogicalResult checkConsumersAreRewritable(ModuleOp module) {
     LogicalResult result = success();
     module.walk([&](triton::SpyreTensorLayoutOp marker) {
@@ -1351,6 +1531,11 @@ struct RewriteDescriptorLayoutGenericPass
               continue;
             for (Operation *consumer : ld.getResult().getUsers())
               if (!isa<linalg::GenericOp, mlir::ktdp::StoreOp>(consumer)) {
+                LLVM_DEBUG(llvm::dbgs()
+                           << "  decline: " << consumer->getName() << " at "
+                           << consumer->getLoc()
+                           << " reads a load this marker would physicalize, and "
+                           << "is not a linalg.generic\n");
                 consumer->emitError(
                     "rewrite-descriptor-layout-generic: this op reads a value "
                     "on a physicalized chain, but the rewrite restates only "
@@ -1367,6 +1552,9 @@ struct RewriteDescriptorLayoutGenericPass
     module.walk([&](Operation *op) {
       if (auto g = dyn_cast<linalg::GenericOp>(op)) {
         if (!isConsistent(g)) {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "  decline: generic at " << g.getLoc() << ": "
+                     << inconsistencyReason(g) << "\n");
           g.emitError("rewrite-descriptor-layout-generic: this op is on a "
                       "physicalized chain but could not be restated at "
                       "physical shape");
@@ -1383,8 +1571,12 @@ struct RewriteDescriptorLayoutGenericPass
       // would answer yes and let the op through.
       if (isa<mlir::ktdp::StoreOp, mlir::ktdp::LoadOp>(op))
         return;
-      for (Value v : op->getOperands())
+      for (auto [i, v] : llvm::enumerate(op->getOperands()))
         if (layoutFor(v)) {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "  decline: " << op->getName() << " at " << op->getLoc()
+                     << " reads retyped operand " << i << " (" << v.getType()
+                     << "), and is not a linalg.generic\n");
           op->emitError("rewrite-descriptor-layout-generic: this op reads a "
                         "value the rewrite retyped, but the rewrite restates "
                         "only linalg.generic, so this op still names the "
@@ -1426,16 +1618,29 @@ struct RewriteDescriptorLayoutGenericPass
     SmallVector<triton::SpyreTensorLayoutOp> markers;
     module.walk([&](triton::SpyreTensorLayoutOp op) { markers.push_back(op); });
 
+    LLVM_DEBUG(llvm::dbgs()
+               << "[rewrite-descriptor-layout-generic] " << markers.size()
+               << " layout marker(s), data-layout=" << dataLayout << "\n");
+
     if (failed(checkConsumersAreRewritable(module)))
       return signalPassFailure();
 
+    LLVM_DEBUG(llvm::dbgs()
+               << "[rewrite-descriptor-layout-generic] Phase 1: physicalizing "
+               << "descriptors\n");
     for (auto marker : markers)
       if (failed(physicalizeDescriptor(marker)))
         return signalPassFailure();
 
+    LLVM_DEBUG(llvm::dbgs()
+               << "[rewrite-descriptor-layout-generic] Phase 2: greedy "
+               << "rewrite\n");
     if (failed(runRewrite(module)))
       return signalPassFailure();
 
+    LLVM_DEBUG(llvm::dbgs()
+               << "[rewrite-descriptor-layout-generic] Phase 3: erasing "
+               << markers.size() << " marker(s)\n");
     for (auto marker : markers)
       eraseMarker(marker);
 
