@@ -195,3 +195,83 @@ tt.func @view_stays_inside_scf_if(%ptr: !tt.ptr<f16>, %cond: i1, %off: i32) {
   }
   tt.return
 }
+
+// -----
+// The same hoisting rule on the indirect (gather) path: descriptors at function
+// top, a gather inside scf.for whose y_offset is loop-variant. The two memory
+// views stay at function top; the ktdp.construct_indirect_access_tile lands
+// inside the loop body, because its direct-dimension subscript captures the
+// loop-variant offset.
+//
+// This is the case with a wrong-answer failure mode rather than a build failure.
+// A regression that hoisted the access tile out of the loop would capture one
+// value of y_offset -- effectively constant-folding the sweep to a single
+// window -- and the kernel would silently read the same window every iteration.
+// Nothing in the type system objects, so the placement has to be pinned here.
+//
+// Triton source pattern (gather_3d_partial_kernel in the gather fixture):
+//
+//   idx      = idx_desc.load([0])                     # at function top
+//   in_desc  = tl.make_tensor_descriptor(in_ptr, ..., [1, TOKEN_BLOCK, D])
+//   out_desc = tl.make_tensor_descriptor(out_ptr, ..., [K, TOKEN_BLOCK, D])
+//   for b in range(0, NUM_TOKENS // TOKEN_BLOCK):
+//       y_offset = b * TOKEN_BLOCK                    # loop-variant
+//       out_desc.store([0, y_offset, 0], in_desc.gather(idx, y_offset))
+//
+// As above, the anchors are the `scf.for ... {` line and the loop's `}`: both
+// views print before the loop line, and the indirect tile prints between the
+// braces. The CHECK-NOT guards after the loop pin the other half -- no second
+// copy of either op escapes to the function tail, and in particular no
+// construct_indirect_access_tile appears outside the loop body.
+
+// CHECK-LABEL:   tt.func @indirect_tile_moves_into_loop(
+// CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f16>, %[[VAL_1:.*]]: !tt.ptr<i32>, %[[VAL_2:.*]]: !tt.ptr<f16>) {
+// CHECK:           %[[IDX_VIEW:.*]] = ktdp.construct_memory_view {{.*}} sizes: [8], strides: [1] {{.*}} : memref<8xi32>
+// CHECK:           %[[ROWS:.*]] = ktdp.load {{.*}} : <8xindex> -> tensor<8xi32>
+// CHECK:           %[[SRC_VIEW:.*]] = ktdp.construct_memory_view {{.*}} sizes: [64, 128, 32], strides: [4096, 32, 1] {{.*}} : memref<64x128x32xf16>
+// CHECK:           %[[DST_VIEW:.*]] = ktdp.construct_memory_view {{.*}} sizes: [8, 128, 32], strides: [4096, 32, 1] {{.*}} : memref<8x128x32xf16>
+// CHECK:           scf.for %[[IV:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
+// CHECK:             %[[B:.*]] = arith.index_cast %[[IV]] : index to i32
+// CHECK:             %[[Y_OFF:.*]] = arith.muli %[[B]], %{{.*}} : i32
+// CHECK:             %[[Y_IDX:.*]] = arith.index_cast %[[Y_OFF]] : i32 to index
+// CHECK:             %[[TILE:.*]] = ktdp.construct_indirect_access_tile intermediate_variables(%[[V0:.*]], %[[V1:.*]], %[[V2:.*]]) %[[SRC_VIEW]][ind(%[[IDX_VIEW]]{{\[}}%{{.*}} + %[[V0]]]), (%[[Y_IDX]] + %[[V1]]), (%[[V2]])] {{.*}} -> !ktdp.access_tile<8x64x32xindex>
+// CHECK:             %[[DATA:.*]] = ktdp.load %[[TILE]] : <8x64x32xindex> -> tensor<8x64x32xf16>
+// CHECK:             ktdp.store %[[DATA]], %{{.*}} : tensor<8x64x32xf16>, <8x64x32xindex>
+// CHECK:           }
+// CHECK-NOT:       ktdp.construct_indirect_access_tile
+// CHECK-NOT:       ktdp.construct_memory_view
+// CHECK-NOT:       tt.descriptor_gather
+// CHECK-NOT:       builtin.unrealized_conversion_cast
+// CHECK:           tt.return
+// CHECK:         }
+tt.func @indirect_tile_moves_into_loop(%in: !tt.ptr<f16>, %idx: !tt.ptr<i32>, %out: !tt.ptr<f16>) {
+  %c0_i32 = arith.constant 0 : i32
+  %c8_i32 = arith.constant 8 : i32
+  %c64_i32 = arith.constant 64 : i32
+  %c128_i32 = arith.constant 128 : i32
+  %c32_i32 = arith.constant 32 : i32
+  %c1_i64 = arith.constant 1 : i64
+  %c32_i64 = arith.constant 32 : i64
+  %c4096_i64 = arith.constant 4096 : i64
+
+  // Index descriptor: 8 row positions, loaded once at function top.
+  %idx_desc = tt.make_tensor_descriptor %idx, [%c8_i32], [%c1_i64] : <i32>, <8xi32>
+  %rows = tt.descriptor_load %idx_desc[%c0_i32] : !tt.tensordesc<8xi32> -> tensor<8xi32>
+
+  // Source [M=64, NUM_TOKENS=128, HEAD_DIM=32], block [1, TOKEN_BLOCK=64, 32]:
+  // strict partial extent on dim 1, so y_offset selects the window.
+  %in_desc = tt.make_tensor_descriptor %in, [%c64_i32, %c128_i32, %c32_i32], [%c4096_i64, %c32_i64, %c1_i64] : <f16>, <1x64x32xf16>
+  %out_desc = tt.make_tensor_descriptor %out, [%c8_i32, %c128_i32, %c32_i32], [%c4096_i64, %c32_i64, %c1_i64] : <f16>, <8x64x32xf16>
+
+  %lo = arith.constant 0 : index
+  %hi = arith.constant 2 : index
+  %step = arith.constant 1 : index
+  scf.for %iv = %lo to %hi step %step {
+    // y_offset = b * TOKEN_BLOCK -- SSA-depends on the induction variable.
+    %b = arith.index_cast %iv : index to i32
+    %y_off = arith.muli %b, %c64_i32 : i32
+    %win = tt.descriptor_gather %in_desc[%rows, %y_off] : (!tt.tensordesc<1x64x32xf16>, tensor<8xi32>, i32) -> tensor<8x64x32xf16>
+    tt.descriptor_store %out_desc[%c0_i32, %y_off, %c0_i32], %win : !tt.tensordesc<8x64x32xf16>, tensor<8x64x32xf16>
+  }
+  tt.return
+}
