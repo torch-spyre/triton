@@ -521,26 +521,6 @@ def _load_examples():
             # base merges.
             merged = dict(_resolve_base(vname))
 
-            # Disabled variants: one entry, no expansion.
-            if merged.get("disabled"):
-                # Which means the raw ``params`` survive into the registry
-                # un-expanded. The group form only has meaning once expansion
-                # zips its names together, so a tuple key here would reach every
-                # consumer as an uninterpreted tuple. Refused at the source
-                # rather than left to be mis-read downstream.
-                grouped = [k for k in merged.get("params", {})
-                           if isinstance(k, tuple)]
-                if grouped:
-                    raise ValueError(
-                        f"{name}::{vname}: a disabled variant skips param "
-                        f"expansion and keeps its 'params' raw, so it cannot use "
-                        f"the group form; {grouped} must be spelled as separate "
-                        f"single-name keys."
-                    )
-                key = name if vname == "default" else f"{name}__{vname}"
-                registry[key] = merged
-                continue
-
             merged_params = merged.get("params", {})
             combos, suffix_names = _expand_params(
                 merged_params, kernel_name=f"{name}::{vname}"

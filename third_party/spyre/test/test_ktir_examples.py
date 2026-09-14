@@ -7,6 +7,10 @@ One class :class:`TestExample` drives everything via pytest parametrize:
 ``test_numerical`` runs the kernel through ``ktir_cpu`` and compares to
 the variant's NumPy oracle, with per-variant ``xfail_numerical`` marks.
 
+A variant whose ``disabled`` block says it cannot compile yet is a strict
+xfail rather than a skip, so closing the gap turns the suite red by itself
+instead of leaving a stale entry nobody notices.
+
 Structural IR checking used to live here too. It now lives in the
 lit/FileCheck suite under ``test/Conversion/*.mlir``, which pins the exact
 lowered IR per pass rather than asserting op presence over a compiled
@@ -28,12 +32,19 @@ DISCOVERED = sorted(k for k, v in EXAMPLES.items() if "kernel_fn" in v)
 def _keys_with_numerical_xfail():
     """Param list for the numerical test — attaches each variant's mark.
 
-    ``disabled`` variants skip (they can't compile, so there is nothing to
-    run numerically). For the rest, ``xfail_numerical`` in meta.py is
-    either a short reason string or a dict forwarded to
-    ``pytest.mark.xfail(**d)`` (so ``raises=ValueError`` etc. work); it
-    is built at collection time so failures are reported as proper
-    XFAIL, not SKIP.
+    ``disabled`` variants are a strict xfail on the compile, not a skip.
+    The variant runs, ``setup_method`` raises ``RuntimeError`` out of the
+    pass pipeline, and xfail absorbs it -- so the day the gap closes and
+    the compile succeeds, strict turns the unexpected pass into a failure
+    and the suite says so on its own. A skip could never do that: nothing
+    observes a test that does not run. ``raises`` is pinned so that only
+    the compile failure counts; any other exception is a real failure
+    rather than a silently absorbed one.
+
+    For the rest, ``xfail_numerical`` in meta.py is either a short reason
+    string or a dict forwarded to ``pytest.mark.xfail(**d)`` (so
+    ``raises=ValueError`` etc. work); it is built at collection time so
+    failures are reported as proper XFAIL, not SKIP.
     """
     params = []
     for k in DISCOVERED:
@@ -41,7 +52,8 @@ def _keys_with_numerical_xfail():
         marks = []
         disabled = entry.get("disabled")
         if disabled is not None:
-            marks.append(pytest.mark.skip(reason=disabled["reason"]))
+            marks.append(pytest.mark.xfail(
+                reason=disabled["reason"], strict=True, raises=RuntimeError))
         else:
             xfm = entry.get("xfail_numerical")
             if xfm is not None:
@@ -49,69 +61,6 @@ def _keys_with_numerical_xfail():
                 marks.append(pytest.mark.xfail(**kw))
         params.append(pytest.param(k, marks=marks, id=k))
     return params
-
-
-def test_disabled_variants_tracking_tests_exist():
-    """Every ``disabled`` entry must carry a non-blank ``tracking_test``.
-
-    A ``disabled`` variant in ``meta.py`` carries a ``tracking_test``
-    string naming where the underlying gap is pinned — normally a lit
-    file, e.g. ``"Conversion/lower-descriptor-memory-addptr-invalid.mlir"``.
-    This meta-test checks only that the field is present and non-blank.
-
-    It used to parse ``"<file>.py::<ClassName>"``, import the module and
-    look for a ``test_*`` attribute on the class. That shape assumed the
-    tracking test was a *Python* test; once the single-pass suites became
-    lit files (#55), no ``.mlir`` could satisfy any of those three checks.
-
-    So the rot this catches is now narrow — an empty or missing pointer.
-    A renamed or deleted tracking file is **not** caught: grep for the
-    filename if you move one. When a gap closes, either re-enable the
-    variant or remove the ``disabled`` block.
-
-    Adding more ``disabled`` rules later
-    -----------------------------------
-    If the ``disabled`` schema grows (extra sub-fields, new invariants),
-    the current shape — one big function with a shared ``failures``
-    list — stays readable for a handful of independent rules. Each new
-    rule appends to ``failures`` and the assert at the end dumps all of
-    them. Keep rules *independent* (no ``continue`` cascades) so a
-    single variant with two issues surfaces both at once rather than
-    only the first.
-
-    Refactor into per-rule methods once the rules start interacting
-    (e.g. rule B only applies when rule A passes) or once per-variant
-    failure visibility in CI matters enough to want separate pytest
-    node IDs per rule. The shape would be a ``TestDisabledField`` class
-    with one ``@pytest.mark.parametrize``'d method per rule, so failing
-    tests report as e.g. ``test_tracking_test_resolves[matmul__bmm]``.
-    """
-    failures = []
-    for key, entry in EXAMPLES.items():
-        disabled = entry.get("disabled")
-        if disabled is None:
-            continue
-        tracking = disabled.get("tracking_test")
-        if not tracking:
-            failures.append(f"{key}: 'disabled' has no 'tracking_test'")
-            continue
-
-        # ``tracking_test`` is free text naming where the gap is pinned —
-        # validated as present and non-blank, nothing more.
-        #
-        # So the rot this rule catches is narrow: an empty or missing
-        # pointer. A renamed lit file will not be caught here — grep for the
-        # filename if you move one.
-        if not isinstance(tracking, str) or not tracking.strip():
-            failures.append(
-                f"{key}: tracking_test must be a non-empty string, got "
-                f"{tracking!r}"
-            )
-
-    assert not failures, (
-        "Disabled variants have broken tracking_test references:\n  "
-        + "\n  ".join(failures)
-    )
 
 
 class TestExample(KTIRCpuTester):
