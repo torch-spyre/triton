@@ -8,6 +8,7 @@
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
 
 int main(int argc, char **argv) {
@@ -18,6 +19,7 @@ int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   registry.insert<mlir::triton::TritonDialect>();
   registry.insert<mlir::ktdp::KtdpDialect>();
+  registry.insert<mlir::spyreop::SpyreOpDialect>();
   mlir::registerAllDialects(registry);
   mlir::registerAllExtensions(registry);
 

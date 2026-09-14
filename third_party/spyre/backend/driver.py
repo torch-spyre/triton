@@ -172,6 +172,30 @@ def _artifact_address_count(directory):
     return None
 
 
+def _torch_dtype(mlir_elem_type: str):
+    """The torch dtype for an MLIR element type as the IR spells it.
+
+    Only the types a spill buffer can hold, which is whatever a ``linalg`` op in
+    this pipeline produces. An unrecognized one is reported rather than guessed:
+    allocating the wrong width would make the kernel read back a buffer of the
+    wrong size, silently.
+    """
+    import torch  # noqa: F401  -- must precede torch_spyre; see above
+
+    dtypes = {
+        "f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32,
+        "f64": torch.float64, "i1": torch.bool, "i8": torch.int8,
+        "i16": torch.int16, "i32": torch.int32, "i64": torch.int64,
+    }
+    if mlir_elem_type not in dtypes:
+        raise TypeError(
+            f"SpyreLauncher: no torch dtype for MLIR element type "
+            f"{mlir_elem_type!r}, so a spill buffer of it cannot be allocated. "
+            f"Known: {', '.join(sorted(dtypes))}."
+        )
+    return dtypes[mlir_elem_type]
+
+
 class SpyreLauncher:
     """Pure-Python launcher over the nine-positional ABI ``jit.py`` calls.
 
@@ -266,7 +290,33 @@ class SpyreLauncher:
                     '.to("spyre") — there is no implicit host staging.'
                 )
             tensors.append(arg)
-        return tensors
+        return tensors + self._spill_tensors()
+
+    def _spill_tensors(self):
+        """Scratch buffers for the values that pass from one compute to the next.
+
+        ``HbmRoundtrip`` breaks every compute-to-compute tensor edge by storing
+        the value to HBM and loading it back, because the scheduler cannot put two
+        computes in one local schedule. Where the kernel did not already write the
+        value out, that takes a buffer the kernel never declared, added as an extra
+        base-address argument — so the launch has to supply it, positionally after
+        the kernel's own pointers, where the correction table expects it.
+
+        Allocated fresh per launch and dropped after it, because nothing reads a
+        spill buffer across launches: every element the kernel reads back is one it
+        wrote in the same launch. Which is also why it is uninitialized rather than
+        zeroed.
+        """
+        buffers = getattr(self.metadata, "spill_buffers", None) or ()
+        if not buffers:
+            return []
+
+        import torch  # noqa: F401  -- must precede torch_spyre; see above
+        _import_torch_spyre()
+        return [torch.empty(tuple(buffer["shape"]),
+                            dtype=_torch_dtype(buffer["elem_type"]),
+                            device="spyre")
+                for buffer in buffers]
 
     def _prepare(self, function, num_addresses):
         """The artifact's JobPlan, prepared once and kept.

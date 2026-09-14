@@ -6,6 +6,7 @@ target_link_libraries(spyre-triton-opt PRIVATE
   ${triton_libs}
   KTDPTransforms
   KTIR::KtdpDialect
+  KTIR::SpyreOpDialect
   MLIROptLib
   MLIRPass
   MLIRRegisterAllDialects

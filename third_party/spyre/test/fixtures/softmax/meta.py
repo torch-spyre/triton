@@ -1,14 +1,27 @@
 """SIGNATURE + VARIANTS + reference oracle + input generator for softmax.
 
-Three variants — ``default`` (single-tile), ``multi_tile``, ``2pass``
-— share the same reference oracle and input shape. They exercise
-different KTIR patterns: single tile with in-tile reduce; 3-pass over
-N-tiles; 2-pass online (Milakov & Gimelshein).
+Four variants, grouped under Level banners the way ``elementwise``,
+``reduce`` and ``spyreop`` group theirs:
+
+- **Level A/B — algorithm × shape on ``ktir_cpu``.** ``default``
+  (single-tile), ``multi_tile`` and ``2pass``, all at ``M × N =
+  1024 × 1024`` against the same oracle, differing only in how the row
+  is tiled and swept: single tile with an in-tile reduce; 3-pass over
+  N-tiles; 2-pass online (Milakov & Gimelshein). There is no Level C
+  (layout) band — see the layout note below, which is why.
+- **Level D — device.** ``one_tile_device``, the loop-free single-tile
+  shape the other fixtures' device variants use. It is ``disabled``: the
+  shape does not compile today, and the layout note below records the wall
+  it hits first.
+
+All four share ``make_inputs`` and ``run``.
 
 See ``fixtures/README.md`` for the field reference and discovery rules.
 """
 
 import numpy as np
+
+from utils import sticksize
 
 from . import kernel
 
@@ -52,27 +65,57 @@ SIGNATURE = {
     "BLOCK_SIZE": "i32",
 }
 
+#: ``softmax_one_tile_device``'s arg list: no BLOCK_SIZE (the block is the whole
+#: tensor), and a layout per descriptor.
+_SIG_DEVICE = {
+    "output_ptr": "*fp16",
+    "input_ptr":  "*fp16",
+    "M":          "constexpr",
+    "N":          "constexpr",
+    "IN_LAYOUT":  "constexpr",
+    "OUT_LAYOUT": "constexpr",
+}
+
+
+# ---------------------------------------------------------------------------
+# Stick layout
+#
+# One helper, taking a dtype rather than a width, so the lane count follows from
+# the element type at the single place it is written. Returns the
+# ``("stick", layout)`` labelled pair, since a bare 3-element tuple in a
+# ``params`` values list would be read as a ``(label, value)`` pair; the value
+# inside stays a tuple because it reaches Triton as a constexpr.
+# ---------------------------------------------------------------------------
+
+def _stick_2d_on_n(dtype: str) -> tuple:
+    """``[M, N]`` -> ``[ceil(N/S), M, S]``: stick on the row."""
+    stick = sticksize({"p": f"*{dtype}"}, "p")
+    return ("stick", ((1, "floordiv", stick), 0, (1, "mod", stick)))
+
 
 # ---------------------------------------------------------------------------
 # VARIANTS
 #
-# All three variants use the same input shape (M=1024, N=1024) and the
-# same oracle. They split on tiling strategy:
+# Level A/B and Level D, banner-separated below. The Level A/B trio all use the
+# same input shape (M=1024, N=1024) and the same oracle, and split on tiling
+# strategy:
 #   - default = single_tile: full row in 1024-wide tile, in-tile reduce.
 #   - multi_tile: 16 N-tiles of width 64, 3-pass per row.
 #   - 2pass: 4-row × 64-col tiles, fused-max + online denom, 2-pass.
 #
-# 1D grid across all 32 cores: each kernel reads only tl.program_id(0)
-# and partitions rows internally via an explicit rows_per_core loop.
+# 1D grid across all 32 cores: each of those three reads only
+# tl.program_id(0) and partitions rows internally via an explicit
+# rows_per_core loop.
 #
-# No tt.spyre_tensor_layout variant: RewriteDescriptorLayout physicalizes the
-# loaded row to rank 3, but the broadcast of row_max stays rank 2, so
+# NO LEVEL C (layout on ktir_cpu) BAND, and the reason is the same one that
+# keeps Level D disabled: annotating any of the three above with a
+# tt.spyre_tensor_layout fails in RewriteDescriptorLayout, which physicalizes the
+# loaded row to rank 3 while the broadcast of row_max stays rank 2, so
 # `row - row_max` fails with "'arith.subf' op requires the same type for all
 # operands and results". The pass does not re-derive broadcasts against the
-# physical rank -- `retypeChain` walks forward along operand 0 only
-# (RewriteDescriptorLayout.cpp:624-633), and the broadcast is a sibling operand
-# of the subf whose producer traces back to the reduce, not to the physicalized
-# load, so no forward walk can reach it.
+# physical rank: `retypeChain` walks forward along operand 0 only, and the
+# broadcast is a sibling operand of the subf whose producer traces back to the
+# reduce, not to the physicalized load, so no forward walk can reach it.
 #
 # Splitting the reduced axis is NOT what makes this hard: stick-on-M (the
 # non-reduced axis, with a multi-row block so the stick dim is not sub-stick)
@@ -83,6 +126,13 @@ SIGNATURE = {
 # ---------------------------------------------------------------------------
 
 VARIANTS = {
+    # -----------------------------------------------------------------------
+    # Level A/B -- algorithm x shape on ktir_cpu
+    #
+    # Three tilings of the same function at one input shape, each with its own
+    # structural claim. DTYPE is pinned at fp16 throughout: what these variants
+    # are for is the sweep pattern, and every dtype tiles alike.
+    # -----------------------------------------------------------------------
     "default": {
         # Single-tile: N fits in BLOCK_SIZE, no inner N-loop.
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce", "broadcast", "program-id-1d", "num-programs-fold"],
@@ -213,5 +263,80 @@ VARIANTS = {
             # other variants.
             t.assert_present("math.exp", "arith.mulf", "arith.addf"),
         ),
+    },
+
+    # -----------------------------------------------------------------------
+    # Level D -- device
+    #
+    # The shape a Spyre binary is built from: one tile that is the whole
+    # tensor, one core, no tl.program_id, no loop, stick-tiled on both
+    # descriptors. Same three ingredients as elementwise's ``1d_device``,
+    # reduce's ``one_tile`` and spyreop's ``1d_device``, all of which reach a
+    # binary and launch.
+    #
+    # DISABLED, because this one does not. It is the whole softmax rather than
+    # one operation, and the row statistic is the part that does not lower:
+    # subtracting a per-row maximum from the row it came from needs that one
+    # value against the whole row, and that is what fails. The variant is kept
+    # rather than left unwritten so the kernel exists, the intent is on record,
+    # and the day it compiles this block is what gets deleted.
+    #
+    # No ``compiles_to_binary`` while it is disabled: that field is what
+    # test_device_launch.py and the spyrecode fixtures parametrize over, and a
+    # variant that skips param expansion has no ``param_values`` for them to
+    # read. It goes in at the same time the ``disabled`` block comes out.
+    #
+    # ``params`` are spelled as separate single-name keys, not a group: a
+    # disabled variant keeps its ``params`` raw and the group form is refused
+    # for it at collection time.
+    #
+    # M = 64, N = 64 at fp16: one whole stick per row and 64 rows, so no ragged
+    # extent and no sub-stick dimension. Nothing here is about padding.
+    # -----------------------------------------------------------------------
+    "one_tile_device": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "broadcast", "simplified:no-loop", "spyre-tensor-layout"],
+        "summary": (
+            "Row-wise softmax over a single stick-tiled tile with no "
+            "distribution loop — the loop-free device shape. Does not compile "
+            "today."
+        ),
+        "doc": (
+            "Takes one `[M, N]` input and writes the row-wise softmax of it: "
+            "for each row, subtract that row's maximum, exponentiate, and "
+            "divide by the row's total. One tile, one core, no loop.\n\n"
+            "The same arithmetic as the `default` variant with the "
+            "distribution removed, so what it exercises is the softmax "
+            "statistics themselves rather than how rows are handed out."
+        ),
+        "kernel_fn":  kernel.softmax_one_tile_device,
+        "SIGNATURE":  _SIG_DEVICE,
+        "constexpr":  ["M", "N", "IN_LAYOUT", "OUT_LAYOUT"],
+        "params": {
+            "M": [64],
+            "N": [64],
+            "IN_LAYOUT":  [_stick_2d_on_n("fp16")],
+            "OUT_LAYOUT": [_stick_2d_on_n("fp16")],
+        },
+        "grid":       [1],
+        # No tl.program_id, so DistributeWork has nothing to place and the
+        # presence check would fail on a kernel that is correct.
+        "parallel":   False,
+        "reference":  run,
+        "inputs":     make_inputs,
+        "output_key": "output_ptr",
+        "rtol":       1e-2,
+        "atol":       5e-2,
+        "disabled": {
+            "reason":        "the row maximum cannot be applied back to the "
+                             "row it was taken from once the tile is "
+                             "stick-tiled. No tracking_test: the per-variant "
+                             "form points at a single pass, and the evidence "
+                             "here is a whole-pipeline compile. A runner over "
+                             "every disabled variant -- the counterpart of the "
+                             "global device test -- is what will pin it, to be "
+                             "handled later.",
+        },
     },
 }

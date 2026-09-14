@@ -203,13 +203,12 @@ resolveIndexView(Value xOffsets) {
   // Invariant from ConvertDescriptorLoad: the traced view is a ranked
   // memref whose rank and element-storage-width match the descriptor's
   // block type, which is also the type of `xOffsets`.  An assert here
-  // means the lowering pipeline is broken, not the user input.
-  //
-  // Element types are compared by integer bit width because the
-  // descriptor block type can be `si32` (signed) while
-  // `tt.descriptor_load` canonicalises its result tensor to `i32`
-  // (signless): the two sides describe the same storage but disagree
-  // on signedness.
+  // means the lowering pipeline is broken, not the user input. Element
+  // types are compared by bit width, not exact equality, as a defensive
+  // backstop: `buildBaseMemoryView` already reads the signless block
+  // type for this reason (a descriptor block type can be `si32` while
+  // `xOffsets` is signless `i32`), so this only matters if that ever
+  // regresses on some path.
   auto memrefType = cast<MemRefType>(resolved->view.getType());
   auto tensorType = cast<RankedTensorType>(xOffsets.getType());
   auto memInt = dyn_cast<IntegerType>(memrefType.getElementType());
@@ -560,9 +559,21 @@ struct LowerDescriptorMemoryPass
       }
 
       builder.setInsertionPoint(descOp);
+      // Use the signless block element type, not raw `getBlockType()`.
+      // Triton stamps signedness onto an integer descriptor's own type
+      // (`*i32` -> block type `si32`, see `create_tensor_descriptor_type`
+      // in `python/src/ir.cc`), but every tensor value actually flowing
+      // through it is signless by TTIR's own invariant
+      // (`getSignlessBlockType()` in `create_descriptor_load`;
+      // `verifyDescriptorLoadStoreOp` in `Ops.cpp` enforces it on stores
+      // too). Reading the raw type here would make this memory view
+      // `memref<...xsi32>` while `ktdp.load`/`store` carry a signless
+      // `tensor<...xi32>` — KTDP tolerates that split, but dbo-opt's
+      // lowering of `ktdp.store` to `ktdf.data_transfer` does not, and
+      // rejects the mismatched source/destination element types.
       Type elemType =
           cast<triton::TensorDescType>(descOp.getResult().getType())
-              .getBlockType()
+              .getSignlessBlockType()
               .getElementType();
       Value memView =
           buildBaseMemoryView(builder, descOp.getLoc(), descOp, elemType);

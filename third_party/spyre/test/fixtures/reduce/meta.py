@@ -69,6 +69,24 @@ def make_inputs(M, N, DTYPE="fp32", AXIS=1, **_unused) -> dict:
     return _make_inputs((M, N), dtype=DTYPE, axis=AXIS)
 
 
+def make_inputs_positive_axis0(M, N, DTYPE="fp32", **_unused) -> dict:
+    """``[M, N]`` in, ``[N]`` out, and every element positive.
+
+    A ramp over [0.1, 1.1) rather than this file's usual standard normal, because
+    the variant using it takes a ``sqrt`` of the column sums and a normal input
+    makes half of those negative. Away from zero, too, where ``sqrt``'s relative
+    error grows fastest.
+
+    Axis 0 is pinned rather than read from ``params``: the kernel using this folds
+    axis 0 by construction and has no ``AXIS`` for :func:`make_inputs` to read.
+    """
+    np_dtype = DTYPE_MAP[DTYPE]
+    total = int(M) * int(N)
+    x = (np.arange(total, dtype=np.float32) / total + 0.1).astype(np_dtype)
+    return {"in_ptr": x.reshape((int(M), int(N))),
+            "out_ptr": np.zeros(int(N), dtype=np_dtype)}
+
+
 def make_inputs_3d(D0, D1, D2, DTYPE="fp32", **_unused) -> dict:
     """``[D0, D1, D2]`` in, ``[D0, D2]`` out."""
     return _make_inputs((D0, D1, D2), dtype=DTYPE)
@@ -99,6 +117,17 @@ def _oracle(OP, axis=1):
 run = _oracle("sum")
 
 
+def run_sum_then_sqrt(inputs: dict) -> np.ndarray:
+    """``sqrt(sum(in, axis=0))``, in the input's own dtype.
+
+    Its own function rather than a factory mode: the factory picks an oracle from
+    ``OP`` and an axis, and this variant is a reduce with something applied after
+    it, which is not a point in that space.
+    """
+    x = inputs["in_ptr"]
+    return np.sqrt(np.sum(x, axis=0).astype(x.dtype)).astype(x.dtype)
+
+
 # ---------------------------------------------------------------------------
 # SIGNATURE
 #
@@ -120,6 +149,12 @@ _SHAPE_ARGS = {
     "one_tile": {"M": "i32", "N": "i32",
                  "IN_LAYOUT": "constexpr", "OUT_LAYOUT": "constexpr",
                  "AXIS": "constexpr"},
+    # reduce_then_sqrt_one_tile folds M by construction, so it has no AXIS
+    # either -- the elementwise op that follows the reduce is written against the
+    # extent that survives folding M.
+    "one_tile_then_sqrt": {"M": "i32", "N": "i32",
+                           "IN_LAYOUT": "constexpr",
+                           "OUT_LAYOUT": "constexpr"},
 }
 
 
@@ -665,5 +700,58 @@ VARIANTS = {
         # (3.2 ulp) is already generous. Inheriting the sibling's 0.25 would
         # check it 20x looser than it needs for no reason.
         "atol":        5e-2,
+    },
+    "one_tile_then_sqrt": {
+        # A reduce with an elementwise op after it: two computes, the second
+        # reading the reduced tensor at its own shape. The single-tile, single-axis
+        # story is `one_tile`'s; this adds the second compute.
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "simplified:no-loop", "spyre-tensor-layout"],
+        "summary": (
+            "`out = sqrt(sum(in, axis=0))` over a single stick-tiled tile, no "
+            "distribution loop. A reduce followed by an elementwise op on the "
+            "reduced tensor."
+        ),
+        "doc": (
+            "Takes one `[M, N]` input, folds axis 0 with a sum, and writes "
+            "`out[n] = sqrt(sum(in[:, n]))` -- an `[N]` vector. One tile, one "
+            "core, no loop.\n\n"
+            "Two computes: the `sqrt` reads what the reduce produced, at the "
+            "reduced tensor's own shape. It is deliberately not combined with the "
+            "`[M, N]` input, which would need the reduced tensor widened back to "
+            "rank 2.\n\n"
+            "`sqrt` rather than `exp` because the sums reach ~24 here and "
+            "`exp(24)` is past the fp16 maximum."
+        ),
+        "kernel_fn":  kernel.reduce_then_sqrt_one_tile,
+        "SIGNATURE":  _signature("one_tile_then_sqrt", "fp32"),
+        "constexpr":  ["M", "N", "IN_LAYOUT", "OUT_LAYOUT"],
+        "params": {
+            ("DTYPE", "N", "IN_LAYOUT", "OUT_LAYOUT"): [
+                # fp32, not the sibling's fp16: `tl.sqrt` admits fp32 and fp64
+                # only, and rejects an fp16 operand in the frontend.
+                _stick_on_n_row("fp32", n_sticks=2),
+            ],
+            # M = 64, and N = 64 from the row above: folding M leaves N as two
+            # whole fp32 sticks. AXIS is absent -- this kernel folds M by
+            # construction.
+            "M": [64],
+        },
+        "grid":        [1],
+        # No tl.program_id, so DistributeWork has nothing to place and the
+        # presence check would fail on a kernel that is correct.
+        "parallel":    False,
+        "data_layout": "host",
+        "compiles_to_binary": True,
+        "reference":   run_sum_then_sqrt,
+        "inputs":      make_inputs_positive_axis0,
+        "output_key":  "out_ptr",
+        "rtol":        1e-2,
+        # fp32 and a positive input, so the reduce is far better conditioned than
+        # the fp16 sibling's: the elementwise-shaped tolerance is enough, and the
+        # sqrt over the sum halves the relative error rather than growing it.
+        "atol":        5e-2,
+        "extra_checks": None,
     },
 }
