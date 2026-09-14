@@ -24,9 +24,9 @@ Quick-reference
                                   from ``test/fixtures/*/meta.py``
 - :class:`KTIRCpuTester`        — EXAMPLE-based setup + numerical CPU execution
 
-Most shared machinery (``OpInfo``, ``walk_module``, ``make_ktir_mod``,
-``compile_to_ttir``) lives in :mod:`utils` — this file re-exports the names
-so existing test modules can keep importing them from ``conftest``.
+Most shared machinery (``compile_to_ttir``, ``make_ktir_mod``) lives in
+:mod:`utils` — this file re-exports the names so existing test modules can
+keep importing them from ``conftest``.
 
 Troubleshooting
 ---------------
@@ -88,10 +88,8 @@ _FIXTURES_DIR = _TEST_DIR / "fixtures"
 
 # Re-export helpers from utils so tests can still import them from conftest.
 from utils import (  # noqa: E402
-    OpInfo,
     compile_to_ttir,
     make_ktir_mod,
-    walk_module,
 )
 
 

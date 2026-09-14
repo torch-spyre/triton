@@ -6,14 +6,10 @@ ad-hoc notebooks) can import them without pulling in pytest fixtures.
 Contents
 --------
 - :func:`compile_to_ttir`      — ``@triton.jit`` → TTIR text
-- :class:`OpInfo`              — structural snapshot of one MLIR op
-- :func:`walk_module`           — build flat OpInfo list from a live ir.module
 - :func:`make_ktir_mod`         — TTIR → KTIR pipeline, returns live ir.module
 - :func:`np_dtype`              — SIGNATURE type string → NumPy dtype
 - :func:`sticksize`             — Spyre stick size (elements per stick) for an arg
 """
-
-from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -119,91 +115,6 @@ def compile_to_ttir(kernel_fn, signature, constexprs):
 
     mod = src.make_ir(target, options, codegen_fns, module_map, context)
     return str(mod)
-
-
-# ---------------------------------------------------------------------------
-# OpInfo — structural snapshot of one MLIR operation
-# ---------------------------------------------------------------------------
-
-@dataclass
-class OpInfo:
-    """Structural snapshot of a single MLIR operation produced by :func:`walk_module`.
-
-    Fields
-    ------
-    name         : dialect-qualified op name, e.g. ``"ktdp.load"``
-    ancestry     : tuple of ancestor op names from root down to the immediate
-                   parent, **not** including this op's own name.
-                   The root ``builtin.module`` has an empty tuple.
-
-                   Example for ``ktdp.load`` nested inside ``scf.for``::
-
-                       ancestry = ("builtin.module", "func.func", "scf.for")
-
-    result_types : string form of each result type, e.g.
-                   ``["!ktdp.access_tile<1024xindex>"]``.
-                   Empty for ops with no results (store, return, …).
-    num_regions  : number of regions owned by this op (0 for leaf ops).
-    _op          : raw ``ir.operation`` handle.
-    """
-    name: str
-    ancestry: tuple
-    result_types: list
-    num_regions: int
-    _op: object = field(repr=False)
-
-
-# ---------------------------------------------------------------------------
-# walk_module — flat OpInfo list from a live ir.module
-# ---------------------------------------------------------------------------
-
-def walk_module(mod) -> list:
-    """Return a flat list of :class:`OpInfo` for every op in *mod*.
-
-    ``ir.module.walk()`` visits ops in **post-order** — children fire before
-    their parent. Ancestry is reconstructed in a **two-pass** approach keyed
-    on MLIR region ids (no recursive descent, which the pybind API doesn't
-    support for block-indexed access).
-    """
-    raw = []  # [(op, in_rid, owned_rids, result_types)]
-
-    def _cb(op):
-        blk = op.get_block()
-        in_rid = blk.get_parent().id() if blk is not None else None
-        owned = [op.get_region(i).id() for i in range(op.get_num_regions())]
-        rtypes = [
-            str(op.get_result(i).get_type())
-            for i in range(op.get_num_results())
-        ]
-        raw.append((op, in_rid, owned, rtypes))
-
-    mod.walk(_cb)
-
-    region_owner: dict = {}
-    region_owner_in_rid: dict = {}
-    for op, in_rid, owned, _ in raw:
-        for rid in owned:
-            region_owner[rid] = op.get_name()
-            region_owner_in_rid[rid] = in_rid
-
-    def _ancestry(in_rid):
-        chain = []
-        rid = in_rid
-        while rid is not None and rid in region_owner:
-            chain.append(region_owner[rid])
-            rid = region_owner_in_rid[rid]
-        return tuple(reversed(chain))
-
-    return [
-        OpInfo(
-            name=op.get_name(),
-            ancestry=_ancestry(in_rid),
-            result_types=rtypes,
-            num_regions=len(owned),
-            _op=op,
-        )
-        for op, in_rid, owned, rtypes in raw
-    ]
 
 
 # ---------------------------------------------------------------------------
