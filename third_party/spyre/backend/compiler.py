@@ -621,7 +621,7 @@ class SpyreBackend(BaseBackend):
 
         then:
           - DistributeWork: tt.get_program_id -> ktdp.get_compute_tile_id
-          - canonicalize + CSE
+          - canonicalize (no CSE -- see the comment where it used to be added)
 
         The default pointer base addresses are also inferred here, into
         metadata["base_addresses"], and consumed by _make_spyrecode. It has to
@@ -661,7 +661,16 @@ class SpyreBackend(BaseBackend):
         _add_ktdp_pass(pm, "distribute_work", options)
         # Clean up redundant arithmetic (fold muli x,1; simplify cast chains)
         passes.common.add_canonicalizer(pm)
-        passes.common.add_cse(pm)
+        # No CSE here. It is not safe on an author-written HBM round-trip: the
+        # ktdp.construct_access_tile of a store and of the matching load address the
+        # same memory view at the same block, so CSE (both ops are Pure) merges them
+        # into one value that serves both sides of the fence, and dbo-opt's
+        # ComputeGroupExtraction then aborts with
+        # "StoreOp found before any LoadOp". The two tensor.empty ops merge the same
+        # way and break it a second way, with "Operation should have no uses left".
+        # Per-group ownership of these ops is not an invariant CSE can be told
+        # about -- upstream's CSE has no exemption hook and --cse takes no options --
+        # so the pass comes out until that is resolved. See issue #161.
         pm.run(mod, "make_ktir")
 
         metadata["name"] = mod.get_entry_func_name()

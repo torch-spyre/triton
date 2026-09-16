@@ -99,6 +99,75 @@ def make_inputs_2d_scalar_dim(N, M=32, DTYPE="fp32", **_unused) -> dict:
     return inputs
 
 
+# The declared-buffer kernels take one input pointer, not two, so they get their own
+# maker and their own oracles rather than a mode of the pair above. A ramp over
+# [0.1, 1.1): away from 0, where sqrt's relative error grows fastest, and small
+# enough that exp applied twice stays well inside fp32.
+
+def make_inputs_unary(n_elements, DTYPE="fp32", scratch=(), **_unused) -> dict:
+    """``x`` plus a zeroed ``output``, and one zeroed buffer per *scratch* name.
+
+    *scratch* is what the declared-buffer variants need: each intermediate is a
+    kernel pointer argument there rather than a value, so it needs a real
+    allocation. Zeroed, and the same length and dtype as ``x`` -- the kernel writes
+    every element of each before reading it, so the initial contents only matter in
+    that a nonzero one could mask a store that never happened.
+    """
+    np_dtype = DTYPE_MAP[DTYPE]
+    total = int(n_elements)
+    x = (np.arange(total, dtype=np.float32) / total + 0.1).astype(np_dtype)
+    inputs = {"x_ptr": x, "output_ptr": np.zeros(total, dtype=np_dtype)}
+    for name in scratch:
+        inputs[name] = np.zeros(total, dtype=np_dtype)
+    return inputs
+
+
+# Named here rather than in the variant so the scratch names sit next to the maker
+# that has to honour them, and so a variant's ``inputs`` field stays a plain callable
+# the framework calls with ``**param_values``.
+make_inputs_dag_buffers = functools.partial(
+    make_inputs_unary, scratch=("e_ptr", "s_ptr", "m_ptr", "r_ptr"))
+
+
+def make_inputs_pooled(n_elements, DTYPE="fp32", regions=1, **_unused) -> dict:
+    """``x`` plus a zeroed ``output``, and one zeroed scratch *pool*.
+
+    The pooled kernels take a single ``pool_ptr`` and address *regions* blocks of
+    ``n_elements`` within it, so the allocation here is ``regions * n_elements``
+    long -- one array where the per-intermediate variant takes *regions* of them.
+    That difference in the allocation is the footprint the pooled arm exists to
+    show; the region count itself is the kernel's liveness claim, and it is spelled
+    in the kernel's docstring.
+    """
+    np_dtype = DTYPE_MAP[DTYPE]
+    inputs = make_inputs_unary(n_elements, DTYPE=DTYPE)
+    total = int(n_elements)
+    return {"x_ptr": inputs["x_ptr"],
+            "pool_ptr": np.zeros(int(regions) * total, dtype=np_dtype),
+            "output_ptr": inputs["output_ptr"]}
+
+
+# One partial per pooled variant, naming that kernel's region count rather than its
+# pointers -- the pool is one pointer whatever the count.
+make_inputs_pooled1 = functools.partial(make_inputs_pooled, regions=1)
+make_inputs_pooled2 = functools.partial(make_inputs_pooled, regions=2)
+make_inputs_pooled3 = functools.partial(make_inputs_pooled, regions=3)
+
+
+def run_chain(inputs: dict) -> np.ndarray:
+    return np.sqrt(np.exp(inputs["x_ptr"]))
+
+
+def run_chain3(inputs: dict) -> np.ndarray:
+    return np.exp(np.sqrt(np.exp(inputs["x_ptr"])))
+
+
+def run_dag(inputs: dict) -> np.ndarray:
+    x = inputs["x_ptr"]
+    e = np.exp(x)
+    return e * np.sqrt(e) + np.sqrt(x)
+
+
 # ---------------------------------------------------------------------------
 # Level B factory — Elementwise(VariantFactory)
 # ---------------------------------------------------------------------------
@@ -300,6 +369,35 @@ _SIG_2D_SCALAR = {
     "BLOCK_M":    "i32",
     "BLOCK_N":    "i32",
 }
+
+# The declared-buffer kernels are unary -- one input pointer, no ``OP`` -- plus one
+# extra pointer per scratch buffer they declare. ``_SIG_1D_UNARY`` is that shape
+# with no scratch at all, and the helper inserts the scratch pointers into its key
+# order rather than respelling the whole dict, so a change to the shape arguments or
+# to ``LAYOUT`` reaches every one of them. The key order is the argument order, and
+# the scratch pointers go after ``x_ptr`` and before ``output_ptr``, the way the
+# kernels declare them.
+_SIG_1D_UNARY = {
+    "x_ptr":      "*fp32",
+    "output_ptr": "*fp32",
+    "n_elements": "i32",
+    "BLOCK_SIZE": "i32",
+    "LAYOUT":     "constexpr",
+}
+
+
+def _sig_1d_buffers(*names: str) -> dict:
+    return {"x_ptr": "*fp32",
+            **{name: "*fp32" for name in names},
+            **{k: v for k, v in _SIG_1D_UNARY.items() if k != "x_ptr"}}
+
+
+_SIG_1D_DAG_BUFFERS = _sig_1d_buffers("e_ptr", "s_ptr", "m_ptr", "r_ptr")
+
+# The pooled arm takes exactly one extra pointer whatever its region count, so one
+# signature serves all of them -- which is the point of the arm.
+_SIG_1D_POOLED = _sig_1d_buffers("pool_ptr")
+
 
 VARIANTS = {
     # -----------------------------------------------------------------------
@@ -821,6 +919,191 @@ VARIANTS = {
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
+    },
+
+    # The declared-buffer arm of Level D: the same single-tile, loop-free shape,
+    # but several computes rather than one, with every intermediate written to HBM
+    # and read back through a descriptor the *author* declared 
+    "1d_device_dag_buffers": {
+        # One buffer per intermediate -- e, s, m, r -- which is the plainest way to
+        # write this and the root of the arm. The DAG rather than a chain, because
+        # `e` is read twice: one store and two loads of the same descriptor. A value
+        # consumed by two later groups is one buffer read twice, not two buffers, and
+        # a chain would not exercise that rule.
+        #
+        # base: None -- the arm shares nothing with the binary elementwise variants
+        # above (they sweep OP through a factory, and a factory hook beside the
+        # literal field it produces is a collection-time error).
+        "base": None,
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "1D `out = exp(x) * sqrt(exp(x)) + sqrt(x)` over a single tile, with "
+            "all four intermediates in explicit HBM buffers. `e` is read twice."
+        ),
+        "doc": (
+            "Takes one 1D input vector `x` of length `n_elements`, four scratch "
+            "vectors of the same length, and writes "
+            "`out = exp(x) * sqrt(exp(x)) + sqrt(x)`. One tile, one core, no "
+            "loop.\n\n"
+            "`e = exp(x)`, `s = sqrt(e)`, `m = e * s` and `r = sqrt(x)` each get "
+            "their own descriptor, store and load. `e` is stored once and loaded "
+            "twice -- by the `sqrt` and by the multiply -- and `x` is loaded twice, "
+            "so no load result is shared across two compute groups."
+        ),
+        "kernel_fn":    kernel.dag_buffers_1d_device,
+        "SIGNATURE":    _SIG_1D_DAG_BUFFERS,
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT"],
+        "params": {
+            "n_elements": [128], "BLOCK_SIZE": [128], "DTYPE": ["fp32"],
+            "LAYOUT": [_stick_1d("fp32")],
+        },
+        "grid":         [1],
+        "compiles_to_binary": True,
+        "reference":    run_dag,
+        "inputs":       make_inputs_dag_buffers,
+        "output_key":   "output_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+    },
+
+    # The pooled sub-arm: the same idea with the intermediates in regions of ONE
+    # scratch buffer instead of taking a pointer each. 
+    "1d_device_chain_pooled": {
+        # The floor of the sub-arm: one intermediate, one region, so the pool is used
+        # whole and no reuse is claimed. Its job is to separate "pooling works" from
+        # "region reuse works" -- if this one fails, nothing further means anything.
+        "base": "1d_device_dag_buffers",
+        "summary": (
+            "1D `out = sqrt(exp(x))` over a single tile, with the intermediate in "
+            "one region of a pooled scratch pointer."
+        ),
+        "doc": (
+            "Takes one 1D input vector `x` of length `n_elements`, one scratch "
+            "*pool* pointer, and writes `out = sqrt(exp(x))`. One tile, one core, "
+            "no loop.\n\n"
+            "The pooled counterpart of the per-intermediate spelling, with the "
+            "scratch pointer treated as a pool the author carves. There is only one "
+            "intermediate here so the pool holds one region and nothing is reused; "
+            "the variant exists so that a failure in the reusing variants can be "
+            "attributed to the reuse rather than to the pooling."
+        ),
+        "kernel_fn":    kernel.chain_pooled_1d_device,
+        "SIGNATURE":    _SIG_1D_POOLED,
+        "inputs":       make_inputs_pooled1,
+        "reference":    run_chain,
+    },
+    "1d_device_chain_pooled_grid2": {
+        # The case that tests whether an author needs per-core pinning at all. The
+        # region gets the WHOLE-tensor shape and is accessed at `pid * BLOCK_SIZE`,
+        # exactly as `x_desc` and `out_desc` are, so the two cores round-trip
+        # disjoint blocks of one region. Nothing about the source says which core
+        # owns which block; the descriptor's block access does.
+        "base": "1d_device_chain_pooled",
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "program-id-1d", "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "1D `out = sqrt(exp(x))` across two cores, with the intermediate in "
+            "one whole-tensor region of a pooled scratch pointer."
+        ),
+        "grid":         [2],
+        "params": {
+            # 128 elements over BLOCK_SIZE=64 is two blocks of two fp32 sticks each
+            # (a stick is 32 elements at fp32), one block per core.
+            "n_elements": [128], "BLOCK_SIZE": [64], "DTYPE": ["fp32"],
+            "LAYOUT": [_stick_1d("fp32")],
+        },
+    },
+    "1d_device_chain3_pooled": {
+        # The one genuine unknown in the sub-arm. Both intermediates share ONE
+        # region, because t0's last reader is the compute that produces t1, so the
+        # ranges are disjoint at the statement level. The consequence is that the
+        # middle schedule does `load R0 -> sqrt -> store R0`.
+        #
+        # There is a double-buffering pass in the pipeline. Whether it may issue the
+        # store into R0 before the pipelined load out of R0 has retired is not
+        # something the source can say, so this is written the minimal way and
+        # measured; `1d_device_chain3_pooled2` is the two-region control that
+        # separates an in-place hazard from a pooling problem.
+        "base": "1d_device_chain_pooled",
+        "summary": (
+            "1D `out = exp(sqrt(exp(x)))` over a single tile, with both "
+            "intermediates sharing one region of a pooled scratch pointer."
+        ),
+        "doc": (
+            "Takes one 1D input vector `x` of length `n_elements`, one scratch "
+            "*pool* pointer of the same length, and writes "
+            "`out = exp(sqrt(exp(x)))`. One tile, one core, no loop.\n\n"
+            "`t0 = exp(x)` and `t1 = sqrt(t0)` have disjoint live ranges -- `t0`'s "
+            "last reader is the compute that produces `t1` -- so one region is the "
+            "minimum an author can justify, and the middle compute both loads from "
+            "and stores to it. Whether reading and writing one region inside a "
+            "single schedule survives the double-buffering pass is what this "
+            "variant measures; `1d_device_chain3_pooled2` is the two-region "
+            "control."
+        ),
+        "kernel_fn":    kernel.chain3_pooled_1d_device,
+        "inputs":       make_inputs_pooled1,
+        "reference":    run_chain3,
+    },
+    "1d_device_chain3_pooled2": {
+        # Control for the above: same pool, two regions, so no schedule reads and
+        # writes the same one. Kept as a variant rather than a comment because the
+        # comparison only means something if both are run by the same suite on the
+        # same day.
+        "base": "1d_device_chain3_pooled",
+        "summary": (
+            "1D `out = exp(sqrt(exp(x)))` over a single tile, with the two "
+            "intermediates in two regions of a pooled scratch buffer."
+        ),
+        "doc": (
+            "Takes one 1D input vector `x` of length `n_elements`, one scratch "
+            "*pool* buffer of twice that length, and writes "
+            "`out = exp(sqrt(exp(x)))`. One tile, one core, no loop.\n\n"
+            "The control for `1d_device_chain3_pooled`: identical pooling, but "
+            "`t0` and `t1` get a region each, so no compute loads from and stores "
+            "to the same region. A difference between the two is the in-place "
+            "reuse and nothing else.\n\n"
+            "The regions are block offsets into one whole-pool descriptor. That is "
+            "forced rather than chosen -- a descriptor per region would need "
+            "pointer arithmetic on the pool argument, which the memory passes do "
+            "not consume."
+        ),
+        "kernel_fn":    kernel.chain3_pooled2_1d_device,
+        "inputs":       make_inputs_pooled2,
+    },
+    "1d_device_dag_pooled": {
+        # Four intermediates, THREE regions. The minimum, not a round number:
+        # e:[1,3] s:[2,3] m:[3,5] r:[4,5] over the kernel's statement order, and
+        # {e, s, m} all contain statement 3, so three is forced. Achievable because
+        # r is stored after e's last read, so R0 carries e and then r.
+        # The full derivation is in the kernel's docstring, next to the code it
+        # constrains.
+        "base": "1d_device_chain_pooled",
+        "summary": (
+            "1D `out = exp(x) * sqrt(exp(x)) + sqrt(x)` over a single tile, with "
+            "four intermediates in three pooled regions."
+        ),
+        "doc": (
+            "Takes one 1D input vector `x` of length `n_elements`, one scratch "
+            "*pool* pointer of three times that length, and writes "
+            "`out = exp(x) * sqrt(exp(x)) + sqrt(x)`. One tile, one core, no "
+            "loop.\n\n"
+            "`1d_device_dag_buffers` takes four scratch pointers for `e`, `s`, `m` "
+            "and `r`; this takes one pool and puts them in three regions. Three is "
+            "the minimum: `e`, `s` and `m` are all live at the compute that reads "
+            "`e` and `s` and writes `m`, so no two of them can share, while `r` is "
+            "written after `e`'s last read and reuses `e`'s region. The reuse here "
+            "is across schedules, unlike `1d_device_chain3_pooled`'s, which is "
+            "inside one."
+        ),
+        "kernel_fn":    kernel.dag_pooled_1d_device,
+        "inputs":       make_inputs_pooled3,
+        "reference":    run_dag,
     },
 
 }

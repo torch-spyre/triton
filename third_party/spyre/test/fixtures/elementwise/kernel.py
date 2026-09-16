@@ -19,9 +19,17 @@ Multi-axis grid kernels — each axis of the grid maps to one tensor
   from memory rather than a kernel argument; `N` is still chunked the
   same way as `M`. KTIR-structural only for now.
 
-No-grid kernel — one tile, no distribution loop at all:
+No-grid kernels — one tile, no distribution loop at all:
 - :func:`elementwise_1d_device` — 1D, single tile; the only variant here
   that dbo-opt can lower all the way to a binary.
+- :func:`dag_buffers_1d_device` — 1D, single tile, unary, and several
+  computes rather than one, with every intermediate written to HBM and read
+  back through a tensor descriptor the author declared. The computes form a
+  DAG rather than a chain.
+- :func:`chain_pooled_1d_device`, :func:`chain3_pooled_1d_device`,
+  :func:`chain3_pooled2_1d_device`, :func:`dag_pooled_1d_device` — the same
+  idea with all the intermediates in regions of **one** scratch buffer
+  instead of one buffer each.
 
 Scalar-load variant of the 1D kernel — same idea, one axis:
 - :func:`elementwise_1d_scalar_dim` — 1D, but `n_elements` is a scalar read
@@ -555,3 +563,321 @@ def elementwise_2d_device(
     else:
         result = x / y
     out_desc.store([offset_m, 0], result)
+
+
+# ---------------------------------------------------------------------------
+# Author-declared buffers: every intermediate makes its own HBM round-trip.
+#
+# The kernels above compute one value from their loads and store it. The ones
+# below compute several, and each intermediate is a *buffer the author declared*:
+# a pointer argument with its own ``tl.make_tensor_descriptor``, its own
+# ``tl.spyre_tensor_layout``, an explicit ``store`` and an explicit ``load``. No
+# compute result is handed to another compute as a value; every one goes to HBM
+# and comes back.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def dag_buffers_1d_device(
+    x_ptr,
+    e_ptr,
+    s_ptr,
+    m_ptr,
+    r_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+):
+    """``out = exp(x) * sqrt(exp(x)) + sqrt(x)``, one declared buffer per value.
+
+    Four intermediates -- ``e = exp(x)``, ``s = sqrt(e)``, ``m = e * s`` and
+    ``r = sqrt(x)`` -- each with its own pointer argument, descriptor, layout
+    annotation, store and load. Loop-free and one tile per core.
+
+    The computes form a DAG, not a chain, which is the point of choosing this
+    shape. The interesting value is ``e``: it is read by the ``sqrt`` and by the
+    multiply, so it becomes **one store and two loads of the same descriptor** --
+    a value consumed by two later groups is one buffer read twice, not two
+    buffers. ``x`` is likewise loaded twice, once for the ``exp`` and once for the
+    other ``sqrt``, so no single load result is shared across two compute groups.
+    That is the load-per-consumer rule, and a chain would not exercise it.
+
+    """
+    pid = tl.program_id(0)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    e_desc = tl.make_tensor_descriptor(
+        e_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    s_desc = tl.make_tensor_descriptor(
+        s_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    m_desc = tl.make_tensor_descriptor(
+        m_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    r_desc = tl.make_tensor_descriptor(
+        r_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(e_desc, LAYOUT)
+    tl.spyre_tensor_layout(s_desc, LAYOUT)
+    tl.spyre_tensor_layout(m_desc, LAYOUT)
+    tl.spyre_tensor_layout(r_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    offset = pid * BLOCK_SIZE
+
+    # e = exp(x)
+    x = x_desc.load([offset])
+    e_desc.store([offset], tl.exp(x))
+
+    # s = sqrt(e) -- first read of e
+    e0 = e_desc.load([offset])
+    s_desc.store([offset], tl.sqrt(e0))
+
+    # m = e * s -- second read of e, joined with s
+    e1 = e_desc.load([offset])
+    s = s_desc.load([offset])
+    m_desc.store([offset], e1 * s)
+
+    # r = sqrt(x) -- second read of x
+    x2 = x_desc.load([offset])
+    r_desc.store([offset], tl.sqrt(x2))
+
+    # out = m + r
+    m = m_desc.load([offset])
+    r = r_desc.load([offset])
+    out_desc.store([offset], m + r)
+
+
+# ---------------------------------------------------------------------------
+# Pooled counterparts: one scratch pointer for all the intermediates.
+#
+# :func:`dag_buffers_1d_device` takes one pointer per intermediate, which is the
+# plainest way to write it and the worst for footprint -- the launcher allocates
+# every one, and its four are four whole-tensor allocations for values that are
+# dead almost immediately. Here the author takes a single ``pool_ptr`` and puts
+# every intermediate in a region of it.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def chain_pooled_1d_device(
+    x_ptr,
+    pool_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+):
+    """``out = sqrt(exp(x))`` with the one intermediate in a pooled region.
+
+    Liveness: one intermediate, ``exp(x)``, live from its store to the ``sqrt``'s
+    load. Nothing else competes, so **one region** -- ``pool_ptr`` is used whole,
+    and the pool is not carved at all. It exists as the floor of the family: if the
+    pooled arm behaves differently from the per-intermediate arm here, the
+    difference is the pooling itself and not the region reuse.
+    """
+    pid = tl.program_id(0)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    r0_desc = tl.make_tensor_descriptor(
+        pool_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(r0_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    offset = pid * BLOCK_SIZE
+    x = x_desc.load([offset])
+    r0_desc.store([offset], tl.exp(x))
+    t = r0_desc.load([offset])
+    out_desc.store([offset], tl.sqrt(t))
+
+
+@triton.jit
+def chain3_pooled_1d_device(
+    x_ptr,
+    pool_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+):
+    """``out = exp(sqrt(exp(x)))`` with both intermediates in **one** region.
+
+    The interesting one. Three computes, so two intermediates::
+
+        t0 = exp(x)     live from its store to the sqrt's load
+        t1 = sqrt(t0)   live from its store to the final exp's load
+
+    ``t0``'s last read is the ``sqrt`` that produces ``t1``, so the two live ranges
+    are disjoint at the statement level and **one region** is the minimum an author
+    can justify. That makes the middle compute ``load R -> sqrt -> store R``: a
+    read and a write of the same region inside one schedule.
+    """
+    pid = tl.program_id(0)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    r0_desc = tl.make_tensor_descriptor(
+        pool_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(r0_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    offset = pid * BLOCK_SIZE
+    x = x_desc.load([offset])
+    r0_desc.store([offset], tl.exp(x))          # t0 -> R0
+    t0 = r0_desc.load([offset])
+    r0_desc.store([offset], tl.sqrt(t0))        # t1 -> R0, t0 now dead
+    t1 = r0_desc.load([offset])
+    out_desc.store([offset], tl.exp(t1))
+
+
+@triton.jit
+def chain3_pooled2_1d_device(
+    x_ptr,
+    pool_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+):
+    """``out = exp(sqrt(exp(x)))`` pooled into **two** regions, not one.
+
+    The control for :func:`chain3_pooled_1d_device`. Same pool, same descriptor,
+    but ``t0`` and ``t1`` get a region each, so no schedule reads and writes the
+    same one. If the one-region variant misbehaves and this does not, the cause is
+    the in-place reuse and not the pooling; if both behave the same, the reuse is
+    free.
+
+    The regions are **block offsets into one whole-pool descriptor**, not separate
+    descriptors over ``pool_ptr + OFF``. That is forced, not preferred -- see the
+    section comment above for the ``tt.addptr`` refusal.
+    """
+    pid = tl.program_id(0)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    pool_desc = tl.make_tensor_descriptor(
+        pool_ptr, shape=[2 * n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(pool_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    offset = pid * BLOCK_SIZE
+    r0 = offset                    # region 0 base for this core
+    r1 = n_elements + offset       # region 1 base for this core
+
+    x = x_desc.load([offset])
+    pool_desc.store([r0], tl.exp(x))            # t0 -> R0
+    t0 = pool_desc.load([r0])
+    pool_desc.store([r1], tl.sqrt(t0))          # t1 -> R1
+    t1 = pool_desc.load([r1])
+    out_desc.store([offset], tl.exp(t1))
+
+
+@triton.jit
+def dag_pooled_1d_device(
+    x_ptr,
+    pool_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+):
+    """``out = exp(x) * sqrt(exp(x)) + sqrt(x)`` with four intermediates in three
+    pooled regions.
+
+    Liveness, over the statement order of :func:`dag_buffers_1d_device`. Writing
+    each intermediate's range as [statement that stores it, statement that last
+    reads it]::
+
+        1  store e          e = exp(x)
+        2  load e, store s  s = sqrt(e)
+        3  load e, load s, store m    m = e * s
+        4  store r          r = sqrt(x)
+        5  load m, load r, store out  out = m + r
+
+        e : [1, 3]     s : [2, 3]     m : [3, 5]     r : [4, 5]
+
+    ``e`` and ``s`` overlap on [2, 3], so they cannot share. ``m`` is stored at 3,
+    where both ``e`` and ``s`` are still being read, so it cannot share with either
+    -- ``{e, s, m}`` all contain statement 3 and that is a clique of three. Three
+    is therefore the minimum, and it is achievable: ``r`` is stored at 4, after
+    ``e``'s last read at 3, so ``r`` reuses ``e``'s region.
+
+        R0 : e, then r      R1 : s      R2 : m
+
+    Four intermediates, three regions, and one of them serving two values with
+    disjoint ranges. The reuse here is *across* schedules -- ``e``'s last reader
+    and ``r``'s writer are different computes -- which is a weaker claim than
+    :func:`chain3_pooled_1d_device`'s reuse inside one schedule, and the two are
+    kept apart so a failure names one of them.
+
+    Two would need ``m`` to overwrite ``e`` or ``s`` in the very compute that reads
+    them, which is that in-place case; it is deliberately not folded in here.
+    """
+    pid = tl.program_id(0)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    pool_desc = tl.make_tensor_descriptor(
+        pool_ptr, shape=[3 * n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(pool_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    offset = pid * BLOCK_SIZE
+    r0 = offset                        # e, then r
+    r1 = n_elements + offset           # s
+    r2 = 2 * n_elements + offset       # m
+
+    # 1. e = exp(x) -> R0
+    x = x_desc.load([offset])
+    pool_desc.store([r0], tl.exp(x))
+
+    # 2. s = sqrt(e) -> R1; first read of e
+    e0 = pool_desc.load([r0])
+    pool_desc.store([r1], tl.sqrt(e0))
+
+    # 3. m = e * s -> R2; second and last read of e, so R0 is free after this
+    e1 = pool_desc.load([r0])
+    s = pool_desc.load([r1])
+    pool_desc.store([r2], e1 * s)
+
+    # 4. r = sqrt(x) -> R0, reusing e's region
+    x2 = x_desc.load([offset])
+    pool_desc.store([r0], tl.sqrt(x2))
+
+    # 5. out = m + r
+    m = pool_desc.load([r2])
+    r = pool_desc.load([r0])
+    out_desc.store([offset], m + r)

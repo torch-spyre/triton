@@ -67,3 +67,33 @@ Level A  shape                fp32, add  (OP and DTYPE pinned)
   dbo-opt can lower all the way to a Spyre binary.
 - **1d_device_grid2** (`elementwise__1d_device_grid2[LAYOUT=stick]`) — Same
   as `1d_device` but distributed over two cores (one stick each).
+
+#### Declared buffers
+
+Several computes rather than one, unary, and every intermediate written to HBM
+and read back through a descriptor the *author* declared — its own pointer
+argument, its own `spyre_tensor_layout`, an explicit store and an explicit load.
+So no compute result flows into another compute, each compute stands between a
+load and a store and becomes its own schedule, and the buffer carrying an
+intermediate physicalizes under `LAYOUT` like any other descriptor.
+
+- **1d_device_dag_buffers** — `out = exp(x) * sqrt(exp(x)) + sqrt(x)`, one
+  declared buffer per intermediate (`e`, `s`, `m`, `r`). A DAG rather than a
+  chain, so `e` is read twice: one store and **two loads** of the same
+  descriptor, which is the load-per-consumer rule.
+
+The pooled sub-arm puts every intermediate in a *region* of one scratch pointer
+instead, addressed as a block offset into one whole-pool descriptor. It is about
+footprint, and what it decides is region reuse:
+
+- **1d_device_chain_pooled** — `out = sqrt(exp(x))`, one intermediate, one
+  region. The floor: no reuse claimed.
+- **1d_device_chain_pooled_grid2** — the same across two cores, which take
+  disjoint blocks of the one whole-tensor region.
+- **1d_device_chain3_pooled** — `out = exp(sqrt(exp(x)))` with both
+  intermediates in **one** region, so the middle schedule does
+  `load R0 → sqrt → store R0`. Reuse *inside* one schedule.
+- **1d_device_chain3_pooled2** — the two-region control for the above.
+- **1d_device_dag_pooled** — four intermediates in three regions (the minimum),
+  with `R0` carrying `e` and then `r`. Reuse *across* schedules.
+
