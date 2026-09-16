@@ -14,6 +14,43 @@ from pathlib import Path
 from typing import Dict, Mapping, Optional, Tuple
 from types import ModuleType
 
+# ---------------------------------------------------------------------------
+# The artifact layout, named once
+#
+# These names are torch-spyre's rather than ours, and nothing here can choose
+# them: ``SpyreSDSCKernelRunner`` appends SPYRE_CODE_DIR to the directory it is
+# given, and ``prepare_kernel`` then opens SPYRECODE_JSON inside it and the
+# ``init_bin_file`` that names, both by name with no directory scan.
+#
+# Here rather than beside either use site, because there are two and they are in
+# different modules: ``_make_spyrecode`` writes the layout and checks it, and
+# ``SpyreUtils.load_binary`` (driver.py) reads it back to decide whether the
+# unpacked directory is complete. Spelled twice, the pair drifts and the symptom
+# is a launch that cannot find a file nobody misspelled on purpose.
+#
+# In the producer, so the dependency runs consumer → producer. Both modules are
+# imported together anyway (``triton/backends/__init__.py`` imports
+# ``<backend>.compiler`` and ``<backend>.driver`` for every discovered backend),
+# so the import costs nothing that was not already paid.
+# ---------------------------------------------------------------------------
+
+#: Sub-directory of the export directory holding the loadable program.
+SPYRE_CODE_DIR = "spyreCodeDir"
+
+#: The job execution plan, inside SPYRE_CODE_DIR. The one file whose presence
+#: means the artifact unpacked completely.
+SPYRECODE_JSON = "spyrecode.json"
+
+#: The initialization payload, named by SPYRECODE_JSON's ``init_bin_file`` field.
+#: Written as a sibling of it, which is where that field's relative path resolves.
+INIT_BINARY = "init_binary.bin"
+
+#: The compile stage, its artifact's file extension, and the value recorded in
+#: metadata["stage"] -- one name in three roles, and they have to agree:
+#: ``binary_ext`` is how CompiledKernel picks which cached file to read as the
+#: kernel, and it picks it by matching this extension against the stage names.
+SPYRECODE_STAGE = "spyrecode"
+
 
 def resolve_dbo_opt(required: bool = True) -> Optional[str]:
     """Absolute path to the ``dbo-opt`` named by ``knobs.spyre.dbo_opt``.
@@ -392,7 +429,7 @@ class SpyreBackend(BaseBackend):
         # so an attribute assigned on the compiling instance is not the one it
         # reads. It also decides bytes-vs-text per artifact — the file
         # whose extension matches binary_ext is read as bytes.
-        self.binary_ext = "spyrecode"
+        self.binary_ext = SPYRECODE_STAGE
 
     def hash(self) -> str:
         """Backend identity folded into the on-disk cache key.
@@ -548,7 +585,7 @@ class SpyreBackend(BaseBackend):
     def add_stages(self, stages: dict, options: SpyreOptions, language=None) -> None:
         stages["ttir"] = lambda src, metadata: self._make_ttir(src, metadata, options)
         stages["ktir"] = lambda src, metadata: self._make_ktir(src, metadata, options)
-        stages["spyrecode"] = lambda src, metadata: self._make_spyrecode(src, metadata, options)
+        stages[SPYRECODE_STAGE] = lambda src, metadata: self._make_spyrecode(src, metadata, options)
 
     def load_dialects(self, context) -> None:
         from triton._C.libtriton import spyre
@@ -815,10 +852,10 @@ class SpyreBackend(BaseBackend):
                     f"{result.stderr}"
                 )
 
-            code_dir = export_dir / "spyreCodeDir"
+            code_dir = export_dir / SPYRE_CODE_DIR
             # dbo-opt can exit 0 having written nothing, so check rather than
             # trust the exit status.
-            missing = [name for name in ("spyrecode.json", "init_binary.bin")
+            missing = [name for name in (SPYRECODE_JSON, INIT_BINARY)
                        if not (code_dir / name).is_file()]
             if missing:
                 raise RuntimeError(
@@ -844,7 +881,7 @@ class SpyreBackend(BaseBackend):
                     info.compress_type = zipfile.ZIP_DEFLATED
                     archive.writestr(info, path.read_bytes())
 
-        metadata["stage"] = "spyrecode"
+        metadata["stage"] = SPYRECODE_STAGE
 
         # Before the first launch, CompiledKernel._init_handles refuses to run a
         # kernel that asks for more than the device has. It makes two such checks,

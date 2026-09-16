@@ -10,6 +10,8 @@ from triton import knobs
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import DriverBase
 
+from .compiler import SPYRE_CODE_DIR, SPYRECODE_JSON
+
 
 # ---------------------------------------------------------------------------
 # SpyreUtils
@@ -97,7 +99,7 @@ class SpyreUtils:
         del name, shared, device  # see the docstring: none of the three is usable
         digest = hashlib.sha256(kernel).hexdigest()
         root = Path(knobs.cache.dir) / self.MODULE_CACHE / digest
-        if not (root / "spyreCodeDir" / "spyrecode.json").is_file():
+        if not (root / SPYRE_CODE_DIR / SPYRECODE_JSON).is_file():
             # Extract into a private directory and then move it into place, so a
             # concurrent load never observes a half-written export directory.
             staging = root.parent / f"tmp.pid_{os.getpid()}_{uuid.uuid4().hex}"

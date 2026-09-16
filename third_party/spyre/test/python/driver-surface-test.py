@@ -138,8 +138,13 @@ def _zip_bytes(entries):
     return buffer.getvalue()
 
 
-#: dbo-opt's --export-dir layout, which is what the ZIP carries: a spyreCodeDir/
-#: with debug/ beside it, not the code dir's contents flattened to the root.
+#: The export layout the ZIP carries: a spyreCodeDir/ with debug/ beside it, not
+#: the code dir's contents flattened to the root.
+#:
+#: Spelled out here rather than built from ``backend.compiler``'s SPYRE_CODE_DIR /
+#: SPYRECODE_JSON. Those exist so the two *modules* cannot disagree; this file's
+#: job is to pin the names torch-spyre actually opens, and a test written in terms
+#: of the constants would follow a wrong one into agreement and stay green.
 _ARTIFACT = {
     "spyreCodeDir/spyrecode.json": b'{"init_bin_file": "init_binary.bin"}',
     "spyreCodeDir/init_binary.bin": b"\x00\x01\x02\x03",
