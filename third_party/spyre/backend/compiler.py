@@ -266,12 +266,19 @@ class SpyreOptions:
 
     # How the kernel's buffer addresses reach the entry function.
     #
-    # False (the default and the only supported mode): the pointer arguments are
-    # replaced by base addresses — base_addresses if set, otherwise the derived
-    # ones.
+    # True: leave the addresses symbolic, for a runtime that patches them in
+    # through the correction table. SpyreLauncher names one tensor per symbol in
+    # the SymbolicArg payload it passes to launch_jobplan.
     #
-    # True: leave the addresses symbolic, for a runtime that patches them via
-    # the correction table. Not implemented — see _make_spyrecode, which raises.
+    # False: the pointer arguments are replaced by base addresses —
+    # base_addresses if set, otherwise the derived ones — and the runtime binds
+    # the buffers to those segments instead.
+    #
+    # The dataclass default is False, but it is not the effective one: every
+    # launch goes through parse_options, which defaults the field from
+    # BUNDLE_SYMBOLIC_ARGS — set to "1" by importing torch_spyre, so a launching
+    # process compiles symbolic unless it says otherwise. The launcher refuses a
+    # launch where the two disagree; see SpyreLauncher._check_argument_mode_agrees.
     #
     # This is a *compile* option, not an environment read at pass-install time:
     # it changes the emitted artifact, so it has to be in options.hash() and
@@ -671,14 +678,17 @@ class SpyreBackend(BaseBackend):
     def _make_spyrecode(self, mod, metadata, options):
         """Lower KTIR to a loadable Spyre binary by running ``dbo-opt``.
 
-        Returns the spyreCodeDir as **ZIP bytes**. A compile stage yields one
-        artifact, but a spyreCodeDir is two files (``spyrecode.json`` +
-        ``init_binary.bin``) plus dbo-opt's ``debug/`` tree, so the archive is
-        the single artifact and ``SpyreUtils.load_binary`` unpacks it. Layout
-        inside the ZIP is flat — spyreCodeDir's own contents at the root, with
-        ``debug/`` as a subdirectory — because ``prepare_kernel`` opens
-        ``<dir>/spyrecode.json`` and the ``init_bin_file`` it names, both by
-        name and with no directory scan.
+        Returns dbo-opt's export directory as **ZIP bytes**. A compile stage
+        yields one artifact, but an export directory is a ``spyreCodeDir/``
+        (``spyrecode.json`` + ``init_binary.bin``) beside dbo-opt's ``debug/``
+        tree, so the archive is the single artifact and
+        ``SpyreUtils.load_binary`` unpacks it.
+
+        Layout inside the ZIP is dbo-opt's own, member names relative to
+        ``--export-dir``, so unpacking reproduces what dbo-opt wrote rather than
+        a second convention. That is what ``torch_spyre``'s
+        ``SpyreSDSCKernelRunner`` expects: it is handed a directory and appends
+        ``/spyreCodeDir`` itself before calling ``prepare_kernel``.
 
         Three steps, the first two in one pass manager:
 
@@ -816,11 +826,11 @@ class SpyreBackend(BaseBackend):
                     f"under {code_dir}\n  argv: {' '.join(argv)}\n{result.stderr}"
                 )
 
-            members = [(path, path.relative_to(code_dir).as_posix())
-                       for path in sorted(code_dir.rglob("*")) if path.is_file()]
-            debug_dir = export_dir / "debug"
-            members += [(path, f"debug/{path.relative_to(debug_dir).as_posix()}")
-                        for path in sorted(debug_dir.rglob("*")) if path.is_file()]
+            # Relative to export_dir, not to code_dir: the archive carries
+            # dbo-opt's layout, spyreCodeDir/ and debug/ side by side, because
+            # that is the layout the launch path consumes.
+            members = [(path, path.relative_to(export_dir).as_posix())
+                       for path in sorted(export_dir.rglob("*")) if path.is_file()]
 
             buffer = io.BytesIO()
             with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:

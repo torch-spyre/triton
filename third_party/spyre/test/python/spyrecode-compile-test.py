@@ -71,8 +71,14 @@ from utils import spyre_target
 def test_artifact_holds_the_spyre_code_dir(compiled):
     # metadata["name"] is "" (issue #104), so the artifact is keyed by the source
     # function name; what matters is the ZIP's contents.
+    #
+    # dbo-opt's own --export-dir layout, member names relative to it: the
+    # spyreCodeDir stays a directory rather than being flattened, because
+    # torch-spyre's SpyreSDSCKernelRunner is handed the parent and appends
+    # /spyreCodeDir itself.
     names = set(zipfile.ZipFile(io.BytesIO(compiled.kernel)).namelist())
-    assert {"spyrecode.json", "init_binary.bin"} <= names
+    assert {"spyreCodeDir/spyrecode.json",
+            "spyreCodeDir/init_binary.bin"} <= names
     assert any(n.startswith("debug/") for n in names), sorted(names)
 
 
