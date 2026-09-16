@@ -185,28 +185,19 @@ def gather_kernel(
 ):
     """Multi-program gather: the parallel counterpart to gather_kernel_1core.
 
-    Same fixed-column-slice semantics as :func:`gather_kernel_1core` —
-    ``out[i, :] = in[idx[i], y_offset : y_offset + BLOCK_COLS]`` — but the
+    Same fixed-column-slice semantics as :func:`gather_kernel_1core`, but
     ``K_INDICES`` rows are tiled into ``BLOCK_ROWS``-sized chunks and
     distributed across the 1D core grid via ``tl.program_id(0)``, instead
     of gathered in one ``descriptor_gather`` call.
 
-    Preconditions:
-      * ``BLOCK_ROWS`` must be at least 8 — under row-tiling it is the
-        gathered index tile's leading dim that the ``descriptor_gather``
-        verifier's "at least 8" minimum binds on, not ``K_INDICES``.
-      * ``K_INDICES`` must be a multiple of ``BLOCK_ROWS`` — no masking is
-        done for a partial final tile.
-      * ``y_offset + BLOCK_COLS <= N`` (the slice must fit inside the
-        source row).
-      * ``BLOCK_COLS`` must be a power of two (Triton frontend constraint
-        on descriptor block shapes).
+    Preconditions: ``K_INDICES`` a multiple of ``BLOCK_ROWS`` (no masking
+    for a partial final tile); ``y_offset + BLOCK_COLS <= N``; ``BLOCK_COLS``
+    a power of two. The TMA-only ``BLOCK_ROWS``/``BLOCK_COLS`` minimums on
+    ``tt.descriptor_gather`` (see ``gather_kernel_1core``) don't apply here
+    either — Spyre skips both checks.
 
-    Distribution mirrors :func:`gather_kernel_spyre`'s row split
-    (``rows_per_core = cdiv(m_blocks, grid_m)``, clamped at ``m_blocks``)
-    minus the column-stick loop and the Spyre layout annotations — this
-    kernel always gathers the full ``BLOCK_COLS``-wide slice in one shot
-    per row tile.
+    Distribution mirrors :func:`gather_kernel_spyre`'s row split, minus the
+    column-stick loop and the Spyre layout annotations.
     """
     pid_m = tl.program_id(0)
     grid_m = tl.num_programs(0)

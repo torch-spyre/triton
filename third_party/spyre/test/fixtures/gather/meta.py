@@ -887,22 +887,8 @@ _SIG_1D = {
 
 VARIANTS = {
     "default": {
-        # Basic, representative gather fixture: plain rank-2 source, plain
-        # 1D grid, no shape exotica — and distributed across the core grid.
-        # Small source matrix, unique indices, non-zero y_offset to
-        # exercise the column-slicing path.  Non-zero y_offset matters
-        # because the lowered indirect access tile uses y_offset as a
-        # captured variable in the direct-dimension subscript map
-        # (``col = y_offset + d1``); a y_offset=0 test would mask any bug
-        # in that subscript.
-        #
-        # ``BLOCK_COLS`` must be a power of two (Triton frontend
-        # constraint on descriptor block shapes).  With BLOCK_COLS=32
-        # and y_offset=16 we read columns [16, 48) of each gathered
-        # row — strictly inside [0, N=64).
-        #
-        # K_INDICES=256 with BLOCK_ROWS=8 gives 32 row tiles, filling
-        # the 32-core grid with exactly one gather per core.
+        # Non-zero y_offset exercises the column-slice subscript map;
+        # K_INDICES=256/BLOCK_ROWS=8 fills the 32-core grid exactly.
         "kernel_fn":  kernel.gather_kernel,
         "constexpr":  ["M", "N", "K_INDICES", "BLOCK_ROWS", "BLOCK_COLS"],
         "params": {
@@ -920,22 +906,10 @@ VARIANTS = {
         "output_key": "out_ptr",
     },
     "1core": {
-        # gather_kernel_1core: the one variant in this fixture that pins
-        # the no-scf.for shape — a single descriptor_gather call consumes
-        # the whole index array in one shot, no tl.program_id, no row
-        # tiling. Formerly the ``default`` variant; demoted because
-        # "default" plays two roles at once (conftest._resolve_base's
-        # implicit merge base for every "base"-less sibling, and
-        # conftest._load_examples's bare test key ``gather``), and the
-        # single-program shape is the exotic one here — every sibling
-        # inheriting it meant no rank-2 variant ever exercised the
-        # distributed gather path. Key spelled "1core" to match the
-        # kernel name.
-        #
-        # "base": None opts out of the implicit default-fallback merge
-        # (conftest._resolve_base) instead of inheriting the new
-        # default's SIGNATURE (which adds BLOCK_ROWS) — this variant
-        # has no BLOCK_ROWS of its own and needs its own SIGNATURE.
+        # Formerly "default"; renamed since "default" is now the
+        # distributed variant every edge case inherits, and the
+        # single-program shape shouldn't be everyone's implicit base.
+        # "base": None skips inheriting default's BLOCK_ROWS-added SIGNATURE.
         "base":       None,
         "kernel_fn":  kernel.gather_kernel_1core,
         "SIGNATURE":  _SIG_1CORE,
@@ -950,10 +924,8 @@ VARIANTS = {
         "tags":       ["descriptor-gather", "1core"],
         "summary": (
             "Single-program gather: one descriptor_gather consumes the whole "
-            "index array, with no tl.program_id and so no distribution "
-            "scf.for. Spyre's fixed core count makes that a legitimate, "
-            "representative class of kernel rather than a gap to close — it "
-            "is the shape ``default`` deliberately does not have."
+            "index array, with no tl.program_id and so no row-tiling "
+            "scf.for — the shape ``default`` deliberately does not have."
         ),
         "grid":       [32],
         "reference":  run,
@@ -961,21 +933,15 @@ VARIANTS = {
         "output_key": "out_ptr",
     },
     # ------------------------------------------------------------------
-    # Edge-case variants.  Each pins one specific bug class that the
-    # default+embedding pair does not cover.  Based on the distributed
-    # ``default`` (gather_kernel), so each exercises the column-slice
-    # machinery on the row-tiled path —
-    # see README.md (the "Variants" and "Preconditions" sections) for
-    # the rules these have to obey:
+    # Edge-case variants: each pins one bug class on the distributed
+    # ``default`` (gather_kernel). See README.md ("Variants" and
+    # "Preconditions") for the rules these must obey:
     #   * BLOCK_COLS is a power of two (validate_block_shape)
-    #   * BLOCK_ROWS >= 8 (descriptor_gather verifier) — under
-    #     row-tiling the verifier's minimum binds on the gathered index
-    #     tile's leading dim, i.e. BLOCK_ROWS, not K_INDICES; K_INDICES
-    #     only needs to be a multiple of BLOCK_ROWS (no masking)
+    #   * K_INDICES is a multiple of BLOCK_ROWS (no masking)
     #   * y_offset + BLOCK_COLS <= N (slice fits in the source row)
-    # The TMA-only ``BLOCK_COLS >= 32 / bitwidth * 8`` minimum does not
-    # apply on Spyre (see kernel.py docstring), but every rank-2
-    # variant below picks BLOCK_COLS >= 8 anyway for portability.
+    # The TMA-only x_offsets/BLOCK_COLS minimums don't apply on Spyre
+    # (semantic.py gates both on target_info.is_spyre()), but every
+    # variant below still picks BLOCK_ROWS=8/BLOCK_COLS>=8 for portability.
     # ------------------------------------------------------------------
     "y_offset_zero": {
         # y_offset=0 case.  The lowered indirect access tile uses
@@ -1029,21 +995,11 @@ VARIANTS = {
         "inputs": make_inputs_full_row,
     },
     "min_block_cols": {
-        # Smallest legal sizes per the verifier: BLOCK_ROWS=8 (verifier
-        # minimum on the gathered index tile) and BLOCK_COLS=8 (verifier
-        # minimum for f32, since 32/bitwidth*8 = 8 when bitwidth=32).
-        # Probes the lower boundary of the legal region.  Per the test
-        # rule "test endpoints of a range, not just the interior" —
-        # interior cases alone wouldn't catch a bug that triggers only
-        # at the smallest legal block.  Allows duplicates so an
-        # aliasing bug at the minimum size shows up.
-        #
-        # K_INDICES=8 == BLOCK_ROWS reduces this variant to a single
-        # row tile — one busy core, 31 idle. That degenerate fan-out is
-        # deliberate: it is the smallest legal shape the row-tiled kernel
-        # accepts, and the clamp in gather_kernel (m_end = min(m_start +
-        # rows_per_core, m_blocks)) is what keeps the 31 idle cores from
-        # walking off the end of the index array.
+        # BLOCK_ROWS=8/BLOCK_COLS=8 match the non-Spyre TMA verifier
+        # minimums for portability, but neither is enforced on Spyre.
+        # K_INDICES=8 == BLOCK_ROWS collapses this to one busy core,
+        # 31 idle — pins the m_end clamp in gather_kernel as load-bearing.
+        # Duplicates allowed so aliasing shows up at this size too.
         "base":   "default",
         "params": {
             "M":          [64],
@@ -1092,18 +1048,11 @@ VARIANTS = {
         "inputs": make_inputs_wide_slice,
     },
     "large_k": {
-        # Largest single-shot fan-out in the fixture: K_INDICES=128 rows
-        # in one descriptor_gather.  (``default`` carries a larger
-        # K_INDICES=256, but tiled 8 rows at a time, so its per-gather
-        # fan-out is 8.)  Stresses the descriptor_load on the index
-        # buffer + the descriptor_gather fan-out at higher row count,
-        # without changing the lowering path.  Duplicates allowed so the
-        # larger fan-out also exercises aliasing.
-        #
-        # Kept on "1core" (not moved onto the distributed default):
-        # under row-tiling the per-gather fan-out would become
-        # BLOCK_ROWS instead of the full K_INDICES, silently changing
-        # what this variant tests.
+        # Largest single-shot fan-out (K_INDICES=128) — default tiles
+        # BLOCK_ROWS=8 rows per gather, so only "1core" exercises a
+        # fan-out this large in one descriptor_gather call. Duplicates
+        # allowed so aliasing shows up too; stays off the distributed
+        # kernel since row-tiling would cap the fan-out at BLOCK_ROWS.
         "base":   "1core",
         "params": {
             "M":          [512],
