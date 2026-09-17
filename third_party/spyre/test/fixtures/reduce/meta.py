@@ -8,9 +8,15 @@ Rank-3, middle axis  ``out[d0, d2] = OP(in[d0, :, d2])`` -- the reduced axis is
 
 Three reductions lower: ``sum``, ``max`` and ``min``, dispatched by
 ``OP: tl.constexpr``. All three reach ``linalg.reduce`` and run on ``ktir_cpu``.
-One combination reaches a Spyre binary and launches -- ``one_tile`` at
-``AXIS=0``, the loop-free shape folding the non-stick axis. The Level D banner
-records why that one and not the others.
+
+Three variants reach a Spyre binary and launch, all in Level D: ``one_tile`` at
+``AXIS=0`` (the loop-free shape folding the non-stick axis),
+``one_tile_on_stick_bcast`` (the stick axis instead, storing its statistic
+replicated across a stick) and ``stat_chain_on_stick``, which reads that
+statistic back out of HBM and applies it to a full tile. The last is not a
+reduce alone -- it is a reduce and a compute chained through memory, which is
+softmax's shape -- and it lives here because the reduce is what puts the
+statistic there. The Level D banner records why these and not the others.
 
 The variants are grouped under Level A-D banners, each of which says what its
 level is for and what it deliberately does not vary. See ``fixtures/README.md``
@@ -100,6 +106,41 @@ run = _oracle("sum")
 
 
 # ---------------------------------------------------------------------------
+# stat_chain_on_stick — a statistic through HBM
+#
+# Its own oracle and input maker rather than the reduce ones above, because the
+# output is the SHAPE OF THE INPUT: the reduce is only half the kernel, and what
+# is compared is the tile the statistic was applied to.
+# ---------------------------------------------------------------------------
+
+def make_inputs_stat_chain(M, N, DTYPE="fp16", **_unused) -> dict:
+    """``[M, N]`` in, an ``[M]`` scratch statistic, and an ``[M, N]`` out.
+
+    The statistic buffer is an input only in the sense that the kernel needs the
+    memory; nothing reads its initial value. It is zeroed rather than left
+    uninitialised so that a run which never writes it is a wrong answer rather
+    than an unpredictable one.
+    """
+    np_dtype = DTYPE_MAP[DTYPE]
+    rng = np.random.default_rng(seed=0)
+    x = rng.standard_normal((M, N)).astype(np_dtype)
+    return {"x_ptr": x,
+            "stat_ptr": np.zeros(M, dtype=np_dtype),
+            "out_ptr": np.zeros((M, N), dtype=np_dtype)}
+
+
+def stat_chain_reference(inputs) -> np.ndarray:
+    """``out[m, n] = x[m, n] - sum(x[m, :])``, in the input's own dtype.
+
+    The sum is kept in fp16 like the kernel's, so the tolerance measures the
+    accumulation ORDER rather than NumPy's promotion rules -- see the atol note
+    on the variant.
+    """
+    x = inputs["x_ptr"]
+    return (x - x.sum(axis=1, keepdims=True).astype(x.dtype)).astype(x.dtype)
+
+
+# ---------------------------------------------------------------------------
 # SIGNATURE
 #
 # One entry per ``@triton.jit`` argument, per ``fixtures/README.md``. Built from
@@ -133,6 +174,23 @@ def _signature(shape: str, dtype: str) -> dict:
 SIGNATURE = _signature("2d", "fp32")
 
 _SIG_3D = _signature("3d", "fp32")
+
+
+def _signature_stat_chain(dtype: str) -> dict:
+    """``stat_chain_on_stick``'s arg list — three pointers over two buffers.
+
+    Not built from ``_SHAPE_ARGS``: this kernel is not a reduce with an output,
+    it is a reduce and a compute chained through one, so its arguments are its
+    own. ``S`` is here because the read-side descriptor is rank-2 ``[M, S]`` and
+    the stick width is what makes it so.
+    """
+    return {"x_ptr": f"*{dtype}", "stat_ptr": f"*{dtype}", "out_ptr": f"*{dtype}",
+            "M": "i32", "N": "i32", "S": "i32",
+            "X_LAYOUT": "constexpr", "STAT_LAYOUT": "constexpr",
+            "OUT_LAYOUT": "constexpr"}
+
+
+_SIG_STAT_CHAIN = _signature_stat_chain("fp16")
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +291,31 @@ def _stick_on_n_row_bcast(dtype: str, n_sticks: int) -> tuple:
     """
     return (dtype, n_sticks * _stick_of(dtype),
             _stick_2d_on_n(dtype), _stick_1d_bcast(dtype))
+
+
+def _stat_chain_row(dtype: str, n_sticks: int) -> tuple:
+    """One row for ``stat_chain_on_stick``'s
+    ``("DTYPE", "N", "S", "X_LAYOUT", "STAT_LAYOUT", "OUT_LAYOUT")`` group.
+
+    Three layouts over two buffers, and the pairing is the whole point:
+
+    - ``X_LAYOUT`` / ``OUT_LAYOUT`` are the same ``[M, N] -> [ceil(N/S), M, S]``
+      split, so the reduce folds the stick axis and the subtract is stated over
+      the same physical tile.
+    - ``STAT_LAYOUT`` is the *broadcast* 1-D layout, ``[M] -> [M, S]``, because a
+      stick-axis reduce has to store its statistic stick-wide.
+
+    ``S`` rides along as a value because the kernel needs the stick width to
+    declare the read-side ``[M, S]`` descriptor -- the same width the layouts are
+    built from, stated once. At ``M=64`` fp16 with ``n_sticks=2``::
+
+        DTYPE = "fp16"   N = 128   S = 64
+        X_LAYOUT/OUT_LAYOUT = ((1, "floordiv", 64), 0, (1, "mod", 64))
+        STAT_LAYOUT         = (0, (0, "broadcast", 64))
+    """
+    stick = _stick_of(dtype)
+    return (dtype, n_sticks * stick, stick,
+            _stick_2d_on_n(dtype), _stick_1d_bcast(dtype), _stick_2d_on_n(dtype))
 
 
 def _stick_on_d2_row(dtype: str, n_sticks: int) -> tuple:
@@ -680,5 +763,90 @@ VARIANTS = {
         # mark the two device axes [M] does not address. Must agree with
         # OUT_LAYOUT above; nothing derives one from the other yet.
         "device_alloc": {"out_ptr": ([1, 64, 64], [-1, 1, -1])},
+    },
+
+    # The other half of the chain, and the two together are softmax's G1 and G2:
+    # the variant above proves a stick-axis reduce can STORE its statistic
+    # replicated across a stick, this one proves a later compute can read it back
+    # and apply it to a full tile.
+    #
+    # What made it fail until FoldDataMovementGenerics existed: `x2 - stat`
+    # lowered to a broadcast generic and then the subtract, and the broadcast has
+    # no descriptor, so RewriteDescriptorLayoutGeneric left it logical while its
+    # consumer was physical and bridged the two with a linearization,
+    # `(d0, d1, d2) -> (d1, d0 * 64 + d2)`. dbo-opt refused it -- "could not
+    # locate matching linalg operand to project loop IVs and tile sizes through".
+    # Folded, the subtract reads the statistic at a constant lane,
+    # `(d0, d1, d2) -> (d1, 0)`, which is what the hand-written reference states.
+    #
+    # Two buffers, two roles for one pointer: the statistic is written through a
+    # rank-1 broadcast-layout descriptor and read back through a rank-2 [M, 1]
+    # one carrying no layout. See the kernel's own docstring for why the read is
+    # at a fixed lane rather than the consumer's own.
+    "stat_chain_on_stick": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "simplified:no-loop", "spyre-tensor-layout", "hbm-round-trip"],
+        "summary": (
+            "out[m, n] = x[m, n] - sum(x[m, :]) with the statistic through HBM: "
+            "a stick-axis reduce storing it stick-wide, then a second compute "
+            "group reading lane 0 of it back and applying it to the tile."
+        ),
+        "kernel_fn":  kernel.stat_chain_on_stick,
+        "SIGNATURE":  _SIG_STAT_CHAIN,
+        "constexpr":  ["M", "N", "S", "X_LAYOUT", "STAT_LAYOUT", "OUT_LAYOUT"],
+        "params": {
+            # One row, because every value here follows from the dtype: S is its
+            # stick, N is a whole number of them, and all three layouts are built
+            # from the same width. Spelling them separately is what would let a
+            # 64-lane layout sit beside a 32-lane stick.
+            ("DTYPE", "N", "S", "X_LAYOUT", "STAT_LAYOUT", "OUT_LAYOUT"): [
+                _stat_chain_row("fp16", n_sticks=2),
+            ],
+            # M = 64 is one whole stick at fp16, so the statistic is one stick of
+            # rows and nothing is padded.
+            "M": [64],
+        },
+        "grid":        [1],
+        "data_layout": "host",
+        "compiles_to_binary": True,
+        "reference":   stat_chain_reference,
+        "inputs":      make_inputs_stat_chain,
+        "output_key":  "out_ptr",
+        "rtol":        1e-2,
+        # The statistic is a 128-term fp16 sum and the subtract passes its error
+        # straight through, so this is sized in ulp like the sibling above, not
+        # fitted to whichever element failed. The sums land near 11, where fp16
+        # ulp is 0.0078, and a 128-term reordering predicts about sqrt(128) = 11
+        # of them = 0.09. Measured on the device against the fp16 oracle for this
+        # exact input (seed 0, M=64, N=128): max |err| = 0.09375, i.e. 12 ulp,
+        # exactly what the reordering predicts. 0.25 is that with a factor of 2.7.
+        #
+        # rtol is along for the ride: `x - sum(x)` has elements near zero, where a
+        # relative bound says nothing (the measured relative difference is 45).
+        "atol":        2.5e-1,
+        # The statistic buffer, not the output: STAT_LAYOUT replicates [M] across
+        # a stick, so the device writes M*S elements where the host tensor holds
+        # M. See the sibling above for what the two lists are. The [M, N] output
+        # needs no entry -- its layout partitions rather than replicates, so
+        # `.to("spyre")` allocates exactly what the device writes.
+        "device_alloc": {"stat_ptr": ([1, 64, 64], [-1, 1, -1])},
+        # The ktir_cpu arm cannot run this one, and the refusal is by design
+        # rather than a gap to close: ktir_cpu reads dense host buffers, so that
+        # arm compiles at data-layout=host, and a BROADCAST physical dim has no
+        # stride in a host row-major buffer -- RewriteDescriptorLayoutGeneric says
+        # so and stops. A stick-axis reduce has nowhere else to put its statistic,
+        # so the device tier is where this variant is checked; the device path
+        # compiles at the default data-layout=device and passes.
+        #
+        # ``one_tile_on_stick_bcast`` above has the same gap for the same reason
+        # and carries no mark yet.
+        "xfail_numerical": {
+            "reason": "a broadcast layout has no host row-major stride, so the "
+                      "ktir_cpu arm's data-layout=host compile is refused; "
+                      "covered on the device tier instead",
+            "strict": True,
+            "raises": RuntimeError,
+        },
     },
 }

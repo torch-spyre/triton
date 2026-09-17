@@ -219,3 +219,68 @@ def reduce_one_tile(
     else:
         reduced = tl.min(a_tile, AXIS)
     out_desc.store([0], reduced)
+
+
+@triton.jit
+def stat_chain_on_stick(
+    x_ptr,
+    stat_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    S: tl.constexpr,
+    X_LAYOUT: tl.constexpr,
+    STAT_LAYOUT: tl.constexpr,
+    OUT_LAYOUT: tl.constexpr,
+):
+    """``out[m, n] = x[m, n] - sum(x[m, :])`` with the statistic through HBM.
+
+    Two compute groups, and the point is the *second* one. ``reduce_one_tile``
+    proved a stick-axis reduce can store its statistic replicated across a stick;
+    this proves the other half -- that a later compute can read it back and apply
+    it against a full tile. Between them they are softmax's G1 and G2.
+
+    The statistic buffer carries **two descriptors over one pointer**, differing
+    only in ``block_shape``:
+
+    - ``stat_w`` is rank-1 ``[M]`` and marked with a *broadcast* layout, so the
+      reduce stores each statistic across a whole stick -- physical ``[M, S]``.
+    - ``stat_r`` is rank-2 ``[M, S]`` blocked ``[M, 1]`` and deliberately carries
+      **no** layout, because its logical shape already *is* its physical one. Its
+      rank-2 tile is what lets the consumer address a fixed lane.
+
+    Reading a fixed lane is not a stylistic choice. The device replicates a
+    statistic only 8 elements wide, not ``S``, so a read of the lane matching the
+    consumer's own output would read memory nothing ever wrote. Lane 0 is written
+    for every row, which is why the block is ``[M, 1]`` at offset 0.
+
+    ``x`` is loaded twice, once per group: a load result may not be shared across
+    two compute groups.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    # Store side: rank-1, broadcast. The pass derives the physical [M, S] strides,
+    # so the stride declared here is the logical one and is not load-bearing.
+    stat_w = tl.make_tensor_descriptor(
+        stat_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    # Read side: the same bytes seen as [M, S], one lane wide.
+    stat_r = tl.make_tensor_descriptor(
+        stat_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    tl.spyre_tensor_layout(x_desc, X_LAYOUT)
+    tl.spyre_tensor_layout(stat_w, STAT_LAYOUT)
+    tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
+
+    # G1: fold the stick axis, store the statistic stick-wide.
+    x = x_desc.load([0, 0])
+    stat_w.store([0], tl.sum(x, axis=1))
+
+    # G2: read lane 0 of the statistic and apply it to the tile.
+    x2 = x_desc.load([0, 0])
+    stat = stat_r.load([0, 0])
+    out_desc.store([0, 0], x2 - stat)
