@@ -211,6 +211,17 @@ _CORE_PIPELINE_PASSES = (
     # no-ops. Still also in _SPYRECODE_STAGE_PASSES -- see the note there.
     "drop_reduction_init_fill",
     "linalg_generalize_named_ops",
+    # After generalization, because fusion matches generic -> generic: a named
+    # producer or consumer blocks it whatever the control function says. And
+    # before the layout pass, which is the pass whose behaviour this changes --
+    # a data-movement generic left standing has no layout marker, so its result
+    # stays logical while its consumer is physical and the operand map bridging
+    # them comes out as a linearization the scheduler cannot take.
+    #
+    # After drop_reduction_init_fill too, and that ordering is safe rather than
+    # required: that pass wants a reduce body of exactly two ops, and a pure
+    # data-movement producer contributes none, so folding cannot grow one.
+    "fold_data_movement_generics",
     "lower_inter_tile",
     "rewrite_descriptor_layout_generic",
     "convert_functions",
@@ -723,6 +734,10 @@ class SpyreBackend(BaseBackend):
             outs, while it is still a named linalg.fill to match
           - LinalgGeneralizeNamedOps (upstream): every named linalg op ->
             linalg.generic, so the layout pass below can read its indexing maps
+          - FoldDataMovementGenerics: a generic that only re-indexes (broadcast,
+            transpose, inserted unit dim) folded into its consumer's indexing
+            maps, so the layout pass below has no logical data-movement op left
+            to bridge with a linearized operand map
           - LowerInterTile: tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery
           - RewriteDescriptorLayoutGeneric: logical tensor descriptors -> physical
             (stick-tiled) layout from tt.spyre_tensor_layout annotations, with
