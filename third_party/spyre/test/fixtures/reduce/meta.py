@@ -160,6 +160,22 @@ def _stick_1d(dtype: str) -> tuple:
     return ("stick", ((0, "floordiv", stick), (0, "mod", stick)))
 
 
+def _stick_1d_bcast(dtype: str) -> tuple:
+    """``[M]`` -> ``[M, S]``: the statistic *replicated* across a stick.
+
+    The counterpart of :func:`_stick_1d`, and the difference is the whole point.
+    ``_stick_1d`` *partitions* M's elements over two physical dims, so the element
+    count is unchanged and one statistic lands in one lane. This one *broadcasts*:
+    physical dim 1 is a replication of width S, so each statistic occupies a whole
+    stick. That is the form a stick-axis reduce has to store, because the lanes it
+    reduced are read as one dim and written as another.
+
+    Note the layout is what targets ``[M, S]``; the host buffer stays logical
+    ``[M]``, and the launcher owns the transform between them.
+    """
+    return ("broadcast", (0, (0, "broadcast", _stick_of(dtype))))
+
+
 def _stick_2d_on_n(dtype: str) -> tuple:
     """``[M, N]`` -> ``[ceil(N/S), M, S]``: stick on the reduced axis.
 
@@ -204,6 +220,19 @@ def _stick_on_n_row(dtype: str, n_sticks: int) -> tuple:
     """
     return (dtype, n_sticks * _stick_of(dtype),
             _stick_2d_on_n(dtype), _stick_1d(dtype))
+
+
+def _stick_on_n_row_bcast(dtype: str, n_sticks: int) -> tuple:
+    """:func:`_stick_on_n_row` with the *broadcast* output layout.
+
+    Same input side, so the reduce folds the same axis; only where the statistic
+    lands differs. At ``M=64, N=128`` fp16 this is::
+
+        IN_LAYOUT  = ((1, "floordiv", 64), 0, (1, "mod", 64))   # [64,128] -> [2,64,64]
+        OUT_LAYOUT = (0, (0, "broadcast", 64))                  # [64]     -> [64,64]
+    """
+    return (dtype, n_sticks * _stick_of(dtype),
+            _stick_2d_on_n(dtype), _stick_1d_bcast(dtype))
 
 
 def _stick_on_d2_row(dtype: str, n_sticks: int) -> tuple:
@@ -624,5 +653,32 @@ VARIANTS = {
         # (3.2 ulp) is already generous. Inheriting the sibling's 0.25 would
         # check it 20x looser than it needs for no reason.
         "atol":        5e-2,
+    },
+
+    "one_tile_on_stick_bcast": {
+        "base": "one_tile",
+        "summary": (
+            "The stick-axis sum again, storing its statistic BROADCAST across a "
+            "stick instead of split across one. The split form cannot be "
+            "scheduled -- the lanes are reduced as one physical dim and would be "
+            "written as another -- and the broadcast form is what the reference "
+            "chains store. This is the arm that reaches a binary."
+        ),
+        "params": {
+            ("DTYPE", "N", "IN_LAYOUT", "OUT_LAYOUT"): [
+                _stick_on_n_row_bcast("fp16", n_sticks=2),
+            ],
+            "M": [64], "OP": ["sum"], "AXIS": [1],
+        },
+        "compiles_to_binary": True,
+        "atol":        5e-2,
+        # The layout targets [M, S], so the device writes M*S elements while the
+        # host tensor is [M]. Staging it with `.to("spyre")` would allocate M and
+        # every statistic but the first would write past the end, so the buffer
+        # is allocated through SpyreTensorLayout instead: device_size is the
+        # (stick, row, lane) form the layout implies, and the -1s in stride_map
+        # mark the two device axes [M] does not address. Must agree with
+        # OUT_LAYOUT above; nothing derives one from the other yet.
+        "device_alloc": {"out_ptr": ([1, 64, 64], [-1, 1, -1])},
     },
 }

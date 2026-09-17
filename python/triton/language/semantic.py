@@ -2119,7 +2119,13 @@ class TritonSemantic(Generic[TensorTy]):
         """
 
         # Coordinate-op encoding: maps keyword -> i64 stored on the MLIR op.
-        _COORD_OPS = {"identity": 0, "floordiv": 1, "mod": 2}
+        #
+        # identity/floordiv/mod all *partition* a logical dim's elements, so the
+        # physical extent follows from the logical one. broadcast does not: it
+        # replicates, and its extent is the arg alone. That is what a reduction
+        # statistic stored stick-wide needs -- logical [M] -> physical [M, S] --
+        # and it is why the arg is not optional for it.
+        _COORD_OPS = {"identity": 0, "floordiv": 1, "mod": 2, "broadcast": 3}
 
         if not isinstance(entry, (tuple, list)):
             return int(tl._unwrap_if_constexpr(entry)), 0, 0
@@ -2140,10 +2146,11 @@ class TritonSemantic(Generic[TensorTy]):
             op_code = _COORD_OPS[op_key]
         else:
             op_code = int(op_key)
-            if op_code not in (0, 1, 2):
+            if op_code not in _COORD_OPS.values():
                 raise ValueError(
                     f"spyre_tensor_layout: entry {i} op must be "
-                    f"{sorted(_COORD_OPS)} or 0/1/2, got {op_key!r}")
+                    f"{sorted(_COORD_OPS)} or one of "
+                    f"{sorted(_COORD_OPS.values())}, got {op_key!r}")
 
         arg_val = int(entry[2]) if len(entry) == 3 else 0
         return src_dim, op_code, arg_val
