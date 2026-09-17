@@ -129,6 +129,16 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   m.def("add_drop_reduction_init_fill", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createDropReductionInitFillPass());
   });
+  // Folds a pure data-movement linalg.generic (body = a lone yield of an input)
+  // into its consumer's indexing maps, with upstream's elementwise-fusion
+  // patterns under a control function that permits nothing else -- so two
+  // computes never merge. Needs every compute op to already be a linalg.generic
+  // (fusion matches generic -> generic), and must run before
+  // rewrite_descriptor_layout_generic, which would otherwise linearize a
+  // surviving data-movement generic's map into its consumer.
+  m.def("add_fold_data_movement_generics", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::ktdp::createFoldDataMovementGenericsPass());
+  });
   m.def("add_lower_inter_tile", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
   });
