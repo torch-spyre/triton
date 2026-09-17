@@ -113,10 +113,11 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
       },
       py::arg("pm"), py::arg("data_layout") = "device");
   // Not in add_convert_ttir_to_ktdp above: this is a fix pass, spliced into the
-  // pipeline from Python via SpyreOptions.required_fixes. It must be anchored on
+  // pipeline from Python via SpyreOptions.required_fixes. It must land after
   // convert_elementwise_to_linalg, which is the pass that creates the ins/outs
-  // aliasing it removes; anchoring it on anything earlier is a silent no-op,
-  // since the pass only rewrites aliasing that already exists.
+  // aliasing it removes; placing it any earlier is a silent no-op, since the
+  // pass only rewrites aliasing that already exists. Today both share the
+  // lower_compute_ops anchor and dict order keeps them in that sequence.
   m.def("add_unalias_linalg_outs", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createUnaliasLinalgOutsPass());
   });

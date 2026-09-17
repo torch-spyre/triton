@@ -811,7 +811,7 @@ def spyrecode_options(compilable_example):
     """Compile options for the variant under test.
 
     The grid alone. The default fixes (``convert_elementwise_to_linalg`` and
-    ``unalias_linalg_outs``, anchored on ``rewrite_descriptor_layout``) are
+    ``unalias_linalg_outs``, anchored on ``lower_compute_ops``) are
     injected by ``parse_options`` so no caller has to name them, and
     ``lower_spyre_ops`` runs automatically at the spyrecode stage (see
     ``_SPYRECODE_STAGE_PASSES``) since this fixture is only used by compiles

@@ -204,8 +204,9 @@ _CORE_PIPELINE_PASSES = (
     "lower_descriptor_memory",
     "lower_scalar_load",
     "lower_compute_ops",
+    "linalg_generalize_named_ops",
     "lower_inter_tile",
-    "rewrite_descriptor_layout",
+    "rewrite_descriptor_layout_generic",
     "convert_functions",
 )
 
@@ -217,6 +218,7 @@ _PASS_OPTIONS = {
     "distribute_work": ("grid",),
     "materialize_base_addresses": ("base_addresses",),
     "rewrite_descriptor_layout": ("data_layout",),
+    "rewrite_descriptor_layout_generic": ("data_layout",),
     "convert_ttir_to_ktdp": ("data_layout",),
 }
 
@@ -567,14 +569,31 @@ class SpyreBackend(BaseBackend):
         # own entries so an explicit override of a specific anchor still wins, but
         # a caller that passes nothing still gets them.
         #
-        # The anchor is rewrite_descriptor_layout, not lower_compute_ops.
-        # lower_compute_ops builds a linalg.generic with logical types before the
-        # layout pass physicalizes the descriptor to its stick shape; the types then
-        # disagree and the pipeline aborts.  rewrite_descriptor_layout runs after
-        # that physicalization, so the fixes see consistent types.
+        # The anchor is lower_compute_ops, so both fixes run *before* the layout
+        # pass rather than after it. That is the opposite of what the named
+        # RewriteDescriptorLayout wanted, and the reason is which pass owns the
+        # physical types.
+        #
+        # RewriteDescriptorLayoutGeneric restates every linalg.generic's
+        # indexing_maps and iterator_types at physical rank, reading only what the
+        # maps already say. So it has to see each compute op in its *final* form:
+        # an arith-on-tensors op that only becomes a generic later, or a generic
+        # whose outs still aliases its ins, is not something it can restate, and a
+        # fix applied afterwards would be rewriting IR the layout pass has already
+        # committed to physical shapes. Early means the layout pass gets operands
+        # it can read.
+        #
+        # The named pass needed the reverse: it recognised specific ops and
+        # physicalized them itself, so a generic built at logical types before it
+        # ran left the types disagreeing and aborted the pipeline. That constraint
+        # is gone with the op-recognition it came from.
+        #
+        # unalias_linalg_outs still has to follow convert_elementwise_to_linalg,
+        # which is what creates the aliasing it removes. Sharing one anchor
+        # preserves that: fixes are added in dict order after their anchor.
         parsed["required_fixes"] = {
-            "convert_elementwise_to_linalg": "rewrite_descriptor_layout",
-            "unalias_linalg_outs":           "rewrite_descriptor_layout",
+            "convert_elementwise_to_linalg": "lower_compute_ops",
+            "unalias_linalg_outs":           "lower_compute_ops",
             **parsed.get("required_fixes", {}),
         }
         return SpyreOptions(**parsed)
@@ -686,9 +705,12 @@ class SpyreBackend(BaseBackend):
             element 1-D read
           - LowerComputeOps: tt.reduce/broadcast/expand_dims -> linalg/tensor
             + dead op sweep
-          - RewriteDescriptorLayout: logical tensor descriptors -> physical
-            (stick-tiled) layout from tt.spyre_tensor_layout annotations
+          - LinalgGeneralizeNamedOps (upstream): every named linalg op ->
+            linalg.generic, so the layout pass below can read its indexing maps
           - LowerInterTile: tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery
+          - RewriteDescriptorLayoutGeneric: logical tensor descriptors -> physical
+            (stick-tiled) layout from tt.spyre_tensor_layout annotations, with
+            each linalg.generic restated at physical rank
           - ConvertFunctions: tt.func/return -> func.func/return, !tt.ptr -> index
             (last of the core passes — the memory passes above consume !tt.ptr
             args via getBasePtrAsIndex)
