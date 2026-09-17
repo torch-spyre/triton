@@ -66,7 +66,12 @@ from triton import knobs
 from triton.compiler.compiler import compile as triton_compile
 
 from conftest import EXAMPLES
-from backend.compiler import INIT_BINARY, SPYRE_CODE_DIR, SPYRECODE_JSON
+from backend.compiler import (
+    DEBUG_DIR,
+    INIT_BINARY,
+    SPYRE_CODE_DIR,
+    SPYRECODE_JSON,
+)
 from utils import spyre_target
 
 
@@ -82,7 +87,7 @@ def test_artifact_holds_the_spyre_code_dir(compiled):
     names = set(zipfile.ZipFile(io.BytesIO(compiled.kernel)).namelist())
     assert {f"{SPYRE_CODE_DIR}/{SPYRECODE_JSON}",
             f"{SPYRE_CODE_DIR}/{INIT_BINARY}"} <= names
-    assert any(n.startswith("debug/") for n in names), sorted(names)
+    assert any(n.startswith(f"{DEBUG_DIR}/") for n in names), sorted(names)
 
 
 def test_the_kernel_name_reaches_the_compiled_kernel(compiled, compilable_example):

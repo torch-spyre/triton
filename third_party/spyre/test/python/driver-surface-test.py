@@ -32,7 +32,12 @@ from triton import knobs
 from triton.backends.driver import DriverBase
 
 import backend.driver as spyre_driver
-from backend.compiler import INIT_BINARY, SPYRE_CODE_DIR, SPYRECODE_JSON
+from backend.compiler import (
+    DEBUG_DIR,
+    INIT_BINARY,
+    SPYRE_CODE_DIR,
+    SPYRECODE_JSON,
+)
 from backend.driver import SpyreDriver, SpyreLauncher, SpyreUtils
 
 
@@ -147,8 +152,10 @@ def _zip_bytes(entries):
 #: (TestArtifactLayoutNames), because a suite written *only* in terms of the
 #: constants would follow a wrong constant into agreement and stay green.
 #:
-#: ``debug/`` stays a literal: it is not a name our code chooses -- the archive is
-#: built by walking the export directory -- so there is no constant to import.
+#: ``dfir.mlir`` stays a literal: the directory it sits in is part of the layout,
+#: the file inside it is not -- nothing here or downstream opens it by name, and
+#: this one only has to be *a* file for the "carried along" assertion to mean
+#: something.
 _ARTIFACT = {
     # The ``init_bin_file`` field is content rather than a path we build, but it
     # names the sibling below, so it is built from the same constant to keep the
@@ -156,7 +163,7 @@ _ARTIFACT = {
     f"{SPYRE_CODE_DIR}/{SPYRECODE_JSON}":
         f'{{"init_bin_file": "{INIT_BINARY}"}}'.encode(),
     f"{SPYRE_CODE_DIR}/{INIT_BINARY}": b"\x00\x01\x02\x03",
-    "debug/dfir.mlir": b"module {}\n",
+    f"{DEBUG_DIR}/dfir.mlir": b"module {}\n",
 }
 
 
@@ -237,6 +244,7 @@ class TestArtifactLayoutNames:
         assert SPYRE_CODE_DIR == "spyreCodeDir"
         assert SPYRECODE_JSON == "spyrecode.json"
         assert INIT_BINARY == "init_binary.bin"
+        assert DEBUG_DIR == "debug"
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +276,7 @@ class TestLoadBinary:
         assert str(root) == module
         assert (root / SPYRE_CODE_DIR / SPYRECODE_JSON).is_file()
         assert (root / SPYRE_CODE_DIR / INIT_BINARY).is_file()
-        assert (root / "debug" / "dfir.mlir").is_file()
+        assert (root / DEBUG_DIR / "dfir.mlir").is_file()
 
     def test_keyed_on_the_artifact_digest(self, cache_dir):
         artifact = _zip_bytes(_ARTIFACT)

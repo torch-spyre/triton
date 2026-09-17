@@ -45,6 +45,12 @@ SPYRECODE_JSON = "spyrecode.json"
 #: Written as a sibling of it, which is where that field's relative path resolves.
 INIT_BINARY = "init_binary.bin"
 
+#: The per-stage artifacts, a sibling of SPYRE_CODE_DIR rather than a child. The
+#: one name here that no code *constructs*: the archive takes it along because it
+#: walks the whole export directory, and nothing on the launch path opens it. Named
+#: anyway, because it is part of the layout and the tests assert it is carried.
+DEBUG_DIR = "debug"
+
 #: The compile stage, its artifact's file extension, and the value recorded in
 #: metadata["stage"] -- one name in three roles, and they have to agree:
 #: ``binary_ext`` is how CompiledKernel picks which cached file to read as the
