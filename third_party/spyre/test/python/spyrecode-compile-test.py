@@ -65,6 +65,7 @@ import pytest
 from triton import knobs
 from triton.compiler.compiler import compile as triton_compile
 
+from conftest import EXAMPLES
 from backend.compiler import INIT_BINARY, SPYRE_CODE_DIR, SPYRECODE_JSON
 from utils import spyre_target
 
@@ -82,6 +83,15 @@ def test_artifact_holds_the_spyre_code_dir(compiled):
     assert {f"{SPYRE_CODE_DIR}/{SPYRECODE_JSON}",
             f"{SPYRE_CODE_DIR}/{INIT_BINARY}"} <= names
     assert any(n.startswith("debug/") for n in names), sorted(names)
+
+
+def test_the_kernel_name_reaches_the_compiled_kernel(compiled, compilable_example):
+    # ``backend-options-test.py`` pins the recording against the stage; this reads
+    # the far end of it, off a full compile, where the name is what CompiledKernel
+    # reports as ``.name`` and what SpyreLauncher hands to torch-spyre for its log
+    # lines, profiler events and failure reports. Read at the end of _make_ktir it
+    # was "" here, for every kernel, with nothing to notice it.
+    assert compiled.name == EXAMPLES[compilable_example]["kernel_fn"].__name__
 
 
 def test_artifact_is_bytes(compiled):

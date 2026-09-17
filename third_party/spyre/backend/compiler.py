@@ -142,6 +142,35 @@ def _segment_addresses(signature_types) -> Tuple[int, ...]:
                  for i, ty in enumerate(ptr_types))
 
 
+def entry_func_name(mod) -> str:
+    """The kernel entry function's name, refusing the empty string.
+
+    ``get_entry_func_name`` (``python/src/ir.cc``) scans the module's top-level ops
+    for a ``tt.func`` that ``triton::isKernel`` accepts, and returns ``""`` when it
+    finds none. That answer conflates two different situations — a module with no
+    kernel in it, and a module whose entry point is no longer a ``tt.func`` — and
+    the second one is *reachable in this pipeline*: ``ConvertFunctions`` rewrites the
+    entry point to a ``func.func``, and the binding's ``dyn_cast`` then misses every
+    op.
+
+    So the empty string is refused here rather than passed on. It is the difference
+    between a name and a silence, and everything downstream that takes a name
+    (``metadata["name"]``, the base-address inference) treats what it is given as
+    one.
+
+    Callers must therefore read this *before* the core pipeline runs. Both do.
+    """
+    name = mod.get_entry_func_name()
+    if not name:
+        raise RuntimeError(
+            "module has no kernel entry function that get_entry_func_name can "
+            "see. Either there is no kernel in it, or its entry point is no "
+            "longer a tt.func -- ConvertFunctions rewrites it to a func.func, "
+            "and this must be read before that runs."
+        )
+    return name
+
+
 def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
     """The default base addresses, from ``mod``'s entry-function pointer types.
 
@@ -159,12 +188,7 @@ def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
     i.e. before or at the very start of the TTIR→KTIR pipeline: ConvertFunctions
     rewrites every pointer to a bare ``index`` and the widths are then gone.
     """
-    entry = mod.get_entry_func_name()
-    if not entry:
-        raise RuntimeError(
-            "module has no kernel entry function, so its pointer arguments "
-            "cannot be located; Spyre needs them to assign HBM base addresses"
-        )
+    entry = entry_func_name(mod)
     return _segment_addresses(mod.get_function_signature(mod.get_function(entry)))
 
 
@@ -683,6 +707,19 @@ class SpyreBackend(BaseBackend):
         """
         from triton._C.libtriton import ir, passes
 
+        # Read before the pipeline, for the same reason as the base addresses
+        # below: the binding behind this name only matches a tt.func, and
+        # ConvertFunctions -- the last core pass -- has rewritten the entry point
+        # to a func.func by the end of this method. Read afterwards it comes back
+        # as the empty string for every kernel, and silently, because "no match"
+        # and "no kernel" are the same answer there.
+        #
+        # A name is not load-bearing for execution, which is what let a blank one
+        # survive: it is what CompiledKernel reports as `.name`, what reaches
+        # utils.load_binary, and what torch-spyre puts in its log lines, profiler
+        # event names and failure reports. 
+        metadata["name"] = entry_func_name(mod)
+
         # Only the address-binding mode has any use for these. Inferring them in
         # symbolic mode would also mean reporting a pointer-width or pointer-count
         # problem in place of the NotImplementedError the caller is actually about
@@ -708,7 +745,6 @@ class SpyreBackend(BaseBackend):
         passes.common.add_cse(pm)
         pm.run(mod, "make_ktir")
 
-        metadata["name"] = mod.get_entry_func_name()
         metadata["stage"] = "ktir"
         return mod
 

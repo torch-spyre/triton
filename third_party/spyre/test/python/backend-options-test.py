@@ -32,6 +32,7 @@ from backend.compiler import (
     SpyreBackend,
     SpyreOptions,
     _segment_addresses,
+    entry_func_name,
     infer_base_addresses_from_ptr_types,
 )
 
@@ -164,6 +165,50 @@ class TestInferBaseAddresses:
         # expressed in that pointer's own elements.
         assert (_segment_addresses(["*f32", "*f32"])
                 != _segment_addresses(["*f16", "*f16"]))
+
+
+# ---------------------------------------------------------------------------
+# metadata["name"]
+#
+# The same pipeline-ordering property as the base addresses above, on the other
+# value that has to be read before ConvertFunctions runs — and the one that had no
+# test, which is how it stayed wrong. Nothing about execution depends on a kernel
+# name, so a blank one degrades reports and cache keys instead of failing.
+# ---------------------------------------------------------------------------
+
+class TestEntryFuncName:
+
+    def test_the_name_is_recorded_and_is_the_source_function(self):
+        # Read at the *end* of _make_ktir this was "" for every kernel:
+        # ConvertFunctions has by then rewritten the entry point to a func.func,
+        # and get_entry_func_name only matches a tt.func. Read before the
+        # pipeline, it is the source function's name -- which is what a report,
+        # an IR dump or an error message needs it to be.
+        metadata = {}
+        ttir = compile_to_ttir(_EXAMPLE["kernel_fn"], _EXAMPLE["signature"],
+                               _EXAMPLE["constexprs"])
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".mlir", delete_on_close=False) as f:
+            f.write(ttir)
+            f.flush()
+            make_ktir_mod(f.name, grid=_EXAMPLE["grid"], metadata=metadata)
+        assert metadata["name"] == _EXAMPLE["kernel_fn"].__name__
+
+    def test_the_empty_answer_is_refused_rather_than_returned(self, tmp_path):
+        # The guard that keeps a future pipeline reordering from reintroducing the
+        # blank quietly. get_entry_func_name returns "" for both "no kernel here"
+        # and "the entry point is not a tt.func any more", so the caller cannot
+        # tell them apart and must not treat either as a name.
+        from triton._C.libtriton import ir
+        context = ir.context()
+        ir.load_dialects(context)
+        SpyreBackend(spyre_target()).load_dialects(context)
+        path = tmp_path / "empty.mlir"
+        path.write_text("module {}\n")
+        mod = ir.parse_mlir_module(str(path), context)
+        mod.context = context
+        with pytest.raises(RuntimeError, match="no kernel entry function"):
+            entry_func_name(mod)
 
 
 # ---------------------------------------------------------------------------

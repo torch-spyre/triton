@@ -78,12 +78,13 @@ class SpyreUtils:
         ``<code_dir>/spyreCodeDir/spyrecode.json`` and the ``init_bin_file``
         that names, both by name and with no directory scan anywhere.
 
-        Keyed on the **artifact digest**, not on ``name``: ``name`` reaches here as
-        the empty string for every Spyre kernel — the binding behind
-        ``metadata["name"]`` looks for a ``tt.func`` entry point, and
-        ``convert_functions`` has already rewritten it to a ``func.func`` — and
-        ``CompiledKernel.hash`` is not passed in. Keying on a name that is always
-        empty would collide every kernel into one directory.
+        Keyed on the **artifact digest**, not on ``name``. A name is not an
+        identity: one ``@triton.jit`` function compiles to as many different
+        binaries as it has specializations, grids and option sets, and every one of
+        them arrives here under the same name — so keying on it would serve the
+        first artifact to whoever compiled the second. What *would* be an identity,
+        ``CompiledKernel.hash``, is not passed in. The bytes are, so they are the
+        key.
 
         ``n_regs`` / ``n_spills`` are meaningless here and reported as 0.
         ``n_max_threads`` is 1, which keeps ``_init_handles``' check
@@ -275,10 +276,12 @@ class SpyreLauncher:
         missing rather than doing.
 
         The name is only ever reported — torch-spyre's log lines, its profiler
-        event names, its failure reports — so it comes from the source function
-        rather than from ``metadata["name"]``, which is the empty string for every
-        Spyre kernel (see ``SpyreUtils.load_binary`` for why). A blank name would
-        make every one of those unattributable.
+        event names, its failure reports — and it comes from ``metadata["name"]``,
+        the name the compile recorded, so that a report and an IR dump of the same
+        kernel agree. It is guaranteed non-empty: ``_make_ktir`` reads it before
+        ``ConvertFunctions`` can erase it and refuses an empty answer, which it
+        used to return for every kernel and which would have made every one of
+        those reports unattributable.
         """
         if self._runner is None:
             # Imported before the mode check below, not merely before the runner:
@@ -289,7 +292,7 @@ class SpyreLauncher:
             from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
 
             self._check_argument_mode_agrees()
-            self._runner = SpyreSDSCKernelRunner(self.src.name, str(code_dir))
+            self._runner = SpyreSDSCKernelRunner(self.metadata.name, str(code_dir))
         return self._runner
 
     def _check_argument_mode_agrees(self):

@@ -276,8 +276,10 @@ class TestLoadBinary:
         assert hashlib.sha256(artifact).hexdigest() == module.rsplit("/", 1)[-1]
 
     def test_name_is_not_part_of_the_key(self, cache_dir):
-        # metadata["name"] is the empty string for every Spyre kernel, so keying
-        # on it would collide every kernel into one directory.
+        # A name is not an identity: one jitted function compiles to a different
+        # binary per specialization, grid and option set, all under that one
+        # name, so keying on it would serve the first artifact to whoever
+        # compiled the second.
         artifact = _zip_bytes(_ARTIFACT)
         first, _, _, _, _ = SpyreUtils().load_binary("", artifact, 0, 0)
         second, _, _, _, _ = SpyreUtils().load_binary("something_else", artifact, 0, 0)
