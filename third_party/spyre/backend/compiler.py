@@ -204,6 +204,12 @@ _CORE_PIPELINE_PASSES = (
     "lower_descriptor_memory",
     "lower_scalar_load",
     "lower_compute_ops",
+    # Before linalg_generalize_named_ops, and that is the whole reason it can be
+    # here: the pass matches the init through getDefiningOp<linalg::FillOp>(), so
+    # it only works while the fill is still a *named* linalg.fill. Generalized it
+    # becomes a linalg.generic, the match returns null and the pass silently
+    # no-ops. Still also in _SPYRECODE_STAGE_PASSES -- see the note there.
+    "drop_reduction_init_fill",
     "linalg_generalize_named_ops",
     "lower_inter_tile",
     "rewrite_descriptor_layout_generic",
@@ -287,6 +293,14 @@ _SPYRECODE_STAGE_PASSES = (
     # A no-op for everything else: it matches only linalg ops carrying a
     # reduction iterator, so the other producer of linalg.fill in this pipeline
     # (tt.splat) is out of scope.
+    #
+    # It ALSO runs in the TTIR→KTIR pipeline now, from _CORE_PIPELINE_PASSES,
+    # because that is the only place the fill is still a named linalg.fill for it
+    # to match. It stays here too: the pass is idempotent (a second run finds no
+    # fill on any reduction init), and any path that reaches the spyrecode stage
+    # without having gone through the composed pipeline still needs it. The two
+    # objections above stand as the reason it does not belong here *alone*, not as
+    # a reason to remove this entry.
     "drop_reduction_init_fill",
 
     # LowerSpyreOps. Rewrites a scalar math/arith op (math.sqrt/exp/rsqrt,
@@ -705,6 +719,8 @@ class SpyreBackend(BaseBackend):
             element 1-D read
           - LowerComputeOps: tt.reduce/broadcast/expand_dims -> linalg/tensor
             + dead op sweep
+          - DropReductionInitFill: drop the zero linalg.fill on a reduction's
+            outs, while it is still a named linalg.fill to match
           - LinalgGeneralizeNamedOps (upstream): every named linalg op ->
             linalg.generic, so the layout pass below can read its indexing maps
           - LowerInterTile: tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery
