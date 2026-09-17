@@ -70,30 +70,105 @@ Level A  shape                fp32, add  (OP and DTYPE pinned)
 
 #### Declared buffers
 
-Several computes rather than one, unary, and every intermediate written to HBM
-and read back through a descriptor the *author* declared — its own pointer
-argument, its own `spyre_tensor_layout`, an explicit store and an explicit load.
-So no compute result flows into another compute, each compute stands between a
-load and a store and becomes its own schedule, and the buffer carrying an
-intermediate physicalizes under `LAYOUT` like any other descriptor.
+The variants above compute one operation. These compute several in sequence, and
+every value passed between them makes a round trip through HBM (high-bandwidth
+memory — the accelerator's main off-chip memory) rather than flowing directly from
+one operation into the next.
 
-- **1d_device_dag_buffers** — `out = exp(x) * sqrt(exp(x)) + sqrt(x)`, one
-  declared buffer per intermediate (`e`, `s`, `m`, `r`). A DAG rather than a
-  chain, so `e` is read twice: one store and **two loads** of the same
-  descriptor, which is the load-per-consumer rule.
+Nothing in the compiler decides that. The kernel author writes it out: each
+intermediate gets its own pointer argument, its own tensor descriptor, its own
+`spyre_tensor_layout` annotation, and an explicit store followed by an explicit
+load. Written normally, `sqrt(exp(x))` would pass `exp(x)` straight to `sqrt`;
+here it is stored and read back.
 
-The pooled sub-arm puts every intermediate in a *region* of one scratch pointer
-instead, addressed as a block offset into one whole-pool descriptor. It is about
-footprint, and what it decides is region reuse:
+Two things follow, and they are what these fixtures test:
 
-- **1d_device_chain_pooled** — `out = sqrt(exp(x))`, one intermediate, one
-  region. The floor: no reuse claimed.
-- **1d_device_chain_pooled_grid2** — the same across two cores, which take
-  disjoint blocks of the one whole-tensor region.
-- **1d_device_chain3_pooled** — `out = exp(sqrt(exp(x)))` with both
-  intermediates in **one** region, so the middle schedule does
-  `load R0 → sqrt → store R0`. Reuse *inside* one schedule.
-- **1d_device_chain3_pooled2** — the two-region control for the above.
-- **1d_device_dag_pooled** — four intermediates in three regions (the minimum),
-  with `R0` carrying `e` and then `r`. Reuse *across* schedules.
+- Every compute sits between a load and a store, so each becomes its own
+  schedule (one unit of work the device runs start to finish).
+- A buffer holding an intermediate is an ordinary descriptor, so it
+  physicalizes under `LAYOUT` — gets laid out in the accelerator's stick format —
+  exactly like an input or output.
 
+##### One buffer per intermediate
+
+- **1d_device_dag_buffers** — `out = exp(x) * sqrt(exp(x)) + sqrt(x)`, with four
+  named intermediates, each in its own buffer:
+
+  ```
+  e = exp(x)      s = sqrt(e)      m = e * s      r = sqrt(x)
+  out = m + r
+  ```
+
+  The kernel takes `e_ptr`, `s_ptr`, `m_ptr`, `r_ptr` as separate arguments, so
+  the launcher allocates four full-size buffers.
+
+  This expression is chosen because it **branches**: `e` is read by both the
+  `sqrt` and the multiply. A straight chain like `sqrt(exp(x))` has no value with
+  two consumers, so it cannot exercise what happens next. A value read twice
+  becomes **one store and two loads of the same descriptor** — not two buffers,
+  and not one load whose result is reused. `x` is likewise loaded twice, once for
+  the `exp` and once for the other `sqrt`. That is the load-per-consumer rule.
+
+##### One pooled buffer, divided into regions
+
+Four separate allocations is the plainest way to write the above and the most
+wasteful: each intermediate is dead within a statement or two, yet occupies a
+whole tensor for the kernel's lifetime. The pooled variants take a **single**
+`pool_ptr` instead and give each intermediate a *region* of it — a fixed-size
+slice, addressed by adding a base offset to the descriptor index.
+
+The regions are offsets into one descriptor covering the whole pool, rather than a
+separate descriptor per region built over a shifted pointer (`pool_ptr + OFF`).
+The kernels note this as forced rather than preferred, because the pointer
+arithmetic the per-region form needs does not survive the descriptor lowering; see
+`chain3_pooled2_1d_device`'s docstring in `kernel.py`.
+
+What varies across these variants is **how many regions the intermediates need**,
+and whether one region can hold two of them at different times. Two intermediates
+can share a region only if their live ranges do not overlap — a live range running
+from the store that writes a value to the last load that reads it.
+
+- **1d_device_chain_pooled** — `out = sqrt(exp(x))`. One intermediate, so one
+  region, and `pool_ptr` is used whole with no offsets. Nothing is shared here,
+  which is the point: it is the baseline. If this behaves differently from
+  `dag_buffers`-style separate allocation, the cause is pooling itself, since
+  there is no sharing present to blame.
+
+- **1d_device_chain_pooled_grid2** — the same kernel across two cores. Each core
+  offsets into its own block of the one region, so the two never collide.
+
+- **1d_device_chain3_pooled** — `out = exp(sqrt(exp(x)))`. Two intermediates,
+  `t0 = exp(x)` and `t1 = sqrt(t0)`. Because `t0`'s last reader is the very `sqrt`
+  that produces `t1`, their live ranges do not overlap and **one** region suffices.
+  The middle compute therefore reads and writes the same region:
+  `load R0 → sqrt → store R0`. This is reuse **within a single schedule**.
+
+- **1d_device_chain3_pooled2** — the same expression given **two** regions, so no
+  schedule reads and writes the same one. It is the comparison for the variant
+  above: if the one-region version misbehaves and this one does not, the cause is
+  the in-place reuse rather than the pooling.
+
+- **1d_device_dag_pooled** — the same expression as `dag_buffers`, with its four
+  intermediates in **three** regions. Three is provably the minimum. Numbering the
+  statements, each intermediate's live range is:
+
+  ```
+  1  store e                          e : [1, 3]
+  2  load e,  store s                 s : [2, 3]
+  3  load e,  load s,  store m        m : [3, 5]
+  4  store r                          r : [4, 5]
+  5  load m,  load r,  store out
+  ```
+
+  All three of `e`, `s`, `m` are live at statement 3, so no two of them can share
+  and three regions are needed. Three are also enough: `r` is written at statement
+  4, after `e`'s last read at 3, so `r` takes over `e`'s region:
+
+  ```
+  R0 : e, then r          R1 : s          R2 : m
+  ```
+
+  Here the reuse is **across** schedules — the compute that last reads `e` and the
+  compute that writes `r` are different ones. That is a weaker claim than
+  `chain3_pooled`'s reuse inside one schedule, and the two are kept in separate
+  fixtures so a failure points at one of them.
