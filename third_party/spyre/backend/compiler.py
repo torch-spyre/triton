@@ -715,17 +715,17 @@ class SpyreBackend(BaseBackend):
     def _make_spyrecode(self, mod, metadata, options):
         """Lower KTIR to a loadable Spyre binary by running ``dbo-opt``.
 
-        Returns dbo-opt's export directory as **ZIP bytes**. A compile stage
-        yields one artifact, but an export directory is a ``spyreCodeDir/``
-        (``spyrecode.json`` + ``init_binary.bin``) beside dbo-opt's ``debug/``
-        tree, so the archive is the single artifact and
+        Returns the exported directory as **ZIP bytes**. A compile stage yields
+        one artifact, but the export is a ``SPYRE_CODE_DIR`` holding
+        ``SPYRECODE_JSON`` and ``INIT_BINARY``, with a ``debug/`` tree of
+        per-stage artifacts beside it, so the archive is the single artifact and
         ``SpyreUtils.load_binary`` unpacks it.
 
-        Layout inside the ZIP is dbo-opt's own, member names relative to
-        ``--export-dir``, so unpacking reproduces what dbo-opt wrote rather than
-        a second convention. That is what ``torch_spyre``'s
-        ``SpyreSDSCKernelRunner`` expects: it is handed a directory and appends
-        ``/spyreCodeDir`` itself before calling ``prepare_kernel``.
+        Member names are relative to the export directory, so unpacking
+        reproduces the layout as written rather than a second convention of our
+        own. That is what ``torch_spyre``'s ``SpyreSDSCKernelRunner`` expects: it
+        is handed a directory and appends ``/spyreCodeDir`` itself before calling
+        ``prepare_kernel``.
 
         Three steps, the first two in one pass manager:
 
@@ -863,8 +863,8 @@ class SpyreBackend(BaseBackend):
                     f"under {code_dir}\n  argv: {' '.join(argv)}\n{result.stderr}"
                 )
 
-            # Relative to export_dir, not to code_dir: the archive carries
-            # dbo-opt's layout, spyreCodeDir/ and debug/ side by side, because
+            # Relative to export_dir, not to code_dir: the archive keeps the
+            # layout as exported, spyreCodeDir/ and debug/ side by side, because
             # that is the layout the launch path consumes.
             members = [(path, path.relative_to(export_dir).as_posix())
                        for path in sorted(export_dir.rglob("*")) if path.is_file()]

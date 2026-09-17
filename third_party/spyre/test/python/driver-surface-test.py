@@ -32,6 +32,7 @@ from triton import knobs
 from triton.backends.driver import DriverBase
 
 import backend.driver as spyre_driver
+from backend.compiler import INIT_BINARY, SPYRE_CODE_DIR, SPYRECODE_JSON
 from backend.driver import SpyreDriver, SpyreLauncher, SpyreUtils
 
 
@@ -141,13 +142,20 @@ def _zip_bytes(entries):
 #: The export layout the ZIP carries: a spyreCodeDir/ with debug/ beside it, not
 #: the code dir's contents flattened to the root.
 #:
-#: Spelled out here rather than built from ``backend.compiler``'s SPYRE_CODE_DIR /
-#: SPYRECODE_JSON. Those exist so the two *modules* cannot disagree; this file's
-#: job is to pin the names torch-spyre actually opens, and a test written in terms
-#: of the constants would follow a wrong one into agreement and stay green.
+#: Built from the constants, so the layout is spelled in one place and this file
+#: cannot drift from the modules. The literals live in exactly one test
+#: (TestArtifactLayoutNames), because a suite written *only* in terms of the
+#: constants would follow a wrong constant into agreement and stay green.
+#:
+#: ``debug/`` stays a literal: it is not a name our code chooses -- the archive is
+#: built by walking the export directory -- so there is no constant to import.
 _ARTIFACT = {
-    "spyreCodeDir/spyrecode.json": b'{"init_bin_file": "init_binary.bin"}',
-    "spyreCodeDir/init_binary.bin": b"\x00\x01\x02\x03",
+    # The ``init_bin_file`` field is content rather than a path we build, but it
+    # names the sibling below, so it is built from the same constant to keep the
+    # fake self-consistent.
+    f"{SPYRE_CODE_DIR}/{SPYRECODE_JSON}":
+        f'{{"init_bin_file": "{INIT_BINARY}"}}'.encode(),
+    f"{SPYRE_CODE_DIR}/{INIT_BINARY}": b"\x00\x01\x02\x03",
     "debug/dfir.mlir": b"module {}\n",
 }
 
@@ -212,6 +220,26 @@ class TestDriverSurface:
 
 
 # ---------------------------------------------------------------------------
+# The layout names
+# ---------------------------------------------------------------------------
+
+class TestArtifactLayoutNames:
+
+    def test_the_constants_are_the_names_torch_spyre_opens(self):
+        # The one place in the suite that spells them out, and the reason the rest
+        # of the file can safely use the constants: everything else would follow a
+        # wrong constant into agreement and stay green, so the literals are pinned
+        # here once.
+        #
+        # None of the three is ours to choose. SpyreSDSCKernelRunner appends
+        # SPYRE_CODE_DIR to the directory it is given, and prepare_kernel opens
+        # SPYRECODE_JSON inside it and then the init_bin_file that names.
+        assert SPYRE_CODE_DIR == "spyreCodeDir"
+        assert SPYRECODE_JSON == "spyrecode.json"
+        assert INIT_BINARY == "init_binary.bin"
+
+
+# ---------------------------------------------------------------------------
 # load_binary / unload_module
 # ---------------------------------------------------------------------------
 
@@ -238,8 +266,8 @@ class TestLoadBinary:
         # init_bin_file it names, both by name with no directory scan -- so
         # debug/ beside the code dir is invisible to it.
         assert str(root) == module
-        assert (root / "spyreCodeDir" / "spyrecode.json").is_file()
-        assert (root / "spyreCodeDir" / "init_binary.bin").is_file()
+        assert (root / SPYRE_CODE_DIR / SPYRECODE_JSON).is_file()
+        assert (root / SPYRE_CODE_DIR / INIT_BINARY).is_file()
         assert (root / "debug" / "dfir.mlir").is_file()
 
     def test_keyed_on_the_artifact_digest(self, cache_dir):
@@ -248,8 +276,8 @@ class TestLoadBinary:
         assert hashlib.sha256(artifact).hexdigest() == module.rsplit("/", 1)[-1]
 
     def test_name_is_not_part_of_the_key(self, cache_dir):
-        # metadata["name"] is "" (issue #104), so keying on it would collide
-        # every kernel into one directory.
+        # metadata["name"] is the empty string for every Spyre kernel, so keying
+        # on it would collide every kernel into one directory.
         artifact = _zip_bytes(_ARTIFACT)
         first, _, _, _, _ = SpyreUtils().load_binary("", artifact, 0, 0)
         second, _, _, _, _ = SpyreUtils().load_binary("something_else", artifact, 0, 0)
@@ -269,7 +297,7 @@ class TestLoadBinary:
     def test_different_artifacts_do_not_collide(self, cache_dir):
         utils = SpyreUtils()
         other = dict(_ARTIFACT)
-        other["spyreCodeDir/init_binary.bin"] = b"\x04\x05\x06\x07"
+        other[f"{SPYRE_CODE_DIR}/{INIT_BINARY}"] = b"\x04\x05\x06\x07"
         first, _, _, _, _ = utils.load_binary("", _zip_bytes(_ARTIFACT), 0, 0)
         second, _, _, _, _ = utils.load_binary("", _zip_bytes(other), 0, 0)
         assert first != second
@@ -288,7 +316,7 @@ class TestLoadBinary:
         utils.unload_module(module)
         # Deliberate: content-addressed, so a cache rather than a leak, and
         # debug/dfir.mlir is the only on-disk record of what ran.
-        assert (Path(module) / "spyreCodeDir" / "spyrecode.json").is_file()
+        assert (Path(module) / SPYRE_CODE_DIR / SPYRECODE_JSON).is_file()
 
 
 # ---------------------------------------------------------------------------

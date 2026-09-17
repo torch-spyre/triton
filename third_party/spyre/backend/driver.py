@@ -78,10 +78,12 @@ class SpyreUtils:
         ``<code_dir>/spyreCodeDir/spyrecode.json`` and the ``init_bin_file``
         that names, both by name and with no directory scan anywhere.
 
-        Keyed on the **artifact digest**, not on ``name``: ``name`` is ``""``
-        (issue #104 — ``get_entry_func_name`` dyn_casts to ``tt.func`` after
-        ``convert_functions`` has made it ``func.func``), and
-        ``CompiledKernel.hash`` is not passed in.
+        Keyed on the **artifact digest**, not on ``name``: ``name`` reaches here as
+        the empty string for every Spyre kernel — the binding behind
+        ``metadata["name"]`` looks for a ``tt.func`` entry point, and
+        ``convert_functions`` has already rewritten it to a ``func.func`` — and
+        ``CompiledKernel.hash`` is not passed in. Keying on a name that is always
+        empty would collide every kernel into one directory.
 
         ``n_regs`` / ``n_spills`` are meaningless here and reported as 0.
         ``n_max_threads`` is 1, which keeps ``_init_handles``' check
@@ -169,8 +171,14 @@ class SpyreLauncher:
 
     The launch itself is torch-spyre's — ``SpyreSDSCKernelRunner``, which owns
     ``prepare_kernel(<dir>/spyreCodeDir)`` for the JobPlan and
-    ``launch_jobplan(plan, tensors, symbolic_args)`` for the launch, and which
-    brings the runtime init, the profiler events and the FFDC collection with it.
+    ``launch_jobplan(plan, tensors, symbolic_args)`` for the launch. Three things
+    come with it that this backend did not have: the runtime initialization
+    ``prepare_kernel`` requires, profiler events around both calls, and
+    first-failure data capture — on a failed launch torch-spyre writes a JSON
+    report naming the exception, the kernel and its artifact directory, so the
+    failure does not have to be reproduced to be diagnosed (opt-in, via
+    ``TORCH_SPYRE_FFDC=1``).
+
     What is left here is the part that is Triton's: deciding which launch
     arguments carry an address, and in which order.
 
@@ -266,9 +274,11 @@ class SpyreLauncher:
         this cannot happen at load time, and a step this backend used to be
         missing rather than doing.
 
-        The name reaches only torch-spyre's logging, its profiler event names and
-        its FFDC reports, so it comes from the source rather than from
-        ``metadata["name"]``, which is ``""`` (issue #104).
+        The name is only ever reported — torch-spyre's log lines, its profiler
+        event names, its failure reports — so it comes from the source function
+        rather than from ``metadata["name"]``, which is the empty string for every
+        Spyre kernel (see ``SpyreUtils.load_binary`` for why). A blank name would
+        make every one of those unattributable.
         """
         if self._runner is None:
             # Imported before the mode check below, not merely before the runner:

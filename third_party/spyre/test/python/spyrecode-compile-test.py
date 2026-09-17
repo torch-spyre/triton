@@ -65,20 +65,22 @@ import pytest
 from triton import knobs
 from triton.compiler.compiler import compile as triton_compile
 
+from backend.compiler import INIT_BINARY, SPYRE_CODE_DIR, SPYRECODE_JSON
 from utils import spyre_target
 
 
 def test_artifact_holds_the_spyre_code_dir(compiled):
-    # metadata["name"] is "" (issue #104), so the artifact is keyed by the source
-    # function name; what matters is the ZIP's contents.
-    #
-    # dbo-opt's own --export-dir layout, member names relative to it: the
+    # The export layout, member names relative to the export directory: the
     # spyreCodeDir stays a directory rather than being flattened, because
     # torch-spyre's SpyreSDSCKernelRunner is handed the parent and appends
     # /spyreCodeDir itself.
+    #
+    # Names from the constants, so this cannot drift from the module that writes
+    # them; driver-surface-test.py's TestArtifactLayoutNames is what pins the
+    # constants themselves to the names torch-spyre opens.
     names = set(zipfile.ZipFile(io.BytesIO(compiled.kernel)).namelist())
-    assert {"spyreCodeDir/spyrecode.json",
-            "spyreCodeDir/init_binary.bin"} <= names
+    assert {f"{SPYRE_CODE_DIR}/{SPYRECODE_JSON}",
+            f"{SPYRE_CODE_DIR}/{INIT_BINARY}"} <= names
     assert any(n.startswith("debug/") for n in names), sorted(names)
 
 
