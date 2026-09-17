@@ -84,11 +84,32 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   m.def("add_convert_elementwise_to_linalg", [](mlir::PassManager &pm) {
     pm.addPass(mlir::createConvertElementwiseToLinalgPass());
   });
+  // Upstream MLIR: rewrites every named linalg op (linalg.matmul, linalg.add,
+  // linalg.reduce, ...) to the linalg.generic that carries the same indexing
+  // maps and body explicitly. RewriteDescriptorLayoutGeneric reads those maps
+  // instead of knowing the op, so it needs the generic spelling; LowerComputeOps
+  // keeps emitting named ops and this is what converts them.
+  m.def("add_linalg_generalize_named_ops", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
+  });
   m.def(
       "add_rewrite_descriptor_layout",
       [](mlir::PassManager &pm, const std::string &data_layout) {
         pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
             mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
+      },
+      py::arg("pm"), py::arg("data_layout") = "device");
+  // The generic-op replacement for the pass above: same input IR and same
+  // data_layout option, but it retypes each linalg.generic by rebuilding its
+  // indexing maps at physical rank rather than by recognising the op. Requires
+  // every compute op to already be a linalg.generic, i.e.
+  // add_linalg_generalize_named_ops must have run.
+  m.def(
+      "add_rewrite_descriptor_layout_generic",
+      [](mlir::PassManager &pm, const std::string &data_layout) {
+        pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayoutGeneric(
+            mlir::triton::ktdp::RewriteDescriptorLayoutGenericOptions{
+                data_layout}));
       },
       py::arg("pm"), py::arg("data_layout") = "device");
   // Not in add_convert_ttir_to_ktdp above: this is a fix pass, spliced into the
