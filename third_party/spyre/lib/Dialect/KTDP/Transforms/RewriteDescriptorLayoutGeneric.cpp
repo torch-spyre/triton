@@ -226,6 +226,24 @@ struct RebuildOperand {
   SmallVector<int> broadcastDim;
 };
 
+/// One piece of the refined loop domain: a logical dim's stick index, its
+/// element offset within a stick, or — when nothing splits the dim — the whole
+/// dim, which is spelled as the stick half.
+///
+/// A piece is the unit the numbering orders, because it is the unit an operand's
+/// physical dim names: a physical dim carries exactly one of these, and that is
+/// what lets an operand's physical order be read as an order on pieces.
+struct DomainPiece {
+  unsigned loop;
+  /// True for the element offset within a stick, false for the stick index (or
+  /// for an unsplit dim held whole).
+  bool elem;
+
+  bool operator==(const DomainPiece &o) const {
+    return loop == o.loop && elem == o.elem;
+  }
+};
+
 /// The rebuilt loop domain: how many physical loop dims there are, and where
 /// each logical dim's pieces landed.
 ///
@@ -233,6 +251,9 @@ struct RebuildOperand {
 /// index and an element offset within the stick — and an operand that holds
 /// that dim whole addresses it as `stick * width + elem`. A dim no operand
 /// splits contributes one.
+///
+/// Which loop number each piece gets is read off the operands' physical orders,
+/// with the RESULT's taken as authoritative — see buildLoopDomain.
 ///
 /// On top of that refinement, each BROADCAST physical dim contributes one loop
 /// dim of its own. A broadcast is not a subdivision of a logical dim, so no
@@ -256,17 +277,127 @@ struct LoopDomain {
   bool isSplit(int64_t d) const { return elemDim[d] >= 0; }
 };
 
+/// The domain pieces one operand's physical dims name, in that operand's own
+/// physical order.
+///
+/// This is the operand's physical order re-expressed as an order on pieces, and
+/// it is the only thing the numbering below reads off an operand. A physical dim
+/// names the piece its coord op picks out: a mod dim names the element half, a
+/// floordiv dim the stick half, and an identity dim the stick half too — an
+/// identity dim over a dim the domain splits addresses it as
+/// `stick * width + elem`, whose leading term is the stick half, so the stick
+/// half is where that physical position sits.
+///
+/// A broadcast dim names none: it is a replication axis, not a piece of any
+/// logical dim, and it gets its own loop after the refinement.
+///
+/// An operand with no layout walks its own logical dims, every one held whole —
+/// which is the same walk under an identity layout. Its logical order IS its
+/// physical order, since nothing physicalized it.
+void collectPieces(const RebuildOperand &o,
+                   SmallVectorImpl<DomainPiece> &pieces) {
+  unsigned numDims =
+      o.layout ? o.layout->physRank() : o.logicalMap.getNumResults();
+  for (unsigned p = 0; p < numDims; ++p) {
+    CoordOp coordOp = o.layout ? o.layout->opAt(p) : CoordOp::Identity;
+    if (coordOp == CoordOp::Broadcast)
+      continue;
+    int64_t logDim = o.layout ? o.layout->src[p] : p;
+    auto dimExpr = dyn_cast<AffineDimExpr>(o.logicalMap.getResult(logDim));
+    if (!dimExpr)
+      continue; // a constant (a folded broadcast) names no loop dim
+    pieces.push_back({dimExpr.getPosition(), coordOp == CoordOp::Mod});
+  }
+}
+
 /// Build the loop domain over `logicalNumLoops` dims, splitting every logical
-/// dim that any operand splits. Loop dims are numbered in logical order, a
-/// split dim taking (stick, elem) adjacently, so the domain is a refinement of
-/// the logical one and an unsplit program keeps its original numbering.
+/// dim that any operand splits. A split dim contributes two loop dims, a stick
+/// index and an element offset. `resultIdx` names the `outs` operand within
+/// `operands`.
+///
+/// A loop domain is only ever defined up to a relabelling -- permuting the loop
+/// dims and permuting every map's reference to them describes the same
+/// computation -- so the numbering is free, and something has to fix it. Two
+/// consumers care which way, and they care about different operands:
+///
+///   - ktir-cpu reads the RESULT's map. For an all-parallel generic it takes the
+///     iteration shape to be the result's shape outright
+///     (`if not reduction_dims: iter_shape = out_shape`), and for a reduction it
+///     folds and squeezes the reduction loops and expects what remains, in loop
+///     order, to be the result's shape. Both say: the result's physical order
+///     must be the order its loops appear in.
+///   - The scheduler reads an INPUT's map. Its ReductionLoopExposurePass
+///     substitutes a loop index for an operand axis index, which is sound only
+///     while a reduction loop sits AT the axis it reduces; moved off it, the
+///     wrong physical dim gets narrowed and the report names a tensor type that
+///     is in no input module. That says: a reduction loop keeps the positional
+///     index of the axis it reduces.
+///
+///     Narrower than "the input's map is the identity", and the difference
+///     matters. Permuting the PARALLEL dims is fine -- a fully reversed version
+///     of the same reduce gets a correctly computed slice out of that pass -- and
+///     the transpose cases below require the permutation. Note also that the
+///     scheduler's KTIR frontend handles the permutation correctly and a later
+///     pass discards that, so this is a defect on that side, filed upstream,
+///     rather than a rule this emitter was wrong to violate. The rule below is
+///     the better emission independently of it.
+///
+/// So the rule is a merge, seeded by the result and refined by the inputs:
+///
+///   1. Walk the result's physical dims and number the pieces they name, in that
+///      order. The result is the one operand whose coordinate order the generic
+///      does not get to choose -- its elements are written where its own type
+///      says they live -- so its order is authoritative and nothing below
+///      reorders it.
+///   2. Walk each remaining operand's physical dims. A piece already numbered
+///      only advances a cursor; a piece the result never named is INSERTED at
+///      the cursor, i.e. at the place this operand's own physical order puts it
+///      relative to the pieces the result did name.
+///   3. Anything still unnumbered is appended in logical order.
+///
+/// Step 2 is what a reduce needs, and it is where the reduced dim's own axis
+/// index comes from. The result of a reduce does not name the reduced dim at all,
+/// so step 1 leaves it unplaced; appending it -- which is what this used to do --
+/// puts it after pieces that come BEFORE it in the input's physical order, so its
+/// loop number no longer matches the axis it occupies there. Stick-on-N is the
+/// case: logical [M, N] -> physical [N/S, M, S], reduce over M, so the result's
+/// physical order (stick, lane) is a subsequence of the input's (stick, M, lane).
+/// Appending M gives `ins (d0, d2, d1)` -- the reduction is loop d2 sitting at
+/// axis 1. Inserting it where the input puts it gives `ins (d0, d1, d2)`, the
+/// reduction at loop d1 and axis 1, with `outs (d0, d2)` and iterators
+/// [parallel, reduction, parallel]. That is exactly what
+/// `linalg.reduce ... dimensions = [1]` desugars to.
+///
+/// The identity is how that particular case comes out, not the goal. A reduce
+/// whose operands' physical orders genuinely disagree still gets a permuted input
+/// map -- and correctly so; what the insertion guarantees is that the reduced
+/// dim's loop number is the axis index it has in the input, which is the part
+/// that is not free.
+///
+/// The two conventions do not collide, because inserting never moves a piece the
+/// result named: the result's map stays monotone in the loop numbering, which is
+/// all ktir-cpu asks of it. What changes is only that the result's map need no
+/// longer project onto a *prefix* of the domain.
+///
+/// Numbering in *logical* order, which this did before the result became the
+/// seed, is a different mistake and still one. A layout is free to reorder dims,
+/// so a logical-order domain makes the result read `(d1, d0, d2)` on a
+/// stick-on-N elementwise chain: faithful to the layout, stated in the logical
+/// frame, and not the frame the result is written in. Nothing cancels it later,
+/// because there is no later -- these maps are the output.
+///
+/// When the result's physical order already reaches every piece -- every
+/// elementwise, broadcast and transpose case -- step 2 inserts nothing and the
+/// numbering is exactly the result's own walk. So this generalizes the
+/// result-as-frame rule rather than weakening it: it only decides where the
+/// pieces that rule left unplaced go.
 ///
 /// Fails when two operands split the same logical dim at different widths:
 /// there is then no single `stick * width + elem` a third operand holding the
 /// dim whole could use, and picking either width would silently address the
 /// wrong elements.
 FailureOr<LoopDomain>
-buildLoopDomain(MutableArrayRef<RebuildOperand> operands,
+buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
                 unsigned logicalNumLoops,
                 llvm::function_ref<InFlightDiagnostic()> emitError) {
   LoopDomain dom;
@@ -295,11 +426,61 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands,
     }
   }
 
-  for (unsigned d = 0; d < logicalNumLoops; ++d) {
-    dom.stickDim[d] = dom.numLoopDims++;
-    if (dom.width[d])
-      dom.elemDim[d] = dom.numLoopDims++;
+  // Step 1: the result's physical order seeds the numbering. The result is the
+  // one operand whose coordinate order the generic does not get to choose, since
+  // its elements are written where its own type says they live, so nothing below
+  // reorders what this places.
+  SmallVector<DomainPiece> order;
+  auto seen = [&](DomainPiece pc) { return llvm::is_contained(order, pc); };
+  {
+    SmallVector<DomainPiece> walk;
+    collectPieces(operands[resultIdx], walk);
+    for (DomainPiece pc : walk)
+      if (!seen(pc))
+        order.push_back(pc);
   }
+
+  // Step 2: merge each remaining operand's physical order in. A piece the result
+  // already placed only advances the cursor -- and only forwards, so an operand
+  // that disagrees with the established order cannot drag it back. A piece the
+  // result never named is inserted AT the cursor, which is the position this
+  // operand's own physical order puts it in relative to the result's pieces.
+  //
+  // This is what makes a reduce's input map the identity: the reduced dim is a
+  // piece the result never names, and the input's walk says where it sits.
+  for (auto [i, o] : llvm::enumerate(operands)) {
+    if (i == resultIdx)
+      continue;
+    SmallVector<DomainPiece> walk;
+    collectPieces(o, walk);
+    unsigned cursor = 0;
+    for (DomainPiece pc : walk) {
+      auto it = llvm::find(order, pc);
+      if (it != order.end()) {
+        unsigned idx = std::distance(order.begin(), it);
+        if (idx >= cursor)
+          cursor = idx + 1;
+        continue;
+      }
+      order.insert(order.begin() + cursor, pc);
+      ++cursor;
+    }
+  }
+
+  // Step 3: anything no operand's walk named -- a dim every operand addresses
+  // through a constant, or the element half of a dim only the domain knows is
+  // split -- goes last, in logical order. Every logical dim needs a stick slot,
+  // and a split one needs an element slot, since the rebuild indexes both.
+  for (unsigned d = 0; d < logicalNumLoops; ++d) {
+    if (!seen({d, /*elem=*/false}))
+      order.push_back({d, /*elem=*/false});
+    if (dom.width[d] && !seen({d, /*elem=*/true}))
+      order.push_back({d, /*elem=*/true});
+  }
+
+  for (auto [n, pc] : llvm::enumerate(order))
+    (pc.elem ? dom.elemDim : dom.stickDim)[pc.loop] = n;
+  dom.numLoopDims = order.size();
 
   // Then one loop per broadcast physical dim, after the refinement so that an
   // operand carrying no broadcast keeps exactly the numbering it would have had.
@@ -1222,7 +1403,19 @@ struct RewriteDescriptorLayoutGenericPass
     for (auto [i, m] : llvm::enumerate(logicalMaps))
       rebuildOperands.push_back(RebuildOperand{m, layouts[i]});
 
-    auto dom = buildLoopDomain(rebuildOperands, numLoops,
+    // The `outs` operand backing result 0 is the loop frame, so it is read off
+    // the op through the destination-style interface rather than assumed to be
+    // last: `rebuildOperands` is built in operand order, and a positional guess
+    // that ever went wrong would not fail the verifier -- the maps stay
+    // internally consistent -- but would state the relation in a frame nothing
+    // else uses, surfacing only as a shape mismatch inside ktir-cpu.
+    unsigned resultIdx =
+        op.getDpsInitOperand(0)->getOperandNumber();
+    if (resultIdx >= rebuildOperands.size())
+      return op.emitError("rewrite-descriptor-layout-generic: the outs operand "
+                          "backing result 0 is outside the indexing maps");
+
+    auto dom = buildLoopDomain(rebuildOperands, resultIdx, numLoops,
                                [&]() { return op.emitError(); });
     if (failed(dom))
       return failure();
