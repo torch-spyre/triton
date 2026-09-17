@@ -186,9 +186,9 @@ and how it was chosen.
 ## Device Launch Dependency
 
 `kernel[grid](x, y, out, ...)` runs on hardware in the calling process:
-`SpyreLauncher` calls torch-spyre's `prepare_kernel` and `launch_jobplan`
-directly, and inputs reach the device with `.to("spyre")` the way CUDA's reach it
-with `.cuda()`.
+`SpyreLauncher` hands the compiled artifact to torch-spyre's
+`SpyreSDSCKernelRunner`, which prepares the job plan and launches it, and inputs
+reach the device with `.to("spyre")` the way CUDA's reach it with `.cuda()`.
 
 torch-spyre is therefore required for a launch, and it is **not** declared as a
 dependency — not in `install_requires` and not in the `spyre-test` extra. That is

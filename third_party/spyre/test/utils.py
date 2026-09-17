@@ -121,8 +121,14 @@ def compile_to_ttir(kernel_fn, signature, constexprs):
 # make_ktir_mod — full TTIR → KTIR pipeline, returns live ir.module
 # ---------------------------------------------------------------------------
 
-def make_ktir_mod(ttir_path, *, grid=None, **options):
+def make_ktir_mod(ttir_path, *, grid=None, metadata=None, **options):
     """Parse *ttir_path*, run TTIR and KTIR passes, return the live module.
+
+    *metadata* is an out-parameter, and the only way to observe what the stages
+    recorded: pass a dict and it comes back holding ``name``, ``stage`` and (in the
+    address-binding mode) ``base_addresses``. Omitted, a throwaway is used, which is
+    what every caller wanting only the IR wants. Not a return value, because that
+    would change the shape for all eight existing call sites to serve one.
 
     Every keyword is forwarded verbatim as a ``SpyreOptions`` field, so a caller
     reaches the whole option surface without this helper growing a parameter per
@@ -167,6 +173,6 @@ def make_ktir_mod(ttir_path, *, grid=None, **options):
     mod = ir.parse_mlir_module(str(ttir_path), ctx)
     mod.context = ctx
 
-    metadata = {}
+    metadata = {} if metadata is None else metadata
     mod = backend._make_ttir(mod, metadata, options)
     return backend._make_ktir(mod, metadata, options)

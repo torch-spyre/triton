@@ -14,6 +14,49 @@ from pathlib import Path
 from typing import Dict, Mapping, Optional, Tuple
 from types import ModuleType
 
+# ---------------------------------------------------------------------------
+# The artifact layout, named once
+#
+# These names are torch-spyre's rather than ours, and nothing here can choose
+# them: ``SpyreSDSCKernelRunner`` appends SPYRE_CODE_DIR to the directory it is
+# given, and ``prepare_kernel`` then opens SPYRECODE_JSON inside it and the
+# ``init_bin_file`` that names, both by name with no directory scan.
+#
+# Here rather than beside either use site, because there are two and they are in
+# different modules: ``_make_spyrecode`` writes the layout and checks it, and
+# ``SpyreUtils.load_binary`` (driver.py) reads it back to decide whether the
+# unpacked directory is complete. Spelled twice, the pair drifts and the symptom
+# is a launch that cannot find a file nobody misspelled on purpose.
+#
+# In the producer, so the dependency runs consumer → producer. Both modules are
+# imported together anyway (``triton/backends/__init__.py`` imports
+# ``<backend>.compiler`` and ``<backend>.driver`` for every discovered backend),
+# so the import costs nothing that was not already paid.
+# ---------------------------------------------------------------------------
+
+#: Sub-directory of the export directory holding the loadable program.
+SPYRE_CODE_DIR = "spyreCodeDir"
+
+#: The job execution plan, inside SPYRE_CODE_DIR. The one file whose presence
+#: means the artifact unpacked completely.
+SPYRECODE_JSON = "spyrecode.json"
+
+#: The initialization payload, named by SPYRECODE_JSON's ``init_bin_file`` field.
+#: Written as a sibling of it, which is where that field's relative path resolves.
+INIT_BINARY = "init_binary.bin"
+
+#: The per-stage artifacts, a sibling of SPYRE_CODE_DIR rather than a child. The
+#: one name here that no code *constructs*: the archive takes it along because it
+#: walks the whole export directory, and nothing on the launch path opens it. Named
+#: anyway, because it is part of the layout and the tests assert it is carried.
+DEBUG_DIR = "debug"
+
+#: The compile stage, its artifact's file extension, and the value recorded in
+#: metadata["stage"] -- one name in three roles, and they have to agree:
+#: ``binary_ext`` is how CompiledKernel picks which cached file to read as the
+#: kernel, and it picks it by matching this extension against the stage names.
+SPYRECODE_STAGE = "spyrecode"
+
 
 def resolve_dbo_opt(required: bool = True) -> Optional[str]:
     """Absolute path to the ``dbo-opt`` named by ``knobs.spyre.dbo_opt``.
@@ -105,6 +148,35 @@ def _segment_addresses(signature_types) -> Tuple[int, ...]:
                  for i, ty in enumerate(ptr_types))
 
 
+def entry_func_name(mod) -> str:
+    """The kernel entry function's name, refusing the empty string.
+
+    ``get_entry_func_name`` (``python/src/ir.cc``) scans the module's top-level ops
+    for a ``tt.func`` that ``triton::isKernel`` accepts, and returns ``""`` when it
+    finds none. That answer conflates two different situations — a module with no
+    kernel in it, and a module whose entry point is no longer a ``tt.func`` — and
+    the second one is *reachable in this pipeline*: ``ConvertFunctions`` rewrites the
+    entry point to a ``func.func``, and the binding's ``dyn_cast`` then misses every
+    op.
+
+    So the empty string is refused here rather than passed on. It is the difference
+    between a name and a silence, and everything downstream that takes a name
+    (``metadata["name"]``, the base-address inference) treats what it is given as
+    one.
+
+    Callers must therefore read this *before* the core pipeline runs. Both do.
+    """
+    name = mod.get_entry_func_name()
+    if not name:
+        raise RuntimeError(
+            "module has no kernel entry function that get_entry_func_name can "
+            "see. Either there is no kernel in it, or its entry point is no "
+            "longer a tt.func -- ConvertFunctions rewrites it to a func.func, "
+            "and this must be read before that runs."
+        )
+    return name
+
+
 def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
     """The default base addresses, from ``mod``'s entry-function pointer types.
 
@@ -122,12 +194,7 @@ def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
     i.e. before or at the very start of the TTIR→KTIR pipeline: ConvertFunctions
     rewrites every pointer to a bare ``index`` and the widths are then gone.
     """
-    entry = mod.get_entry_func_name()
-    if not entry:
-        raise RuntimeError(
-            "module has no kernel entry function, so its pointer arguments "
-            "cannot be located; Spyre needs them to assign HBM base addresses"
-        )
+    entry = entry_func_name(mod)
     return _segment_addresses(mod.get_function_signature(mod.get_function(entry)))
 
 
@@ -266,12 +333,19 @@ class SpyreOptions:
 
     # How the kernel's buffer addresses reach the entry function.
     #
-    # False (the default and the only supported mode): the pointer arguments are
-    # replaced by base addresses — base_addresses if set, otherwise the derived
-    # ones.
+    # True: leave the addresses symbolic, for a runtime that patches them in
+    # through the correction table. SpyreLauncher names one tensor per symbol in
+    # the SymbolicArg payload it passes to launch_jobplan.
     #
-    # True: leave the addresses symbolic, for a runtime that patches them via
-    # the correction table. Not implemented — see _make_spyrecode, which raises.
+    # False: the pointer arguments are replaced by base addresses —
+    # base_addresses if set, otherwise the derived ones — and the runtime binds
+    # the buffers to those segments instead.
+    #
+    # The dataclass default is False, but it is not the effective one: every
+    # launch goes through parse_options, which defaults the field from
+    # BUNDLE_SYMBOLIC_ARGS — set to "1" by importing torch_spyre, so a launching
+    # process compiles symbolic unless it says otherwise. The launcher refuses a
+    # launch where the two disagree; see SpyreLauncher._check_argument_mode_agrees.
     #
     # This is a *compile* option, not an environment read at pass-install time:
     # it changes the emitted artifact, so it has to be in options.hash() and
@@ -385,7 +459,7 @@ class SpyreBackend(BaseBackend):
         # so an attribute assigned on the compiling instance is not the one it
         # reads. It also decides bytes-vs-text per artifact — the file
         # whose extension matches binary_ext is read as bytes.
-        self.binary_ext = "spyrecode"
+        self.binary_ext = SPYRECODE_STAGE
 
     def hash(self) -> str:
         """Backend identity folded into the on-disk cache key.
@@ -541,7 +615,7 @@ class SpyreBackend(BaseBackend):
     def add_stages(self, stages: dict, options: SpyreOptions, language=None) -> None:
         stages["ttir"] = lambda src, metadata: self._make_ttir(src, metadata, options)
         stages["ktir"] = lambda src, metadata: self._make_ktir(src, metadata, options)
-        stages["spyrecode"] = lambda src, metadata: self._make_spyrecode(src, metadata, options)
+        stages[SPYRECODE_STAGE] = lambda src, metadata: self._make_spyrecode(src, metadata, options)
 
     def load_dialects(self, context) -> None:
         from triton._C.libtriton import spyre
@@ -639,6 +713,19 @@ class SpyreBackend(BaseBackend):
         """
         from triton._C.libtriton import ir, passes
 
+        # Read before the pipeline, for the same reason as the base addresses
+        # below: the binding behind this name only matches a tt.func, and
+        # ConvertFunctions -- the last core pass -- has rewritten the entry point
+        # to a func.func by the end of this method. Read afterwards it comes back
+        # as the empty string for every kernel, and silently, because "no match"
+        # and "no kernel" are the same answer there.
+        #
+        # A name is not load-bearing for execution, which is what let a blank one
+        # survive: it is what CompiledKernel reports as `.name`, what reaches
+        # utils.load_binary, and what torch-spyre puts in its log lines, profiler
+        # event names and failure reports. 
+        metadata["name"] = entry_func_name(mod)
+
         # Only the address-binding mode has any use for these. Inferring them in
         # symbolic mode would also mean reporting a pointer-width or pointer-count
         # problem in place of the NotImplementedError the caller is actually about
@@ -673,21 +760,23 @@ class SpyreBackend(BaseBackend):
         # so the pass comes out until that is resolved. See issue #161.
         pm.run(mod, "make_ktir")
 
-        metadata["name"] = mod.get_entry_func_name()
         metadata["stage"] = "ktir"
         return mod
 
     def _make_spyrecode(self, mod, metadata, options):
         """Lower KTIR to a loadable Spyre binary by running ``dbo-opt``.
 
-        Returns the spyreCodeDir as **ZIP bytes**. A compile stage yields one
-        artifact, but a spyreCodeDir is two files (``spyrecode.json`` +
-        ``init_binary.bin``) plus dbo-opt's ``debug/`` tree, so the archive is
-        the single artifact and ``SpyreUtils.load_binary`` unpacks it. Layout
-        inside the ZIP is flat — spyreCodeDir's own contents at the root, with
-        ``debug/`` as a subdirectory — because ``prepare_kernel`` opens
-        ``<dir>/spyrecode.json`` and the ``init_bin_file`` it names, both by
-        name and with no directory scan.
+        Returns the exported directory as **ZIP bytes**. A compile stage yields
+        one artifact, but the export is a ``SPYRE_CODE_DIR`` holding
+        ``SPYRECODE_JSON`` and ``INIT_BINARY``, with a ``debug/`` tree of
+        per-stage artifacts beside it, so the archive is the single artifact and
+        ``SpyreUtils.load_binary`` unpacks it.
+
+        Member names are relative to the export directory, so unpacking
+        reproduces the layout as written rather than a second convention of our
+        own. That is what ``torch_spyre``'s ``SpyreSDSCKernelRunner`` expects: it
+        is handed a directory and appends ``/spyreCodeDir`` itself before calling
+        ``prepare_kernel``.
 
         Three steps, the first two in one pass manager:
 
@@ -814,10 +903,10 @@ class SpyreBackend(BaseBackend):
                     f"{result.stderr}"
                 )
 
-            code_dir = export_dir / "spyreCodeDir"
+            code_dir = export_dir / SPYRE_CODE_DIR
             # dbo-opt can exit 0 having written nothing, so check rather than
             # trust the exit status.
-            missing = [name for name in ("spyrecode.json", "init_binary.bin")
+            missing = [name for name in (SPYRECODE_JSON, INIT_BINARY)
                        if not (code_dir / name).is_file()]
             if missing:
                 raise RuntimeError(
@@ -825,11 +914,11 @@ class SpyreBackend(BaseBackend):
                     f"under {code_dir}\n  argv: {' '.join(argv)}\n{result.stderr}"
                 )
 
-            members = [(path, path.relative_to(code_dir).as_posix())
-                       for path in sorted(code_dir.rglob("*")) if path.is_file()]
-            debug_dir = export_dir / "debug"
-            members += [(path, f"debug/{path.relative_to(debug_dir).as_posix()}")
-                        for path in sorted(debug_dir.rglob("*")) if path.is_file()]
+            # Relative to export_dir, not to code_dir: the archive keeps the
+            # layout as exported, spyreCodeDir/ and debug/ side by side, because
+            # that is the layout the launch path consumes.
+            members = [(path, path.relative_to(export_dir).as_posix())
+                       for path in sorted(export_dir.rglob("*")) if path.is_file()]
 
             buffer = io.BytesIO()
             with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -843,7 +932,7 @@ class SpyreBackend(BaseBackend):
                     info.compress_type = zipfile.ZIP_DEFLATED
                     archive.writestr(info, path.read_bytes())
 
-        metadata["stage"] = "spyrecode"
+        metadata["stage"] = SPYRECODE_STAGE
 
         # Before the first launch, CompiledKernel._init_handles refuses to run a
         # kernel that asks for more than the device has. It makes two such checks,

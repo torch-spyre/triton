@@ -31,6 +31,13 @@ import pytest
 from triton import knobs
 from triton.backends.driver import DriverBase
 
+import backend.driver as spyre_driver
+from backend.compiler import (
+    DEBUG_DIR,
+    INIT_BINARY,
+    SPYRE_CODE_DIR,
+    SPYRECODE_JSON,
+)
 from backend.driver import SpyreDriver, SpyreLauncher, SpyreUtils
 
 
@@ -72,6 +79,45 @@ class _Src:
         self.signature = signature
 
 
+class _FakeTorchSpyre:
+    """Stand-in for the two ``torch_spyre._C`` names the payload is built from.
+
+    Faked rather than imported, because this file runs everywhere, including
+    machines with no torch-spyre — and where torch-spyre *is* installed but its
+    shared libraries are not on ``LD_LIBRARY_PATH``, ``import torch`` itself
+    raises ``RuntimeError`` from the device-extension autoload, which
+    ``importorskip`` does not catch. What is under test is which entries the
+    launcher builds and in what order, not pybind's constructor; the keyword
+    names below are the pybind ones, so passing the wrong keyword still fails.
+    """
+
+    class _C:
+
+        class SymbolicArgKind:
+            kAddress = "kAddress"
+            kDimension = "kDimension"
+
+        class SymbolicArg:
+
+            def __init__(self, kind, tensor_id, dim_index=-1, value=-1):
+                self.kind = kind
+                self.tensor_id = tensor_id
+                self.dim_index = dim_index
+                self.value = value
+
+
+class _Metadata:
+    """The one option field the launch path reads: ``symbolic_args``.
+
+    Read for both decisions torch-spyre's runner does not make for us — whether
+    to build a symbolic payload, and whether the ambient mode is the one the
+    artifact was compiled in.
+    """
+
+    def __init__(self, symbolic_args):
+        self.symbolic_args = symbolic_args
+
+
 class _SpyreTensor:
     """Enough of a Spyre tensor for the launcher's device check: ``device.type``.
 
@@ -98,10 +144,26 @@ def _zip_bytes(entries):
     return buffer.getvalue()
 
 
+#: The export layout the ZIP carries: a spyreCodeDir/ with debug/ beside it, not
+#: the code dir's contents flattened to the root.
+#:
+#: Built from the constants, so the layout is spelled in one place and this file
+#: cannot drift from the modules. The literals live in exactly one test
+#: (TestArtifactLayoutNames), because a suite written *only* in terms of the
+#: constants would follow a wrong constant into agreement and stay green.
+#:
+#: ``dfir.mlir`` stays a literal: the directory it sits in is part of the layout,
+#: the file inside it is not -- nothing here or downstream opens it by name, and
+#: this one only has to be *a* file for the "carried along" assertion to mean
+#: something.
 _ARTIFACT = {
-    "spyrecode.json": b'{"init_bin_file": "init_binary.bin"}',
-    "init_binary.bin": b"\x00\x01\x02\x03",
-    "debug/dfir.mlir": b"module {}\n",
+    # The ``init_bin_file`` field is content rather than a path we build, but it
+    # names the sibling below, so it is built from the same constant to keep the
+    # fake self-consistent.
+    f"{SPYRE_CODE_DIR}/{SPYRECODE_JSON}":
+        f'{{"init_bin_file": "{INIT_BINARY}"}}'.encode(),
+    f"{SPYRE_CODE_DIR}/{INIT_BINARY}": b"\x00\x01\x02\x03",
+    f"{DEBUG_DIR}/dfir.mlir": b"module {}\n",
 }
 
 
@@ -165,6 +227,27 @@ class TestDriverSurface:
 
 
 # ---------------------------------------------------------------------------
+# The layout names
+# ---------------------------------------------------------------------------
+
+class TestArtifactLayoutNames:
+
+    def test_the_constants_are_the_names_torch_spyre_opens(self):
+        # The one place in the suite that spells them out, and the reason the rest
+        # of the file can safely use the constants: everything else would follow a
+        # wrong constant into agreement and stay green, so the literals are pinned
+        # here once.
+        #
+        # None of the three is ours to choose. SpyreSDSCKernelRunner appends
+        # SPYRE_CODE_DIR to the directory it is given, and prepare_kernel opens
+        # SPYRECODE_JSON inside it and then the init_bin_file that names.
+        assert SPYRE_CODE_DIR == "spyreCodeDir"
+        assert SPYRECODE_JSON == "spyrecode.json"
+        assert INIT_BINARY == "init_binary.bin"
+        assert DEBUG_DIR == "debug"
+
+
+# ---------------------------------------------------------------------------
 # load_binary / unload_module
 # ---------------------------------------------------------------------------
 
@@ -181,17 +264,19 @@ class TestLoadBinary:
         # Must be >= 1 so num_warps * warp_size (1) does not exceed it.
         assert n_max_threads >= 1
 
-    def test_unpacks_flat_with_debug_beside(self, cache_dir):
+    def test_unpacks_dbo_opts_layout_and_returns_the_parent(self, cache_dir):
         module, _, _, _, _ = SpyreUtils().load_binary("", _zip_bytes(_ARTIFACT), 0, 0)
         root = cache_dir / SpyreUtils.MODULE_CACHE / hashlib.sha256(
             _zip_bytes(_ARTIFACT)).hexdigest()
+        # The handle is the *parent* of spyreCodeDir, because that is what
+        # SpyreSDSCKernelRunner takes as its code_dir: it appends /spyreCodeDir
+        # itself, and prepare_kernel then opens that spyrecode.json and the
+        # init_bin_file it names, both by name with no directory scan -- so
+        # debug/ beside the code dir is invisible to it.
         assert str(root) == module
-        # prepare_kernel opens <dir>/spyrecode.json and the init_bin_file it
-        # names, both by name with no directory scan, so debug/ beside them is
-        # invisible to it.
-        assert (root / "spyrecode.json").is_file()
-        assert (root / "init_binary.bin").is_file()
-        assert (root / "debug" / "dfir.mlir").is_file()
+        assert (root / SPYRE_CODE_DIR / SPYRECODE_JSON).is_file()
+        assert (root / SPYRE_CODE_DIR / INIT_BINARY).is_file()
+        assert (root / DEBUG_DIR / "dfir.mlir").is_file()
 
     def test_keyed_on_the_artifact_digest(self, cache_dir):
         artifact = _zip_bytes(_ARTIFACT)
@@ -199,8 +284,10 @@ class TestLoadBinary:
         assert hashlib.sha256(artifact).hexdigest() == module.rsplit("/", 1)[-1]
 
     def test_name_is_not_part_of_the_key(self, cache_dir):
-        # metadata["name"] is "" (issue #104), so keying on it would collide
-        # every kernel into one directory.
+        # A name is not an identity: one jitted function compiles to a different
+        # binary per specialization, grid and option set, all under that one
+        # name, so keying on it would serve the first artifact to whoever
+        # compiled the second.
         artifact = _zip_bytes(_ARTIFACT)
         first, _, _, _, _ = SpyreUtils().load_binary("", artifact, 0, 0)
         second, _, _, _, _ = SpyreUtils().load_binary("something_else", artifact, 0, 0)
@@ -219,8 +306,8 @@ class TestLoadBinary:
 
     def test_different_artifacts_do_not_collide(self, cache_dir):
         utils = SpyreUtils()
-        other = dict(_ARTIFACT, init_binary=b"different")
-        other["init_binary.bin"] = b"\x04\x05\x06\x07"
+        other = dict(_ARTIFACT)
+        other[f"{SPYRE_CODE_DIR}/{INIT_BINARY}"] = b"\x04\x05\x06\x07"
         first, _, _, _, _ = utils.load_binary("", _zip_bytes(_ARTIFACT), 0, 0)
         second, _, _, _, _ = utils.load_binary("", _zip_bytes(other), 0, 0)
         assert first != second
@@ -239,7 +326,7 @@ class TestLoadBinary:
         utils.unload_module(module)
         # Deliberate: content-addressed, so a cache rather than a leak, and
         # debug/dfir.mlir is the only on-disk record of what ran.
-        assert (Path(module) / "spyrecode.json").is_file()
+        assert (Path(module) / SPYRE_CODE_DIR / SPYRECODE_JSON).is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -340,8 +427,9 @@ class TestAddressArgs:
 
     def test_constexprs_and_runtime_scalars_leave_nothing_behind(self):
         # A kernel with no pointers at all patches no addresses. The empty list
-        # is the answer, not an error: _prepare compares it against the count the
-        # artifact declares, and that is where a disagreement is caught.
+        # is the answer, not an error: the symbolic payload built from it is what
+        # launch_jobplan compares against the artifact's own symbol count, and
+        # that is where a disagreement is caught.
         launcher = SpyreLauncher(
             _Src({"n": "i32", "BLOCK": "constexpr"}), object())
         assert launcher._address_args((4096, 64)) == []
@@ -362,3 +450,73 @@ class TestAddressArgs:
         launcher = SpyreLauncher(
             _Src({"z_ptr": "*fp16", "a_ptr": "*fp16"}), object())
         assert launcher._address_args((z, a)) == [z, a]
+
+
+# ---------------------------------------------------------------------------
+# The symbolic payload and the mode check
+#
+# The two things torch-spyre's runner does not decide for us. Both read only
+# metadata.symbolic_args and the environment, so neither needs a device, and the
+# one that would reach for torch_spyre._C takes a fake instead (_FakeTorchSpyre),
+# which keeps this file free of the dependency its RUN line does not gate on.
+# ---------------------------------------------------------------------------
+
+class TestSymbolicArgs:
+
+    def test_baked_mode_passes_no_payload(self):
+        # No symbols to patch: the addresses are arith.constants in the binary,
+        # and None is what makes the runner take launch_jobplan's two-argument
+        # form. Reached without torch-spyre on purpose -- an import here would
+        # make the answer depend on a package that has nothing to say about it.
+        launcher = SpyreLauncher(_Src({}), _Metadata(False))
+        assert launcher._symbolic_args(2) is None
+
+    def test_one_address_entry_per_tensor_in_order(self, monkeypatch):
+        monkeypatch.setattr(spyre_driver, "_import_torch_spyre",
+                            lambda: _FakeTorchSpyre)
+        launcher = SpyreLauncher(_Src({}), _Metadata(True))
+        payload = launcher._symbolic_args(3)
+        # Slot i is resolved from entry i, so tensor_id has to be the position:
+        # a right-length payload in the wrong order is silent wrong numerics.
+        assert [entry.tensor_id for entry in payload] == [0, 1, 2]
+        assert all(entry.kind == "kAddress" for entry in payload)
+        # kDimension's fields, left at their -1 defaults: that kind carries a
+        # runtime scalar dim and raises "not yet implemented" downstream.
+        assert all((entry.dim_index, entry.value) == (-1, -1) for entry in payload)
+
+
+class TestArgumentModeCheck:
+
+    @pytest.mark.parametrize("symbolic, ambient", [(True, "1"), (False, "0")])
+    def test_agreement_is_accepted(self, monkeypatch, symbolic, ambient):
+        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", ambient)
+        SpyreLauncher(_Src({}), _Metadata(symbolic))._check_argument_mode_agrees()
+
+    @pytest.mark.parametrize("symbolic, ambient", [
+        (True, "0"),
+        (False, "1"),
+        # Unset is not neutral: prepare_kernel binds addresses unless the value
+        # is exactly "1", so an artifact compiled symbolic disagrees with it.
+        (True, None),
+    ])
+    def test_disagreement_is_refused_naming_both_sides(self, monkeypatch,
+                                                       symbolic, ambient):
+        if ambient is None:
+            monkeypatch.delenv("BUNDLE_SYMBOLIC_ARGS", raising=False)
+        else:
+            monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", ambient)
+        launcher = SpyreLauncher(_Src({}), _Metadata(symbolic))
+        with pytest.raises(RuntimeError) as excinfo:
+            launcher._check_argument_mode_agrees()
+        message = str(excinfo.value)
+        # Both sides, because knowing only one does not say which to change.
+        assert "BUNDLE_SYMBOLIC_ARGS" in message
+        assert ("symbolic" if symbolic else "baked") in message
+
+    def test_only_the_exact_string_one_means_symbolic(self, monkeypatch):
+        # torch-spyre's own rule (prepare_kernel.cpp), not a truthy test: "true"
+        # binds addresses there, so accepting it here would disagree with the
+        # runtime in the direction that fails silently.
+        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "true")
+        with pytest.raises(RuntimeError):
+            SpyreLauncher(_Src({}), _Metadata(True))._check_argument_mode_agrees()
