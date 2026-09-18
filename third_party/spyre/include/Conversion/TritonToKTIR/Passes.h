@@ -1,3 +1,9 @@
+// Declarations for the TTIR -> KTIR conversions.  One of three Passes.h under
+// third_party/spyre, all in namespace mlir::triton::ktdp: this one for passes
+// that cross a dialect boundary, Dialect/KTDP/Transforms/ for those whose
+// subject is ktdp's own abstractions, Transforms/ for the rest.  The criterion
+// and the per-pass contracts are in the Passes.td beside this file.
+
 #ifndef TRITON_SPYRE_CONVERSION_TRITONTOKTIR_PASSES_H
 #define TRITON_SPYRE_CONVERSION_TRITONTOKTIR_PASSES_H
 

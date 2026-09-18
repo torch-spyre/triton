@@ -144,7 +144,7 @@ Two crossings are deliberate and worth knowing:
   non-const reference member and would let an analysis rule write 2B's state.
   The phase split is only worth something if neither side can reach across.
 
-The 2A/2B vocabulary is this doc's and `Passes.td`'s, not the driver's:
+The 2A/2B vocabulary is this doc's and `Dialect/KTDP/Transforms/Passes.td`'s, not the driver's:
 `RewriteDescriptorLayout.cpp` says "Phase 2A" and never "Phase 2B", its second
 block is labelled just "Phase 2", and its file-header staged-model comment lists
 only Phase 1 and Phase 3. Reconciling that is unfinished business.

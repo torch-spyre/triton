@@ -296,7 +296,7 @@ _SPYRECODE_STAGE_PASSES = (
     # math/arith op it matches is already inside the linalg.generic body
     # those produced. A scalar op on a type spyreop has no intrinsic for
     # (f64, bf16, ...) is reported as illegal rather than left alone -- see
-    # LowerSpyreOps.cpp and Passes.td.
+    # LowerSpyreOps.cpp and Conversion/TritonToKTIR/Passes.td.
     "lower_spyre_ops",
 )
 

@@ -25,7 +25,7 @@
 // Tensor-of-pointers `tt.load` (pointer operand shaped as a tensor of
 // `!tt.ptr<ElemT>`) is out of scope for this pass and remains
 // legal/untouched; see `[LowerPointerChainMemory]` (not yet implemented,
-// Passes.td pipeline diagram) for that path.
+// Conversion/TritonToKTIR/Passes.td pipeline diagram) for that path.
 //
 // Pass-ordering note: when a scalar `tt.load` result feeds a dynamic shape
 // operand of `tt.make_tensor_descriptor`, `LowerDescriptorMemory` reaches
