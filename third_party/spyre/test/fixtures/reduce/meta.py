@@ -21,6 +21,11 @@ through memory, which is softmax's shape -- and they live here because the reduc
 is what puts the statistic there. The Level D banner records why these and not
 the others.
 
+``softmax_on_stick`` is the end of that line: the whole softmax, six compute
+groups over all seven base addresses. It compiles and launches but is off the
+device tier, because a float immediate in its reciprocal group arrives halved --
+its own banner has the isolation.
+
 The variants are grouped under Level A-D banners, each of which says what its
 level is for and what it deliberately does not vary. See ``fixtures/README.md``
 for the field reference and the discovery rules.
@@ -148,6 +153,45 @@ def make_inputs_max_shift_exp(M, N, DTYPE="fp16", **_unused) -> dict:
             "out_ptr": np.zeros((M, N), dtype=np_dtype)}
 
 
+def make_inputs_softmax(M, N, S, DTYPE="fp16", **_unused) -> dict:
+    """``[M, N]`` in, five scratch buffers and an ``[M, N]`` out -- seven in all.
+
+    Seven because that is every base address there is, so the shapes are worth
+    reading rather than skimming: two rank-1 statistics (``max``, ``sum``) which a
+    broadcast layout stretches to ``[M, S]`` on the device and which therefore
+    need a ``device_alloc`` entry; one ``[M, S]`` reciprocal, whose host shape is
+    already its device shape because the compute that writes it is stick-wide and
+    no layout replicates it; and two ``[M, N]`` intermediates.
+    """
+    np_dtype = DTYPE_MAP[DTYPE]
+    rng = np.random.default_rng(seed=0)
+    x = rng.standard_normal((M, N)).astype(np_dtype)
+    return {"x_ptr": x,
+            "max_ptr": np.zeros(M, dtype=np_dtype),
+            "diff_ptr": np.zeros((M, N), dtype=np_dtype),
+            "exp_ptr": np.zeros((M, N), dtype=np_dtype),
+            "sum_ptr": np.zeros(M, dtype=np_dtype),
+            "recip_ptr": np.zeros((M, S), dtype=np_dtype),
+            "out_ptr": np.zeros((M, N), dtype=np_dtype)}
+
+
+def softmax_reference(inputs) -> np.ndarray:
+    """A row softmax, in the input's own dtype and by the kernel's own steps.
+
+    Written out rather than as ``e / e.sum()`` because the kernel does not divide:
+    it inverts the total in a group of its own and multiplies. A reciprocal and a
+    multiply is not a divide in fp16 -- the reciprocal is rounded before it is
+    applied -- so an oracle that divided would charge the device for arithmetic it
+    was never asked to do.
+    """
+    x = inputs["x_ptr"]
+    dt = x.dtype
+    shifted = (x - x.max(axis=1, keepdims=True)).astype(dt)
+    e = np.exp(shifted).astype(dt)
+    recip = (np.float32(1.0) / e.sum(axis=1, keepdims=True).astype(dt)).astype(dt)
+    return (e * recip).astype(dt)
+
+
 def max_shift_exp_reference(inputs) -> np.ndarray:
     """``exp(x - max(x, axis=1))``, in the input's own dtype.
 
@@ -239,6 +283,25 @@ def _signature_max_shift_exp(dtype: str) -> dict:
 
 
 _SIG_MAX_SHIFT_EXP = _signature_max_shift_exp("fp16")
+
+
+def _signature_softmax(dtype: str) -> dict:
+    """``softmax_on_stick``'s arg list -- seven pointers over seven buffers.
+
+    :func:`_signature_max_shift_exp` with three more pointers and the same two
+    layouts, which is the point of ``TILE_LAYOUT`` being one name: ``exp`` is
+    another full-width tile and carries the same stick-on-N split as ``x``,
+    ``diff`` and ``out``. ``recip`` takes no layout at all -- it is written
+    stick-wide by a compute, so its logical shape is its physical one.
+    """
+    return {"x_ptr": f"*{dtype}", "max_ptr": f"*{dtype}", "diff_ptr": f"*{dtype}",
+            "exp_ptr": f"*{dtype}", "sum_ptr": f"*{dtype}",
+            "recip_ptr": f"*{dtype}", "out_ptr": f"*{dtype}",
+            "M": "i32", "N": "i32", "S": "i32",
+            "TILE_LAYOUT": "constexpr", "STAT_LAYOUT": "constexpr"}
+
+
+_SIG_SOFTMAX = _signature_softmax("fp16")
 
 
 # ---------------------------------------------------------------------------
@@ -1068,5 +1131,113 @@ VARIANTS = {
         # device writes M*S where the host tensor holds M. S is 64 at fp16. Must
         # agree with STAT_LAYOUT above; nothing derives one from the other yet.
         "device_alloc": {"max_ptr": ([1, 64, 64], [-1, 1, -1])},
+    },
+
+    # The whole thing: a row softmax in six compute groups over SEVEN buffers,
+    # which is every base address there is (the eighth segment holds the program).
+    # ``max_shift_exp_on_stick`` continued to the end -- sum the exponentials,
+    # invert the total in a group of its own, scale every exponential by its row's
+    # reciprocal -- and group for group it is the hand-written reference chain.
+    #
+    # Nothing new had to be forked to get here. The two fp16 refusals
+    # ``max_shift_exp_on_stick`` needed were the whole frontend cost; a THIRD
+    # narrow-float promotion turned up on the way and did not need a fork, because
+    # Triton already ships the op that avoids it: ``/`` promotes fp16 to fp32
+    # (PTX has no native fp16 divide) but ``tl.fdiv`` divides at the operand
+    # width. See the kernel's docstring.
+    #
+    # One divergence from the reference, benign so far as the device is concerned
+    # but worth knowing: the reference states G5 as ONE generic, reading the total
+    # through a splat map and writing a stick. This emission produces two -- the
+    # reciprocal at ``[M, 1]`` and then a pure-copy generic widening it to
+    # ``[M, S]`` -- because the broadcast is written before the divide in the
+    # kernel and the pipeline reassociates a splat-constant divide back through
+    # it. Two computes in one group is the thing dbo-opt normally refuses; it does
+    # not here, the second having no arithmetic in its body. Nothing depends on
+    # that holding, and if it stops holding, the fix is to give the divide
+    # something lane-varying to consume rather than to reorder the groups.
+    #
+    # NOT ON THE DEVICE TIER, and `compiles_to_binary: False` below is NOT what it
+    # says. This variant DOES reach a binary and DOES launch. It is off the tier
+    # because the answer is wrong, and the fixture vocabulary has no way to state
+    # that: `xfail_numerical` belongs to the ktir_cpu arm, and the device tier is
+    # gated on this one boolean, so "compiles" and "gets the right answer" cannot
+    # be said apart. That gap is why this field reads as a lie; naming it here is
+    # the honest option available. Whoever adds a device xfail should move this.
+    #
+    # What is wrong is ONE VALUE, and it is not in this repo. Measured on the
+    # device against the fp16 oracle (seed 0, M=64, N=128), group by group:
+    #
+    #   max     max |err| 2.0e-3   (one ulp)
+    #   diff    max |err| 7.8e-3   (one ulp; see max_shift_exp_on_stick)
+    #   exp     max rel  9.8e-3    (as its own variant measures)
+    #   sum     max rel  2.9e-3
+    #   recip   max rel  5.0e-1    <-- exactly a factor of two
+    #   out     max rel  7.5e-1
+    #
+    # The reciprocal group computes `0.5 / sum`, not `1.0 / sum`: the device's
+    # recip agrees with `0.5/sum_device` to 9.0e-4, one ulp. The FLOAT IMMEDIATE
+    # arrives halved. It is a bit reinterpretation -- an fp16 literal is emitted as
+    # its IEEE binary16 pattern and read as Spyre's 1-6-9 float, and 0x3C00 (1.0
+    # IEEE, exp 15) is 0.5 in 1-6-9 (exp 30, bias 31). Isolated on a two-line
+    # elementwise kernel with no reduce, no chain and no broadcast, where every
+    # value the mangling predicts is exactly what comes back:
+    #
+    #   1.0 -> 0.5      2.0 -> 2.0      0.5 -> 0.125      3.0 -> 4.0
+    #
+    # (2.0 is unchanged by coincidence: its pattern happens to read as itself.)
+    # And 1.5, the value whose bits WOULD read as 1.0, is refused outright --
+    # "slot arith.constant 1.500000e+00 : f16 does not have a constant address" --
+    # so the immediates that work at all come from a fixed table. Compensating for
+    # the mangling is therefore both impossible and the wrong thing to do.
+    #
+    # Everything else the chain does is right. G6 agrees with
+    # `exp_device * recip_device` to 3.1e-5 absolute, and the sum agrees with
+    # `sum(exp_device)` to 4.8e-3 relative. Six groups over seven buffers schedule,
+    # the address count fits, and both statistics round-trip. One immediate is the
+    # whole gap, and it is a deeptools one.
+    "softmax_on_stick": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "simplified:no-loop", "spyre-tensor-layout", "hbm-round-trip"],
+        "summary": (
+            "A whole row softmax over the stick axis: max, shift, exp, sum, "
+            "reciprocal and multiply as six compute groups chained through HBM, "
+            "over all seven base addresses."
+        ),
+        "kernel_fn":  kernel.softmax_on_stick,
+        "SIGNATURE":  _SIG_SOFTMAX,
+        "constexpr":  ["M", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT"],
+        "params": {
+            ("DTYPE", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT"): [
+                _tile_stat_row("fp16", n_sticks=2),
+            ],
+            # M = 64 rows, two whole 64-lane sticks of N. Nothing is padded.
+            "M": [64],
+        },
+        "grid":        [1],
+        "data_layout": "host",
+        # False, and the banner above says why it is not the statement it looks
+        # like: this compiles and launches, and the answer is wrong.
+        "compiles_to_binary": False,
+        "reference":   softmax_reference,
+        "inputs":      make_inputs_softmax,
+        "output_key":  "out_ptr",
+        # A PREDICTION, not a measurement, and said plainly because every other
+        # tolerance here records something observed. Once the halved immediate is
+        # fixed, the error should be a little over ``max_shift_exp_on_stick``'s
+        # 9.8e-3: the numerator is the same arithmetic, and the normalisation adds
+        # a 128-term fp16 accumulation in the device's order plus a reciprocal
+        # rounded to fp16 before it is applied. 6e-2 is 3x a doubling of that. No
+        # atol -- a softmax row sums to one over 128 terms, so the outputs sit
+        # around 8e-3 and none is near zero.
+        "rtol":        6e-2,
+        "atol":        0.0,
+        # Both rank-1 statistics: STAT_LAYOUT replicates [M] across a stick, so
+        # the device writes M*S elements where the host tensor holds M. S is 64 at
+        # fp16. recip_ptr needs no entry -- it is [M, S] on the host already,
+        # because a stick-wide compute writes it and no layout replicates it.
+        "device_alloc": {"max_ptr": ([1, 64, 64], [-1, 1, -1]),
+                         "sum_ptr": ([1, 64, 64], [-1, 1, -1])},
     },
 }

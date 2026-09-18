@@ -359,3 +359,136 @@ def max_shift_exp_on_stick(
     # G3: the exponential.
     d = diff_desc.load([0, 0])
     out_desc.store([0, 0], tl.exp(d))
+
+
+@triton.jit
+def softmax_on_stick(
+    x_ptr,
+    max_ptr,
+    diff_ptr,
+    exp_ptr,
+    sum_ptr,
+    recip_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    S: tl.constexpr,
+    TILE_LAYOUT: tl.constexpr,
+    STAT_LAYOUT: tl.constexpr,
+):
+    """A whole softmax over the stick axis: six compute groups, seven buffers.
+
+    :func:`max_shift_exp_on_stick` continued to the end, and the end is the
+    normalisation: the exponentials are summed, the total is inverted, and every
+    exponential is scaled by its row's reciprocal. It is the shape of the
+    hand-written reference chain, group for group --
+
+        max     reduce the stick axis      the largest value per row
+        sub     x - max                    read at the head of the stick
+        exp     the intrinsic
+        sum     reduce the stick axis      the total of the exponentials
+        recip   one over that total        written back across a stick
+        mul     exp * recip                read at the head of the stick
+
+    -- and the buffer count is the binding constraint rather than an incidental
+    fact: seven, which is every base address there is (the eighth segment holds
+    the program). Nothing here can be given a scratch buffer it does not already
+    have.
+
+    Two things about the shape are not free choices:
+
+    * The exponentials go to memory because TWO groups read them -- the sum
+      reduces them and the multiply scales them -- and a load result may not be
+      shared across groups.
+    * The reciprocal is its own group producing a STICK-WIDE result, rather than
+      a divide folded into the multiply. The multiply reads its statistic one
+      lane wide like every other consumer here, so something has to have written
+      that lane; a divide in the last group would instead need the sum broadcast
+      into it, which is a second compute in a group that already has one.
+
+    It reaches a binary and launches, and the answer is wrong in exactly one
+    place: the ``1.0`` below arrives on the device as ``0.5``, an fp16 literal
+    emitted as its IEEE binary16 pattern and read as Spyre's 1-6-9 float. Not a
+    property of this kernel -- a two-line elementwise kernel shows it -- and not
+    something to compensate for. The variant's banner in ``meta.py`` has the
+    measurements and the isolation.
+
+    ``tl.fdiv`` and not ``one / s``, which is a real distinction and not style:
+    ``/`` promotes fp16 to fp32 (``computation_type_impl`` in semantic.py, on the
+    grounds that PTX has no native fp16 divide), and the promotion emits an
+    ``arith.extf`` that no pass here lowers. ``tl.fdiv`` divides at the operand
+    width, which is what ``spyreop.realdiv`` wants. The numerator is a same-dtype
+    ``tl.full`` for the same reason -- a bare Python ``1.0`` is an fp32 scalar.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    diff_desc = tl.make_tensor_descriptor(
+        diff_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    exp_desc = tl.make_tensor_descriptor(
+        exp_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    # The two statistics, each in its two roles: written rank-1 through a
+    # broadcast layout so a value lands across a whole stick, read back as the
+    # [M, S] the broadcast made, one lane wide. See stat_chain_on_stick for why
+    # the read is at lane 0 rather than at the consumer's own lane.
+    max_w = tl.make_tensor_descriptor(
+        max_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    max_r = tl.make_tensor_descriptor(
+        max_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1],
+    )
+    sum_w = tl.make_tensor_descriptor(
+        sum_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    sum_r = tl.make_tensor_descriptor(
+        sum_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1],
+    )
+    # The reciprocal is the one statistic written WITHOUT a broadcast layout: it
+    # is produced [M, S] already, by a compute whose output tile is stick-wide,
+    # so its logical shape is its physical one and there is nothing to replicate.
+    # Both descriptors are rank-2 over the same bytes; only the block differs.
+    recip_w = tl.make_tensor_descriptor(
+        recip_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, S],
+    )
+    recip_r = tl.make_tensor_descriptor(
+        recip_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1],
+    )
+    tl.spyre_tensor_layout(x_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(diff_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(exp_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(out_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(max_w, STAT_LAYOUT)
+    tl.spyre_tensor_layout(sum_w, STAT_LAYOUT)
+
+    # G1: the row maximum, stored stick-wide.
+    x1 = x_desc.load([0, 0])
+    max_w.store([0], tl.max(x1, axis=1))
+
+    # G2: every value shifted by its row's maximum.
+    x2 = x_desc.load([0, 0])
+    m = max_r.load([0, 0])
+    diff_desc.store([0, 0], x2 - m)
+
+    # G3: the exponential, to memory because two groups below read it.
+    d = diff_desc.load([0, 0])
+    exp_desc.store([0, 0], tl.exp(d))
+
+    # G4: the total of the exponentials, stored stick-wide.
+    e1 = exp_desc.load([0, 0])
+    sum_w.store([0], tl.sum(e1, axis=1))
+
+    # G5: one over that total, spread across the stick so G6 can read a lane.
+    s = sum_r.load([0, 0])
+    s_bcast = tl.broadcast_to(s, [M, S])
+    one = tl.full([M, S], 1.0, dtype=s_bcast.dtype)
+    recip_w.store([0, 0], tl.fdiv(one, s_bcast))
+
+    # G6: every exponential scaled by its row's reciprocal.
+    e2 = exp_desc.load([0, 0])
+    r = recip_r.load([0, 0])
+    out_desc.store([0, 0], e2 * r)
