@@ -102,21 +102,69 @@ offsets like 512, 3072 and 98304, so a plausible-looking hand-picked number is
 exactly the dangerous kind. Without the check, pinning is unsound whoever chose the
 number.
 
+### Composing pinned shares across cores
+
+[inter-tile-lowering-to-mem-view.md](inter-tile-lowering-to-mem-view.md) proposes
+`tl.make_distributed_descriptor`, which composes each core's share of a tensor into
+one descriptor read at author-chosen offsets. Its first assumption is that a kernel's
+**entry inputs live in global memory**, and its examples build the share from a
+global load. But a scratchpad relayout is on-chip on both sides, and its lowering
+emits one memory view per partition carrying a holder and a base address — so it
+needs a scratchpad address per share, and nothing in that design supplies one. It
+presupposes an allocation it cannot request.
+
+The pin is what supplies it, and the shape that shows this most clearly is a kernel
+with **no entry inputs at all**:
+
+```python
+@triton.jit
+def relayout():                                        # no inputs
+    share = ...                                        # produced on-chip
+    tl.spyre_pin(share, ...)                           # <- gives it an LX offset
+    whole = tl.make_distributed_descriptor(share, work_slices=SRC, axes=[None, "n"])
+    mine  = whole.load([0, my_offset])                 # my region under the new division
+    out   = tl.exp(mine)                               # and on into the next compute
+```
+
+The empty signature is not a way around that assumption. It constrains what an entry
+input may *be*, not that there must be one, so a kernel with none satisfies it
+trivially. And it is the case that isolates the question: were the share loaded from
+global memory, the address in play would be the global one and the scratchpad
+question would not arise. With no inputs, the pin is the only possible source of the
+address.
+
+Nor is a zero-argument entry function an exotic shape for the backend — the
+baked-address mode already produces one, replacing every pointer argument with a
+constant because the scheduler requires it.
+
+**One address, not one per core.** Every instance runs the same kernel and pins its
+own share at the same offset; what varies per partition is the coordinate set, which
+is the composition's business. So the pin stays a scalar even here.
+
+Two things this leaves open. Whether a kernel ever needs to *receive* a
+scratchpad-resident tile rather than produce one — if so, the assumption above needs
+weakening and the pin is not sufficient, since an address would have to be passed in.
+And what such a kernel returns: under the pull model each destination writes into its
+own scratchpad, so possibly nothing crosses the signature in either direction.
+
 ## Open: what the pin is for
 
 This decides whether the op exists at all, so it comes before the questions about
 how it is spelled.
 
-If the compiler already places every intermediate, an override needs a reason.
-Two candidates:
+If the compiler already places every intermediate, an override needs a reason. Three
+candidates, the third with a concrete consumer and the first two without one yet:
 
-- **Coordination** — something outside the kernel expects a value at a known
-  offset.
+- **Composition** — `tl.make_distributed_descriptor` needs a base address per share
+  and cannot derive one, as above. Note this is not an override at all: the compiler
+  has no placement to override, because the value has to sit where the composition
+  agrees it sits.
+- **Coordination** — something outside the kernel expects a value at a known offset.
 - **Disagreement** — the author believes the compiler's placement is wrong.
 
-If neither turns out to be real, the pass alone is the whole proposal and the rest
-of this document is unnecessary. That is a live possibility and worth settling
-first.
+The first makes the pin necessary rather than optional, so the pass alone is no longer
+the whole proposal. Whether either of the others is real is still worth settling,
+since they would shape what a good name expresses.
 
 ## Open: the name
 
