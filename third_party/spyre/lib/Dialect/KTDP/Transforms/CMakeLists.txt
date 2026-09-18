@@ -29,7 +29,6 @@ add_triton_library(KTDPTransforms
   MLIRFuncDialect
   MLIRArithDialect
   MLIRLinalgDialect
-  MLIRLinalgTransforms
   MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect
