@@ -131,9 +131,12 @@ Uses SCF (Structured Control Flow) dialect:
 ## Compilation Pipeline (Triton → KTIR)
 
 This pipeline is owned in *this* repo, so read it from the source rather than a
-summary: `third_party/spyre/backend/compiler.py` wires the stages, the passes
-live in `third_party/spyre/lib/Dialect/KTDP/Transforms/`, and their contracts
-are declared in `include/Dialect/KTDP/Transforms/Passes.td` (the ground truth).
+summary: `third_party/spyre/backend/compiler.py` wires the stages, and the passes
+live in three libraries under `third_party/spyre/lib/` —
+`Conversion/TritonToKTIR/` for the dialect-crossing passes,
+`Dialect/KTDP/Transforms/` for those whose subject is KTDP's own abstractions,
+and `Transforms/` for the rest. Each has its own `Passes.td` under the matching
+`include/` directory, and those are the ground truth for per-pass contracts.
 
 At a glance: a **ttir** stage runs standard Triton IR optimization, then a
 **ktir** stage lowers to KTIR via a handful of C++ passes — descriptor-memory

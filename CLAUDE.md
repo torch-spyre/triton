@@ -120,12 +120,24 @@ Current upstream touch points:
 
 - `third_party/spyre/backend/compiler.py` — `SpyreBackend`; `add_stages()`
   defines the `ttir` and `ktir` stages. `_make_ktir` runs the KTDP passes.
-- `third_party/spyre/lib/Dialect/KTDP/Transforms/` — the lowering passes
-  (C++). See the spyre / spyre-ktir agents for the pass pipeline.
-- `third_party/spyre/include/Dialect/KTDP/Transforms/Passes.td` — authoritative
-  per-pass contracts (input/lowering/output).
-- `third_party/spyre/test/` — structural + numerical tests; `fixtures/` holds
-  the kernel examples (vector_add, softmax, matmul, gather).
+- The C++ passes live in three libraries, split by what each pass's subject is.
+  See the spyre / spyre-ktir agents for the pass pipeline.
+  - `third_party/spyre/lib/Conversion/TritonToKTIR/` — passes that cross a
+    dialect boundary, taking `tt` into KTIR (`ktdp`, linalg, tensor, func,
+    spyreop). `ktdp` is one dialect; KTIR is the language it composes with.
+  - `third_party/spyre/lib/Dialect/KTDP/Transforms/` — passes whose subject is
+    KTDP's own abstractions: memory views, access tiles.
+  - `third_party/spyre/lib/Transforms/` — passes acting on upstream structure or
+    the whole program, not on a dialect's own abstractions.
+  - `third_party/spyre/lib/Dialect/KTDP/Utils/` — shared helpers; kept out of the
+    peer libraries so neither has to depend on the other.
+- `Passes.td` under the matching `include/` directory for each of the three —
+  authoritative per-pass contracts (input/lowering/output). Note a pass's
+  `dependentDialects` there is a second source of link dependencies alongside
+  its `#include`s.
+- `third_party/spyre/test/` — structural + numerical tests. The lit tree mirrors
+  `lib/`; `fixtures/` holds the kernel examples (vector_add, softmax, matmul,
+  gather).
 - `third_party/spyre/ktir-mlir-frontend/` — KTIR MLIR frontend submodule
   (provides the `mlir_ktdp` bindings; supplies LLVM).
 
