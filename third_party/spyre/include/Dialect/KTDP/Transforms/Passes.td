@@ -260,7 +260,8 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         - math.sqrt  (operand f16 or f32)        → spyreop.sqrt
         - math.exp   (operand f16 or f32)        → spyreop.exp
         - math.rsqrt (operand f16 or f32)        → spyreop.rsqrt
-        - arith.divf (operand f16 or f32)        → spyreop.realdiv
+        - arith.divf (operand f16 or f32)        → spyreop.realdiv,
+          or spyreop.reciprocal when the numerator is a constant 1.0
         - arith.addi (i32, inside linalg.generic) → spyreop.addi32toi32
         - arith.addi (i64, inside linalg.generic) → spyreop.addi64toi64
         - arith.muli (i32, inside linalg.generic) → spyreop.muli32toi32
@@ -273,6 +274,18 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         diagnostic rather than silently skipped. Still on a tensor/vector,
         they are left legal, quietly, since ConvertElementwiseToLinalg (not
         this pass) is what will eventually scalarize them.
+
+        arith.divf splits on its NUMERATOR as well as its type, and that is
+        a correctness matter rather than a strength reduction. A float
+        immediate is emitted as its IEEE bit pattern and read by the device
+        as Spyre's own 1-6-9 float (exponent bias 31, not 15), so a literal
+        1.0 arrives as 0.5. `1.0 / x` does not have to carry an immediate at
+        all -- spyreop.reciprocal is unary -- so it does not, matched by
+        value with m_OneFloat (which accepts a scalar float constant or a
+        splat). No OTHER value is special-cased: pre-scaling an immediate to
+        survive the reinterpretation would be compensating for a bug in a
+        place that cannot see it, and the constant whose bits would read as
+        1.0 is refused by the toolchain regardless.
 
         arith.addi/arith.muli are different: plain scalar integer add/mul is
         also used throughout a kernel for loop indices, offsets, and tile
@@ -288,7 +301,9 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         tensor-typed and left alone, never reaching its spyreop intrinsic.
 
         Output: no math.sqrt/exp/rsqrt or arith.divf remains on a supported
-        scalar type; no arith.addi/muli at a supported bit-width remains
+        scalar type (a divf by a constant-1.0 numerator leaving its constant
+        behind, dead, for the pipeline's own cleanup); no arith.addi/muli at
+        a supported bit-width remains
         inside a linalg.generic. The corresponding spyreop intrinsic is
         introduced in its place. Everything else -- unsupported types or
         widths, tensor/vector operands, or index arithmetic outside a

@@ -12,6 +12,11 @@
 // convertible and an unsupported type (e.g. f64) is reported as illegal
 // rather than left alone.
 //
+// arith.divf has two targets rather than one: `1.0 / x` becomes the unary
+// spyreop.reciprocal and everything else the binary spyreop.realdiv. That is
+// not an optimization -- the pattern's own comment has why an immediate the
+// device never sees is the only reliable one.
+//
 // arith.addi/arith.muli are different: plain scalar integer add/mul is used
 // throughout a kernel for loop indices, offsets, and tile addressing, not
 // just scalarized tensor compute. Converting every scalar occurrence would
@@ -33,6 +38,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -120,7 +126,7 @@ struct ConvertMathRsqrt : public OpConversionPattern<math::RsqrtOp> {
 };
 
 //===----------------------------------------------------------------------===//
-// arith.divf -> spyreop.realdiv
+// arith.divf -> spyreop.realdiv, or spyreop.reciprocal when the numerator is 1
 //===----------------------------------------------------------------------===//
 
 struct ConvertArithDivF : public OpConversionPattern<arith::DivFOp> {
@@ -131,6 +137,36 @@ struct ConvertArithDivF : public OpConversionPattern<arith::DivFOp> {
                   ConversionPatternRewriter &rewriter) const override {
     if (!isSpyreOpScalarType(op.getType()))
       return failure();
+    // `1.0 / x` becomes the UNARY intrinsic, so no float immediate reaches the
+    // device at all. That is the whole point of the special case: an fp16
+    // constant is emitted as its IEEE binary16 bit pattern and read by the
+    // device as Spyre's 1-6-9 float (bias 31, not 15), so 0x3C00 -- IEEE 1.0 --
+    // arrives as 0.5. The reinterpretation is not ours to fix, but a reciprocal
+    // does not have to depend on it: spyreop.reciprocal carries no operand to
+    // misread. Nothing here compensates for the mangling for any other value,
+    // and nothing should -- see the softmax_on_stick banner in
+    // fixtures/reduce/meta.py for why there is no table of pre-scaled
+    // immediates to exploit.
+    //
+    // Matched through m_OneFloat -- the standard MLIR value matcher -- rather
+    // than by poking at the constant's attribute, so the shape of the numerator
+    // is not assumed: it accepts a scalar float constant (softmax's, a
+    // `arith.constant 1.0 : f16` hoisted above the linalg.generic that uses it)
+    // and equally a splat, without either being spelled here.
+    if (matchPattern(adaptor.getLhs(), m_OneFloat())) {
+      // The numerator's own op is erased with it when the divide was its only
+      // reader, so nothing dead is left for a later stage to have to decide
+      // about. Guarded rather than unconditional because two reciprocals may
+      // have been CSE'd onto one constant; then it has another reader and
+      // outliving this rewrite is correct.
+      Operation *numerator = adaptor.getLhs().getDefiningOp();
+      bool sole = numerator && adaptor.getLhs().hasOneUse();
+      rewriter.replaceOpWithNewOp<spyreop::Reciprocal>(op, op.getType(),
+                                                       adaptor.getRhs());
+      if (sole)
+        rewriter.eraseOp(numerator);
+      return success();
+    }
     rewriter.replaceOpWithNewOp<spyreop::RealDiv>(
         op, op.getType(), adaptor.getLhs(), adaptor.getRhs());
     return success();
