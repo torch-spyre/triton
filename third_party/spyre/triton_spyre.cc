@@ -7,9 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "ktir/Dialect/KTDP/KTDP.h"
-#include "ktir/Dialect/KTDP/KTDPDialect.h"
-#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
+#include "RegisterEverything.h"
 // All three pass groups: this file reaches create* entry points from each --
 // the conversions and the top-level transforms by their hand-declared
 // factories, RewriteDescriptorLayout through the options struct tablegen
@@ -17,10 +15,7 @@
 #include "Conversion/TritonToKTIR/Passes.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
 #include "Transforms/Passes.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
-#include "mlir/Dialect/Math/IR/Math.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/IntegerSet.h"
@@ -216,14 +211,12 @@ void init_triton_spyre(py::module &&m) {
   // IR utilities submodule
   init_triton_spyre_ir_utils(m.def_submodule("ir_utils"));
 
-  // Dialect registration
+  // Dialect registration. Appends to a context Triton has already populated
+  // (python/src/ir.cc load_dialects runs first), so this adds only what the
+  // Spyre passes need on top.
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
-    registry.insert<mlir::ktdp::KtdpDialect>();
-    registry.insert<mlir::spyreop::SpyreOpDialect>();
-    registry.insert<mlir::linalg::LinalgDialect>();
-    registry.insert<mlir::tensor::TensorDialect>();
-    registry.insert<mlir::math::MathDialect>();
+    mlir::triton::spyre::registerDialects(registry);
     context.appendDialectRegistry(registry);
   });
 }
