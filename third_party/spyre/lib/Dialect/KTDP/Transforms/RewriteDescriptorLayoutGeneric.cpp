@@ -1366,6 +1366,28 @@ struct RewriteDescriptorLayoutGenericPass
     return layoutOf.try_emplace(v, cm).second;
   }
 
+  /// Drop `v`'s layout, because `v` is about to be destroyed.
+  ///
+  /// NOT housekeeping. `layoutOf` is keyed on `Value`, which is a handle onto
+  /// storage MLIR REUSES once the op holding it is erased — so an entry for a
+  /// dead value is not merely stale, it is a layout waiting to be handed to
+  /// whatever value is allocated onto the same address next. The rewrite erases
+  /// a generic every time it fires and clones a new one right after, so the two
+  /// happen in that order routinely.
+  ///
+  /// The symptom is silent and reads as an unrelated bug. A reduce storing a
+  /// statistic through a rank-2 broadcast layout, rewritten first, leaves its
+  /// rank-2 entry behind; an elementwise generic on a rank-3 stick-tiled chain,
+  /// rebuilt later and landing on that address, is then judged inconsistent
+  /// against a rank-2 layout it never had and gets rebuilt a SECOND time, over
+  /// its own already-physical operands. That produces a domain one loop too wide
+  /// with the extra loop named by no map, and the verifier reports the maps as
+  /// non-invertible several passes from anything the author wrote.
+  ///
+  /// The invariant this restores: `layoutOf` holds live values only. Every value
+  /// this pass destroys goes through here.
+  void forgetLayout(Value v) { layoutOf.erase(v); }
+
   //===--------------------------------------------------------------------===//
   // The rewrite
   //===--------------------------------------------------------------------===//
@@ -1505,6 +1527,12 @@ struct RewriteDescriptorLayoutGenericPass
       return failure();
 
     op.getResults().replaceAllUsesWith(physOp.getResults());
+    // Before the erase, not after: erasing frees the storage the old results are
+    // handles onto, and a later value allocated there would inherit their
+    // layouts. See forgetLayout. The old `outs` operands are NOT dropped -- the
+    // clone above reuses those same values, so they are still live.
+    for (Value oldRes : op.getResults())
+      forgetLayout(oldRes);
     op.erase();
     return success();
   }

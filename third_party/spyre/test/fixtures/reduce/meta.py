@@ -129,6 +129,34 @@ def make_inputs_stat_chain(M, N, DTYPE="fp16", **_unused) -> dict:
             "out_ptr": np.zeros((M, N), dtype=np_dtype)}
 
 
+def make_inputs_max_shift_exp(M, N, DTYPE="fp32", **_unused) -> dict:
+    """``[M, N]`` in, an ``[M]`` scratch maximum, an ``[M, N]`` scratch shift, out.
+
+    Two scratch buffers, and neither is an input in any sense but that the kernel
+    needs the memory. Zeroed rather than left uninitialised so a group that never
+    runs is a wrong answer rather than an unpredictable one.
+    """
+    np_dtype = DTYPE_MAP[DTYPE]
+    rng = np.random.default_rng(seed=0)
+    x = rng.standard_normal((M, N)).astype(np_dtype)
+    return {"x_ptr": x,
+            "max_ptr": np.zeros(M, dtype=np_dtype),
+            "diff_ptr": np.zeros((M, N), dtype=np_dtype),
+            "out_ptr": np.zeros((M, N), dtype=np_dtype)}
+
+
+def max_shift_exp_reference(inputs) -> np.ndarray:
+    """``exp(x - max(x, axis=1))``, in the input's own dtype.
+
+    Softmax's numerator, and the reason it is written this way round rather than
+    as ``exp(x) / something``: subtracting the row maximum first is what keeps
+    every argument to the exponential at or below zero.
+    """
+    x = inputs["x_ptr"]
+    shifted = x - x.max(axis=1, keepdims=True)
+    return np.exp(shifted).astype(x.dtype)
+
+
 def stat_chain_reference(inputs) -> np.ndarray:
     """``out[m, n] = x[m, n] - sum(x[m, :])``, in the input's own dtype.
 
@@ -191,6 +219,23 @@ def _signature_stat_chain(dtype: str) -> dict:
 
 
 _SIG_STAT_CHAIN = _signature_stat_chain("fp16")
+
+
+def _signature_max_shift_exp(dtype: str) -> dict:
+    """``max_shift_exp_on_stick``'s arg list -- four pointers over four buffers.
+
+    Two layouts rather than three, and that is the point of the naming: every
+    full-width tile in the chain (``x``, ``diff``, ``out``) is stick-tiled the
+    same way, so one ``TILE_LAYOUT`` states it once. Only the statistic differs,
+    and it is the one that has to.
+    """
+    return {"x_ptr": f"*{dtype}", "max_ptr": f"*{dtype}",
+            "diff_ptr": f"*{dtype}", "out_ptr": f"*{dtype}",
+            "M": "i32", "N": "i32", "S": "i32",
+            "TILE_LAYOUT": "constexpr", "STAT_LAYOUT": "constexpr"}
+
+
+_SIG_MAX_SHIFT_EXP = _signature_max_shift_exp("fp32")
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +361,25 @@ def _stat_chain_row(dtype: str, n_sticks: int) -> tuple:
     stick = _stick_of(dtype)
     return (dtype, n_sticks * stick, stick,
             _stick_2d_on_n(dtype), _stick_1d_bcast(dtype), _stick_2d_on_n(dtype))
+
+
+def _tile_stat_row(dtype: str, n_sticks: int) -> tuple:
+    """One row for the ``("DTYPE", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT")`` group
+    the max/shift/exp and softmax chains sweep.
+
+    :func:`_stat_chain_row` with one layout fewer, because those chains give every
+    full-width tile the same name: ``TILE_LAYOUT`` is the stick-on-N split that
+    ``x`` and every intermediate carries, and ``STAT_LAYOUT`` is the broadcast
+    1-D one a stick-axis reduce has to store through. At ``M=64`` fp32 with
+    ``n_sticks=2``::
+
+        DTYPE = "fp32"   N = 64   S = 32
+        TILE_LAYOUT = ((1, "floordiv", 32), 0, (1, "mod", 32))
+        STAT_LAYOUT = (0, (0, "broadcast", 32))
+    """
+    stick = _stick_of(dtype)
+    return (dtype, n_sticks * stick, stick,
+            _stick_2d_on_n(dtype), _stick_1d_bcast(dtype))
 
 
 def _stick_on_d2_row(dtype: str, n_sticks: int) -> tuple:
@@ -906,5 +970,92 @@ VARIANTS = {
             "strict": True,
             "raises": RuntimeError,
         },
+    },
+
+    # Softmax's numerator, and the first three-deep chain here: the reduce is a
+    # max, and the tile it shifts goes to a scratch buffer that a THIRD group
+    # exponentiates. So `diff` is both a store destination and a load source
+    # through one descriptor, which is what `stat_chain_on_stick` never had --
+    # there the statistic round-tripped and the full-width tile did not.
+    #
+    # That is what turned up the layout pass's stale-layout bug: a reduce storing
+    # through a rank-2 broadcast layout leaves its entry behind when the rewrite
+    # erases it, and the exp generic, rebuilt later onto the same freed Value
+    # address, was judged against a rank-2 layout it never had. See forgetLayout
+    # in RewriteDescriptorLayoutGeneric.cpp -- the chain could not be two groups
+    # long and hit it, which is why this variant is the one that found it.
+    #
+    # fp32 throughout: tl.exp refuses fp16 and tl.max promotes it. Four buffers,
+    # so four base addresses of the seven.
+    #
+    # NOT ON THE DEVICE TIER, and the wall is neither the chain nor the reduce.
+    # Its KTIR is what the reference states, and dbo-opt takes it all the way to
+    # instruction selection before refusing:
+    #
+    #   'vectorchain.shuffle' op unsupported ldtype
+    #   %0 = "vectorchain.shuffle"(...) <{indices = [0], repetition = 32}>
+    #        : (vector<1xf32>) -> vector<32xf32>
+    #   could not set ldtype
+    #   %69 = "agen.vector_load"(...) : (memref<2x1x32xf32>, index) -> vector<1xf32>
+    #   Unable to generate load_and_send 'statement for the agen.vector_load
+    #   cannot lower agen.vector_load
+    #
+    # That is the STATISTIC READ: one lane loaded and splatted across the stick.
+    # It is an fp16-only path in this dbo-opt, and the isolation is exact --
+    # ``stat_chain_on_stick``, which is on the device tier and passes, produces
+    # the identical error when its dtype alone is changed to fp32, and this
+    # variant's own max reduce reaches a binary at fp32 in
+    # ``one_tile_on_stick_bcast_max`` because that one only WRITES a statistic.
+    #
+    # So the read-back needs fp16 and the compute needs fp32, and nothing here can
+    # have both: ``tl.exp`` rejects fp16 at trace time (``_check_dtype`` in
+    # language/math.py) and ``tl.max`` promotes it (standard.py), emitting
+    # arith.extf/truncf that no pass here lowers. Closing that is a frontend
+    # decision -- forking those two guards behind ``is_spyre()`` -- not a fixture
+    # one, which is why this variant records the wall instead of working around it.
+    "max_shift_exp_on_stick": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "simplified:no-loop", "spyre-tensor-layout", "hbm-round-trip"],
+        "summary": (
+            "out[m, n] = exp(x[m, n] - max(x[m, :])) through HBM: a stick-axis "
+            "max storing its statistic stick-wide, a second group shifting the "
+            "tile by it, and a third exponentiating the result."
+        ),
+        "kernel_fn":  kernel.max_shift_exp_on_stick,
+        "SIGNATURE":  _SIG_MAX_SHIFT_EXP,
+        "constexpr":  ["M", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT"],
+        "params": {
+            ("DTYPE", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT"): [
+                _tile_stat_row("fp32", n_sticks=2),
+            ],
+            # M = 64 rows, two whole 32-lane sticks of N. Nothing is padded.
+            "M": [64],
+        },
+        "grid":        [1],
+        "data_layout": "host",
+        # False, not absent: say it, because every neighbour in this Level D block
+        # carries True and a reader would take an omission for an oversight. The
+        # banner above is the reason.
+        "compiles_to_binary": False,
+        "reference":   max_shift_exp_reference,
+        "inputs":      make_inputs_max_shift_exp,
+        "output_key":  "out_ptr",
+        # Sized for the device arm this variant does not yet reach, so it is a
+        # prediction rather than a measurement -- said plainly, because every
+        # other tolerance in this file records something observed. The device's
+        # fp32 datapath runs at SEN169 precision (see the note on
+        # one_tile_on_stick_bcast_max) and an exp AMPLIFIES what that costs: the
+        # shifted values reach -6, where exp is 2.5e-3, so a 2.5e-3 relative error
+        # on the shift moves the exponent by about that much again. 1e-2 is what
+        # every other fp32 device variant here uses; atol covers the far tail,
+        # where the outputs are ~1e-3 and a relative bound would be asking the
+        # device to be exact about a number the shift only knows to 2.5e-3.
+        "rtol":        1e-2,
+        "atol":        1e-3,
+        # The statistic buffer: STAT_LAYOUT replicates [M] across a stick, so the
+        # device writes M*S where the host tensor holds M. S is 32 at fp32. Must
+        # agree with STAT_LAYOUT above; nothing derives one from the other yet.
+        "device_alloc": {"max_ptr": ([1, 64, 32], [-1, 1, -1])},
     },
 }

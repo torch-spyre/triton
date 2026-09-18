@@ -284,3 +284,75 @@ def stat_chain_on_stick(
     x2 = x_desc.load([0, 0])
     stat = stat_r.load([0, 0])
     out_desc.store([0, 0], x2 - stat)
+
+
+@triton.jit
+def max_shift_exp_on_stick(
+    x_ptr,
+    max_ptr,
+    diff_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    S: tl.constexpr,
+    TILE_LAYOUT: tl.constexpr,
+    STAT_LAYOUT: tl.constexpr,
+):
+    """``out[m, n] = exp(x[m, n] - max(x[m, :]))`` -- softmax's numerator.
+
+    :func:`stat_chain_on_stick` with two changes and no third: the reduce is a
+    ``max`` instead of a ``sum``, and the shifted tile goes to a scratch buffer
+    that a third group exponentiates rather than straight out. Three compute
+    groups, four buffers.
+
+    It exists as its own variant because it is the first kernel here where a
+    statistic's CONSUMER is not the last group -- ``diff`` is both written and
+    read, so the chain is three deep rather than two -- and because a max reduce
+    plus an exp is the pair softmax needs before any of the normalisation does.
+
+    ``diff`` and ``exp`` cannot be the same buffer, and neither can ``diff`` and
+    ``out``: a group's store and a later group's load of the same buffer is the
+    fence the scheduler splits on, so each intermediate needs its own.
+
+    fp32 throughout, and not by preference. ``tl.max`` promotes anything narrower
+    than 32 bits before reducing and ``tl.exp`` refuses fp16 outright, so this is
+    the only width the chain traces at -- which makes it the on-stick shape at a
+    32-lane stick rather than the 64-lane one its fp16 siblings use.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    diff_desc = tl.make_tensor_descriptor(
+        diff_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    # The statistic, in its two roles: written rank-1 through a broadcast layout
+    # so each value lands across a whole stick, read back as the [M, S] the
+    # broadcast made, one lane wide. See stat_chain_on_stick for why the read is
+    # at lane 0 rather than at the consumer's own lane.
+    max_w = tl.make_tensor_descriptor(
+        max_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    max_r = tl.make_tensor_descriptor(
+        max_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1],
+    )
+    tl.spyre_tensor_layout(x_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(diff_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(out_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(max_w, STAT_LAYOUT)
+
+    # G1: the row maximum, stored stick-wide.
+    x1 = x_desc.load([0, 0])
+    max_w.store([0], tl.max(x1, axis=1))
+
+    # G2: every value shifted by its row's maximum, so the exponential below
+    # never sees a positive argument.
+    x2 = x_desc.load([0, 0])
+    m = max_r.load([0, 0])
+    diff_desc.store([0, 0], x2 - m)
+
+    # G3: the exponential.
+    d = diff_desc.load([0, 0])
+    out_desc.store([0, 0], tl.exp(d))
