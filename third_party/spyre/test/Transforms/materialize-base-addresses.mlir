@@ -60,7 +60,7 @@ func.func @three_addrs(%a: index, %b: index, %c: index) {
 // The input is written directly as func.func to keep this test to the one pass
 // it names. ConvertFunctions preserves the `private` marker on the way here, so
 // a tt.func private reaching this pass arrives still private; the marker's
-// survival is pinned in Conversion/convert-functions.mlir.
+// survival is pinned in Conversion/TritonToKTIR/convert-functions.mlir.
 
 // CHECK-LABEL:   func.func private @helper(
 // CHECK-SAME:      %[[ARG_0:.*]]: index,

@@ -79,7 +79,8 @@ reference oracle and input generator. Different functions
 it on `ktir_cpu` and compares against the NumPy oracle.
 
 Structural claims about the lowered IR are **not** made here. They live in the
-lit/FileCheck suite under `test/Conversion/*.mlir`, which pins the exact IR a
+lit/FileCheck suite, whose layout mirrors `lib/` -- `test/Conversion/`,
+`test/Dialect/` and `test/Transforms/` -- which pins the exact IR a
 pass emits rather than asserting op presence over a compiled fixture. A fixture
 whose numerical result is right but whose IR shape matters belongs in a `.mlir`
 carrier, not in a field on the variant.

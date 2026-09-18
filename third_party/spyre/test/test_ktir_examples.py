@@ -12,7 +12,8 @@ xfail rather than a skip, so closing the gap turns the suite red by itself
 instead of leaving a stale entry nobody notices.
 
 Structural IR checking used to live here too. It now lives in the
-lit/FileCheck suite under ``test/Conversion/*.mlir``, which pins the exact
+lit/FileCheck suite, laid out to mirror ``lib/`` -- ``test/Conversion/``,
+``test/Dialect/`` and ``test/Transforms/`` -- which pins the exact
 lowered IR per pass rather than asserting op presence over a compiled
 fixture.
 """
@@ -74,8 +75,9 @@ class TestExample(KTIRCpuTester):
     New kernels added under ``fixtures/`` are picked up automatically by
     discovery; they supply their oracle in ``meta.py``.
 
-    Structural claims about the lowered IR belong in the lit suite under
-    ``test/Conversion/``, not here.
+    Structural claims about the lowered IR belong in the lit suite
+    (``test/Conversion/``, ``test/Dialect/``, ``test/Transforms/``), not
+    here.
     """
 
     @pytest.mark.parametrize("key", _keys_with_numerical_xfail())

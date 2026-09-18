@@ -59,7 +59,7 @@ Three variants, split by arity/dtype (matching ``kernel.py``):
   the same reason Level A/B can't here (see below) -- ``lower_spyre_ops``
   only runs at the spyrecode stage, which Level B compiles never reach.
   ``LowerSpyreOps.cpp``'s own pass-level lit test
-  (``test/Conversion/lower-spyre-ops.mlir``) already covers the containment
+  (``test/Conversion/TritonToKTIR/lower-spyre-ops.mlir``) already covers the containment
   predicate itself precisely, positive and negative cases both (i32/i64
   inside a ``linalg.generic`` converts -- i64 only for add, no
   ``muli64toi64`` intrinsic exists; i16 and anything outside a
@@ -86,7 +86,7 @@ hook here that captures the post-``lower_spyre_ops`` KTIR to assert
 ``spyreop.<op>``/``spyreop.realdiv``/``spyreop.addi32toi32``/
 ``spyreop.muli32toi32`` actually appears. The pass's own correctness at that
 level (that the rewrite fires, and fires only where it should) is what
-``test/Conversion/lower-spyre-ops.mlir`` covers precisely, at the pass
+``test/Conversion/TritonToKTIR/lower-spyre-ops.mlir`` covers precisely, at the pass
 level; what this fixture adds on top is that a real Triton kernel, run
 through the full pipeline on real hardware, produces the right numbers.
 

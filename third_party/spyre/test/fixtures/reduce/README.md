@@ -136,7 +136,7 @@ Past that the two diverge, on what happens to the stick split:
 
   It used to walk the stick axis with an `scf.for` and a slice per stick, plus a
   second loop to re-tile for the store, and dbo-opt rejected the loop.
-  `Conversion/rewrite-descriptor-layout-reduce-batch-dim.mlir` pins the form that
+  `Dialect/KTDP/Transforms/rewrite-descriptor-layout-reduce-batch-dim.mlir` pins the form that
   replaced it; `docs/spyre-tensor-layouts.md` is the design.
 
   Its `atol` is 0.25 rather than the elementwise-shaped 5e-2, set by the device

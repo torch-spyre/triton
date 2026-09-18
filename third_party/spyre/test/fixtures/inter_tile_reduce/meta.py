@@ -89,7 +89,7 @@ def run_element_sum(inputs: dict, BLOCK_M: int, BLOCK_N: int, NUM_N_TILES: int, 
 
     If the ``tl.inter_tile`` API or the fixture grid changes this oracle must
     be updated to match.  The exact KTIR structure (affine sets, combiner op)
-    is pinned by ``Conversion/lower-inter-tile.mlir``, so a lowering
+    is pinned by ``Conversion/TritonToKTIR/lower-inter-tile.mlir``, so a lowering
     regression surfaces there before this oracle becomes the only signal.
     """
     x = inputs["x_ptr"]

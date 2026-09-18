@@ -1096,7 +1096,7 @@ VARIANTS = {
         # reads ``tl.program_id`` on both axes, so DistributeWork lowers it
         # to ``ktdp.get_compute_tile_id`` plus a distribution loop over a
         # 2D tile space. That lowering is pinned by
-        # ``Conversion/distribute-work-multi-axis.mlir``.
+        # ``Conversion/TritonToKTIR/distribute-work-multi-axis.mlir``.
         "kernel_fn":    kernel.gather_2d_kernel,
         "SIGNATURE":    _SIG_2D,
         "constexpr":    [
@@ -1157,9 +1157,9 @@ VARIANTS = {
         # Internally the kernel describes the 1D source as [K, 1] with
         # block_shape=[1, 1] — see gather_1d_kernel docstring and the paired
         # lit negative+positive pair:
-        # Conversion/lower-descriptor-memory-invalid.mlir
+        # Conversion/TritonToKTIR/lower-descriptor-memory-invalid.mlir
         # (@gather_rank1_block_rejected) and
-        # Conversion/lower-descriptor-memory-gather.mlir
+        # Conversion/TritonToKTIR/lower-descriptor-memory-gather.mlir
         # (@gather_1d_source_as_column).
         "kernel_fn":    kernel.gather_1d_kernel,
         "SIGNATURE":    _SIG_1D,
@@ -1374,7 +1374,7 @@ VARIANTS = {
     # The full sweep reconstructs ``in[idx, :, :]`` numerically, so the
     # oracle is the same as the ``3d`` variant. The partial-extent + in-
     # loop y_offset capture properties live in IR — pinned by
-    # ``Conversion/lower-descriptor-memory-placement.mlir`` (access tile
+    # ``Conversion/TritonToKTIR/lower-descriptor-memory-placement.mlir`` (access tile
     # inside ``scf.for``, memory view hoisted to function top).
     #
     # Sizes: NUM_TOKENS=64, TOKEN_BLOCK=16 → 4 windows. K_INDICES=32 keeps
@@ -1403,7 +1403,7 @@ VARIANTS = {
         # structure, so gather/scatter exercise symmetric partial-extent
         # windowed access. The scatter's indirect access tile also lands
         # inside the scf.for; pinned by
-        # ``Conversion/lower-descriptor-memory-placement.mlir``.
+        # ``Conversion/TritonToKTIR/lower-descriptor-memory-placement.mlir``.
         "base":       "3d_partial",
         "kernel_fn":  kernel.scatter_3d_partial_kernel,
         "SIGNATURE":  _SIG_SCATTER_3D_PARTIAL,

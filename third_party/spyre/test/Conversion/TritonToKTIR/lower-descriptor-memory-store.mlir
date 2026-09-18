@@ -260,7 +260,7 @@ tt.func @store_static_2d_2048x256(%ptr: !tt.ptr<f16>, %m: i32, %k: i32,
 //
 // This is the store-side counterpart of the dynamic load case. The load-side
 // rank-1 dynamic claim is already pinned by
-// Conversion/lower-scalar-load-feeds-descriptor-shape.mlir under both pass
+// Conversion/TritonToKTIR/lower-scalar-load-feeds-descriptor-shape.mlir under both pass
 // orderings, so only the store direction is stated here.
 //
 // Triton source pattern:

@@ -402,7 +402,7 @@ carry a layout of its own, a `PhysicalPropagationPattern` stating which output
 layout its operand's layout induces. It does **not** need to touch the
 accumulator or the permutation code — that is what keeping roles unique bought.
 The case a per-logical-dim role provably cannot express is the rank-4 case in
-`test/Conversion/rewrite-descriptor-layout-reduce-batch-dim.mlir`: two batch dims,
+`test/Dialect/KTDP/Transforms/rewrite-descriptor-layout-reduce-batch-dim.mlir`: two batch dims,
 a stick index and an untouched dim. If that test ever needs a special case, the
 abstraction has sprung a leak.
 
@@ -479,7 +479,7 @@ requirement at its own result and compares it arrays-against-arrays, the walk
 deleted from every caller, and the agreement check went with it — with nothing
 left to agree with, a check comparing the analysis to itself would be worse than
 none. What guards the reach now is the reduce coverage itself: Case 4 of
-`Conversion/rewrite-descriptor-layout-reduce-batch-dim.mlir` (`reduce` →
+`Dialect/KTDP/Transforms/rewrite-descriptor-layout-reduce-batch-dim.mlir` (`reduce` →
 `math.exp` → annotated store) pins that a requirement crosses an op between the
 reduce and its store, and `reduce__one_tile[stick, stick]` on device fails to
 compile at all if the Physical selection is lost.

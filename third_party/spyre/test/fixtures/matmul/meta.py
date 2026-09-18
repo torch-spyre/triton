@@ -24,7 +24,7 @@ Pointer-arithmetic descriptor variants — per-batch descriptors built on a
 ``tt.addptr``-advanced base pointer instead of directly on the argument.
 Both are currently ``disabled``: ``tt.addptr`` into
 ``tt.make_tensor_descriptor`` is not yet lowered by ``LowerDescriptorMemory``
-(pinned by ``Conversion/lower-descriptor-memory-addptr-invalid.mlir``).
+(pinned by ``Conversion/TritonToKTIR/lower-descriptor-memory-addptr-invalid.mlir``).
 - ``bmm_addptr``         -- batched addptr descriptors, static
 - ``bmm_addptr_dynamic`` -- batched addptr descriptors, dynamic
 
@@ -449,7 +449,7 @@ VARIANTS = {
             # Free text: names where the gap is pinned. Was a
             # file.py::ClassName pointer resolved by import; the tracking
             # test is now a lit file, which no import can reach.
-            "tracking_test": "Conversion/"
+            "tracking_test": "Conversion/TritonToKTIR/"
                              "lower-descriptor-memory-addptr-invalid.mlir",
         },
     },
@@ -653,7 +653,7 @@ VARIANTS = {
     # BMM with two independent stick splits on A: M (parallel) and K
     # (reduction), giving a rank-5 physical view. Numerical counterpart of the
     # @parallel_floor_rank5 lit case in
-    # test/Conversion/rewrite-descriptor-layout-parallel-multistick.mlir.
+    # test/Dialect/KTDP/Transforms/rewrite-descriptor-layout-parallel-multistick.mlir.
     # A's M floor dim is indexed by the outer scatter IV and its K floor dim by
     # the inner reduction IV, so the two IVs must be threaded independently.
     # C is left logical (rank-3) so the store sink drives the scatter.
