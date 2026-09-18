@@ -15,12 +15,12 @@ add_triton_library(KTDPTransforms
   DropReductionInitFill.cpp
   DistributeWork.cpp
   MaterializeBaseAddresses.cpp
-  Utility.cpp
 
   DEPENDS
   KTDPTransformsIncGen
 
   LINK_LIBS PUBLIC
+  KTDPUtils
   KTIR::KtdpDialect
   KTIR::SpyreOpDialect
   TritonIR

@@ -62,7 +62,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/KTDP/Transforms/Passes.h"
-#include "Dialect/KTDP/Transforms/Utility.h"
+#include "Dialect/KTDP/Utils/Utility.h"
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/BuiltinOps.h"

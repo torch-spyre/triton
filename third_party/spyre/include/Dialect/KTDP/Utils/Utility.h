@@ -1,7 +1,7 @@
-//===- Utility.h - Shared transform utilities for KTDP passes -------------===//
+//===- Utility.h - Shared utilities for the Spyre passes ------------------===//
 
-#ifndef KTDP_TRANSFORMS_UTILITY_H
-#define KTDP_TRANSFORMS_UTILITY_H
+#ifndef TRITON_SPYRE_DIALECT_KTDP_UTILS_UTILITY_H
+#define TRITON_SPYRE_DIALECT_KTDP_UTILS_UTILITY_H
 
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "mlir/IR/Builders.h"
@@ -89,4 +89,4 @@ Value createEmptyTensor(OpBuilder &builder, Location loc,
 
 } // namespace mlir::triton::ktdp
 
-#endif // KTDP_TRANSFORMS_UTILITY_H
+#endif // TRITON_SPYRE_DIALECT_KTDP_UTILS_UTILITY_H

@@ -21,7 +21,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/KTDP/Transforms/Passes.h"
-#include "Dialect/KTDP/Transforms/Utility.h"
+#include "Dialect/KTDP/Utils/Utility.h"
 #include "RewriteDescriptorLayout/PermutationUtils.h"
 #include "RewriteDescriptorLayout/Types.h"
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"

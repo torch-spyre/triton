@@ -23,7 +23,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "RewriteDescriptorLayout/IndexDomain.h"
-#include "Dialect/KTDP/Transforms/Utility.h"
+#include "Dialect/KTDP/Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 

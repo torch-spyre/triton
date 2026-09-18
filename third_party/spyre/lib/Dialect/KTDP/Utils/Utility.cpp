@@ -1,6 +1,6 @@
 //===- Utility.cpp - Shared transform utilities for KTDP passes -----------===//
 
-#include "Dialect/KTDP/Transforms/Utility.h"
+#include "Dialect/KTDP/Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPTypes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
