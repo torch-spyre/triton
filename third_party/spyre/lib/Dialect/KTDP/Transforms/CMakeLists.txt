@@ -20,6 +20,7 @@ add_triton_library(KTDPTransforms
 
   LINK_LIBS PUBLIC
   KTDPUtils
+  SpyreUtils
   KTIR::KtdpDialect
   TritonIR
   MLIRIR

@@ -10,7 +10,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "Conversion/TritonToKTIR/Passes.h"
+#include "ConversionUtils.h"
 #include "Dialect/KTDP/Utils/Utility.h"
+#include "Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
@@ -40,6 +42,8 @@ namespace {
 
 using mlir::triton::ktdp::getDescriptorMemView;
 using mlir::triton::ktdp::isLoweredDescriptor;
+using mlir::triton::spyre::getBasePtrAsIndex;
+using mlir::triton::spyre::getConstantInt;
 
 //===----------------------------------------------------------------------===//
 // Shared memory view construction
@@ -53,14 +57,13 @@ static Value buildBaseMemoryView(OpBuilder &builder, Location loc,
                                  triton::MakeTensorDescOp descOp,
                                  Type elemType) {
   MLIRContext *ctx = builder.getContext();
-  Value baseIndex =
-      mlir::triton::ktdp::getBasePtrAsIndex(builder, loc, descOp.getBase());
+  Value baseIndex = getBasePtrAsIndex(builder, loc, descOp.getBase());
 
   // Extract shape/strides as constants when possible, kDynamic otherwise.
   SmallVector<int64_t> shape;
   SmallVector<Value> dynSizes;
   for (auto s : descOp.getShape()) {
-    if (auto c = mlir::triton::ktdp::getConstantInt(s)) {
+    if (auto c = getConstantInt(s)) {
       shape.push_back(*c);
     } else {
       shape.push_back(ShapedType::kDynamic);
@@ -78,7 +81,7 @@ static Value buildBaseMemoryView(OpBuilder &builder, Location loc,
   SmallVector<int64_t> strides;
   SmallVector<Value> dynStrides;
   for (auto s : descOp.getStrides()) {
-    if (auto c = mlir::triton::ktdp::getConstantInt(s)) {
+    if (auto c = getConstantInt(s)) {
       strides.push_back(*c);
     } else {
       strides.push_back(ShapedType::kDynamic);

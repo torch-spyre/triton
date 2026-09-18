@@ -28,6 +28,7 @@
 #include "RewriteDescriptorLayout/IndexDomain.h"
 #include "RewriteDescriptorLayout/PhysicalTypeAnalysis.h"
 #include "RewriteDescriptorLayout/RequirementAnalysis.h"
+#include "Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
@@ -239,7 +240,7 @@ struct RewriteDescriptorLayoutPass
       auto muli = dyn_cast<arith::MulIOp>(user);
       if (!muli || muli.getLhs() != iv)
         continue;
-      auto cst = getConstantInt(muli.getRhs());
+      auto cst = triton::spyre::getConstantInt(muli.getRhs());
       if (!cst || (*cst % factor) != 0)
         continue;
       OpBuilder b(muli);
