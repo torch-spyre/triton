@@ -66,15 +66,15 @@
 
 using namespace mlir;
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 #define GEN_PASS_DEF_MATERIALIZEBASEADDRESSES
 #include "Transforms/Passes.h.inc"
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre
 
 namespace {
 
 struct MaterializeBaseAddressesPass
-    : public mlir::triton::ktdp::impl::MaterializeBaseAddressesBase<
+    : public mlir::triton::spyre::impl::MaterializeBaseAddressesBase<
           MaterializeBaseAddressesPass> {
 
   using MaterializeBaseAddressesBase::MaterializeBaseAddressesBase;
@@ -163,9 +163,9 @@ private:
 
 } // namespace
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 std::unique_ptr<OperationPass<ModuleOp>>
 createMaterializeBaseAddressesPass(ArrayRef<int64_t> baseAddresses) {
   return std::make_unique<MaterializeBaseAddressesPass>(baseAddresses);
 }
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre

@@ -39,10 +39,10 @@
 
 using namespace mlir;
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 #define GEN_PASS_DEF_LOWERSPYREOPS
 #include "Conversion/TritonToKTIR/Passes.h.inc"
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre
 
 namespace {
 
@@ -184,7 +184,7 @@ struct ConvertArithMulI : public OpConversionPattern<arith::MulIOp> {
 //===----------------------------------------------------------------------===//
 
 struct LowerSpyreOpsPass
-    : public mlir::triton::ktdp::impl::LowerSpyreOpsBase<LowerSpyreOpsPass> {
+    : public mlir::triton::spyre::impl::LowerSpyreOpsBase<LowerSpyreOpsPass> {
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -240,8 +240,8 @@ struct LowerSpyreOpsPass
 
 } // namespace
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 std::unique_ptr<OperationPass<ModuleOp>> createLowerSpyreOpsPass() {
   return std::make_unique<LowerSpyreOpsPass>();
 }
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre

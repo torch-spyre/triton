@@ -67,10 +67,10 @@
 
 using namespace mlir;
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 #define GEN_PASS_DEF_LOWERSCALARLOAD
 #include "Conversion/TritonToKTIR/Passes.h.inc"
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre
 
 namespace {
 
@@ -215,7 +215,7 @@ struct ConvertScalarLoad : public OpConversionPattern<triton::LoadOp> {
 //===----------------------------------------------------------------------===//
 
 struct LowerScalarLoadPass
-    : public mlir::triton::ktdp::impl::LowerScalarLoadBase<
+    : public mlir::triton::spyre::impl::LowerScalarLoadBase<
           LowerScalarLoadPass> {
 
   void runOnOperation() override {
@@ -287,8 +287,8 @@ struct LowerScalarLoadPass
 
 } // namespace
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 std::unique_ptr<OperationPass<ModuleOp>> createLowerScalarLoadPass() {
   return std::make_unique<LowerScalarLoadPass>();
 }
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre

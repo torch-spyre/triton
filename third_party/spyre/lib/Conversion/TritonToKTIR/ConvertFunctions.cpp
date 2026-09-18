@@ -17,15 +17,15 @@
 
 using namespace mlir;
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 #define GEN_PASS_DEF_CONVERTFUNCTIONS
 #include "Conversion/TritonToKTIR/Passes.h.inc"
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre
 
 namespace {
 
 struct ConvertFunctionsPass
-    : public mlir::triton::ktdp::impl::ConvertFunctionsBase<
+    : public mlir::triton::spyre::impl::ConvertFunctionsBase<
           ConvertFunctionsPass> {
 
   void runOnOperation() override {
@@ -368,8 +368,8 @@ private:
 
 } // namespace
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 std::unique_ptr<OperationPass<ModuleOp>> createConvertFunctionsPass() {
   return std::make_unique<ConvertFunctionsPass>();
 }
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre

@@ -79,10 +79,10 @@
 
 using namespace mlir;
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 #define GEN_PASS_DEF_DROPREDUCTIONINITFILL
 #include "Transforms/Passes.h.inc"
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre
 
 namespace {
 
@@ -150,7 +150,7 @@ bool isZeroNeutralCombiner(Operation *payload) {
 }
 
 struct DropReductionInitFillPass
-    : public mlir::triton::ktdp::impl::DropReductionInitFillBase<
+    : public mlir::triton::spyre::impl::DropReductionInitFillBase<
           DropReductionInitFillPass> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
@@ -255,10 +255,10 @@ struct DropReductionInitFillPass
 
 } // namespace
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 
 std::unique_ptr<OperationPass<ModuleOp>> createDropReductionInitFillPass() {
   return std::make_unique<DropReductionInitFillPass>();
 }
 
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre

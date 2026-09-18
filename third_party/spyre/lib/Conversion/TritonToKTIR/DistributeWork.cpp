@@ -48,15 +48,15 @@
 
 using namespace mlir;
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 #define GEN_PASS_DEF_DISTRIBUTEWORK
 #include "Conversion/TritonToKTIR/Passes.h.inc"
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre
 
 namespace {
 
 struct DistributeWorkPass
-    : public mlir::triton::ktdp::impl::DistributeWorkBase<
+    : public mlir::triton::spyre::impl::DistributeWorkBase<
           DistributeWorkPass> {
 
   using DistributeWorkBase::DistributeWorkBase;
@@ -299,9 +299,9 @@ private:
 
 } // namespace
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 std::unique_ptr<OperationPass<ModuleOp>>
 createDistributeWorkPass(ArrayRef<int64_t> grid) {
   return std::make_unique<DistributeWorkPass>(grid);
 }
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre

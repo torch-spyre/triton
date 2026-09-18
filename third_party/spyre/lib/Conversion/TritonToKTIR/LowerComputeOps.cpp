@@ -29,10 +29,10 @@
 
 using namespace mlir;
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 #define GEN_PASS_DEF_LOWERCOMPUTEOPS
 #include "Conversion/TritonToKTIR/Passes.h.inc"
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre
 
 namespace {
 
@@ -497,7 +497,7 @@ struct ConvertTTDot : public OpConversionPattern<triton::DotOp> {
 //===----------------------------------------------------------------------===//
 
 struct LowerComputeOpsPass
-    : public mlir::triton::ktdp::impl::LowerComputeOpsBase<
+    : public mlir::triton::spyre::impl::LowerComputeOpsBase<
           LowerComputeOpsPass> {
 
   void runOnOperation() override {
@@ -542,8 +542,8 @@ struct LowerComputeOpsPass
 
 } // namespace
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 std::unique_ptr<OperationPass<ModuleOp>> createLowerComputeOpsPass() {
   return std::make_unique<LowerComputeOpsPass>();
 }
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre

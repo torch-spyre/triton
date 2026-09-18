@@ -31,10 +31,10 @@
 
 using namespace mlir;
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 #define GEN_PASS_DEF_LOWERDESCRIPTORMEMORY
 #include "Conversion/TritonToKTIR/Passes.h.inc"
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre
 
 namespace {
 
@@ -522,7 +522,7 @@ struct ConvertDescriptorScatter
 //===----------------------------------------------------------------------===//
 
 struct LowerDescriptorMemoryPass
-    : public mlir::triton::ktdp::impl::LowerDescriptorMemoryBase<
+    : public mlir::triton::spyre::impl::LowerDescriptorMemoryBase<
           LowerDescriptorMemoryPass> {
 
   void runOnOperation() override {
@@ -658,8 +658,8 @@ struct LowerDescriptorMemoryPass
 
 } // namespace
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 std::unique_ptr<OperationPass<ModuleOp>> createLowerDescriptorMemoryPass() {
   return std::make_unique<LowerDescriptorMemoryPass>();
 }
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre

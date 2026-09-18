@@ -38,10 +38,10 @@
 
 using namespace mlir;
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 #define GEN_PASS_DEF_LOWERINTERTILE
 #include "Conversion/TritonToKTIR/Passes.h.inc"
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre
 
 namespace {
 
@@ -297,7 +297,7 @@ static FailureOr<Value> combinerEmitOp(OpBuilder &b, Location loc,
 //===----------------------------------------------------------------------===//
 
 struct LowerInterTilePass
-    : public mlir::triton::ktdp::impl::LowerInterTileBase<LowerInterTilePass> {
+    : public mlir::triton::spyre::impl::LowerInterTileBase<LowerInterTilePass> {
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
@@ -582,10 +582,10 @@ struct LowerInterTilePass
 
 } // namespace
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 
 std::unique_ptr<OperationPass<ModuleOp>> createLowerInterTilePass() {
   return std::make_unique<LowerInterTilePass>();
 }
 
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre

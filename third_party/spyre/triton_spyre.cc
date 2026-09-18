@@ -65,13 +65,13 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   m.def(
       "add_convert_ttir_to_ktdp",
       [](mlir::PassManager &pm, const std::string &data_layout) {
-        pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
-        pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
-        pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
-        pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
+        pm.addPass(mlir::triton::spyre::createLowerDescriptorMemoryPass());
+        pm.addPass(mlir::triton::spyre::createLowerScalarLoadPass());
+        pm.addPass(mlir::triton::spyre::createLowerComputeOpsPass());
+        pm.addPass(mlir::triton::spyre::createLowerInterTilePass());
         pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
             mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
-        pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
+        pm.addPass(mlir::triton::spyre::createConvertFunctionsPass());
       },
       py::arg("pm"), py::arg("data_layout") = "device");
   // Individual pass bindings. add_convert_ttir_to_ktdp above is the default
@@ -99,7 +99,7 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // aliasing it removes; anchoring it on anything earlier is a silent no-op,
   // since the pass only rewrites aliasing that already exists.
   m.def("add_unalias_linalg_outs", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createUnaliasLinalgOutsPass());
+    pm.addPass(mlir::triton::spyre::createUnaliasLinalgOutsPass());
   });
   // Also a fix pass, and also anchored on the pass that creates what it removes:
   // lower_compute_ops is what gives every tt.reduce a linalg.fill init. The
@@ -107,30 +107,30 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // rejected at pass 00; see the pass description for why the gate is zero
   // rather than the combiner's neutral element.
   m.def("add_drop_reduction_init_fill", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createDropReductionInitFillPass());
+    pm.addPass(mlir::triton::spyre::createDropReductionInitFillPass());
   });
   m.def("add_lower_inter_tile", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
+    pm.addPass(mlir::triton::spyre::createLowerInterTilePass());
   });
   m.def("add_lower_descriptor_memory", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
+    pm.addPass(mlir::triton::spyre::createLowerDescriptorMemoryPass());
   });
   m.def("add_lower_scalar_load", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
+    pm.addPass(mlir::triton::spyre::createLowerScalarLoadPass());
   });
   m.def("add_lower_compute_ops", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
+    pm.addPass(mlir::triton::spyre::createLowerComputeOpsPass());
   });
   m.def("add_lower_spyre_ops", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createLowerSpyreOpsPass());
+    pm.addPass(mlir::triton::spyre::createLowerSpyreOpsPass());
   });
   m.def("add_convert_functions", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
+    pm.addPass(mlir::triton::spyre::createConvertFunctionsPass());
   });
   m.def(
       "add_distribute_work",
       [](mlir::PassManager &pm, const std::vector<int64_t> &grid) {
-        pm.addPass(mlir::triton::ktdp::createDistributeWorkPass(grid));
+        pm.addPass(mlir::triton::spyre::createDistributeWorkPass(grid));
       },
       py::arg("pm"), py::arg("grid"));
   // Opt-in only: MaterializeBaseAddresses is deliberately absent from
@@ -142,7 +142,7 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   m.def(
       "add_materialize_base_addresses",
       [](mlir::PassManager &pm, const std::vector<int64_t> &base_addresses) {
-        pm.addPass(mlir::triton::ktdp::createMaterializeBaseAddressesPass(
+        pm.addPass(mlir::triton::spyre::createMaterializeBaseAddressesPass(
             base_addresses));
       },
       py::arg("pm"), py::arg("base_addresses"));

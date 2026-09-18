@@ -77,10 +77,10 @@
 
 using namespace mlir;
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 #define GEN_PASS_DEF_UNALIASLINALGOUTS
 #include "Transforms/Passes.h.inc"
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre
 
 namespace {
 
@@ -89,7 +89,7 @@ namespace {
 constexpr unsigned kInlineInsCapacity = 4;
 
 struct UnaliasLinalgOutsPass
-    : public mlir::triton::ktdp::impl::UnaliasLinalgOutsBase<
+    : public mlir::triton::spyre::impl::UnaliasLinalgOutsBase<
           UnaliasLinalgOutsPass> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
@@ -219,10 +219,10 @@ struct UnaliasLinalgOutsPass
 
 } // namespace
 
-namespace mlir::triton::ktdp {
+namespace mlir::triton::spyre {
 
 std::unique_ptr<OperationPass<ModuleOp>> createUnaliasLinalgOutsPass() {
   return std::make_unique<UnaliasLinalgOutsPass>();
 }
 
-} // namespace mlir::triton::ktdp
+} // namespace mlir::triton::spyre
