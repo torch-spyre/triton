@@ -35,11 +35,17 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("torch_spyre")  # registers the "spyre" device with torch
 
 
-#: torch dtype -> the device format SpyreTensorLayout wants. Only the dtypes a
-#: replicating layout is used at need an entry; anything else raises rather than
-#: guessing, because a wrong device format is a silently wrong reinterpretation of
-#: the same bytes.
-_DEVICE_FORMAT = {"torch.float16": "SEN169_FP16", "torch.float32": "SEN169_FP32"}
+#: torch dtype -> the name of the ``torch_spyre._C.DataFormats`` member
+#: SpyreTensorLayout wants. Only the dtypes a replicating layout is used at need an
+#: entry; anything else raises rather than guessing, because a wrong device format
+#: is a silently wrong reinterpretation of the same bytes.
+#:
+#: The two names do not follow one convention, so neither can be derived from the
+#: other: fp16 is Spyre's own 1-6-9 float and is spelled ``SEN169_FP16``, while
+#: fp32 is plain IEEE and is ``IEEE_FP32`` -- there is no ``SEN169_FP32``. Looked
+#: up by name rather than held as a value so importing this module does not need
+#: the extension.
+_DEVICE_FORMAT = {"torch.float16": "SEN169_FP16", "torch.float32": "IEEE_FP32"}
 
 
 def _empty_with_device_layout(host_array, device_size, stride_map):

@@ -765,6 +765,64 @@ VARIANTS = {
         "device_alloc": {"out_ptr": ([1, 64, 64], [-1, 1, -1])},
     },
 
+    # The same broadcast-storing stick-axis reduce with the COMBINER changed, and
+    # it is here because a max is what softmax's G1 actually is. Two things had to
+    # be true for it that were not:
+    #
+    #   - NormalizeFloatMinMax. Triton's tl.max emits arith.maxnumf, which the
+    #     scheduler lowers to vectorchain `abs_max` -- a magnitude comparison, so
+    #     abs_max(-5, 1) = -5 and every row with a negative outlier comes back
+    #     wrong. The pass rewrites it to arith.maximumf, which lowers to `max`.
+    #   - DropReductionInitFill admitting a non-zero neutral. It refused any
+    #     combiner but addf/subf on the premise that the scheduler resets an
+    #     accumulator to zero regardless; the scheduler in fact derives the
+    #     neutral from the combiner, so -inf is re-established for a max and the
+    #     init can be dropped like a sum's.
+    #
+    # fp32, NOT fp16 like its siblings, and not for the reduce's sake: tl.max
+    # PROMOTES anything narrower than 32 bits before reducing (standard.py), which
+    # emits arith.extf/truncf that no pass in this tree lowers. So this is also the
+    # first on-stick variant at a 32-lane stick rather than 64 -- N and both
+    # layouts follow from the dtype through the same row helper, so nothing here
+    # states a width.
+    "one_tile_on_stick_bcast_max": {
+        "base": "one_tile_on_stick_bcast",
+        "summary": (
+            "The stick-axis reduce storing its statistic broadcast across a "
+            "stick, with max as the combiner instead of sum — softmax's G1, at "
+            "fp32 because tl.max promotes anything narrower."
+        ),
+        "params": {
+            ("DTYPE", "N", "IN_LAYOUT", "OUT_LAYOUT"): [
+                _stick_on_n_row_bcast("fp32", n_sticks=2),
+            ],
+            "M": [64], "OP": ["max"], "AXIS": [1],
+        },
+        # A max is a SELECTION -- it returns one of its inputs unchanged, so there
+        # is no accumulation order to drift and no reason for the sums' tolerances
+        # here, every one of which is sized for a reordering this op cannot have.
+        # A relative bound alone, with no atol: a max over 64 standard normals
+        # lands near 2 for every row, so nothing here is near zero for a relative
+        # bound to be meaningless at.
+        #
+        # It is still not exact, and what is lost is NOT the reduce. Measured on
+        # the device against the fp32 oracle for this input (seed 0, M=64, N=64):
+        # the device picks the RIGHT ELEMENT in every row -- argmax matches
+        # everywhere -- and returns its value up to 2.5e-3 relative off, which is
+        # about one ulp of a 9-bit mantissa. The input is transferred as IEEE_FP32
+        # (torch-spyre's type map, so nothing is lost staging it), so that is the
+        # device's fp32 COMPUTE datapath, which this emission drives at SEN169
+        # precision -- it never asks for spyreop's fused-fp32 types. The same loss
+        # is why the fp32 elementwise device variants carry rtol 1e-2, and 1e-2 is
+        # what this shares, at 4x the measured error.
+        "rtol":        1e-2,
+        "atol":        0.0,
+        # Same replicating output layout as the sum sibling, so the same explicit
+        # allocation -- but S is 32 at fp32, so the lane extent is 32 and not 64.
+        # Must agree with OUT_LAYOUT above; nothing derives one from the other yet.
+        "device_alloc": {"out_ptr": ([1, 64, 32], [-1, 1, -1])},
+    },
+
     # The other half of the chain, and the two together are softmax's G1 and G2:
     # the variant above proves a stick-axis reduce can STORE its statistic
     # replicated across a stick, this one proves a later compute can read it back

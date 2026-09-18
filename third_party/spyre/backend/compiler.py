@@ -204,6 +204,17 @@ _CORE_PIPELINE_PASSES = (
     "lower_descriptor_memory",
     "lower_scalar_load",
     "lower_compute_ops",
+    # arith.maxnumf/minnumf -> arith.maximumf/minimumf. Triton emits the `numf`
+    # spelling for tl.max/tl.min/tl.maximum/tl.minimum and the scheduler
+    # mis-lowers it -- maxnumf becomes vectorchain `abs_max`, a magnitude
+    # comparison, and minnumf has no neutral element there at all. A DELIBERATE
+    # NaN behaviour change; the pass description states the trade.
+    #
+    # Here rather than in _SPYRECODE_STAGE_PASSES despite being a
+    # scheduler-driven rewrite, because drop_reduction_init_fill below cases on a
+    # reduction's combiner op and the effective run of that pass is this one --
+    # so the spelling has to be settled in this pipeline, before it.
+    "normalize_float_min_max",
     # Before linalg_generalize_named_ops, and that is the whole reason it can be
     # here: the pass matches the init through getDefiningOp<linalg::FillOp>(), so
     # it only works while the fill is still a *named* linalg.fill. Generalized it
@@ -730,8 +741,11 @@ class SpyreBackend(BaseBackend):
             element 1-D read
           - LowerComputeOps: tt.reduce/broadcast/expand_dims -> linalg/tensor
             + dead op sweep
-          - DropReductionInitFill: drop the zero linalg.fill on a reduction's
-            outs, while it is still a named linalg.fill to match
+          - NormalizeFloatMinMax: arith.maxnumf/minnumf -> arith.maximumf/
+            minimumf, the only float min/max spelling the scheduler lowers
+            correctly (a deliberate NaN behaviour change)
+          - DropReductionInitFill: drop a reduction's neutral-element
+            linalg.fill, while it is still a named linalg.fill to match
           - LinalgGeneralizeNamedOps (upstream): every named linalg op ->
             linalg.generic, so the layout pass below can read its indexing maps
           - FoldDataMovementGenerics: a generic that only re-indexes (broadcast,

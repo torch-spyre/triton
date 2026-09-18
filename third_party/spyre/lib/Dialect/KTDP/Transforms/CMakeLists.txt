@@ -14,6 +14,7 @@ add_triton_library(KTDPTransforms
   RewriteDescriptorLayout/RequirementAnalysis.cpp
   UnaliasLinalgOuts.cpp
   DropReductionInitFill.cpp
+  NormalizeFloatMinMax.cpp
   FoldDataMovementGenerics.cpp
   DistributeWork.cpp
   MaterializeBaseAddresses.cpp

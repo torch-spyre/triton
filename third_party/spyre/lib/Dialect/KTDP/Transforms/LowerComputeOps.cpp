@@ -46,12 +46,15 @@ static std::optional<TypedAttr>
 getReductionNeutralAttr(Operation *combinerOp, Type elemType,
                         MLIRContext *ctx) {
   Builder b(ctx);
-  if (isa<arith::MaxNumFOp>(combinerOp)) {
+  // Both spellings of each, so the answer does not depend on whether
+  // NormalizeFloatMinMax has already run: it rewrites maxnumf → maximumf, and
+  // this pass is normally ahead of it but need not be.
+  if (isa<arith::MaxNumFOp, arith::MaximumFOp>(combinerOp)) {
     auto ftype = cast<FloatType>(elemType);
     return TypedAttr(b.getFloatAttr(
         ftype, APFloat::getInf(ftype.getFloatSemantics(), /*neg=*/true)));
   }
-  if (isa<arith::MinNumFOp>(combinerOp)) {
+  if (isa<arith::MinNumFOp, arith::MinimumFOp>(combinerOp)) {
     auto ftype = cast<FloatType>(elemType);
     return TypedAttr(b.getFloatAttr(
         ftype, APFloat::getInf(ftype.getFloatSemantics(), /*neg=*/false)));

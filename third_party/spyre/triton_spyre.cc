@@ -122,6 +122,15 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
     pm.addPass(mlir::triton::ktdp::createUnaliasLinalgOutsPass());
   });
   // Also a fix pass, and also anchored on the pass that creates what it removes:
+  // Rewrites arith.maxnumf/minnumf to arith.maximumf/minimumf module-wide. The
+  // scheduler maps maxnumf to vectorchain `abs_max` (magnitude comparison, so a
+  // wrong answer for every input) and has no neutral element for minnumf at all.
+  // A DELIBERATE NaN behaviour change -- see the pass description. Must run after
+  // lower_compute_ops and before drop_reduction_init_fill, which cases on the
+  // combiner op of a reduction body.
+  m.def("add_normalize_float_min_max", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::ktdp::createNormalizeFloatMinMaxPass());
+  });
   // lower_compute_ops is what gives every tt.reduce a linalg.fill init. The
   // scheduler's allowlist has no linalg.fill, so without this the KTIR is
   // rejected at pass 00; see the pass description for why the gate is zero

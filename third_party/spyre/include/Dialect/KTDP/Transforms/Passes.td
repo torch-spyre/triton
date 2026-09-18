@@ -353,6 +353,66 @@ def UnaliasLinalgOuts : Pass<"unalias-linalg-outs", "mlir::ModuleOp"> {
     ];
 }
 
+def NormalizeFloatMinMax
+    : Pass<"normalize-float-min-max", "mlir::ModuleOp"> {
+    let summary = "Rewrite arith.maxnumf/minnumf to arith.maximumf/minimumf, "
+                  "the only float min/max spelling the Spyre backend lowers "
+                  "correctly. CHANGES NaN BEHAVIOUR.";
+    let description = [{
+        Input: any IR. The ops are matched wherever they appear -- inside a
+        linalg.generic body, inside a linalg.reduce combiner, or as plain scalar
+        arithmetic -- because the mis-lowering below does not depend on where
+        they sit.
+
+        Lowering:
+        - arith.maxnumf → arith.maximumf
+        - arith.minnumf → arith.minimumf
+        Operands and the fastmath attribute are carried across unchanged.
+        Nothing else is touched.
+
+        THIS IS A DELIBERATE BEHAVIOUR CHANGE, NOT A SPELLING FIX. The two
+        families differ on NaN, and only on NaN:
+
+          maxnumf(NaN, x) = x          -- the non-NaN operand wins
+          maximumf(NaN, x) = NaN       -- NaN propagates
+
+        So a kernel whose input contains a NaN can compute a different answer
+        after this pass. The trade is accepted because the alternative is worse:
+        keeping `maxnumf` produces a WRONG ANSWER FOR ALL INPUTS on the device,
+        NaN or not (see Motivation), whereas after this pass every NaN-free input
+        -- which is every input the numerical suite and every softmax feed it --
+        is computed exactly. A wrong answer on a NaN is a strictly smaller loss
+        than a wrong answer everywhere.
+
+        Motivation: what Triton emits and what the dataflow-scheduler lowers do
+        not meet. `tl.max`/`tl.min`/`tl.maximum`/`tl.minimum` emit the `numf`
+        spelling; the scheduler's KTDF→DFIR LinalgLowering maps
+
+          arith.maximumf → vectorchain `max`     (correct)
+          arith.maxnumf  → vectorchain `abs_max` (a DIFFERENT FUNCTION: it
+                                                  compares magnitudes, so
+                                                  abs_max(-5, 1) = -5)
+
+        and its MapReductionPartials has no neutral element for `minnumf` at all,
+        which aborts the compile. Nothing else in this pipeline rewrites either
+        op, so without this pass a Triton `tl.max` reduce either silently returns
+        the largest-magnitude element or fails to schedule.
+
+        Ordering: after LowerComputeOps, which is what turns a `tt.reduce` into a
+        `linalg.reduce` carrying the combiner in its body, and BEFORE
+        DropReductionInitFill, which decides what to do with a reduction's stated
+        init by looking at that combiner op -- it must see the settled spelling,
+        since `maxnumf` and `maximumf` are separate cases there and in the
+        scheduler's own neutral-element table.
+
+        Output: no arith.maxnumf or arith.minnumf remains anywhere in the module.
+    }];
+
+    let dependentDialects = [
+        "mlir::arith::ArithDialect"
+    ];
+}
+
 def FoldDataMovementGenerics
     : Pass<"fold-data-movement-generics", "mlir::ModuleOp"> {
     let summary = "Fold a pure data-movement linalg.generic into the indexing "

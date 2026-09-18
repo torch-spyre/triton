@@ -1,15 +1,16 @@
 // RUN: spyre-triton-opt %s --drop-reduction-init-fill -split-input-file | FileCheck %s
 
-// DropReductionInitFill removes the zero linalg.fill that LowerComputeOps gives a
-// tt.reduce for its accumulator, leaving the bare tensor.empty that hand-written
-// reference KTIR states directly.
+// DropReductionInitFill removes the neutral-element linalg.fill that LowerComputeOps
+// gives a tt.reduce for its accumulator, leaving the bare tensor.empty that
+// hand-written reference KTIR states directly.
 //
-// The rewrite is sound ONLY because MapReductionPartials overwrites the accumulator
-// with its own hardcoded 0.0 reset before it is read — a reduction payload does read
-// its init, and tensor.empty is explicitly unspecified. So the gate is narrow: the
-// op must be a shape that pass actually rewrites (one ins, one init, simple body),
-// the combiner must be addf/subf, and the fill must be zero. Anything else is left
-// alone or reported.
+// The rewrite is sound ONLY because MapReductionPartials re-establishes the
+// accumulator before it is read — a reduction payload does read its init, and
+// tensor.empty is explicitly unspecified. That pass derives the value it writes
+// FROM THE COMBINER, so the gate follows its table: the op must be a shape it
+// actually rewrites (one ins, one init, simple body), the combiner must be one of
+// its five float entries (addf/subf/mulf/maximumf/minimumf), and the fill must
+// state that combiner's neutral. Anything else is left alone or reported.
 //
 // Inputs here are written in the already-lowered form the pass actually sees, so
 // they do not depend on what the upstream producer happens to emit.
@@ -100,6 +101,79 @@ func.func @sub_reduce(%a: tensor<2x256x64xf16>) -> tensor<2x64xf16> {
   %r = linalg.reduce ins(%a : tensor<2x256x64xf16>) outs(%init : tensor<2x64xf16>) dimensions = [1]
     (%in: f16, %acc: f16) {
       %s = arith.subf %acc, %in : f16
+      linalg.yield %s : f16
+    }
+  return %r : tensor<2x64xf16>
+}
+}
+
+// -----
+
+// Test 4a: a MAX reduce initialised at -inf, which is softmax's G1 and the case
+// this pass used to reject. Its neutral is not zero and that is fine: the
+// scheduler writes the neutral of the combiner it finds, so -inf is restored the
+// same way 0.0 is for a sum. NormalizeFloatMinMax has already settled the spelling
+// to arith.maximumf — arith.maxnumf still reaches the rejection file, because the
+// scheduler mis-lowers that one and it must not be quietly accepted here.
+module {
+// CHECK-LABEL:   func.func @max_reduce_neg_inf(
+// CHECK-NOT:       linalg.fill
+// CHECK:           %[[EMPTY:.*]] = tensor.empty() : tensor<2x64xf16>
+// CHECK:           linalg.reduce ins(%{{.*}} : tensor<2x256x64xf16>) outs(%[[EMPTY]] : tensor<2x64xf16>) dimensions = [1]
+func.func @max_reduce_neg_inf(%a: tensor<2x256x64xf16>) -> tensor<2x64xf16> {
+  %neg_inf = arith.constant 0xFC00 : f16
+  %empty = tensor.empty() : tensor<2x64xf16>
+  %init = linalg.fill ins(%neg_inf : f16) outs(%empty : tensor<2x64xf16>) -> tensor<2x64xf16>
+  %r = linalg.reduce ins(%a : tensor<2x256x64xf16>) outs(%init : tensor<2x64xf16>) dimensions = [1]
+    (%in: f16, %acc: f16) {
+      %m = arith.maximumf %in, %acc : f16
+      linalg.yield %m : f16
+    }
+  return %r : tensor<2x64xf16>
+}
+}
+
+// -----
+
+// Test 4b: a MIN reduce initialised at the largest FINITE float rather than +inf.
+// Both spellings are accepted, and this is the one that matters for reading:
+// LowerComputeOps emits +inf, but the scheduler's own reset — which hand-written
+// reference KTIR mirrors — uses the largest finite. Rejecting the form the target
+// itself writes would be perverse.
+module {
+// CHECK-LABEL:   func.func @min_reduce_largest_finite(
+// CHECK-NOT:       linalg.fill
+// CHECK:           linalg.reduce
+func.func @min_reduce_largest_finite(%a: tensor<2x256x64xf16>) -> tensor<2x64xf16> {
+  %pos_max = arith.constant 6.550400e+04 : f16
+  %empty = tensor.empty() : tensor<2x64xf16>
+  %init = linalg.fill ins(%pos_max : f16) outs(%empty : tensor<2x64xf16>) -> tensor<2x64xf16>
+  %r = linalg.reduce ins(%a : tensor<2x256x64xf16>) outs(%init : tensor<2x64xf16>) dimensions = [1]
+    (%in: f16, %acc: f16) {
+      %m = arith.minimumf %in, %acc : f16
+      linalg.yield %m : f16
+    }
+  return %r : tensor<2x64xf16>
+}
+}
+
+// -----
+
+// Test 4c: mulf at 1.0. Nothing in this tree emits a product reduction yet, so
+// this is here for the rule rather than for a kernel: the gate is the scheduler's
+// combiner table, and mulf is in it, so an allowlist that left it out would be a
+// second policy nobody could derive from anything.
+module {
+// CHECK-LABEL:   func.func @mul_reduce_one(
+// CHECK-NOT:       linalg.fill
+// CHECK:           linalg.reduce
+func.func @mul_reduce_one(%a: tensor<2x256x64xf16>) -> tensor<2x64xf16> {
+  %one = arith.constant 1.000000e+00 : f16
+  %empty = tensor.empty() : tensor<2x64xf16>
+  %init = linalg.fill ins(%one : f16) outs(%empty : tensor<2x64xf16>) -> tensor<2x64xf16>
+  %r = linalg.reduce ins(%a : tensor<2x256x64xf16>) outs(%init : tensor<2x64xf16>) dimensions = [1]
+    (%in: f16, %acc: f16) {
+      %s = arith.mulf %in, %acc : f16
       linalg.yield %s : f16
     }
   return %r : tensor<2x64xf16>

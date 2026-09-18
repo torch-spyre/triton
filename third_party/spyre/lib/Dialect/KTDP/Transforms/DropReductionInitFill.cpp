@@ -1,7 +1,8 @@
-//===- DropReductionInitFill.cpp - Drop a zero reduction init fill --------===//
+//===- DropReductionInitFill.cpp - Drop a reduction's init fill -----------===//
 //
-// Removes a `linalg.fill` of zero that supplies the `outs` of a reduction,
-// repointing that `outs` at the `tensor.empty` the fill wrote into.
+// Removes a `linalg.fill` of a combiner's neutral element that supplies the
+// `outs` of a reduction, repointing that `outs` at the `tensor.empty` the fill
+// wrote into.
 //
 // Why this is needed:
 //   tt.reduce lowers (LowerComputeOps) to a linalg.reduce whose `outs` is
@@ -15,17 +16,27 @@
 //   `ins` — never absorbs it). Hand-written reference KTIR states a bare
 //   tensor.empty for exactly this reason.
 //
-// Why the rewrite is sound, and why the gate is narrow:
+// Why the rewrite is sound, and why the gate is what it is:
 //   A reduction's payload READS its init operand — `linalg.reduce` names the
 //   operand `$inits` and its own ODS example writes `arith.addf %out, %in` — and
 //   `tensor.empty` has explicitly "unspecified" contents. So the rewritten IR is
-//   only well-defined because something downstream overwrites the accumulator
-//   before it is read: MapReductionPartials' "Step 2: zero-fill the accumulator".
-//   That reset is a hardcoded 0.0. The rewrite is therefore sound in exactly one
-//   situation — when that pass will run on this op, and the value it writes is
-//   the value the fill states.
+//   only well-defined because something downstream re-establishes the
+//   accumulator before it is read: MapReductionPartials, which on seeing a
+//   reduction whose init is a bare `tensor.empty` emits its own `linalg.fill` of
+//   the neutral element it derives FROM THE COMBINER — `getNeutralAttr` there,
+//   whose float table is
 //
-//   Both halves of that are checked, because neither implies the other:
+//       addf / subf → 0.0    mulf → 1.0
+//       maximumf    → the largest negative finite    minimumf → the largest
+//                                                                positive finite
+//
+//   (`maxnumf` is in that table too and `minnumf` is not, which is a separate
+//   reason NormalizeFloatMinMax runs before this pass: it settles the spelling
+//   so both this gate and that table see one form.)
+//
+//   The rewrite is therefore sound when that pass will run on this op AND the
+//   value it will write is a neutral element for this combiner. Both halves are
+//   checked, because neither implies the other:
 //
 //     isMapReductionPartialsShape  one `ins`, one `init` — mirroring that pass's
 //                                  own asserts. Excludes MATMUL above all: a
@@ -37,19 +48,42 @@
 //     simpleReductionPayload       body is exactly payload + yield, init read by
 //                                  the payload — the shape that pass clones and
 //                                  LinalgLowering maps to one vectorchain op.
-//     isZeroNeutralCombiner        addf/subf only. An allowlist, not a
-//                                  neutral-is-zero test: integer combiners have a
-//                                  zero neutral but abort the scheduler, whose
-//                                  reset is built as a float attribute, and
-//                                  maxnumf mis-lowers to abs_max.
-//     isConstantZero               the stated init matches what the reset writes.
+//     neutralKind                  the combiner is one the scheduler derives a
+//                                  neutral for: the five FLOAT entries of that
+//                                  table. Integers are excluded — see below.
+//     statesNeutral                the init this pass is about to throw away is
+//                                  that same neutral, so throwing it away loses
+//                                  nothing.
+//
+//   Note `maximumf` is admitted even though the two values are not identical: we
+//   state -inf (what LowerComputeOps emits) and the scheduler writes the largest
+//   negative FINITE float. Both are ≤ every finite element, so the answer agrees
+//   for finite data; they differ only for an input that is entirely -inf, where
+//   the scheduler's init would survive as the answer. `statesNeutral` accepts
+//   either spelling for that reason — hand-written reference KTIR uses the
+//   scheduler's.
+//
+//   Integer combiners are held out on purpose. The scheduler's table does cover
+//   addi/subi/muli, so the rewrite would very likely be sound there too, but no
+//   integer reduction in this tree has been carried to a binary, so there is
+//   nothing that has shown it is. An early diagnostic is the honest answer until
+//   one exists. (This is the one gate here that costs something: it also refuses
+//   an integer reduce that only ever meant to run on ktir_cpu, which never sees
+//   the scheduler at all — see the note on _SPYRECODE_STAGE_PASSES in
+//   backend/compiler.py about this pass not belonging in a pipeline every compile
+//   runs.)
 //
 //   Failing the first two means the fill is load-bearing, so it is LEFT ALONE and
 //   no diagnostic is emitted — this pass is not responsible for ops it cannot
 //   reason about, and failing on them would break any pipeline that merely
 //   contains a matmul. Failing the last two means this IS our op but its init
-//   cannot be honoured (mulf wants 1.0, max wants -inf); both alternatives are
-//   wrong, so it is reported.
+//   cannot be honoured; both alternatives are wrong, so it is reported.
+//
+//   ALL OF THIS IS A CLAIM ABOUT THE SCHEDULER, not about linalg. It holds for a
+//   dbo-opt whose MapReductionPartials derives the neutral per combiner. Against
+//   an older one that reset every accumulator to a hardcoded zero, dropping a
+//   `mulf` or `maximumf` init would silently return the wrong numbers rather than
+//   failing — which is why the reasoning above names that function.
 //
 // Algorithm:
 //   1. Collect linalg ops that have at least one reduction iterator
@@ -60,7 +94,8 @@
 //   3. For each remaining `outs` operand defined by a linalg.fill whose own
 //      output is a tensor.empty:
 //      a. Skip    — the body is not a simple reduction.
-//      b. Reject  — the combiner's neutral is not zero, or the fill is non-zero.
+//      b. Reject  — the scheduler derives no neutral for this combiner, or the
+//                   fill does not state that neutral.
 //      c. Rewrite — point the operand at the tensor.empty, and erase the fill
 //                   if nothing else uses it.
 //
@@ -86,11 +121,53 @@ namespace mlir::triton::ktdp {
 
 namespace {
 
-/// True iff `v` is defined by a constant whose value is zero, of either a float
-/// or an integer type. m_AnyZeroFloat accepts -0.0 as well as +0.0; both are
-/// additive identities, and both are what the scheduler's reset writes.
-bool isConstantZero(Value v) {
-  return matchPattern(v, m_AnyZeroFloat()) || matchPattern(v, m_Zero());
+/// The neutral element a combiner needs, as a *kind* rather than a value: the
+/// float value differs by element type, and for min/max this pass accepts two
+/// spellings of the same idea (see `statesNeutral`).
+enum class Neutral { Zero, One, NegExtreme, PosExtreme };
+
+/// The neutral MapReductionPartials will re-establish for `payload`'s combiner,
+/// or nullopt when it derives none that this pass will act on.
+///
+/// The five float entries of that pass's `getNeutralAttr` table, and only those.
+/// Integers are deliberately absent — the header says why.
+std::optional<Neutral> neutralKind(Operation *payload) {
+  if (isa<arith::AddFOp, arith::SubFOp>(payload))
+    return Neutral::Zero;
+  if (isa<arith::MulFOp>(payload))
+    return Neutral::One;
+  if (isa<arith::MaximumFOp>(payload))
+    return Neutral::NegExtreme;
+  if (isa<arith::MinimumFOp>(payload))
+    return Neutral::PosExtreme;
+  return std::nullopt;
+}
+
+/// True iff `v` is a constant stating the `kind` neutral.
+///
+/// Zero accepts -0.0 as well as +0.0, and an integer zero, via m_AnyZeroFloat /
+/// m_Zero: all are additive identities.
+///
+/// The two extremes accept BOTH an infinity and the largest finite of that sign,
+/// because the two producers of this IR spell it differently and both are neutral
+/// over finite data: LowerComputeOps emits ±inf, and the scheduler's own reset —
+/// which hand-written reference KTIR mirrors — uses the largest finite.
+bool statesNeutral(Value v, Neutral kind) {
+  if (kind == Neutral::Zero)
+    return matchPattern(v, m_AnyZeroFloat()) || matchPattern(v, m_Zero());
+
+  FloatAttr attr;
+  if (!matchPattern(v, m_Constant(&attr)))
+    return false;
+  const APFloat &f = attr.getValue();
+  if (kind == Neutral::One)
+    return f.isExactlyValue(1.0);
+
+  bool wantNegative = kind == Neutral::NegExtreme;
+  if (f.isNegative() != wantNegative)
+    return false;
+  return f.isInfinity() ||
+         f.bitwiseIsEqual(APFloat::getLargest(f.getSemantics(), wantNegative));
 }
 
 /// True iff `op` has the shape MapReductionPartials actually handles, and will
@@ -136,19 +213,6 @@ Operation *simpleReductionPayload(linalg::LinalgOp op, OpOperand &init) {
   return payload;
 }
 
-/// True iff `payload` is a combiner whose neutral is zero AND which the
-/// scheduler lowers correctly with a zero reset.
-///
-/// Deliberately an allowlist of two, not "does its neutral happen to be zero".
-/// These are the only combiners that reach a correct answer today: `mul` needs
-/// 1.0, `max`/`min` need -/+inf, and `maxnumf` additionally mis-lowers to
-/// `abs_max`. Integer combiners (`addi`, `ori`) have a zero neutral but abort the
-/// scheduler outright, because its reset is built as a float attribute — so
-/// restricting to the float ops turns that abort into a diagnostic here.
-bool isZeroNeutralCombiner(Operation *payload) {
-  return isa<arith::AddFOp, arith::SubFOp>(payload);
-}
-
 struct DropReductionInitFillPass
     : public mlir::triton::ktdp::impl::DropReductionInitFillBase<
           DropReductionInitFillPass> {
@@ -189,9 +253,10 @@ struct DropReductionInitFillPass
   ///
   ///  * **Reject, with a diagnostic** — `op` IS a simple single-input reduction,
   ///    so this pass is responsible for it, but its init cannot be discarded
-  ///    soundly (non-zero fill, or a combiner whose neutral is not zero). Both
-  ///    alternatives are wrong — dropping loses a stated init, keeping it is
-  ///    refused downstream — so the error is the only honest outcome.
+  ///    soundly (a combiner the scheduler derives no neutral for, or a fill that
+  ///    is not that neutral). Both alternatives are wrong — dropping loses a
+  ///    stated init, keeping it is refused downstream — so the error is the only
+  ///    honest outcome.
   ///
   /// Operands that can be rewritten are rewritten even when a sibling is
   /// rejected, so the IR is left partially modified on failure.
@@ -220,25 +285,28 @@ struct DropReductionInitFillPass
       if (!payload)
         continue;
 
-      if (!isZeroNeutralCombiner(payload)) {
+      std::optional<Neutral> kind = neutralKind(payload);
+      if (!kind) {
         op->emitError("reduction 'outs' operand #")
             << out.getOperandNumber() << " is combined with '"
             << payload->getName().getStringRef()
-            << "', whose neutral element is not zero; the dataflow-scheduler "
-               "resets a reduction accumulator to zero regardless of the "
-               "combiner, so this reduction cannot be lowered correctly at all";
+            << "', which the dataflow-scheduler derives no neutral element for; "
+               "it rejects linalg.fill, and re-establishes an accumulator only "
+               "for the float combiners addf/subf/mulf/maximumf/minimumf, so "
+               "this reduction cannot be lowered correctly at all";
         result = failure();
         continue;
       }
 
-      if (!isConstantZero(fill.getInputs()[0])) {
+      if (!statesNeutral(fill.getInputs()[0], *kind)) {
         op->emitError("reduction 'outs' operand #")
             << out.getOperandNumber()
-            << " is initialised by a linalg.fill of a non-zero value; the "
-               "dataflow-scheduler rejects linalg.fill and resets a reduction "
-               "accumulator to zero regardless of the combiner, so this "
-               "reduction cannot be lowered without discarding its stated "
-               "initial value";
+            << " is initialised by a linalg.fill of a value that is not '"
+            << payload->getName().getStringRef()
+            << "'s neutral element; the dataflow-scheduler rejects linalg.fill "
+               "and re-establishes the accumulator at the neutral element "
+               "whatever the stated init was, so this reduction cannot be "
+               "lowered without discarding that stated initial value";
         result = failure();
         continue;
       }
