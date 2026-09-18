@@ -26,6 +26,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
   # serve the plugin.  Named where it is actually used instead.
   add_triton_plugin(TritonSpyre
     ${CMAKE_CURRENT_SOURCE_DIR}/triton_spyre.cc
-    LINK_LIBS KTDPTransforms KTIR::KtdpDialect MLIRLinalgTransforms)
+    LINK_LIBS TritonToKTIR KTDPTransforms SpyreTransforms
+              KTIR::KtdpDialect MLIRLinalgTransforms)
   target_link_libraries(TritonSpyre PRIVATE Python3::Module pybind11::headers)
 endif()

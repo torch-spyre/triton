@@ -4,7 +4,9 @@ add_executable(spyre-triton-opt spyre-triton-opt.cpp)
 target_compile_options(spyre-triton-opt PRIVATE -fno-exceptions -fno-rtti)
 target_link_libraries(spyre-triton-opt PRIVATE
   ${triton_libs}
+  TritonToKTIR
   KTDPTransforms
+  SpyreTransforms
   KTIR::KtdpDialect
   KTIR::SpyreOpDialect
   MLIROptLib

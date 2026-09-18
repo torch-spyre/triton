@@ -568,7 +568,7 @@ collective call, a `mode` enum, one work-slice table, and a tensor result.
 
 **What lowers today.** `all_reduce` and `reduce_to_one`. `reduce_scatter` and `broadcast`
 are accepted by the Python surface and rejected by the pass
-([`LowerInterTile.cpp:340-346`](../lib/Dialect/KTDP/Transforms/LowerInterTile.cpp)), as are
+([`LowerInterTile.cpp:340-346`](../lib/Conversion/TritonToKTIR/LowerInterTile.cpp)), as are
 custom combiner regions (`:356`), non-contiguous groups (`:180-183`) and non-uniform `pick0`
 layouts for `reduce_to_one` (`:253-255`).
 

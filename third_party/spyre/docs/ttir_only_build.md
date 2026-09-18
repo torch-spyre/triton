@@ -48,7 +48,7 @@ rm -rf python/triton.egg-info
 | Tools | `lib/Tools/` | ✅ Built | `PluginUtils`, `LayoutUtils`, etc. — no GPU dependencies |
 | NVIDIA backend | `third_party/nvidia/` | ❌ Skipped | Filtered from `TRITON_CODEGEN_BACKENDS` |
 | AMD backend | `third_party/amd/` | ❌ Skipped | Filtered from `TRITON_CODEGEN_BACKENDS` |
-| Spyre backend | `third_party/spyre/` | ✅ Built | The whole point — `KTDPTransforms` and `TritonSpyre` plugin |
+| Spyre backend | `third_party/spyre/` | ✅ Built | The whole point — `TritonToKTIR` / `KTDPTransforms` / `SpyreTransforms` and the `TritonSpyre` plugin |
 | Proton dialect | `third_party/proton/Dialect/` | ❌ Skipped | |
 | CLI tools (`triton-opt`, etc.) | `bin/` | ❌ Skipped | `RegisterTritonDialects.h` pulls in all GPU dialects |
 | Example plugins | `examples/plugins/` | ❌ Skipped | |
