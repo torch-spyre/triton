@@ -22,9 +22,9 @@ is what puts the statistic there. The Level D banner records why these and not
 the others.
 
 ``softmax_on_stick`` is the end of that line: the whole softmax, six compute
-groups over all seven base addresses. It compiles and launches but is off the
-device tier, because a float immediate in its reciprocal group arrives halved --
-its own banner has the isolation.
+groups over all seven base addresses, launching and matching the oracle. Its
+reciprocal group carries no float immediate, which is the one thing that had to
+be true -- its own banner has why.
 
 The variants are grouped under Level A-D banners, each of which says what its
 level is for and what it deliberately does not vary. See ``fixtures/README.md``
@@ -1157,45 +1157,47 @@ VARIANTS = {
     # that holding, and if it stops holding, the fix is to give the divide
     # something lane-varying to consume rather than to reorder the groups.
     #
-    # NOT ON THE DEVICE TIER, and `compiles_to_binary: False` below is NOT what it
-    # says. This variant DOES reach a binary and DOES launch. It is off the tier
-    # because the answer is wrong, and the fixture vocabulary has no way to state
-    # that: `xfail_numerical` belongs to the ktir_cpu arm, and the device tier is
-    # gated on this one boolean, so "compiles" and "gets the right answer" cannot
-    # be said apart. That gap is why this field reads as a lie; naming it here is
-    # the honest option available. Whoever adds a device xfail should move this.
+    # THE RECIPROCAL GROUP CARRIES NO FLOAT IMMEDIATE, and that is what put this
+    # variant on the device tier rather than a footnote below it. ``tl.fdiv(one, s)``
+    # lowers to ``spyreop.reciprocal``, a UNARY intrinsic, not to
+    # ``spyreop.realdiv`` with a ``1.0`` operand: LowerSpyreOps matches a numerator
+    # of one and drops it, exactly as the hand-written reference chain writes the
+    # group. That is not a strength reduction, it is the only spelling that gets the
+    # right answer here. A float immediate is emitted as its IEEE bit pattern and
+    # read by the device as Spyre's own 1-6-9 float (exponent bias 31, not 15), so
+    # 0x3C00 -- IEEE 1.0 -- arrives as 0.5, and until the peephole existed this
+    # group computed ``0.5 / sum``. Isolated on a two-line elementwise kernel with
+    # no reduce, no chain and no broadcast, where every value the mangling predicts
+    # is exactly what came back:
     #
-    # What is wrong is ONE VALUE, and it is not in this repo. Measured on the
-    # device against the fp16 oracle (seed 0, M=64, N=128), group by group:
+    #   1.0 -> 0.5      2.0 -> 2.0      0.5 -> 0.125      3.0 -> 4.0
+    #
+    # (2.0 is unchanged by coincidence: its pattern happens to read as itself.)
+    # Compensating was never an option -- 1.5, the value whose bits WOULD read as
+    # 1.0, is refused outright, "slot arith.constant 1.500000e+00 : f16 does not
+    # have a constant address" -- so the fix was to emit no immediate at all, which
+    # a reciprocal can do and a divide cannot. The reinterpretation is still a live
+    # deeptools bug for any other literal; nothing in this kernel depends on it now.
+    #
+    # Measured on the device against the fp16 oracle (seed 0, M=64, N=128), group by
+    # group, which is also how the tolerance below is sized:
     #
     #   max     max |err| 2.0e-3   (one ulp)
     #   diff    max |err| 7.8e-3   (one ulp; see max_shift_exp_on_stick)
     #   exp     max rel  9.8e-3    (as its own variant measures)
     #   sum     max rel  2.9e-3
-    #   recip   max rel  5.0e-1    <-- exactly a factor of two
-    #   out     max rel  7.5e-1
+    #   recip   max rel  3.6e-3
+    #   out     max rel  1.3e-2
     #
-    # The reciprocal group computes `0.5 / sum`, not `1.0 / sum`: the device's
-    # recip agrees with `0.5/sum_device` to 9.0e-4, one ulp. The FLOAT IMMEDIATE
-    # arrives halved. It is a bit reinterpretation -- an fp16 literal is emitted as
-    # its IEEE binary16 pattern and read as Spyre's 1-6-9 float, and 0x3C00 (1.0
-    # IEEE, exp 15) is 0.5 in 1-6-9 (exp 30, bias 31). Isolated on a two-line
-    # elementwise kernel with no reduce, no chain and no broadcast, where every
-    # value the mangling predicts is exactly what comes back:
+    # ``diff`` is quoted as an absolute because a shifted value passes through zero
+    # and a relative bound there measures nothing.
     #
-    #   1.0 -> 0.5      2.0 -> 2.0      0.5 -> 0.125      3.0 -> 4.0
-    #
-    # (2.0 is unchanged by coincidence: its pattern happens to read as itself.)
-    # And 1.5, the value whose bits WOULD read as 1.0, is refused outright --
-    # "slot arith.constant 1.500000e+00 : f16 does not have a constant address" --
-    # so the immediates that work at all come from a fixed table. Compensating for
-    # the mangling is therefore both impossible and the wrong thing to do.
-    #
-    # Everything else the chain does is right. G6 agrees with
-    # `exp_device * recip_device` to 3.1e-5 absolute, and the sum agrees with
-    # `sum(exp_device)` to 4.8e-3 relative. Six groups over seven buffers schedule,
-    # the address count fits, and both statistics round-trip. One immediate is the
-    # whole gap, and it is a deeptools one.
+    # Each stage accounts for the next. G6 agrees with
+    # ``exp_device * recip_device`` to 6.1e-5 absolute, so the final multiply adds
+    # essentially nothing; the reciprocal agrees with ``1/sum_device`` to 9.0e-4
+    # (one ulp), so its 3.6e-3 is the sum's own 2.9e-3 carried through. The 1.3e-2
+    # on the output is the numerator's 9.8e-3 and the normalisation's 3.6e-3, and
+    # the device's rows sum to between 0.9951 and 1.0007.
     "softmax_on_stick": {
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
@@ -1217,21 +1219,23 @@ VARIANTS = {
         },
         "grid":        [1],
         "data_layout": "host",
-        # False, and the banner above says why it is not the statement it looks
-        # like: this compiles and launches, and the answer is wrong.
-        "compiles_to_binary": False,
+        "compiles_to_binary": True,
         "reference":   softmax_reference,
         "inputs":      make_inputs_softmax,
         "output_key":  "out_ptr",
-        # A PREDICTION, not a measurement, and said plainly because every other
-        # tolerance here records something observed. Once the halved immediate is
-        # fixed, the error should be a little over ``max_shift_exp_on_stick``'s
-        # 9.8e-3: the numerator is the same arithmetic, and the normalisation adds
-        # a 128-term fp16 accumulation in the device's order plus a reciprocal
-        # rounded to fp16 before it is applied. 6e-2 is 3x a doubling of that. No
+        # A relative bound alone, and MEASURED like its siblings': on the device
+        # against the fp16 oracle for this exact input (seed 0, M=64, N=128) the max
+        # relative difference is 1.3e-2, so 4e-2 is that with a factor of 3. No
         # atol -- a softmax row sums to one over 128 terms, so the outputs sit
         # around 8e-3 and none is near zero.
-        "rtol":        6e-2,
+        #
+        # Two effects in it are characterised rather than slack, and the banner
+        # above splits them out: the device's fp16 is Spyre's 1-6-9 float where the
+        # oracle's is IEEE 1-5-10, so the shift is up to one ulp off and cannot be
+        # bit-exact; and ``spyreop.exp`` is itself accurate to about 3.1e-3. Neither
+        # is a reason to widen this further, and a failure above it should be read as
+        # a real error rather than as either of them growing.
+        "rtol":        4e-2,
         "atol":        0.0,
         # Both rank-1 statistics: STAT_LAYOUT replicates [M] across a stick, so
         # the device writes M*S elements where the host tensor holds M. S is 64 at

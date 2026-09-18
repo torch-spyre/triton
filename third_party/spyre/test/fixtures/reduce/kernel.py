@@ -406,19 +406,24 @@ def softmax_on_stick(
       that lane; a divide in the last group would instead need the sum broadcast
       into it, which is a second compute in a group that already has one.
 
-    It reaches a binary and launches, and the answer is wrong in exactly one
-    place: the ``1.0`` below arrives on the device as ``0.5``, an fp16 literal
-    emitted as its IEEE binary16 pattern and read as Spyre's 1-6-9 float. Not a
-    property of this kernel -- a two-line elementwise kernel shows it -- and not
-    something to compensate for. The variant's banner in ``meta.py`` has the
-    measurements and the isolation.
+    It reaches a binary, launches, and matches the fp16 oracle to 1.3e-2
+    relative -- the variant's banner in ``meta.py`` has that group by group.
+
+    The ``1.0`` below never reaches the device, and that is load-bearing rather
+    than incidental: LowerSpyreOps sees a numerator of one and emits the UNARY
+    ``spyreop.reciprocal``, so the literal dies in lowering. It has to. A float
+    immediate is emitted as its IEEE bit pattern and read by the device as
+    Spyre's 1-6-9 float, so an fp16 ``1.0`` would arrive as ``0.5``. Do not
+    replace this with anything that keeps the constant alive.
 
     ``tl.fdiv`` and not ``one / s``, which is a real distinction and not style:
     ``/`` promotes fp16 to fp32 (``computation_type_impl`` in semantic.py, on the
     grounds that PTX has no native fp16 divide), and the promotion emits an
     ``arith.extf`` that no pass here lowers. ``tl.fdiv`` divides at the operand
-    width, which is what ``spyreop.realdiv`` wants. The numerator is a same-dtype
-    ``tl.full`` for the same reason -- a bare Python ``1.0`` is an fp32 scalar.
+    width, which is what the ``spyreop`` divide intrinsics want. The numerator is
+    a same-dtype ``tl.full`` for the same reason -- a bare Python ``1.0`` is an
+    fp32 scalar, and an fp32 numerator over an fp16 total is not the shape the
+    reciprocal peephole (or a ``realdiv``) can take.
     """
     x_desc = tl.make_tensor_descriptor(
         x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
