@@ -9,14 +9,17 @@ Rank-3, middle axis  ``out[d0, d2] = OP(in[d0, :, d2])`` -- the reduced axis is
 Three reductions lower: ``sum``, ``max`` and ``min``, dispatched by
 ``OP: tl.constexpr``. All three reach ``linalg.reduce`` and run on ``ktir_cpu``.
 
-Three variants reach a Spyre binary and launch, all in Level D: ``one_tile`` at
-``AXIS=0`` (the loop-free shape folding the non-stick axis),
-``one_tile_on_stick_bcast`` (the stick axis instead, storing its statistic
-replicated across a stick) and ``stat_chain_on_stick``, which reads that
-statistic back out of HBM and applies it to a full tile. The last is not a
-reduce alone -- it is a reduce and a compute chained through memory, which is
-softmax's shape -- and it lives here because the reduce is what puts the
-statistic there. The Level D banner records why these and not the others.
+Several variants reach a Spyre binary and launch, all in Level D, and they build
+on each other: ``one_tile`` at ``AXIS=0`` (the loop-free shape folding the
+non-stick axis), ``one_tile_on_stick_bcast`` (the stick axis instead, storing its
+statistic replicated across a stick) and its ``_max`` sibling, then
+``stat_chain_on_stick``, which reads that statistic back out of HBM and applies it
+to a full tile, and ``max_shift_exp_on_stick``, which is softmax's numerator:
+a max, a shift by it and an exponential, three groups over four buffers. The last
+two are not reduces alone -- they are a reduce and further computes chained
+through memory, which is softmax's shape -- and they live here because the reduce
+is what puts the statistic there. The Level D banner records why these and not
+the others.
 
 The variants are grouped under Level A-D banners, each of which says what its
 level is for and what it deliberately does not vary. See ``fixtures/README.md``
@@ -129,7 +132,7 @@ def make_inputs_stat_chain(M, N, DTYPE="fp16", **_unused) -> dict:
             "out_ptr": np.zeros((M, N), dtype=np_dtype)}
 
 
-def make_inputs_max_shift_exp(M, N, DTYPE="fp32", **_unused) -> dict:
+def make_inputs_max_shift_exp(M, N, DTYPE="fp16", **_unused) -> dict:
     """``[M, N]`` in, an ``[M]`` scratch maximum, an ``[M, N]`` scratch shift, out.
 
     Two scratch buffers, and neither is an input in any sense but that the kernel
@@ -235,7 +238,7 @@ def _signature_max_shift_exp(dtype: str) -> dict:
             "TILE_LAYOUT": "constexpr", "STAT_LAYOUT": "constexpr"}
 
 
-_SIG_MAX_SHIFT_EXP = _signature_max_shift_exp("fp32")
+_SIG_MAX_SHIFT_EXP = _signature_max_shift_exp("fp16")
 
 
 # ---------------------------------------------------------------------------
@@ -370,12 +373,12 @@ def _tile_stat_row(dtype: str, n_sticks: int) -> tuple:
     :func:`_stat_chain_row` with one layout fewer, because those chains give every
     full-width tile the same name: ``TILE_LAYOUT`` is the stick-on-N split that
     ``x`` and every intermediate carries, and ``STAT_LAYOUT`` is the broadcast
-    1-D one a stick-axis reduce has to store through. At ``M=64`` fp32 with
+    1-D one a stick-axis reduce has to store through. At ``M=64`` fp16 with
     ``n_sticks=2``::
 
-        DTYPE = "fp32"   N = 64   S = 32
-        TILE_LAYOUT = ((1, "floordiv", 32), 0, (1, "mod", 32))
-        STAT_LAYOUT = (0, (0, "broadcast", 32))
+        DTYPE = "fp16"   N = 128   S = 64
+        TILE_LAYOUT = ((1, "floordiv", 64), 0, (1, "mod", 64))
+        STAT_LAYOUT = (0, (0, "broadcast", 64))
     """
     stick = _stick_of(dtype)
     return (dtype, n_sticks * stick, stick,
@@ -843,18 +846,22 @@ VARIANTS = {
     #     neutral from the combiner, so -inf is re-established for a max and the
     #     init can be dropped like a sum's.
     #
-    # fp32, NOT fp16 like its siblings, and not for the reduce's sake: tl.max
-    # PROMOTES anything narrower than 32 bits before reducing (standard.py), which
-    # emits arith.extf/truncf that no pass in this tree lowers. So this is also the
-    # first on-stick variant at a 32-lane stick rather than 64 -- N and both
-    # layouts follow from the dtype through the same row helper, so nothing here
-    # states a width.
+    # fp32, NOT fp16 like its siblings, and it is now a CHOICE rather than the
+    # only option it once was: tl.max used to promote anything narrower than 32
+    # bits before reducing, which emitted arith.extf/truncf that no pass in this
+    # tree lowers, and that promotion is now forked off on Spyre (standard.py's
+    # _widens_narrow_float_reduce). Left at fp32 deliberately, because it is the
+    # only max reduce here at that width and dropping it would leave the fp32
+    # combiner path uncovered -- ``max_shift_exp_on_stick`` covers the fp16 one.
+    # So this is also the one on-stick variant at a 32-lane stick rather than 64;
+    # N and both layouts follow from the dtype through the same row helper, so
+    # nothing here states a width.
     "one_tile_on_stick_bcast_max": {
         "base": "one_tile_on_stick_bcast",
         "summary": (
             "The stick-axis reduce storing its statistic broadcast across a "
             "stick, with max as the combiner instead of sum — softmax's G1, at "
-            "fp32 because tl.max promotes anything narrower."
+            "fp32 so the wider combiner path stays covered."
         ),
         "params": {
             ("DTYPE", "N", "IN_LAYOUT", "OUT_LAYOUT"): [
@@ -985,34 +992,30 @@ VARIANTS = {
     # in RewriteDescriptorLayoutGeneric.cpp -- the chain could not be two groups
     # long and hit it, which is why this variant is the one that found it.
     #
-    # fp32 throughout: tl.exp refuses fp16 and tl.max promotes it. Four buffers,
-    # so four base addresses of the seven.
-    #
-    # NOT ON THE DEVICE TIER, and the wall is neither the chain nor the reduce.
-    # Its KTIR is what the reference states, and dbo-opt takes it all the way to
-    # instruction selection before refusing:
+    # fp16 throughout, and that is the whole reason this variant now reaches a
+    # binary. It used to be fp32 and stopped in instruction selection:
     #
     #   'vectorchain.shuffle' op unsupported ldtype
     #   %0 = "vectorchain.shuffle"(...) <{indices = [0], repetition = 32}>
     #        : (vector<1xf32>) -> vector<32xf32>
-    #   could not set ldtype
-    #   %69 = "agen.vector_load"(...) : (memref<2x1x32xf32>, index) -> vector<1xf32>
-    #   Unable to generate load_and_send 'statement for the agen.vector_load
     #   cannot lower agen.vector_load
     #
-    # That is the STATISTIC READ: one lane loaded and splatted across the stick.
-    # It is an fp16-only path in this dbo-opt, and the isolation is exact --
-    # ``stat_chain_on_stick``, which is on the device tier and passes, produces
-    # the identical error when its dtype alone is changed to fp32, and this
-    # variant's own max reduce reaches a binary at fp32 in
-    # ``one_tile_on_stick_bcast_max`` because that one only WRITES a statistic.
+    # That is the STATISTIC READ -- one lane loaded and splatted across the stick
+    # -- and it is an fp16-only path in this dbo-opt. The isolation was exact:
+    # ``stat_chain_on_stick`` produces the identical error when its dtype alone is
+    # changed to fp32, while this variant's own max reduce reaches a binary at
+    # fp32 in ``one_tile_on_stick_bcast_max`` because that one only WRITES a
+    # statistic.
     #
-    # So the read-back needs fp16 and the compute needs fp32, and nothing here can
-    # have both: ``tl.exp`` rejects fp16 at trace time (``_check_dtype`` in
-    # language/math.py) and ``tl.max`` promotes it (standard.py), emitting
-    # arith.extf/truncf that no pass here lowers. Closing that is a frontend
-    # decision -- forking those two guards behind ``is_spyre()`` -- not a fixture
-    # one, which is why this variant records the wall instead of working around it.
+    # So the chain needed fp16 and the frontend refused it twice over: ``tl.exp``
+    # rejected fp16 at trace time (``_check_dtype`` in language/math.py) and
+    # ``tl.max`` promoted it (standard.py), emitting arith.extf/truncf that no
+    # pass here lowers. Both refusals are now forked behind ``is_spyre()``; see
+    # ``test_frontend_guards.py`` for the fork and the accuracy trade it accepts.
+    # Being fp16 also puts the chain back on a 64-lane stick, so N is 128 where
+    # the fp32 shape was 64.
+    #
+    # Four buffers, so four base addresses of the seven.
     "max_shift_exp_on_stick": {
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
@@ -1027,35 +1030,43 @@ VARIANTS = {
         "constexpr":  ["M", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT"],
         "params": {
             ("DTYPE", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT"): [
-                _tile_stat_row("fp32", n_sticks=2),
+                _tile_stat_row("fp16", n_sticks=2),
             ],
-            # M = 64 rows, two whole 32-lane sticks of N. Nothing is padded.
+            # M = 64 rows, two whole 64-lane sticks of N. Nothing is padded.
             "M": [64],
         },
         "grid":        [1],
         "data_layout": "host",
-        # False, not absent: say it, because every neighbour in this Level D block
-        # carries True and a reader would take an omission for an oversight. The
-        # banner above is the reason.
-        "compiles_to_binary": False,
+        "compiles_to_binary": True,
         "reference":   max_shift_exp_reference,
         "inputs":      make_inputs_max_shift_exp,
         "output_key":  "out_ptr",
-        # Sized for the device arm this variant does not yet reach, so it is a
-        # prediction rather than a measurement -- said plainly, because every
-        # other tolerance in this file records something observed. The device's
-        # fp32 datapath runs at SEN169 precision (see the note on
-        # one_tile_on_stick_bcast_max) and an exp AMPLIFIES what that costs: the
-        # shifted values reach -6, where exp is 2.5e-3, so a 2.5e-3 relative error
-        # on the shift moves the exponent by about that much again. 1e-2 is what
-        # every other fp32 device variant here uses; atol covers the far tail,
-        # where the outputs are ~1e-3 and a relative bound would be asking the
-        # device to be exact about a number the shift only knows to 2.5e-3.
-        "rtol":        1e-2,
-        "atol":        1e-3,
+        # A relative bound alone, and MEASURED: on the device against the fp16
+        # oracle for this exact input (seed 0, M=64, N=128) the max relative
+        # difference is 9.8e-3, so 3e-2 is that with a factor of 3. No atol,
+        # because there is nothing here for a relative bound to be meaningless
+        # at -- the outputs are exponentials of a non-positive argument and the
+        # smallest is 1.5e-3, nowhere near fp16's normal minimum.
+        #
+        # Where it comes from, measured stage by stage rather than attributed:
+        #
+        #  - The SHIFT is not exact, which is not obvious: `x - max(x)` in fp16
+        #    ought to be, and against an IEEE fp16 oracle it is not, because the
+        #    device's fp16 is Spyre's own 1-6-9 float and IEEE's is 1-5-10. One
+        #    mantissa bit fewer, so the difference lands up to one ulp of the
+        #    operand away (max |err| 7.8e-3, an ulp at magnitude 8).
+        #  - The EXP is accurate to 3.1e-3 relative when compared against numpy's
+        #    exp of the device's OWN shifted value, so most of the 9.8e-3 is the
+        #    shift's ulp carried through the exponential rather than the
+        #    intrinsic's own error.
+        #
+        # The max reduce contributes nothing: it is a selection, returning one of
+        # its inputs unchanged.
+        "rtol":        3e-2,
+        "atol":        0.0,
         # The statistic buffer: STAT_LAYOUT replicates [M] across a stick, so the
-        # device writes M*S where the host tensor holds M. S is 32 at fp32. Must
+        # device writes M*S where the host tensor holds M. S is 64 at fp16. Must
         # agree with STAT_LAYOUT above; nothing derives one from the other yet.
-        "device_alloc": {"max_ptr": ([1, 64, 32], [-1, 1, -1])},
+        "device_alloc": {"max_ptr": ([1, 64, 64], [-1, 1, -1])},
     },
 }

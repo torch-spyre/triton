@@ -314,10 +314,13 @@ def max_shift_exp_on_stick(
     ``out``: a group's store and a later group's load of the same buffer is the
     fence the scheduler splits on, so each intermediate needs its own.
 
-    fp32 throughout, and not by preference. ``tl.max`` promotes anything narrower
-    than 32 bits before reducing and ``tl.exp`` refuses fp16 outright, so this is
-    the only width the chain traces at -- which makes it the on-stick shape at a
-    32-lane stick rather than the 64-lane one its fp16 siblings use.
+    fp16 throughout, and not by preference either: the statistic read-back --
+    one lane loaded and splatted across the stick -- is an fp16-only path in
+    dbo-opt, so any chain whose reduce round-trips through HBM has to be fp16.
+    Both frontend refusals that used to stand in the way (``tl.max`` promoting
+    narrow floats, ``tl.exp`` rejecting fp16) are forked behind ``is_spyre()``;
+    see ``test_frontend_guards.py`` for the fork and the accuracy trade it
+    accepts.
     """
     x_desc = tl.make_tensor_descriptor(
         x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
