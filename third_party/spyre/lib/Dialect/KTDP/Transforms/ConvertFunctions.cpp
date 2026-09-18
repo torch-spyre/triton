@@ -5,7 +5,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Dialect/KTDP/Transforms/Passes.h"
+#include "Conversion/TritonToKTIR/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 
@@ -19,7 +19,7 @@ using namespace mlir;
 
 namespace mlir::triton::ktdp {
 #define GEN_PASS_DEF_CONVERTFUNCTIONS
-#include "Dialect/KTDP/Transforms/Passes.h.inc"
+#include "Conversion/TritonToKTIR/Passes.h.inc"
 } // namespace mlir::triton::ktdp
 
 namespace {

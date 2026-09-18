@@ -20,7 +20,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Dialect/KTDP/Transforms/Passes.h"
+#include "Conversion/TritonToKTIR/Passes.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "ktir/Dialect/KTDP/KTDPTypes.h"
@@ -40,7 +40,7 @@ using namespace mlir;
 
 namespace mlir::triton::ktdp {
 #define GEN_PASS_DEF_LOWERINTERTILE
-#include "Dialect/KTDP/Transforms/Passes.h.inc"
+#include "Conversion/TritonToKTIR/Passes.h.inc"
 } // namespace mlir::triton::ktdp
 
 namespace {

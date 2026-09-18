@@ -10,7 +10,13 @@
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
+// All three pass groups: this file reaches create* entry points from each --
+// the conversions and the top-level transforms by their hand-declared
+// factories, RewriteDescriptorLayout through the options struct tablegen
+// generates into the KTDP transforms header.
+#include "Conversion/TritonToKTIR/Passes.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
+#include "Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Math/IR/Math.h"

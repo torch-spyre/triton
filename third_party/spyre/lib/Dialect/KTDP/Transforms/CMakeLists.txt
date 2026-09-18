@@ -17,7 +17,9 @@ add_triton_library(KTDPTransforms
   MaterializeBaseAddresses.cpp
 
   DEPENDS
+  TritonToKTIRIncGen
   KTDPTransformsIncGen
+  SpyreTransformsIncGen
 
   LINK_LIBS PUBLIC
   KTDPUtils

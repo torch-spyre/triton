@@ -9,7 +9,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Dialect/KTDP/Transforms/Passes.h"
+#include "Conversion/TritonToKTIR/Passes.h"
 #include "Dialect/KTDP/Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
@@ -33,7 +33,7 @@ using namespace mlir;
 
 namespace mlir::triton::ktdp {
 #define GEN_PASS_DEF_LOWERDESCRIPTORMEMORY
-#include "Dialect/KTDP/Transforms/Passes.h.inc"
+#include "Conversion/TritonToKTIR/Passes.h.inc"
 } // namespace mlir::triton::ktdp
 
 namespace {

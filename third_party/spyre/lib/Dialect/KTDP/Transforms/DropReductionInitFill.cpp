@@ -66,7 +66,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Dialect/KTDP/Transforms/Passes.h"
+#include "Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -81,7 +81,7 @@ using namespace mlir;
 
 namespace mlir::triton::ktdp {
 #define GEN_PASS_DEF_DROPREDUCTIONINITFILL
-#include "Dialect/KTDP/Transforms/Passes.h.inc"
+#include "Transforms/Passes.h.inc"
 } // namespace mlir::triton::ktdp
 
 namespace {
