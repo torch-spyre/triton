@@ -1,6 +1,7 @@
 add_subdirectory(Conversion)
 add_subdirectory(Dialect)
 add_subdirectory(Transforms)
+add_subdirectory(Utils)
 
 # Sits above the pass libraries and is depended on by no other library, which is
 # what lets it link all of them. Keep in step with RegisterEverything.cpp: a new

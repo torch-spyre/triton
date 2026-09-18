@@ -12,7 +12,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "Conversion/TritonToKTIR/Passes.h"
-#include "Dialect/KTDP/Utils/Utility.h"
+#include "ConversionUtils.h"
+#include "Utils/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -35,6 +36,9 @@ namespace mlir::triton::spyre {
 } // namespace mlir::triton::spyre
 
 namespace {
+
+using mlir::triton::spyre::cleanupDeadOps;
+using mlir::triton::spyre::createEmptyTensor;
 
 //===----------------------------------------------------------------------===//
 // Helpers
@@ -100,8 +104,7 @@ struct ConvertTTSplat : public OpConversionPattern<triton::SplatOp> {
   matchAndRewrite(triton::SplatOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
-    Value empty = mlir::triton::ktdp::createEmptyTensor(rewriter, op.getLoc(),
-                                                        resultType);
+    Value empty = createEmptyTensor(rewriter, op.getLoc(), resultType);
     auto fill = linalg::FillOp::create(rewriter, op.getLoc(),
                                        adaptor.getSrc(), empty);
     rewriter.replaceOp(op, fill.getResult(0));
@@ -247,8 +250,7 @@ struct ConvertTTTrans : public OpConversionPattern<triton::TransOp> {
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
-    Value empty =
-        mlir::triton::ktdp::createEmptyTensor(rewriter, loc, resultType);
+    Value empty = createEmptyTensor(rewriter, loc, resultType);
 
     SmallVector<int64_t> perm(op.getOrder().begin(), op.getOrder().end());
     auto transpose = linalg::TransposeOp::create(
@@ -536,7 +538,7 @@ struct LowerComputeOpsPass
       return;
     }
 
-    mlir::triton::ktdp::cleanupDeadOps(module);
+    cleanupDeadOps(module);
   }
 };
 

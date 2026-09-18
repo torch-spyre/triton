@@ -17,9 +17,10 @@ add_triton_library(SpyreTransforms
   SpyreTransformsIncGen
 
   LINK_LIBS PUBLIC
-  # For Utility.h in UnaliasLinalgOuts; also carries the ktdp include path it
-  # needs, so KTIR::KtdpDialect is not named again here.
-  KTDPUtils
+  # For createEmptyTensor in UnaliasLinalgOuts.  Not KTDPUtils: none of these
+  # three touches a ktdp op, so this library no longer reaches the ktdp dialect
+  # at all -- the third absence worth noting alongside the two below.
+  SpyreUtils
   MLIRIR
   MLIRPass
   MLIRArithDialect
