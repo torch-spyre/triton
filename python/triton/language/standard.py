@@ -3,6 +3,8 @@ from __future__ import annotations
 from ..runtime.jit import jit, constexpr_function
 from . import core
 from . import math
+# --- added for spyre
+from . import target_info
 
 # constexpr utilities
 
@@ -140,6 +142,39 @@ def zeros_like(input):
     return zeros(input.shape, input.dtype)
 
 
+# --- START --- added for spyre
+@constexpr_function
+def _widens_narrow_float_reduce():
+    """Whether ``max``/``min`` widen a sub-32-bit float to fp32 before reducing.
+
+    True everywhere but Spyre, and the fork is not a preference — on Spyre the
+    promotion is both unlowerable and unwanted:
+
+    * The ``arith.extf``/``arith.truncf`` pair it emits is lowered by no pass in
+      the Spyre pipeline, so a narrow-float ``max`` does not compile at all.
+    * fp16 is the only width in which a reduce's statistic can be *read back*.
+      Spyre stores a stick-axis statistic replicated across a stick and a
+      consumer reads one lane and splats it; that splat is an fp16-only path in
+      the backend. So the very kernels that need a narrow ``max`` — softmax and
+      anything else shifting a tile by a row statistic — cannot use fp32.
+
+    The precision cost is real and deliberately accepted. Widening exists
+    because accumulating many terms in fp16 drifts, and on Spyre the whole
+    chain around this reduce accumulates in fp16 regardless: there is no wider
+    datapath available for the statistic round-trip, so promoting only the
+    reduce would buy nothing and cost the kernel its ability to compile. For
+    ``max``/``min`` specifically the reduce itself loses nothing — it is a
+    selection, returning one of its inputs unchanged — and what precision is
+    lost is lost in the fp16 arithmetic surrounding it either way.
+
+    Note this covers *floats* only. Sub-32-bit integer reduces still widen to
+    i32, and ``_promote_bfloat16_to_float32`` still runs: neither is on the path
+    described above.
+    """
+    return not target_info.is_spyre()
+# --- END --- added for spyre
+
+
 # max and argmax
 
 
@@ -184,7 +219,10 @@ def max(input, axis=None, return_indices=False, return_indices_tie_break_left=Tr
     else:
         if core.constexpr(input.dtype.primitive_bitwidth) < core.constexpr(32):
             if core.constexpr(input.dtype.is_floating()):
-                input = input.to(core.float32)
+                # --- START --- added for spyre
+                if _widens_narrow_float_reduce():
+                    input = input.to(core.float32)
+                # --- END --- added for spyre
             else:
                 assert input.dtype.is_int(), "Expecting input to be integer type"
                 input = input.to(core.int32)
@@ -243,7 +281,10 @@ def min(input, axis=None, return_indices=False, return_indices_tie_break_left=Tr
     else:
         if core.constexpr(input.dtype.primitive_bitwidth) < 32:
             if core.constexpr(input.dtype.is_floating()):
-                input = input.to(core.float32)
+                # --- START --- added for spyre
+                if _widens_narrow_float_reduce():
+                    input = input.to(core.float32)
+                # --- END --- added for spyre
             else:
                 assert input.dtype.is_int(), "Expecting input to be integer type"
                 input = input.to(core.int32)

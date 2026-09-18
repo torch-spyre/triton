@@ -1,8 +1,39 @@
 from . import core
 from functools import wraps
 from typing import List
+# --- added for spyre
+from . import target_info
 
 T = core.TypeVar('T')
+
+# --- START --- added for spyre
+#: Narrower floats the Spyre backend admits into any math op that declares fp32.
+#:
+#: Spyre needs fp16 for these, and it is not a convenience. A reduce's statistic
+#: is stored replicated across a stick and read back one lane wide then splatted,
+#: and that splat is an fp16-only path in the backend — so a chain that shifts a
+#: tile by a row statistic and then exponentiates it (softmax's numerator) has to
+#: be fp16 end to end. The alternative is not a less precise softmax, it is no
+#: softmax: at fp32 the read-back fails instruction selection.
+#:
+#: The precision trade is deliberate. fp16 exp/log over a shifted tile is less
+#: accurate than fp32, and the surrounding chain accumulates in fp16 anyway
+#: because there is no wider datapath for the statistic round-trip; refusing fp16
+#: here would not buy accuracy, it would only move the failure earlier. The
+#: fixture tolerances under ``third_party/spyre/test/fixtures`` record the
+#: measured cost.
+#:
+#: fp16 only, and bf16 deliberately not: nothing in this tree has run bf16
+#: through these ops, and ``standard.py``'s ``_promote_bfloat16_to_float32``
+#: still widens bf16 reduces, so admitting it here would claim support the rest
+#: of the frontend does not.
+#:
+#: Ops Spyre cannot lower at all are *not* this decorator's business to refuse —
+#: ``LowerSpyreOps`` converts sqrt/rsqrt/exp and the pipeline rejects the rest
+#: with a lowering diagnostic naming the op, which is a better error than a
+#: dtype table's.
+_SPYRE_EXTRA_FLOAT_DTYPES = ("fp16", )
+# --- END --- added for spyre
 
 
 def _check_dtype(dtypes: List[str]) -> T:
@@ -18,11 +49,25 @@ def _check_dtype(dtypes: List[str]) -> T:
 
         @wraps(fn)
         def check(*args, **kwargs):
+            # --- START --- added for spyre
+            # Resolved per call, not per decoration: there is no active driver
+            # when this module is imported. ``is_spyre()`` is a
+            # ``constexpr_function``, but this wrapper runs as ordinary Python at
+            # trace time — outside the builtin, so no ``_semantic`` is threaded
+            # through it — and called that way it returns a plain bool.
+            #
+            # Gated on fp32 being declared so this only ever relaxes a *float*
+            # op: ``umulhi``'s integer list is left exactly as upstream wrote it.
+            accepted = list(dtypes)
+            if "fp32" in dtypes and target_info.is_spyre():
+                accepted += [d for d in _SPYRE_EXTRA_FLOAT_DTYPES if d not in accepted]
+            # --- END --- added for spyre
             # concatenate args and kwargs
             all_args = list(args) + list(kwargs.values())
             for arg in [a for a in all_args if isinstance(a, core.tensor)]:
-                if arg.type.scalar.name not in dtypes:
-                    raise ValueError(f"Expected dtype {dtypes} but got {arg.type.scalar.name}")
+                # --- added for spyre: ``accepted``, upstream reads ``dtypes``
+                if arg.type.scalar.name not in accepted:
+                    raise ValueError(f"Expected dtype {accepted} but got {arg.type.scalar.name}")
             return fn(*args, **kwargs)
 
         return check
