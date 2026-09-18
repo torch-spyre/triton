@@ -21,9 +21,13 @@ if(TRITON_BUILD_PYTHON_MODULE)
   # MLIRLinalgTransforms is for this file's own
   # createConvertElementwiseToLinalgPass, which the plugin exposes as
   # add_convert_elementwise_to_linalg.  
+  # The three pass libraries stay named: unlike spyre-triton-opt, this file
+  # reaches individual create*Pass factories, not just the registration entry
+  # point.
   add_triton_plugin(TritonSpyre
     ${CMAKE_CURRENT_SOURCE_DIR}/triton_spyre.cc
-    LINK_LIBS TritonToKTIR KTDPTransforms SpyreTransforms
-              KTIR::KtdpDialect MLIRLinalgTransforms)
+    LINK_LIBS SpyreRegisterEverything
+              TritonToKTIR KTDPTransforms SpyreTransforms
+              MLIRLinalgTransforms)
   target_link_libraries(TritonSpyre PRIVATE Python3::Module pybind11::headers)
 endif()
