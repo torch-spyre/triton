@@ -16,15 +16,16 @@
 // instead of partitioning it, so [M] -> phys_src=[0,0] phys_op=[0,3]
 // phys_arg=[0,64] gives physical size [M, 64].
 //
-//   Phase 1  physicalize each annotated descriptor: memory view, access tiles,
-//            loads. Stores have their access tile redirected. Each physicalized
-//            view is recorded against the layout it was physicalized under.
-//   Phase 2  for each recorded view, find the generics that read its loads or
-//            supply its stores, and restate each one over the physical loop
-//            domain. Every generic the pass considers is reached this way, so
-//            the recorded views are the scope; no fixpoint, no pattern driver,
-//            and each generic is rewritten at most once.
-//   Phase 3  erase the markers and their now-dead bridge casts.
+//   physicalizeDescriptors   physicalize each annotated descriptor: memory view,
+//            access tiles, loads. Stores have their access tile redirected. Each
+//            physicalized view is recorded against the layout it was
+//            physicalized under.
+//   rewriteAdjacentGenerics  for each recorded view, find the generics that read
+//            its loads or supply its stores, and restate each one over the
+//            physical loop domain. Every generic the pass considers is reached
+//            this way, so the recorded views are the scope; no fixpoint, no
+//            pattern driver, and each generic is rewritten at most once.
+//   eraseMarkers  erase the markers and their now-dead bridge casts.
 //
 //===----------------------------------------------------------------------===//
 
@@ -316,7 +317,7 @@ struct CoordMap {
   unsigned physRank() const { return src.size(); }
   CoordOp opAt(unsigned p) const { return static_cast<CoordOp>(op[p]); }
 
-  /// Is logical dim `d` split into a (stick, elem) pair by this layout?
+  /// Is logical dim `d` split into a (stick, lane) pair by this layout?
   ///
   /// A splat names `d` too, but it partitions nothing — it replicates `d`
   /// across a fresh axis — so it is not a split and the dim stays whole. Asking
@@ -422,17 +423,17 @@ FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
 
 /// The composite that recovers logical dim `d`'s index from the two physical
 /// dims a stick split gave it: the stick index counts whole sticks of `width`
-/// elements, and the element offset picks one out of the stick it lands in.
+/// elements, and the lane picks one element out of the stick it lands in.
 ///
 /// This is the *only* arithmetic either carrier introduces, and both introduce
-/// the same one. Phase 2 names its two halves after loop dims of the rebuilt
-/// linalg domain; the indirect access tile names them after intermediate
-/// variables of its own variable space. Different numbering, identical algebra —
-/// so the algebra lives here once and each carrier passes in the exprs it
-/// numbers the halves with.
+/// the same one. rewriteAdjacentGenerics names its two halves after loop dims of
+/// the rebuilt linalg domain; the indirect access tile names them after
+/// intermediate variables of its own variable space. Different numbering,
+/// identical algebra — so the algebra lives here once and each carrier passes in
+/// the exprs it numbers the halves with.
 inline AffineExpr composeStickSplit(AffineExpr stick, int64_t width,
-                                    AffineExpr elem) {
-  return stick * width + elem;
+                                    AffineExpr lane) {
+  return stick * width + lane;
 }
 
 /// The physical tensor type `cm` prescribes for a logical shape.
@@ -446,7 +447,7 @@ FailureOr<RankedTensorType> physicalTensorType(const CoordMap &cm,
 }
 
 //===----------------------------------------------------------------------===//
-// Phase 2's map rebuild
+// The map rebuild, for rewriteAdjacentGenerics
 //===----------------------------------------------------------------------===//
 
 /// One value's place in the rebuild: its logical indexing map, and the layout
@@ -459,24 +460,24 @@ struct RebuildOperand {
   /// by physical dim; -1 for every dim that is not a splat. Filled by
   /// buildLoopDomain, because a splat axis is the one physical dim that no
   /// logical loop dim accounts for — see LoopDomain.
-  SmallVector<int> broadcastDim;
+  SmallVector<int> splatDim;
 };
 
-/// One piece of the refined loop domain: a logical dim's stick index, its
-/// element offset within a stick, or — when nothing splits the dim — the whole
-/// dim, which is spelled as the stick half.
+/// One piece of the refined loop domain: a logical dim's stick index, its lane
+/// (the element offset within a stick), or — when nothing splits the dim — the
+/// whole dim, which is spelled as the stick half.
 ///
 /// A piece is the unit the numbering orders, because it is the unit an operand's
 /// physical dim names: a physical dim carries exactly one of these, and that is
 /// what lets an operand's physical order be read as an order on pieces.
 struct DomainPiece {
   unsigned loop;
-  /// True for the element offset within a stick, false for the stick index (or
-  /// for an unsplit dim held whole).
-  bool elem;
+  /// True for the lane — the element offset within a stick — false for the
+  /// stick index (or for an unsplit dim held whole).
+  bool lane;
 
   bool operator==(const DomainPiece &o) const {
-    return loop == o.loop && elem == o.elem;
+    return loop == o.loop && lane == o.lane;
   }
 };
 
@@ -486,15 +487,15 @@ struct LoopDomain {
   /// Loop dim carrying logical dim d's stick index, or its whole extent when
   /// the dim is unsplit.
   SmallVector<int> stickDim;
-  /// Loop dim carrying logical dim d's element offset within a stick; -1 when
-  /// the dim is unsplit.
-  SmallVector<int> elemDim;
+  /// Loop dim carrying logical dim d's lane — its element offset within a
+  /// stick; -1 when the dim is unsplit.
+  SmallVector<int> laneDim;
   /// The stick width to compose with, per logical dim; 0 when unsplit. Taken
   /// from the operands, which must agree — see buildLoopDomain.
   SmallVector<int64_t> width;
   unsigned numLoopDims = 0;
 
-  bool isSplit(int64_t d) const { return elemDim[d] >= 0; }
+  bool isSplit(int64_t d) const { return laneDim[d] >= 0; }
 };
 
 /// The domain pieces one operand's physical dims name, in that operand's own
@@ -524,7 +525,7 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
                 llvm::function_ref<InFlightDiagnostic()> emitError) {
   LoopDomain dom;
   dom.stickDim.assign(logicalNumLoops, -1);
-  dom.elemDim.assign(logicalNumLoops, -1);
+  dom.laneDim.assign(logicalNumLoops, -1);
   dom.width.assign(logicalNumLoops, 0);
 
   // Which logical loop dims are split, and at what width.
@@ -586,24 +587,24 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
 
   // Step 3: anything no operand's walk named goes last, in logical order.
   for (unsigned d = 0; d < logicalNumLoops; ++d) {
-    if (!seen({d, /*elem=*/false}))
-      order.push_back({d, /*elem=*/false});
-    if (dom.width[d] && !seen({d, /*elem=*/true}))
-      order.push_back({d, /*elem=*/true});
+    if (!seen({d, /*lane=*/false}))
+      order.push_back({d, /*lane=*/false});
+    if (dom.width[d] && !seen({d, /*lane=*/true}))
+      order.push_back({d, /*lane=*/true});
   }
 
   for (auto [n, pc] : llvm::enumerate(order))
-    (pc.elem ? dom.elemDim : dom.stickDim)[pc.loop] = n;
+    (pc.lane ? dom.laneDim : dom.stickDim)[pc.loop] = n;
   dom.numLoopDims = order.size();
 
   // One loop per splat physical dim, after the refinement.
   for (RebuildOperand &o : operands) {
     if (!o.layout)
       continue;
-    o.broadcastDim.assign(o.layout->physRank(), -1);
+    o.splatDim.assign(o.layout->physRank(), -1);
     for (unsigned p = 0, e = o.layout->physRank(); p < e; ++p)
       if (o.layout->opAt(p) == CoordOp::Splat)
-        o.broadcastDim[p] = dom.numLoopDims++;
+        o.splatDim[p] = dom.numLoopDims++;
   }
   return dom;
 }
@@ -635,11 +636,11 @@ AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
       results.push_back(loopExpr(dom.stickDim[loop]));
       break;
     case CoordOp::Mod:
-      results.push_back(loopExpr(dom.elemDim[loop]));
+      results.push_back(loopExpr(dom.laneDim[loop]));
       break;
     case CoordOp::Splat:
       // The replication axis, named by the loop the domain allocated for it.
-      results.push_back(loopExpr(o.broadcastDim[p]));
+      results.push_back(loopExpr(o.splatDim[p]));
       break;
     case CoordOp::Identity:
       // This operand holds the dim whole. If the domain split it, the two
@@ -647,7 +648,7 @@ AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
       results.push_back(
           dom.isSplit(loop)
               ? composeStickSplit(loopExpr(dom.stickDim[loop]),
-                                  dom.width[loop], loopExpr(dom.elemDim[loop]))
+                                  dom.width[loop], loopExpr(dom.laneDim[loop]))
               : loopExpr(dom.stickDim[loop]));
       break;
     }
@@ -666,7 +667,7 @@ rebuildIterators(ArrayRef<utils::IteratorType> logicalIterators,
   for (unsigned d = 0, e = logicalIterators.size(); d < e; ++d) {
     out[dom.stickDim[d]] = logicalIterators[d];
     if (dom.isSplit(d))
-      out[dom.elemDim[d]] = logicalIterators[d];
+      out[dom.laneDim[d]] = logicalIterators[d];
   }
   return out;
 }
@@ -690,24 +691,24 @@ struct RewriteDescriptorLayoutGenericPass
   /// Operation* of the PHYSICALIZED (new) view op, set in physicalizeDescriptor
   /// after physicalizeMemView returns.
   ///
-  /// This is what Phase 2 iterates: the physicalized views ARE the scope of the
-  /// rewrite, so the traversal starts here and reaches generics through the
-  /// loads and stores over each view. It is also what the rewrite looks an
-  /// operand up in, once it has a generic in hand.
+  /// This is what rewriteAdjacentGenerics iterates: the physicalized views ARE
+  /// the scope of the rewrite, so the traversal starts here and reaches generics
+  /// through the loads and stores over each view. It is also what the rewrite
+  /// looks an operand up in, once it has a generic in hand.
   ///
-  /// A MapVector, not a DenseMap, because Phase 2's order comes off this
+  /// A MapVector, not a DenseMap, because the rewrite's order comes off this
   /// container and a DenseMap's iteration order is not the order the markers
   /// were physicalized in — the rewrite would be run in an order that varied
   /// with the pointer values.
   llvm::MapVector<Operation *, CoordMap> physViewOf;
 
-  /// Logical construct_memory_view ops superseded in Phase 1. They cannot be
-  /// erased there: the marker's bridge cast still holds them, and that cast
-  /// only dies in Phase 3.
+  /// Logical construct_memory_view ops superseded by physicalizeDescriptors.
+  /// They cannot be erased there: the marker's bridge cast still holds them, and
+  /// that cast only dies in eraseMarkers.
   SmallVector<mlir::ktdp::ConstructMemoryViewOp> deadLogicalMemViews;
 
   //===--------------------------------------------------------------------===//
-  // Phase 1 — physicalize one descriptor
+  // physicalizeDescriptors — one descriptor at a time
   //===--------------------------------------------------------------------===//
 
   /// Physical sizes for a view, as static extents plus the dynamic values the
@@ -1095,7 +1096,7 @@ struct RewriteDescriptorLayoutGenericPass
     // Recover each logical variable from the physical ones.
     SmallVector<AffineExpr> logicalFromPhysical(logRank);
     SmallVector<int64_t> width(logRank, 0);
-    SmallVector<AffineExpr> stickHalf(logRank), elemHalf(logRank);
+    SmallVector<AffineExpr> stickHalf(logRank), laneHalf(logRank);
     for (unsigned p = 0; p < physRank; ++p) {
       int64_t logDim = cm.src[p];
       switch (cm.opAt(p)) {
@@ -1106,7 +1107,7 @@ struct RewriteDescriptorLayoutGenericPass
         stickHalf[logDim] = physVar(p);
         break;
       case CoordOp::Mod:
-        elemHalf[logDim] = physVar(p);
+        laneHalf[logDim] = physVar(p);
         width[logDim] = cm.arg[p];
         break;
       case CoordOp::Splat:
@@ -1118,7 +1119,7 @@ struct RewriteDescriptorLayoutGenericPass
     for (unsigned d = 0; d < logRank; ++d)
       if (width[d])
         logicalFromPhysical[d] =
-            composeStickSplit(stickHalf[d], width[d], elemHalf[d]);
+            composeStickSplit(stickHalf[d], width[d], laneHalf[d]);
 
     SmallVector<AffineExpr> oldToNew(numCaptured + logRank);
     for (unsigned c = 0; c < numCaptured; ++c)
@@ -1236,7 +1237,7 @@ struct RewriteDescriptorLayoutGenericPass
     if (failed(physMemView))
       return failure();
 
-    // Record the physicalized view → coord map for Phase 2 tracing.
+    // Record the physicalized view → coord map, for the rewrite's tracing.
     if (Operation *physViewOp = (*physMemView).getDefiningOp())
       physViewOf.try_emplace(physViewOp, *cm);
 
@@ -1251,8 +1252,21 @@ struct RewriteDescriptorLayoutGenericPass
     return success();
   }
 
+  /// Physicalize the descriptor behind every marker, recording each
+  /// physicalized view against the layout it was physicalized under.
+  LogicalResult
+  physicalizeDescriptors(ArrayRef<triton::SpyreTensorLayoutOp> markers) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[rewrite-descriptor-layout-generic] physicalizing "
+               << markers.size() << " descriptor(s)\n");
+    for (auto marker : markers)
+      if (failed(physicalizeDescriptor(marker)))
+        return failure();
+    return success();
+  }
+
   //===--------------------------------------------------------------------===//
-  // Phase 2 — the one rewrite
+  // rewriteAdjacentGenerics — the one rewrite
   //===--------------------------------------------------------------------===//
 
   /// Trace a generic's input operand back to the physicalized view it was
@@ -1384,16 +1398,16 @@ struct RewriteDescriptorLayoutGenericPass
         llvm::dbgs() << "      logical d" << d << " -> ";
         if (dom->isSplit(d))
           llvm::dbgs() << "stick d" << dom->stickDim[d] << " + lane d"
-                       << dom->elemDim[d] << " at width " << dom->width[d];
+                       << dom->laneDim[d] << " at width " << dom->width[d];
         else
           llvm::dbgs() << "whole d" << dom->stickDim[d];
         llvm::dbgs() << "\n";
       }
       for (auto [i, o] : llvm::enumerate(rebuildOperands)) {
-        for (unsigned p = 0, e = o.broadcastDim.size(); p < e; ++p)
-          if (o.broadcastDim[p] >= 0)
+        for (unsigned p = 0, e = o.splatDim.size(); p < e; ++p)
+          if (o.splatDim[p] >= 0)
             llvm::dbgs() << "      operand " << i << " splat phys dim " << p
-                         << " -> fresh loop d" << o.broadcastDim[p] << "\n";
+                         << " -> fresh loop d" << o.splatDim[p] << "\n";
         llvm::dbgs() << "      operand " << i << " " << o.logicalMap << " -> "
                      << physMaps[i];
         if (!o.layout)
@@ -1500,8 +1514,8 @@ struct RewriteDescriptorLayoutGenericPass
                : failure();
   }
 
-  /// Before Phase 1 mutates anything, check that every consumer of a
-  /// to-be-physicalized load is a linalg.generic or a ktdp.store.
+  /// Before physicalizeDescriptors mutates anything, check that every consumer
+  /// of a to-be-physicalized load is a linalg.generic or a ktdp.store.
   LogicalResult checkConsumersAreRewritable(ModuleOp module) {
     LogicalResult result = success();
     module.walk([&](triton::SpyreTensorLayoutOp marker) {
@@ -1528,9 +1542,10 @@ struct RewriteDescriptorLayoutGenericPass
     return result;
   }
 
-  /// The generics adjacent to a physicalized view: for each view Phase 1
-  /// recorded, every generic that reads one of its loads or supplies one of its
-  /// stores. Listed once each, in the order the views were physicalized.
+  /// The generics adjacent to a physicalized view: for each view
+  /// physicalizeDescriptors recorded, every generic that reads one of its loads
+  /// or supplies one of its stores. Listed once each, in the order the views
+  /// were physicalized.
   ///
   /// This is the whole scope of the rewrite, and starting from the views is what
   /// makes that legible: a generic on no physicalized chain is never looked at,
@@ -1564,12 +1579,13 @@ struct RewriteDescriptorLayoutGenericPass
 
   /// No ModuleOp parameter: the recorded views are the entry points now, so
   /// nothing here needs the module to walk.
-  LogicalResult runPhase2() {
+  LogicalResult rewriteAdjacentGenerics() {
     SmallVector<linalg::GenericOp> generics;
     collectAdjacentGenerics(generics);
     LLVM_DEBUG(llvm::dbgs()
-               << "    " << generics.size()
-               << " generic(s) adjacent to a physicalized view\n");
+               << "[rewrite-descriptor-layout-generic] rewriting "
+               << generics.size() << " generic(s) adjacent to "
+               << physViewOf.size() << " physicalized view(s)\n");
     for (auto g : generics)
       if (failed(rewriteGeneric(g)))
         return failure();
@@ -1577,7 +1593,7 @@ struct RewriteDescriptorLayoutGenericPass
   }
 
   //===--------------------------------------------------------------------===//
-  // Phase 3 — marker cleanup
+  // eraseMarkers — the cleanup
   //===--------------------------------------------------------------------===//
 
   void eraseMarker(triton::SpyreTensorLayoutOp marker) {
@@ -1587,6 +1603,15 @@ struct RewriteDescriptorLayoutGenericPass
     marker.erase();
     if (castOp && castOp.use_empty())
       castOp.erase();
+  }
+
+  /// Erase every marker, and with it the bridge cast that held the superseded
+  /// logical view alive.
+  void eraseMarkers(ArrayRef<triton::SpyreTensorLayoutOp> markers) {
+    LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout-generic] erasing "
+                            << markers.size() << " marker(s)\n");
+    for (auto marker : markers)
+      eraseMarker(marker);
   }
 
   void runOnOperation() override {
@@ -1610,25 +1635,11 @@ struct RewriteDescriptorLayoutGenericPass
     if (failed(checkConsumersAreRewritable(module)))
       return signalPassFailure();
 
-    LLVM_DEBUG(llvm::dbgs()
-               << "[rewrite-descriptor-layout-generic] Phase 1: physicalizing "
-               << "descriptors\n");
-    for (auto marker : markers)
-      if (failed(physicalizeDescriptor(marker)))
-        return signalPassFailure();
-
-    LLVM_DEBUG(llvm::dbgs()
-               << "[rewrite-descriptor-layout-generic] Phase 2: rewriting the "
-               << "generics adjacent to " << physViewOf.size()
-               << " physicalized view(s)\n");
-    if (failed(runPhase2()))
+    if (failed(physicalizeDescriptors(markers)))
       return signalPassFailure();
-
-    LLVM_DEBUG(llvm::dbgs()
-               << "[rewrite-descriptor-layout-generic] Phase 3: erasing "
-               << markers.size() << " marker(s)\n");
-    for (auto marker : markers)
-      eraseMarker(marker);
+    if (failed(rewriteAdjacentGenerics()))
+      return signalPassFailure();
+    eraseMarkers(markers);
 
     for (auto memViewOp : deadLogicalMemViews)
       if (memViewOp->getBlock() && memViewOp.use_empty())
