@@ -1,12 +1,24 @@
 // RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic=data-layout=host -split-input-file | FileCheck %s --check-prefix=HOST
 // RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic -split-input-file | FileCheck %s --check-prefix=DEVICE
 
-// The two data layouts, on the same descriptors.
+// Where the physical memory view's strides come from.
 //
-// data-layout=host derives physical strides from the view's logical strides
-// through the coordinate map; device mode ignores them and lays the physical
-// shape out row-major. Every module here is checked under both prefixes, so
-// neither mode's checks can pass by matching the other's output.
+// Physicalizing a ktdp.construct_memory_view restates its sizes from the marker,
+// and the data-layout option decides what to do about the strides:
+// data-layout=host derives each physical stride from the view's LOGICAL strides
+// through the coordinate map, so the physical view still addresses host-order
+// data; data-layout=device (the default) ignores the logical strides entirely
+// and lays the physical shape out row-major.
+//
+// Every module here is checked under BOTH prefixes, so neither mode's checks can
+// pass by matching the other's output -- which is the only way to state a
+// difference between two whole-view stride computations. The three cases are the
+// same rule at a static shape, then at a dynamic size and a dynamic logical
+// stride, where device mode has to emit stride arithmetic that host mode can read
+// straight off the input.
+//
+// Checks are hand-written and minimal on purpose: the claim is the strides on the
+// physical view, not the whole module.
 
 // Case 1 -- static shape.
 //
