@@ -1,19 +1,21 @@
 // RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic -split-input-file -verify-diagnostics
 
-// A marker that is well formed and still wrong for the context it annotates.
+// A layout that is well formed and still wrong for the context it annotates.
 //
-// Every marker here passes tt.spyre_tensor_layout's own verifier: the fields are
-// consistent, the splits are paired, the ranks line up. What is wrong is the fit
-// between the marker and something the verifier cannot see -- the block the tile
-// reads, another operand's marker, or the op that consumes the load. So each
+// Every tts.tensor_layout here passes the tts dialect's own verifier: the fields
+// are consistent, the splits are paired, the ranks line up. What is wrong is the
+// fit between the layout and something the verifier cannot see -- the block the
+// tile reads, another operand's layout, or the op that consumes the load. So each
 // diagnostic has to come from the pass, and each has to name the pass or the op
 // rather than surfacing later as a verifier failure about an indexing map.
 //
 // These three are reachable through the shapes the backend's own lowering
-// produces. Diagnostics about a MALFORMED marker, or a malformed KTIR chain
-// beneath one, live in invalid-ktir.mlir.
+// produces. Diagnostics about a layout the pass cannot consume at all, or a
+// malformed KTIR chain beneath one it can, live in invalid-ktir.mlir; the
+// structural rules the verifier owns are in
+// test/Dialect/TTS/tensor-layout-verifier.mlir.
 
-// Case 1 -- the marker does not fit the block.
+// Case 1 -- the layout does not fit the block.
 //
 // The mod dim's extent IS the stick width, so a block whose logical extent on the
 // split dim is below that width would give a physical dim wider than the data it
@@ -25,11 +27,10 @@ module {
 tt.func @block_smaller_than_stick(%ptr: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
   %c0 = arith.constant 0 : index
   %ai = builtin.unrealized_conversion_cast %ptr : !tt.ptr<f32> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [64, 32], strides: [32, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>} : memref<64x32xf32>
-  %ad = builtin.unrealized_conversion_cast %av : memref<64x32xf32> to !tt.tensordesc<64x32xf32>
   // Stick-on-N at width 64, but N is only 32.
-  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <64x32xf32>
-  // expected-error @below {{spyre_tensor_layout: block extent of stick dim (32) is smaller than the stick size (64); a stick dim cannot be sub-stick}}
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 32], strides: [32, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x32xf32>
+  // expected-error @below {{tts.tensor_layout: block extent of stick dim (32) is smaller than the stick size (64); a stick dim cannot be sub-stick}}
   %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x32xf32> -> !ktdp.access_tile<64x32xindex>
   %al = ktdp.load %at : <64x32xindex> -> tensor<64x32xf32>
 
@@ -43,13 +44,13 @@ tt.func @block_smaller_than_stick(%ptr: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
 
 // -----
 
-// Case 2 -- two markers disagree about one loop dim.
+// Case 2 -- two layouts disagree about one loop dim.
 //
 // The rebuilt domain gives a split dim a (stick, elem) pair with ONE width, and an
 // operand holding that dim whole addresses it as `stick * width + elem` -- see
 // rebuild-composite.mlir. The pair can have only one pair of extents, so two
 // widths on one loop dim leave no such composite -- and naming the two candidates
-// shows why neither choice is safe. The third operand, %c, carries no marker and
+// shows why neither choice is safe. The third operand, %c, carries no layout and
 // so holds logical dim 1 whole at 128; it is the one that would have to read a
 // composite, and its two candidates are
 //
@@ -67,21 +68,19 @@ module {
 tt.func @two_stick_widths_on_one_dim(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>) {
   %c0 = arith.constant 0 : index
   %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %ad = builtin.unrealized_conversion_cast %av : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <64x128xf32>
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
   %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf32>
 
   %bi = builtin.unrealized_conversion_cast %b : !tt.ptr<f32> to index
-  %bv = ktdp.construct_memory_view %bi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %bd = builtin.unrealized_conversion_cast %bv : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
   // Same logical dim, same role, width 32 rather than 64.
-  tt.spyre_tensor_layout %bd {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>} : <64x128xf32>
+  %bv = ktdp.construct_memory_view %bi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>}} : memref<64x128xf32>
   %bt = ktdp.construct_access_tile %bv[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %bl = ktdp.load %bt : <64x128xindex> -> tensor<64x128xf32>
 
-  // The third operand carries no marker, so it holds logical dim 1 whole and is
+  // The third operand carries no layout, so it holds logical dim 1 whole and is
   // the one that would have to read a composite.
   %ci = builtin.unrealized_conversion_cast %c : !tt.ptr<f32> to index
   %cv = ktdp.construct_memory_view %ci, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
@@ -101,11 +100,12 @@ tt.func @two_stick_widths_on_one_dim(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt
 
 // -----
 
-// Case 3 -- the marker is fine and the consumer is the wrong shape of op.
+// Case 3 -- the layout is fine and the consumer is the wrong shape of op.
 //
 // LowerComputeOps lowers tt.dot to a NAMED linalg.matmul, which is fixed at
 // logical rank and so cannot carry a stick dim. This pass rewrites only generics,
-// so it rejects the op up front, before Phase 1 retypes the load underneath it.
+// so it rejects the op up front, before physicalizeDescriptors retypes the load
+// underneath it.
 // The ordering is the point: retyping first would leave a rank mismatch that
 // MLIR's own verifier reports against an indexing map, naming neither this pass
 // nor what it could not restate.
@@ -119,9 +119,8 @@ module {
 tt.func @named_matmul_declines(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f16>) {
   %c0 = arith.constant 0 : index
   %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f16> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [128, 64], strides: [64, 1] {coordinate_set = #sa, memory_space = #ktdp.memory_space<global>} : memref<128x64xf16>
-  %ad = builtin.unrealized_conversion_cast %av : memref<128x64xf16> to !tt.tensordesc<128x64xf16>
-  tt.spyre_tensor_layout %ad {phys_src = array<i64: 0, 1, 0>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <128x64xf16>
+  %av = ktdp.construct_memory_view %ai, sizes: [128, 64], strides: [64, 1] {coordinate_set = #sa, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 1, 0>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<128x64xf16>
   %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #sa} : memref<128x64xf16> -> !ktdp.access_tile<128x64xindex>
   %al = ktdp.load %at : <128x64xindex> -> tensor<128x64xf16>
 

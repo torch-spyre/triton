@@ -59,7 +59,7 @@
 // names it before -- the one shape where the two inputs cannot both have a
 // monotone map, since the domain has to pick one order for the pair.
 //
-// The output carries no marker, so it stays logical and pins nothing: it names
+// The output carries no layout, so it stays logical and pins nothing: it names
 // only the M piece, and the pair's relative order is decided entirely by the
 // inputs. The pass resolves it by first-merged-wins -- A, the earlier operand,
 // gets the plain projected permutation and B gets the legal non-monotone map
@@ -105,18 +105,16 @@ module {
 tt.func @two_inputs_opposite_order(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
   %c0 = arith.constant 0 : index
   %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %ad = builtin.unrealized_conversion_cast %av : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
   // Stick dim first.
-  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <64x128xf32>
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
   %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id2, access_tile_set = #s2} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf32>
 
   %bi = builtin.unrealized_conversion_cast %b : !tt.ptr<f32> to index
-  %bv = ktdp.construct_memory_view %bi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %bd = builtin.unrealized_conversion_cast %bv : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
   // The one line that differs from A: stick dim second.
-  tt.spyre_tensor_layout %bd {phys_src = array<i64: 0, 1, 1>, phys_op = array<i64: 0, 1, 2>, phys_arg = array<i64: 0, 64, 64>} : <64x128xf32>
+  %bv = ktdp.construct_memory_view %bi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 1, 1>, phys_op = array<i64: 0, 1, 2>, phys_arg = array<i64: 0, 64, 64>}} : memref<64x128xf32>
   %bt = ktdp.construct_access_tile %bv[%c0, %c0] {access_tile_order = #id2, access_tile_set = #s2} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %bl = ktdp.load %bt : <64x128xindex> -> tensor<64x128xf32>
 

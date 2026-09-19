@@ -1,10 +1,11 @@
 //===- RewriteDescriptorLayoutGeneric.cpp ---------------------------------===//
 //
 // Rewrites logical tensor descriptors to their physical (stick-tiled) layout,
-// driven by tt.spyre_tensor_layout markers, and retypes the compute ops on the
-// annotated chain — which are all linalg.generic.
+// driven by the `tts.tensor_layout` attribute on a ktdp.construct_memory_view,
+// and retypes the compute ops on the annotated chain — which are all
+// linalg.generic.
 //
-// The marker carries the physical layout as the OpSpec `device_coordinates`
+// The attribute carries the physical layout as the OpSpec `device_coordinates`
 // form, three i64 arrays with one entry per physical dim:
 //   phys_src[p] : the logical dim physical dim p derives from
 //   phys_op[p]  : 0 = identity, 1 = floordiv, 2 = mod, 3 = splat
@@ -16,16 +17,26 @@
 // instead of partitioning it, so [M] -> phys_src=[0,0] phys_op=[0,3]
 // phys_arg=[0,64] gives physical size [M, 64].
 //
-//   physicalizeDescriptors   physicalize each annotated descriptor: memory view,
-//            access tiles, loads. Stores have their access tile redirected. Each
-//            physicalized view is recorded against the layout it was
-//            physicalized under.
+// The layout sits ON the view rather than beside it, so the annotated view IS
+// the root of the rewrite: there is no marker op to find the view from and no
+// bridge cast to peer through.
+//
+//   physicalizeDescriptors   physicalize each annotated view: the view itself,
+//            its access tiles, its loads. Stores have their access tile
+//            redirected. Each physicalized view is recorded against the layout
+//            it was physicalized under.
 //   rewriteAdjacentGenerics  for each recorded view, find the generics that read
 //            its loads or supply its stores, and restate each one over the
 //            physical loop domain. Every generic the pass considers is reached
 //            this way, so the recorded views are the scope; no fixpoint, no
 //            pattern driver, and each generic is rewritten at most once.
-//   eraseMarkers  erase the markers and their now-dead bridge casts.
+//
+// There is no erase phase. The superseded logical view is dropped by the dead-
+// view sweep at the end of runOnOperation, which is all that is left once
+// nothing holds it alive. IDEMPOTENCE rests on the same place it used to: a
+// second run must find no root, and it does because physicalizeMemView strips
+// `tts.tensor_layout` from the physical clone — the one attribute this pass owns
+// by deleting rather than by recomputing. See isShapeOwnedAttr.
 //
 // VOCABULARY. Two words below mean something narrower than they look, and one of
 // them collides with an op.
@@ -53,6 +64,7 @@
 
 #include "Dialect/KTDP/Transforms/Passes.h"
 #include "Dialect/KTDP/Utils/Utility.h"
+#include "Dialect/TTS/IR/Dialect.h"
 #include "Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
@@ -305,22 +317,22 @@ static Value rebuildInIndexDomain(OpBuilder &b, Location loc, Value v) {
 }
 
 //===----------------------------------------------------------------------===//
-// The coordinate map, read off a marker
+// The coordinate map, read off the attribute
 //===----------------------------------------------------------------------===//
 
-/// One descriptor's physical layout: a copy of the marker's three arrays, plus
-/// the logical rank they index into.
+/// One descriptor's physical layout: a copy of the attribute's three arrays,
+/// plus the logical rank they index into.
 ///
-/// The marker is an *instruction* — it says how to split logical dims. It is
+/// The layout is an *instruction* — it says how to split logical dims. It is
 /// not a source of truth about the tensor: element type, memory space, base
 /// offset, strides, coordinate set and dynamic extents all come from the ops
 /// being rewritten, and where the two could disagree the op wins.
 ///
-/// A copy, not a view of the marker's attribute storage: a CoordMap is recorded
+/// A copy, not a view of the attribute's storage: a CoordMap is recorded
 /// against a physicalized view and read for the whole rewrite, which outlives
-/// the marker it came from. Borrowing would make that lifetime a constraint on
-/// the order the phases run in, and the ranks here are a handful of dims, so
-/// there is nothing to save by it.
+/// the annotated view it came from. Borrowing would make that lifetime a
+/// constraint on the order the phases run in, and the ranks here are a handful
+/// of dims, so there is nothing to save by it.
 struct CoordMap {
   SmallVector<int64_t, 4> src, op, arg;
   unsigned logicalRank = 0;
@@ -377,7 +389,7 @@ const char *coordOpName(CoordOp op) {
 /// Print a coord map as one physical dim per entry, each naming the logical dim
 /// it came from, the coord op that made it, and the op's argument where the
 /// argument means something. This is the whole layout in one line, which is what
-/// lets a reader check the marker against the shape derived from it below.
+/// lets a reader check the attribute against the shape derived from it below.
 ///
 /// Reached only from an LLVM_DEBUG body, so a release build has no caller left;
 /// [[maybe_unused]] keeps that from warning.
@@ -393,33 +405,43 @@ const char *coordOpName(CoordOp op) {
   os << "]";
 }
 
-/// Read the coord map off a marker, checking phys_src against `logicalRank`.
+/// Read a coord map off the three arrays of a `tts.tensor_layout`, against
+/// `logicalRank`.
 ///
-/// Most of what this checks, SpyreTensorLayoutOp::verify() checks too; the
-/// deletion note at the top of RewriteDescriptorLayout.cpp records that the
-/// overlap needs an owner when the op becomes a tts attribute.
-FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
-                                 unsigned logicalRank) {
+/// Two tiers of check, and which tier a rule is in is the thing to keep
+/// straight:
+///
+///   The STRUCTURAL rules — parallel lengths, the phys_src and phys_op ranges,
+///   phys_arg positivity, and the stick-split / splat-re-stick pairings — are
+///   not restated here. They belong to the attribute, and the tts dialect's
+///   verifyOperationAttribute enforces them on every annotated op at every
+///   verification point. This calls the same function that hook does, so a
+///   caller that reached the layout some other way than by parsing verified IR
+///   is held to the identical rules rather than to a second copy of them. That
+///   single owner is the decision recorded in the deletion note at the top of
+///   RewriteDescriptorLayout.cpp; SpyreTensorLayoutOp::verify() still holds its
+///   own copy for the op form, and that duplication ends with the op.
+///
+///   The CONSUMER rules below are this pass's, and are stricter. A layout that
+///   drops a logical dim, or carries one half of a split, or splats a dim it
+///   does not also carry whole, is a well-formed coordinate map that this
+///   rewrite cannot build an addressable map from. They are checked here, where
+///   that map would be built, rather than in the verifier — an annotation is
+///   allowed to be more general than one consumer of it.
+FailureOr<CoordMap>
+readCoordMap(ArrayRef<int64_t> physSrc, ArrayRef<int64_t> physOp,
+             ArrayRef<int64_t> physArg, unsigned logicalRank,
+             llvm::function_ref<InFlightDiagnostic()> emitError) {
+  if (failed(triton::tts::verifyTensorLayoutArrays(physSrc, physOp, physArg,
+                                                  logicalRank, emitError)))
+    return failure();
+
   CoordMap cm;
-  ArrayRef<int64_t> physSrc = marker.getPhysSrc(), physOp = marker.getPhysOp(),
-                    physArg = marker.getPhysArg();
   cm.src.assign(physSrc.begin(), physSrc.end());
   cm.op.assign(physOp.begin(), physOp.end());
   cm.arg.assign(physArg.begin(), physArg.end());
   cm.logicalRank = logicalRank;
-  if (cm.op.size() != cm.physRank() || cm.arg.size() != cm.physRank())
-    return marker.emitError("spyre_tensor_layout: phys_src, phys_op and "
-                            "phys_arg must have the same length");
-  for (unsigned p = 0, e = cm.physRank(); p < e; ++p) {
-    if (cm.src[p] < 0 || cm.src[p] >= (int64_t)logicalRank)
-      return marker.emitError("spyre_tensor_layout: phys_src out of range for "
-                              "logical rank ")
-             << logicalRank;
-    if (cm.op[p] < 0 || cm.op[p] > 3)
-      return marker.emitError("spyre_tensor_layout: phys_op must be 0 "
-                              "(identity), 1 (floordiv), 2 (mod) or 3 "
-                              "(splat)");
-  }
+
   // A delinearization names the same logical dim twice, once floordiv and once
   // mod, the pair being the multi-index over (ceildiv(extent, W), W). One
   // component without the other would leave the rebuild unable to state where the
@@ -433,43 +455,34 @@ FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
     // collectPieces emits a piece for logical position d only when some physical
     // dim has src[p] == d.
     //
-    // Nothing upstream rejects it: SpyreTensorLayoutOp::verify() tallies the
-    // physical dims per logical dim and would answer this in a line, but it only
-    // constrains a dim named TWICE and lets a dim named zero times through.
+    // The shared structural checker does not answer this: it tallies the
+    // physical dims per logical dim, but only constrains a dim named TWICE and
+    // lets a dim named zero times through.
     //
     // It is also what makes collectPieces' skips safe, and with them the claim
     // that buildLoopDomain needs no catch-all: because every logical dim is
-    // sourced, that walk visits every logical position of a marked operand. Both
-    // sites say so; keep the three in step.
-    //
-    // That verifier is arguably the better home even so — this is a property of
-    // the marker alone, and the structural tallies are already there. It is here
-    // to keep lib/Dialect/Triton/IR/Ops.cpp untouched, since that file is being
-    // reverted to upstream when the op moves to the tts dialect; the deletion
-    // note at the top of RewriteDescriptorLayout.cpp records the same ownership
-    // question for the rest of this function's overlap.
+    // sourced, that walk visits every logical position of an annotated operand.
+    // Both sites say so; keep the three in step.
     if (!cm.names(d))
-      return marker.emitError("spyre_tensor_layout: logical dim ")
-             << d
-             << " is named by no phys_src entry, so its extent would be "
-                "dropped from the physical layout";
+      return emitError() << "tts.tensor_layout: logical dim " << d
+                         << " is named by no phys_src entry, so its extent "
+                            "would be dropped from the physical layout";
     bool hasFloor = cm.findPhys(d, CoordOp::FloorDiv) >= 0;
     bool hasMod = cm.findPhys(d, CoordOp::Mod) >= 0;
     if (hasFloor != hasMod)
-      return marker.emitError("spyre_tensor_layout: logical dim ")
-             << d << " has a " << (hasFloor ? "floordiv" : "mod")
-             << " physical dim without the matching "
-             << (hasFloor ? "mod" : "floordiv") << " half";
+      return emitError() << "tts.tensor_layout: logical dim " << d << " has a "
+                         << (hasFloor ? "floordiv" : "mod")
+                         << " physical dim without the matching "
+                         << (hasFloor ? "mod" : "floordiv") << " half";
     // A splat replicates the dim it names, so that dim must also be present
     // whole for the replication to have something to replicate. It cannot be
     // present as a split: the elements would then live in the floordiv/mod pair
     // and the splat axis would name a third copy of them.
     if (cm.findPhys(d, CoordOp::Splat) >= 0 &&
         cm.findPhys(d, CoordOp::Identity) < 0)
-      return marker.emitError("spyre_tensor_layout: logical dim ")
-             << d
-             << " is splat but has no identity physical dim; a splat "
-                "replicates a dim that is also carried whole";
+      return emitError() << "tts.tensor_layout: logical dim " << d
+                         << " is splat but has no identity physical dim; a "
+                            "splat replicates a dim that is also carried whole";
   }
   return cm;
 }
@@ -507,8 +520,8 @@ FailureOr<RankedTensorType> physicalTensorType(const CoordMap &cm,
 //===----------------------------------------------------------------------===//
 
 /// One value's place in the rebuild: its logical indexing map, and the layout
-/// it is physicalized under. `layout` is null for a value that carries no
-/// marker and therefore stays logical.
+/// it is physicalized under. `layout` is null for a value on no annotated chain,
+/// which therefore stays logical.
 struct RebuildOperand {
   AffineMap logicalMap;
   const CoordMap *layout = nullptr;
@@ -718,11 +731,11 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
   // catch-all step: `order` is exactly the pieces, and its size is #logical +
   // #split. The argument, in four parts:
   //
-  //   - a marked operand sources every logical dim — readCoordMap rejects a
-  //     marker that leaves one out — so collectPieces visits every one of its
+  //   - an annotated operand sources every logical dim — readCoordMap rejects a
+  //     layout that leaves one out — so collectPieces visits every one of its
   //     logical positions and emits a piece for each whose map result is a bare
   //     AffineDimExpr;
-  //   - an unmarked operand's walk IS its map results, one per position, so
+  //   - an unannotated operand's walk IS its map results, one per position, so
   //     likewise;
   //   - every loop dim is named by a bare AffineDimExpr in at least one
   //     operand's map, or the generic handed to this pass was already
@@ -929,14 +942,17 @@ struct RewriteDescriptorLayoutGenericPass
   /// looks an operand up in, once it has a generic in hand.
   ///
   /// A MapVector, not a DenseMap, because the rewrite's order comes off this
-  /// container and a DenseMap's iteration order is not the order the markers
-  /// were physicalized in — the rewrite would be run in an order that varied
-  /// with the pointer values.
+  /// container and a DenseMap's iteration order is not the order the annotated
+  /// views were physicalized in — the rewrite would be run in an order that
+  /// varied with the pointer values.
   llvm::MapVector<Operation *, CoordMap> physViewOf;
 
   /// Logical construct_memory_view ops superseded by physicalizeDescriptors.
-  /// They cannot be erased there: the marker's bridge cast still holds them, and
-  /// that cast only dies in eraseMarkers.
+  /// Erased in one sweep at the end, each guarded on having no uses left, rather
+  /// than at the point each is superseded: physicalizeDescriptor repoints the
+  /// tile users it knows about, and a view still held by anything else is a
+  /// state the rewrite should leave standing for a later diagnostic to name
+  /// rather than delete out from under.
   SmallVector<mlir::ktdp::ConstructMemoryViewOp> deadLogicalMemViews;
 
   //===--------------------------------------------------------------------===//
@@ -953,7 +969,7 @@ struct RewriteDescriptorLayoutGenericPass
   /// Compute the physical sizes of `memViewOp` under `cm`.
   FailureOr<PhysicalSizes>
   physicalSizes(const CoordMap &cm, mlir::ktdp::ConstructMemoryViewOp memViewOp,
-                OpBuilder &b, triton::SpyreTensorLayoutOp marker) {
+                OpBuilder &b) {
     ArrayRef<int64_t> logStatic = memViewOp.getStaticSizes();
     ValueRange logDyn = memViewOp.getSizes();
     Location loc = memViewOp.getLoc();
@@ -972,7 +988,7 @@ struct RewriteDescriptorLayoutGenericPass
         continue;
       }
       if (dynPos[d] < 0)
-        return marker.emitError("spyre_tensor_layout: physical dim ")
+        return memViewOp.emitError("tts.tensor_layout: physical dim ")
                << p << " has no static extent and logical dim " << d
                << " supplies no dynamic one";
       out.staticSizes.push_back(ShapedType::kDynamic);
@@ -1043,10 +1059,21 @@ struct RewriteDescriptorLayoutGenericPass
   ///
   /// Per op, this is also the only place that says which attributes the rewrite
   /// of that op restates.
+  ///
+  /// `tts.tensor_layout` is owned differently from the rest: it is not
+  /// recomputed but DELETED. It is the instruction to physicalize, so a physical
+  /// view carrying it would be an instruction to physicalize something already
+  /// physical, and the clone below would hand it to a second run of the pass.
+  /// Dropping it is what makes the pass idempotent, in the same structural way
+  /// the marker op's erasure used to — a second run finds no root. Listing it
+  /// here is what lets verifyAttributesCarried permit the drop; that check
+  /// exists to catch the attribute nobody thought about, so the one attribute
+  /// the pass does think about has to say so.
   static bool isShapeOwnedAttr(StringRef name, Operation *op) {
     if (isa<mlir::ktdp::ConstructMemoryViewOp>(op))
       return name == "static_sizes" || name == "static_strides" ||
-             name == "coordinate_set" || name == "operandSegmentSizes";
+             name == "coordinate_set" || name == "operandSegmentSizes" ||
+             name == triton::tts::TTSDialect::kTensorLayoutAttrName;
     if (isa<mlir::ktdp::ConstructAccessTilesOp>(op))
       return name == "base_map" || name == "access_tile_set" ||
              name == "access_tile_order" || name == "operandSegmentSizes";
@@ -1089,11 +1116,10 @@ struct RewriteDescriptorLayoutGenericPass
     return success();
   }
 
-  /// Physicalize the memory view behind `marker`.
+  /// Physicalize an annotated memory view.
   FailureOr<Value>
   physicalizeMemView(mlir::ktdp::ConstructMemoryViewOp memViewOp,
-                     const CoordMap &cm,
-                     triton::SpyreTensorLayoutOp marker) {
+                     const CoordMap &cm) {
     OpBuilder b(memViewOp);
     Location loc = memViewOp.getLoc();
 
@@ -1102,11 +1128,11 @@ struct RewriteDescriptorLayoutGenericPass
     if (!isDenseRangeSet(memViewOp.getCoordinateSetAttr().getValue(),
                          b.getContext(), memViewOp.getStaticSizes()))
       return memViewOp.emitError(
-          "spyre_tensor_layout: coordinate_set must be the dense range of the "
+          "tts.tensor_layout: coordinate_set must be the dense range of the "
           "view's sizes to physicalize it; a partitioned set would be "
           "overwritten");
 
-    auto sizes = physicalSizes(cm, memViewOp, b, marker);
+    auto sizes = physicalSizes(cm, memViewOp, b);
     if (failed(sizes))
       return failure();
     PhysicalSizes strides = physicalStrides(cm, memViewOp, *sizes, b);
@@ -1115,6 +1141,11 @@ struct RewriteDescriptorLayoutGenericPass
     // element type and any attribute this pass has never heard of all come
     // across without being named.
     auto physOp = cast<mlir::ktdp::ConstructMemoryViewOp>(b.clone(*memViewOp));
+    // The one exception, and the reason the clone is not the whole story: the
+    // layout is the instruction, not a property of the data, so the physical
+    // view must not carry it. See isShapeOwnedAttr — this and that list are the
+    // two halves of one claim.
+    physOp->removeAttr(triton::tts::TTSDialect::kTensorLayoutAttrName);
     physOp.getSizesMutable().assign(sizes->dynSizes);
     physOp.getStridesMutable().assign(strides.dynSizes);
     physOp.setStaticSizes(sizes->staticSizes);
@@ -1134,8 +1165,7 @@ struct RewriteDescriptorLayoutGenericPass
 
   /// Physicalize one direct access tile over the already-physical `physMemView`.
   LogicalResult physicalizeAccessTile(mlir::ktdp::ConstructAccessTilesOp tileOp,
-                                      Value physMemView, const CoordMap &cm,
-                                      triton::SpyreTensorLayoutOp marker) {
+                                      Value physMemView, const CoordMap &cm) {
     OpBuilder b(tileOp);
     Location loc = tileOp.getLoc();
 
@@ -1143,7 +1173,7 @@ struct RewriteDescriptorLayoutGenericPass
     unsigned logRank = logBlock.size();
     SmallVector<int64_t> physBlock;
     if (!applyCoordMap(logBlock, cm.src, cm.op, cm.arg, physBlock))
-      return tileOp.emitError("spyre_tensor_layout: cannot derive a static "
+      return tileOp.emitError("tts.tensor_layout: cannot derive a static "
                               "physical block shape for this access tile");
 
     for (unsigned p = 0, e = cm.physRank(); p < e; ++p) {
@@ -1152,7 +1182,7 @@ struct RewriteDescriptorLayoutGenericPass
       int64_t logExtent = logBlock[cm.src[p]];
       if (logExtent != ShapedType::kDynamic && logExtent < cm.arg[p])
         return tileOp.emitError(
-                   "spyre_tensor_layout: block extent of stick dim (")
+                   "tts.tensor_layout: block extent of stick dim (")
                << logExtent << ") is smaller than the stick size (" << cm.arg[p]
                << "); a stick dim cannot be sub-stick";
     }
@@ -1176,12 +1206,12 @@ struct RewriteDescriptorLayoutGenericPass
 
     if (!tileOp.getAccessTileOrder().isIdentity())
       return tileOp.emitError(
-          "spyre_tensor_layout: access_tile_order must be the identity to "
+          "tts.tensor_layout: access_tile_order must be the identity to "
           "physicalize this tile; a permuted order would be overwritten");
     if (!isDenseRangeSet(tileOp.getAccessTileSetAttr().getValue(),
                          b.getContext(), logBlock))
       return tileOp.emitError(
-          "spyre_tensor_layout: access_tile_set must be the dense range of the "
+          "tts.tensor_layout: access_tile_set must be the dense range of the "
           "block shape to physicalize this tile; a non-dense set would be "
           "overwritten");
 
@@ -1251,7 +1281,7 @@ struct RewriteDescriptorLayoutGenericPass
         st.getAccessTileMutable().assign(physTile.getResult());
       } else {
         return user->emitError(
-            "spyre_tensor_layout: unexpected user of an access tile");
+            "tts.tensor_layout: unexpected user of an access tile");
       }
     }
 
@@ -1284,7 +1314,7 @@ struct RewriteDescriptorLayoutGenericPass
       int64_t logDim = cm.src[p];
       if (!cast<BoolAttr>(oldKinds[logDim]).getValue())
         continue;
-      return tileOp.emitError("spyre_tensor_layout: logical dim ")
+      return tileOp.emitError("tts.tensor_layout: logical dim ")
              << logDim
              << " is an indirect (gather) subscript, so it cannot be "
                 "stick-split";
@@ -1292,18 +1322,18 @@ struct RewriteDescriptorLayoutGenericPass
 
     SmallVector<int64_t> physBlock;
     if (!applyCoordMap(logBlock, cm.src, cm.op, cm.arg, physBlock))
-      return tileOp.emitError("spyre_tensor_layout: cannot derive a static "
+      return tileOp.emitError("tts.tensor_layout: cannot derive a static "
                               "physical block shape for this indirect access "
                               "tile");
 
     if (!tileOp.getVariablesSpaceOrder().isIdentity())
       return tileOp.emitError(
-          "spyre_tensor_layout: variables_space_order must be the identity to "
+          "tts.tensor_layout: variables_space_order must be the identity to "
           "physicalize this tile; a permuted order would be overwritten");
     if (!isDenseRangeSet(tileOp.getVariablesSpaceSetAttr().getValue(), ctx,
                          logBlock))
       return tileOp.emitError(
-          "spyre_tensor_layout: variables_space_set must be the dense range of "
+          "tts.tensor_layout: variables_space_set must be the dense range of "
           "the tile shape to physicalize this tile; a non-dense set would be "
           "overwritten");
 
@@ -1344,7 +1374,7 @@ struct RewriteDescriptorLayoutGenericPass
       oldToNew[c] = getAffineDimExpr(c, ctx);
     for (unsigned d = 0; d < logRank; ++d) {
       if (!logicalFromPhysical[d])
-        return tileOp.emitError("spyre_tensor_layout: logical dim ")
+        return tileOp.emitError("tts.tensor_layout: logical dim ")
                << d << " is named by no physical dim, so its subscript cannot "
                        "be restated";
       oldToNew[numCaptured + d] = logicalFromPhysical[d];
@@ -1425,7 +1455,7 @@ struct RewriteDescriptorLayoutGenericPass
         st.getAccessTileMutable().assign(physTile.getResult());
       } else {
         return user->emitError(
-            "spyre_tensor_layout: unexpected user of an indirect access tile");
+            "tts.tensor_layout: unexpected user of an indirect access tile");
       }
     }
 
@@ -1433,37 +1463,46 @@ struct RewriteDescriptorLayoutGenericPass
     return success();
   }
 
-  LogicalResult physicalizeDescriptor(triton::SpyreTensorLayoutOp marker) {
-    Value desc = marker.getDesc();
-    if (!isLoweredDescriptor(desc))
-      return marker.emitError(
-          "spyre_tensor_layout: desc operand is not a lowered descriptor");
-    Value memView = getDescriptorMemView(desc);
-    auto memViewOp = memView.getDefiningOp<mlir::ktdp::ConstructMemoryViewOp>();
-    if (!memViewOp)
-      return marker.emitError("spyre_tensor_layout: cannot locate "
-                              "construct_memory_view behind the bridge cast");
+  /// Read the layout off `memViewOp`, which the caller has established carries
+  /// one.
+  ///
+  /// The logical rank is the view's own rank, measured off the same static-sizes
+  /// array every consumer below indexes with phys_src — so this is the rank the
+  /// checks are about, not merely a rank that happens to agree with it.
+  FailureOr<CoordMap>
+  readLayout(mlir::ktdp::ConstructMemoryViewOp memViewOp) {
+    auto emitError = [&]() { return memViewOp.emitError(); };
+    ArrayRef<int64_t> physSrc, physOp, physArg;
+    if (failed(triton::tts::readTensorLayoutArrays(
+            memViewOp->getAttr(triton::tts::TTSDialect::kTensorLayoutAttrName),
+            physSrc, physOp, physArg, emitError)))
+      return failure();
+    return readCoordMap(physSrc, physOp, physArg,
+                        memViewOp.getStaticSizes().size(), emitError);
+  }
 
-    auto cm = readCoordMap(marker, memViewOp.getStaticSizes().size());
+  LogicalResult
+  physicalizeDescriptor(mlir::ktdp::ConstructMemoryViewOp memViewOp) {
+    auto cm = readLayout(memViewOp);
     if (failed(cm))
       return failure();
 
     LLVM_DEBUG({
-      llvm::dbgs() << "  descriptor at " << marker.getLoc() << ": ";
+      llvm::dbgs() << "  descriptor at " << memViewOp.getLoc() << ": ";
       printCoordMap(llvm::dbgs(), *cm);
       llvm::dbgs() << "\n";
     });
 
     SmallVector<mlir::ktdp::ConstructAccessTilesOp> tiles;
     SmallVector<mlir::ktdp::ConstructIndirectAccessTilesOp> indirectTiles;
-    for (Operation *user : memView.getUsers())
+    for (Operation *user : memViewOp.getResult().getUsers())
       if (auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(user))
         tiles.push_back(tile);
       else if (auto indirect =
                    dyn_cast<mlir::ktdp::ConstructIndirectAccessTilesOp>(user))
         indirectTiles.push_back(indirect);
 
-    auto physMemView = physicalizeMemView(memViewOp, *cm, marker);
+    auto physMemView = physicalizeMemView(memViewOp, *cm);
     if (failed(physMemView))
       return failure();
 
@@ -1472,7 +1511,7 @@ struct RewriteDescriptorLayoutGenericPass
       physViewOf.try_emplace(physViewOp, *cm);
 
     for (auto tile : tiles)
-      if (failed(physicalizeAccessTile(tile, *physMemView, *cm, marker)))
+      if (failed(physicalizeAccessTile(tile, *physMemView, *cm)))
         return failure();
     for (auto tile : indirectTiles)
       if (failed(physicalizeIndirectAccessTile(tile, *physMemView, *cm)))
@@ -1482,15 +1521,15 @@ struct RewriteDescriptorLayoutGenericPass
     return success();
   }
 
-  /// Physicalize the descriptor behind every marker, recording each
-  /// physicalized view against the layout it was physicalized under.
-  LogicalResult
-  physicalizeDescriptors(ArrayRef<triton::SpyreTensorLayoutOp> markers) {
+  /// Physicalize every annotated view, recording each physicalized view against
+  /// the layout it was physicalized under.
+  LogicalResult physicalizeDescriptors(
+      ArrayRef<mlir::ktdp::ConstructMemoryViewOp> annotatedViews) {
     LLVM_DEBUG(llvm::dbgs()
                << "[rewrite-descriptor-layout-generic] physicalizing "
-               << markers.size() << " descriptor(s)\n");
-    for (auto marker : markers)
-      if (failed(physicalizeDescriptor(marker)))
+               << annotatedViews.size() << " descriptor(s)\n");
+    for (auto view : annotatedViews)
+      if (failed(physicalizeDescriptor(view)))
         return failure();
     return success();
   }
@@ -1751,14 +1790,12 @@ struct RewriteDescriptorLayoutGenericPass
 
   /// Before physicalizeDescriptors mutates anything, check that every consumer
   /// of a to-be-physicalized load is a linalg.generic or a ktdp.store.
-  LogicalResult checkConsumersAreRewritable(ModuleOp module) {
+  LogicalResult
+  checkConsumersAreRewritable(
+      ArrayRef<mlir::ktdp::ConstructMemoryViewOp> annotatedViews) {
     LogicalResult result = success();
-    module.walk([&](triton::SpyreTensorLayoutOp marker) {
-      Value desc = marker.getDesc();
-      if (!isLoweredDescriptor(desc))
-        return;
-      Value memView = getDescriptorMemView(desc);
-      for (Operation *tile : memView.getUsers())
+    for (auto view : annotatedViews)
+      for (Operation *tile : view.getResult().getUsers())
         for (Value tileRes : tile->getResults())
           for (Operation *user : tileRes.getUsers()) {
             auto ld = dyn_cast<mlir::ktdp::LoadOp>(user);
@@ -1773,7 +1810,6 @@ struct RewriteDescriptorLayoutGenericPass
                 result = failure();
               }
           }
-    });
     return result;
   }
 
@@ -1827,46 +1863,32 @@ struct RewriteDescriptorLayoutGenericPass
     return success();
   }
 
-  //===--------------------------------------------------------------------===//
-  // eraseMarkers — the cleanup
-  //===--------------------------------------------------------------------===//
-
-  void eraseMarker(triton::SpyreTensorLayoutOp marker) {
-    if (!marker->getBlock())
-      return;
-    auto castOp = marker.getDesc().getDefiningOp<UnrealizedConversionCastOp>();
-    marker.erase();
-    if (castOp && castOp.use_empty())
-      castOp.erase();
-  }
-
-  /// Erase every marker, and with it the bridge cast that held the superseded
-  /// logical view alive.
-  void eraseMarkers(ArrayRef<triton::SpyreTensorLayoutOp> markers) {
-    LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout-generic] erasing "
-                            << markers.size() << " marker(s)\n");
-    for (auto marker : markers)
-      eraseMarker(marker);
-  }
-
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    SmallVector<triton::SpyreTensorLayoutOp> markers;
-    module.walk([&](triton::SpyreTensorLayoutOp op) { markers.push_back(op); });
+    // Collected before anything is rewritten, and into a vector rather than
+    // visited in place: physicalizeMemView inserts the physical clone next to
+    // the view it came from, so a walk that rewrote as it went would be adding
+    // ops to the region it is walking. The clone does not carry the layout, so
+    // it would not be a root — but the list is also the scope
+    // checkConsumersAreRewritable checks below, which has to be the pre-rewrite
+    // scope.
+    SmallVector<mlir::ktdp::ConstructMemoryViewOp> annotatedViews;
+    module.walk([&](mlir::ktdp::ConstructMemoryViewOp op) {
+      if (op->hasAttr(triton::tts::TTSDialect::kTensorLayoutAttrName))
+        annotatedViews.push_back(op);
+    });
 
-    LLVM_DEBUG(llvm::dbgs()
-               << "[rewrite-descriptor-layout-generic] " << markers.size()
-               << " layout marker(s)\n");
+    LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout-generic] "
+                            << annotatedViews.size() << " annotated view(s)\n");
 
-    if (failed(checkConsumersAreRewritable(module)))
+    if (failed(checkConsumersAreRewritable(annotatedViews)))
       return signalPassFailure();
 
-    if (failed(physicalizeDescriptors(markers)))
+    if (failed(physicalizeDescriptors(annotatedViews)))
       return signalPassFailure();
     if (failed(rewriteAdjacentGenerics()))
       return signalPassFailure();
-    eraseMarkers(markers);
 
     for (auto memViewOp : deadLogicalMemViews)
       if (memViewOp->getBlock() && memViewOp.use_empty())

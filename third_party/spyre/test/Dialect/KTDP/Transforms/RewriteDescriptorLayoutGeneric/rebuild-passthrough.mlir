@@ -18,9 +18,9 @@
 
 // Case 1 -- every operand split identically.
 //
-// All three markers split logical dim 1 at the same width, so no operand holds a
+// All three layouts split logical dim 1 at the same width, so no operand holds a
 // split dim whole and no map carries arithmetic. The physical dim order is the
-// marker's, (K/W, M, K%W), so the emitted identity is over (ks, m, kl) rather
+// layout's, (K/W, M, K%W), so the emitted identity is over (ks, m, kl) rather
 // than the logical order grown on the right.
 //
 // The width here is 32, not the 64 every other positive case in this directory
@@ -72,21 +72,18 @@ module {
 tt.func @elementwise_split_alike(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>) {
   %c0 = arith.constant 0 : index
   %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %ad = builtin.unrealized_conversion_cast %av : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>} : <64x128xf32>
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>}} : memref<64x128xf32>
   %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #s2} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf32>
   %bi = builtin.unrealized_conversion_cast %b : !tt.ptr<f32> to index
-  %bv = ktdp.construct_memory_view %bi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %bd = builtin.unrealized_conversion_cast %bv : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %bd {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>} : <64x128xf32>
+  %bv = ktdp.construct_memory_view %bi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>}} : memref<64x128xf32>
   %bt = ktdp.construct_access_tile %bv[%c0, %c0] {access_tile_order = #id, access_tile_set = #s2} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %bl = ktdp.load %bt : <64x128xindex> -> tensor<64x128xf32>
   %ci = builtin.unrealized_conversion_cast %c : !tt.ptr<f32> to index
-  %cv = ktdp.construct_memory_view %ci, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %cd = builtin.unrealized_conversion_cast %cv : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %cd {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>} : <64x128xf32>
+  %cv = ktdp.construct_memory_view %ci, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>}} : memref<64x128xf32>
   %ct = ktdp.construct_access_tile %cv[%c0, %c0] {access_tile_order = #id, access_tile_set = #s2} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %e = tensor.empty() : tensor<64x128xf32>
   %r = linalg.generic {indexing_maps = [#id, #id, #id], iterator_types = ["parallel", "parallel"]} ins(%al, %bl : tensor<64x128xf32>, tensor<64x128xf32>) outs(%e : tensor<64x128xf32>) {
@@ -155,9 +152,8 @@ module {
 tt.func @broadcast_operand_not_split(%a: !tt.ptr<f32>, %s: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
   %c0 = arith.constant 0 : index
   %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [24, 128], strides: [128, 1] {coordinate_set = #sx, memory_space = #ktdp.memory_space<global>} : memref<24x128xf32>
-  %ad = builtin.unrealized_conversion_cast %av : memref<24x128xf32> to !tt.tensordesc<24x128xf32>
-  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <24x128xf32>
+  %av = ktdp.construct_memory_view %ai, sizes: [24, 128], strides: [128, 1] {coordinate_set = #sx, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<24x128xf32>
   %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sx} : memref<24x128xf32> -> !ktdp.access_tile<24x128xindex>
   %al = ktdp.load %at : <24x128xindex> -> tensor<24x128xf32>
   %si = builtin.unrealized_conversion_cast %s : !tt.ptr<f32> to index
@@ -165,9 +161,8 @@ tt.func @broadcast_operand_not_split(%a: !tt.ptr<f32>, %s: !tt.ptr<f32>, %o: !tt
   %st = ktdp.construct_access_tile %sv[%c0, %c0] {access_tile_order = #id2, access_tile_set = #ss} : memref<24x1xf32> -> !ktdp.access_tile<24x1xindex>
   %sl = ktdp.load %st : <24x1xindex> -> tensor<24x1xf32>
   %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
-  %ov = ktdp.construct_memory_view %oi, sizes: [24, 128], strides: [128, 1] {coordinate_set = #sx, memory_space = #ktdp.memory_space<global>} : memref<24x128xf32>
-  %od = builtin.unrealized_conversion_cast %ov : memref<24x128xf32> to !tt.tensordesc<24x128xf32>
-  tt.spyre_tensor_layout %od {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <24x128xf32>
+  %ov = ktdp.construct_memory_view %oi, sizes: [24, 128], strides: [128, 1] {coordinate_set = #sx, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<24x128xf32>
   %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sx} : memref<24x128xf32> -> !ktdp.access_tile<24x128xindex>
   %e = tensor.empty() : tensor<24x128xf32>
   %r = linalg.generic {indexing_maps = [#x, #stat, #x], iterator_types = ["parallel", "parallel"]} ins(%al, %sl : tensor<24x128xf32>, tensor<24x1xf32>) outs(%e : tensor<24x128xf32>) {

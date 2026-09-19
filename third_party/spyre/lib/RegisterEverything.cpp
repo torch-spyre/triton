@@ -20,6 +20,7 @@
 
 #include "Conversion/TritonToKTIR/Passes.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
+#include "Dialect/TTS/IR/Dialect.h"
 #include "Pipeline.h"
 #include "Transforms/Passes.h"
 
@@ -108,4 +109,10 @@ void mlir::triton::spyre::registerDialects(DialectRegistry &registry) {
   registry.insert<mlir::ktdp::KtdpDialect, mlir::spyreop::SpyreOpDialect,
                   linalg::LinalgDialect, tensor::TensorDialect,
                   math::MathDialect>();
+
+  // tts is ours, and it is here for its verifier rather than for anything it
+  // defines: a discardable attribute is routed to its name's dialect only when
+  // that dialect is registered, so leaving this line out does not fail to
+  // build, or to parse -- it silently stops checking tts.tensor_layout.
+  registry.insert<tts::TTSDialect>();
 }

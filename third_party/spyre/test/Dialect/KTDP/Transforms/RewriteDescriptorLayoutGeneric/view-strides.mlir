@@ -2,7 +2,7 @@
 
 // Where the physical memory view's strides come from.
 //
-// Physicalizing a ktdp.construct_memory_view restates its sizes from the marker
+// Physicalizing a ktdp.construct_memory_view restates its sizes from the layout
 // and lays the physical shape out row-major. It ignores the view's logical
 // strides entirely: a physicalized view addresses stick-tiled device data, whose
 // element order is the physical shape's own, so the logical strides describe a
@@ -34,17 +34,15 @@ module {
 tt.func @pointwise_static(%ptr: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
   %c0 = arith.constant 0 : index
   %ai = builtin.unrealized_conversion_cast %ptr : !tt.ptr<f32> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [128, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>} : memref<128x128xf32>
-  %ad = builtin.unrealized_conversion_cast %av : memref<128x128xf32> to !tt.tensordesc<128x128xf32>
-  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <128x128xf32>
+  %av = ktdp.construct_memory_view %ai, sizes: [128, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<128x128xf32>
   %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<128x128xf32> -> !ktdp.access_tile<128x128xindex>
   %al = ktdp.load %at : <128x128xindex> -> tensor<128x128xf32>
 
   // Store to a second annotated descriptor, to keep the loaded value alive.
   %oi = builtin.unrealized_conversion_cast %out : !tt.ptr<f32> to index
-  %ov = ktdp.construct_memory_view %oi, sizes: [128, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>} : memref<128x128xf32>
-  %od = builtin.unrealized_conversion_cast %ov : memref<128x128xf32> to !tt.tensordesc<128x128xf32>
-  tt.spyre_tensor_layout %od {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <128x128xf32>
+  %ov = ktdp.construct_memory_view %oi, sizes: [128, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<128x128xf32>
   %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<128x128xf32> -> !ktdp.access_tile<128x128xindex>
   ktdp.store %al, %ot : tensor<128x128xf32>, <128x128xindex>
   tt.return
@@ -79,16 +77,14 @@ module {
 tt.func @dynamic_strides(%ptr: !tt.ptr<f32>, %out: !tt.ptr<f32>, %m: index, %stride: index) {
   %c0 = arith.constant 0 : index
   %ai = builtin.unrealized_conversion_cast %ptr : !tt.ptr<f32> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [%m, 64], strides: [%stride, 1] {coordinate_set = #sdyn, memory_space = #ktdp.memory_space<global>} : memref<?x64xf32>
-  %ad = builtin.unrealized_conversion_cast %av : memref<?x64xf32> to !tt.tensordesc<128x64xf32>
-  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <128x64xf32>
+  %av = ktdp.construct_memory_view %ai, sizes: [%m, 64], strides: [%stride, 1] {coordinate_set = #sdyn, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<?x64xf32>
   %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #sblock} : memref<?x64xf32> -> !ktdp.access_tile<128x64xindex>
   %al = ktdp.load %at : <128x64xindex> -> tensor<128x64xf32>
 
   %oi = builtin.unrealized_conversion_cast %out : !tt.ptr<f32> to index
-  %ov = ktdp.construct_memory_view %oi, sizes: [%m, 64], strides: [%stride, 1] {coordinate_set = #sdyn, memory_space = #ktdp.memory_space<global>} : memref<?x64xf32>
-  %od = builtin.unrealized_conversion_cast %ov : memref<?x64xf32> to !tt.tensordesc<128x64xf32>
-  tt.spyre_tensor_layout %od {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <128x64xf32>
+  %ov = ktdp.construct_memory_view %oi, sizes: [%m, 64], strides: [%stride, 1] {coordinate_set = #sdyn, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<?x64xf32>
   %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id, access_tile_set = #sblock} : memref<?x64xf32> -> !ktdp.access_tile<128x64xindex>
   ktdp.store %al, %ot : tensor<128x64xf32>, <128x64xindex>
   tt.return

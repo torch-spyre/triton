@@ -18,10 +18,17 @@ add_triton_library(KTDPTransforms
 
   DEPENDS
   KTDPTransformsIncGen
+  # RewriteDescriptorLayoutGeneric.cpp includes the tts dialect's generated
+  # declarations through Dialect/TTS/IR/Dialect.h, so a clean parallel build
+  # must not rely on the link edge to order that tablegen ahead of it.
+  TTSIncGen
 
   LINK_LIBS PUBLIC
   KTDPUtils
   SpyreUtils
+  # For the shared tts.tensor_layout checker, which this library's generic
+  # layout pass and the dialect's own verifier both call.
+  TTSIR
   KTIR::KtdpDialect
   TritonIR
   MLIRIR
