@@ -125,11 +125,15 @@ def RewriteDescriptorLayoutGeneric
              view, every generic that reads one of its loads or supplies one of
              its stores is restated over the physical loop domain: all its
              operands and results at their prescribed physical rank, and its
-             indexing maps stated over that domain.  The domain is built from
-             the markers — splitting any logical dim any operand splits — and
-             each map is restated over it.  The recorded views are therefore the
-             scope of the rewrite: a generic on no physicalized chain is never
-             examined.  Each generic is rewritten at most once; there is no
+             indexing maps stated over that domain.  The domain refines the
+             generic's iteration space — a stick split is a delinearization over
+             the basis (ceildiv(extent, W), W), so a split logical dim becomes
+             two loop dims, and an operand holding that dim whole carries the
+             linearization `stick * W + lane` in its map.  A split adds loop dims
+             and nothing else: no scf.for is emitted for it.  The domain splits
+             any logical dim any operand splits; the recorded views are therefore
+             the scope of the rewrite, and a generic on no physicalized chain is
+             never examined.  Each generic is rewritten at most once; there is no
              fixpoint and no pattern driver.
 
     Phase 3  Erase the markers and their now-dead bridge casts.

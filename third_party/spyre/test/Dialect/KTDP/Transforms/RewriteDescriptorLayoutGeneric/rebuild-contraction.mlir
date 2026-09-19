@@ -2,7 +2,9 @@
 // RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic -split-input-file | FileCheck %s --check-prefix=NOLOOP
 
 // rebuild-reduction.mlir's rule, with a second input: the iterator kinds follow
-// the dims, so splitting the reduced dim gives two reduction loops.
+// the dims, so splitting the reduced dim gives two reduction LOOP DIMS -- dims of
+// the generic's iteration space, which is what "loop" means throughout this
+// directory. Never an scf.for, and the difference is the point below.
 //
 // What that buys here is worth stating on its own, because a contraction is where
 // one would expect a loop over sticks. There is none: this pass emits no scf.for
@@ -143,7 +145,7 @@ module {
 // 128; N=64 gives one stick on B and on the output. A therefore names the two K
 // loops (d4, d5) as a plain projected permutation and B carries the composite,
 // while the accumulator -- an unmarked splat constant, so it stays logical --
-// composes the N split it does not carry. Two reduction loops for the split K;
+// composes the N split it does not carry. Two reduction loop dims for the split K;
 // batch, M and the N split are parallel.
 //
 // This is the case that proves the loop elimination, because the kernel's own
@@ -330,7 +332,7 @@ module {
 // The accumulator carries no marker, so it stays logical and composes the N
 // split it does not carry.
 // CHECK:           %[[CL:.*]] = ktdp.load %{{.*}} : <64x64xindex> -> tensor<64x64xf32>
-// Two reduction loops for the split K; M and the N split are parallel.
+// Two reduction loop dims for the split K; M and the N split are parallel.
 // CHECK:           %[[R:.*]] = linalg.generic {indexing_maps = [#[[$S3_A]], #[[$S3_B]], #[[$S3_C]]], iterator_types = ["reduction", "parallel", "reduction", "parallel", "parallel"]} ins(%[[AL]], %[[BL]] : tensor<2x64x64xf32>, tensor<1x128x64xf32>) outs(%[[CL]] : tensor<64x64xf32>) {
 // CHECK:           } -> tensor<64x64xf32>
 // CHECK:           ktdp.store %[[R]], %{{.*}} : tensor<64x64xf32>, <64x64xindex>

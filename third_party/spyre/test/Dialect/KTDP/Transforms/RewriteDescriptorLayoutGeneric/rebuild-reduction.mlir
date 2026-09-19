@@ -8,9 +8,11 @@
 // iterator_types say which loop dims are reductions, and the rebuild inherits
 // them: a stick-split logical dim contributes two loop dims, and those two
 // inherit the kind the one dim had. So splitting the REDUCED dim gives two
-// reduction loops -- which is what a loop over sticks would have been, expressed
-// where the scheduler can still see it as one op -- while splitting some other dim
-// leaves the reduction alone and the stick structure alone. The neutral-element
+// reduction loop dims -- which is what an scf.for over sticks would have been,
+// expressed where the scheduler can still see it as one op -- while splitting
+// some other dim leaves the reduction alone and the stick structure alone. A
+// "loop" here is a dim of the generic's iteration space, never an scf.for; the
+// pass file's vocabulary note spells that out. The neutral-element
 // linalg.fill that LowerComputeOps puts on every reduction is an ordinary producer
 // on the chain, so it follows the reduce to physical shape along with the
 // tensor.empty underneath it.
@@ -166,7 +168,7 @@ module {
 // CHECK:           %[[VAL_15:.*]] = arith.constant 0.000000e+00 : f32
 // CHECK:           %[[VAL_16:.*]] = tensor.empty() : tensor<256x64xf32>
 // CHECK:           %[[VAL_17:.*]] = linalg.fill ins(%[[VAL_15]] : f32) outs(%[[VAL_16]] : tensor<256x64xf32>) -> tensor<256x64xf32>
-// Two reduction loops for the split K, and the broadcast loop is parallel.
+// Two reduction loop dims for the split K, and the broadcast one is parallel.
 // CHECK:           %[[VAL_18:.*]] = linalg.generic {indexing_maps = [#[[$ON_IN]], #[[$ON_OUT]]], iterator_types = ["reduction", "parallel", "reduction", "parallel"]} ins(%[[VAL_10]] : tensor<2x256x64xf32>) outs(%[[VAL_17]] : tensor<256x64xf32>) {
 // CHECK:           ^bb0(%[[VAL_19:.*]]: f32, %[[VAL_20:.*]]: f32):
 // CHECK:             %[[VAL_21:.*]] = arith.addf %[[VAL_19]], %[[VAL_20]] : f32
