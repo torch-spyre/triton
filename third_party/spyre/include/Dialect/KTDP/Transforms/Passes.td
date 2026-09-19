@@ -111,8 +111,10 @@ def RewriteDescriptorLayoutGeneric
     2=mod, 3=splat).
 
     Phase 1  Physicalize each annotated descriptor: rebuild
-             construct_memory_view with physical sizes and strides, rebuild
-             each access tile with physical block shape and remapped subscripts,
+             construct_memory_view with physical sizes and with strides laid out
+             row-major over them -- a physicalized view addresses stick-tiled
+             device data, so the logical strides are not read -- rebuild each
+             access tile with physical block shape and remapped subscripts,
              retype load results and record the physicalized view against the
              layout it was physicalized under.
 
@@ -131,11 +133,6 @@ def RewriteDescriptorLayoutGeneric
 
     Unannotated kernels are left unchanged.
   }];
-  let options = [
-    Option<"dataLayout", "data-layout", "std::string",
-           /*default=*/"\"device\"",
-           "Format of tensors: \"device\" (stickified) or \"host\" (row-major)">
-  ];
   let dependentDialects = [
     "mlir::arith::ArithDialect",
     "mlir::ktdp::KtdpDialect",

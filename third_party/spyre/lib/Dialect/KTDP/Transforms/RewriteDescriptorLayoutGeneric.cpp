@@ -683,10 +683,6 @@ struct RewriteDescriptorLayoutGenericPass
   using RewriteDescriptorLayoutGenericBase::
       RewriteDescriptorLayoutGenericBase;
 
-  /// True = "device" (physical row-major strides), false = "host" (derive
-  /// the physical strides from the logical ones through the coord map).
-  bool hwDataLayout = false;
-
   /// Physicalized ConstructMemoryViewOp → its coord map. Keyed on the
   /// Operation* of the PHYSICALIZED (new) view op, set in physicalizeDescriptor
   /// after physicalizeMemView returns.
@@ -758,12 +754,18 @@ struct RewriteDescriptorLayoutGenericPass
     return out;
   }
 
-  /// Physical strides for a view under `cm`.
-  FailureOr<PhysicalSizes>
-  physicalStrides(const CoordMap &cm,
-                  mlir::ktdp::ConstructMemoryViewOp memViewOp,
-                  const PhysicalSizes &sizes, OpBuilder &b,
-                  triton::SpyreTensorLayoutOp marker) {
+  /// Physical strides for a view under `cm`: row-major over the physical sizes.
+  ///
+  /// The view's own logical strides are not read. A physicalized view addresses
+  /// stick-tiled device data, whose element order IS the physical shape's
+  /// row-major order — so the logical strides describe a buffer this view no
+  /// longer names, and there is nothing in them to derive from.
+  ///
+  /// Cannot fail: every stride is a function of the physical sizes, which the
+  /// caller has already computed.
+  PhysicalSizes physicalStrides(const CoordMap &cm,
+                                mlir::ktdp::ConstructMemoryViewOp memViewOp,
+                                const PhysicalSizes &sizes, OpBuilder &b) {
     Location loc = memViewOp.getLoc();
     unsigned physRank = cm.physRank();
     PhysicalSizes out;
@@ -772,66 +774,31 @@ struct RewriteDescriptorLayoutGenericPass
       return arith::ConstantOp::create(b, loc, b.getIndexAttr(c)).getResult();
     };
 
-    if (hwDataLayout) {
-      bool allStatic = llvm::none_of(sizes.staticSizes, ShapedType::isDynamic);
-      if (allStatic) {
-        out.staticSizes.assign(physRank, 1);
-        for (int p = (int)physRank - 2; p >= 0; --p)
-          out.staticSizes[p] =
-              out.staticSizes[p + 1] * sizes.staticSizes[p + 1];
-        return out;
-      }
-      // Any dynamic size makes every outer stride dynamic.
-      SmallVector<Value> strides(physRank);
-      strides[physRank - 1] = asValue(1);
-      auto sizeValue = [&](unsigned p) -> Value {
-        if (!ShapedType::isDynamic(sizes.staticSizes[p]))
-          return asValue(sizes.staticSizes[p]);
-        unsigned n = 0;
-        for (unsigned q = 0; q < p; ++q)
-          if (ShapedType::isDynamic(sizes.staticSizes[q]))
-            ++n;
-        return sizes.dynSizes[n];
-      };
+    bool allStatic = llvm::none_of(sizes.staticSizes, ShapedType::isDynamic);
+    if (allStatic) {
+      out.staticSizes.assign(physRank, 1);
       for (int p = (int)physRank - 2; p >= 0; --p)
-        strides[p] = arith::MulIOp::create(b, loc, strides[p + 1],
-                                           sizeValue(p + 1))
-                         .getResult();
-      out.staticSizes.assign(physRank, ShapedType::kDynamic);
-      out.dynSizes.assign(strides.begin(), strides.end());
+        out.staticSizes[p] = out.staticSizes[p + 1] * sizes.staticSizes[p + 1];
       return out;
     }
-
-    ArrayRef<int64_t> logStatic = memViewOp.getStaticStrides();
-    ValueRange logDyn = memViewOp.getStrides();
-    SmallVector<int> dynPos(logStatic.size(), -1);
-    for (unsigned d = 0, n = 0; d < logStatic.size(); ++d)
-      if (logStatic[d] == ShapedType::kDynamic)
-        dynPos[d] = n++;
-
-    for (unsigned p = 0; p < physRank; ++p) {
-      int64_t d = cm.src[p];
-      if (cm.opAt(p) == CoordOp::Splat)
-        return marker.emitError("spyre_tensor_layout: physical dim ")
-               << p
-               << " is a splat, which has no stride in a host row-major "
-                  "buffer; splat dims need data-layout=device";
-      // A stick index advances by a whole stick of the logical dim.
-      int64_t scale = cm.opAt(p) == CoordOp::FloorDiv ? cm.arg[p] : 1;
-      if (logStatic[d] != ShapedType::kDynamic) {
-        out.staticSizes.push_back(logStatic[d] * scale);
-        continue;
-      }
-      if (dynPos[d] < 0)
-        return marker.emitError("spyre_tensor_layout: logical dim ")
-               << d << " has neither a static nor a dynamic stride";
-      out.staticSizes.push_back(ShapedType::kDynamic);
-      Value logStride = logDyn[dynPos[d]];
-      out.dynSizes.push_back(
-          scale == 1 ? logStride
-                     : arith::MulIOp::create(b, loc, logStride, asValue(scale))
-                           .getResult());
-    }
+    // Any dynamic size makes every outer stride dynamic.
+    SmallVector<Value> strides(physRank);
+    strides[physRank - 1] = asValue(1);
+    auto sizeValue = [&](unsigned p) -> Value {
+      if (!ShapedType::isDynamic(sizes.staticSizes[p]))
+        return asValue(sizes.staticSizes[p]);
+      unsigned n = 0;
+      for (unsigned q = 0; q < p; ++q)
+        if (ShapedType::isDynamic(sizes.staticSizes[q]))
+          ++n;
+      return sizes.dynSizes[n];
+    };
+    for (int p = (int)physRank - 2; p >= 0; --p)
+      strides[p] =
+          arith::MulIOp::create(b, loc, strides[p + 1], sizeValue(p + 1))
+              .getResult();
+    out.staticSizes.assign(physRank, ShapedType::kDynamic);
+    out.dynSizes.assign(strides.begin(), strides.end());
     return out;
   }
 
@@ -889,18 +856,16 @@ struct RewriteDescriptorLayoutGenericPass
     auto sizes = physicalSizes(cm, memViewOp, b, marker);
     if (failed(sizes))
       return failure();
-    auto strides = physicalStrides(cm, memViewOp, *sizes, b, marker);
-    if (failed(strides))
-      return failure();
+    PhysicalSizes strides = physicalStrides(cm, memViewOp, *sizes, b);
 
     // Clone rather than build: the offset operand, the memory space, the
     // element type and any attribute this pass has never heard of all come
     // across without being named.
     auto physOp = cast<mlir::ktdp::ConstructMemoryViewOp>(b.clone(*memViewOp));
     physOp.getSizesMutable().assign(sizes->dynSizes);
-    physOp.getStridesMutable().assign(strides->dynSizes);
+    physOp.getStridesMutable().assign(strides.dynSizes);
     physOp.setStaticSizes(sizes->staticSizes);
-    physOp.setStaticStrides(strides->staticSizes);
+    physOp.setStaticStrides(strides.staticSizes);
     physOp.setCoordinateSetAttr(IntegerSetAttr::get(
         buildRangeSetND(b.getContext(), sizes->staticSizes)));
     physOp.getResult().setType(
@@ -1617,20 +1582,12 @@ struct RewriteDescriptorLayoutGenericPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    if (dataLayout != "device" && dataLayout != "host") {
-      module.emitError("rewrite-descriptor-layout-generic: data-layout must be "
-                       "'device' or 'host', got '")
-          << dataLayout << "'";
-      return signalPassFailure();
-    }
-    hwDataLayout = (dataLayout == "device");
-
     SmallVector<triton::SpyreTensorLayoutOp> markers;
     module.walk([&](triton::SpyreTensorLayoutOp op) { markers.push_back(op); });
 
     LLVM_DEBUG(llvm::dbgs()
                << "[rewrite-descriptor-layout-generic] " << markers.size()
-               << " layout marker(s), data-layout=" << dataLayout << "\n");
+               << " layout marker(s)\n");
 
     if (failed(checkConsumersAreRewritable(module)))
       return signalPassFailure();
