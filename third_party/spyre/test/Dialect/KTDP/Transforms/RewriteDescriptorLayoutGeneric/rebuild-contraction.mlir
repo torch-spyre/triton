@@ -42,7 +42,7 @@
 // deliberately: an extent test is exactly the special case that would stop this
 // being one rule.
 //
-// The output descriptor carries no marker, so the result stays logical by design
+// The output view carries no layout, so the result stays logical by design
 // and its map names only the unsplit dims, composing the split ones.
 //
 // Input produced from the @matmul_single_stick kernel in
@@ -100,15 +100,13 @@ module {
   tt.func @matmul_single_stick(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: !tt.ptr<f32>) {
     %c0 = arith.constant 0 : index
     %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
-    %1 = ktdp.construct_memory_view %0, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
-    %2 = builtin.unrealized_conversion_cast %1 : memref<64x64xf32> to !tt.tensordesc<64x64xf32>
-    tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x64xf32>
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>,
+        tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x64xf32>
     %3 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
     %4 = ktdp.load %3 : <64x64xindex> -> tensor<64x64xf32>
     %5 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
-    %6 = ktdp.construct_memory_view %5, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
-    %7 = builtin.unrealized_conversion_cast %6 : memref<64x64xf32> to !tt.tensordesc<64x64xf32>
-    tt.spyre_tensor_layout %7 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x64xf32>
+    %6 = ktdp.construct_memory_view %5, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>,
+        tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x64xf32>
     %8 = ktdp.construct_access_tile %6[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
     %9 = ktdp.load %8 : <64x64xindex> -> tensor<64x64xf32>
     %10 = builtin.unrealized_conversion_cast %arg2 : !tt.ptr<f32> to index
@@ -249,17 +247,14 @@ module {
     %4 = arith.addi %3, %2 : i32
     %5 = arith.minsi %4, %c1_i32 : i32
     %6 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f16> to index
-    %7 = ktdp.construct_memory_view %6, sizes: [4, 64, 128], strides: [8192, 128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<4x64x128xf16>
-    %8 = builtin.unrealized_conversion_cast %7 : memref<4x64x128xf16> to !tt.tensordesc<4x64x128xf16>
+    %7 = ktdp.construct_memory_view %6, sizes: [4, 64, 128], strides: [8192, 128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>,
+        tts.tensor_layout = {phys_src = array<i64: 2, 0, 1, 2>, phys_op = array<i64: 1, 0, 0, 2>, phys_arg = array<i64: 64, 0, 0, 64>}} : memref<4x64x128xf16>
     %9 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f16> to index
-    %10 = ktdp.construct_memory_view %9, sizes: [4, 128, 64], strides: [8192, 64, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<4x128x64xf16>
-    %11 = builtin.unrealized_conversion_cast %10 : memref<4x128x64xf16> to !tt.tensordesc<4x128x64xf16>
+    %10 = ktdp.construct_memory_view %9, sizes: [4, 128, 64], strides: [8192, 64, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>,
+        tts.tensor_layout = {phys_src = array<i64: 2, 0, 1, 2>, phys_op = array<i64: 1, 0, 0, 2>, phys_arg = array<i64: 64, 0, 0, 64>}} : memref<4x128x64xf16>
     %12 = builtin.unrealized_conversion_cast %arg2 : !tt.ptr<f16> to index
-    %13 = ktdp.construct_memory_view %12, sizes: [4, 64, 64], strides: [4096, 64, 1] {coordinate_set = #set2, memory_space = #ktdp.memory_space<global>} : memref<4x64x64xf16>
-    %14 = builtin.unrealized_conversion_cast %13 : memref<4x64x64xf16> to !tt.tensordesc<4x64x64xf16>
-    tt.spyre_tensor_layout %8 {phys_arg = array<i64: 64, 0, 0, 64>, phys_op = array<i64: 1, 0, 0, 2>, phys_src = array<i64: 2, 0, 1, 2>} : <4x64x128xf16>
-    tt.spyre_tensor_layout %11 {phys_arg = array<i64: 64, 0, 0, 64>, phys_op = array<i64: 1, 0, 0, 2>, phys_src = array<i64: 2, 0, 1, 2>} : <4x128x64xf16>
-    tt.spyre_tensor_layout %14 {phys_arg = array<i64: 64, 0, 0, 64>, phys_op = array<i64: 1, 0, 0, 2>, phys_src = array<i64: 2, 0, 1, 2>} : <4x64x64xf16>
+    %13 = ktdp.construct_memory_view %12, sizes: [4, 64, 64], strides: [4096, 64, 1] {coordinate_set = #set2, memory_space = #ktdp.memory_space<global>,
+        tts.tensor_layout = {phys_src = array<i64: 2, 0, 1, 2>, phys_op = array<i64: 1, 0, 0, 2>, phys_arg = array<i64: 64, 0, 0, 64>}} : memref<4x64x64xf16>
     scf.for %arg3 = %3 to %5 step %c1_i32  : i32 {
       %15 = arith.muli %arg3, %c4_i32 : i32
       %16 = arith.index_cast %15 : i32 to index
@@ -329,7 +324,7 @@ module {
 // CHECK:           ktdp.construct_memory_view %{{.*}}, sizes: [1, 128, 64], strides: [8192, 64, 1]
 // CHECK-SAME:        : memref<1x128x64xf32>
 // CHECK:           %[[BL:.*]] = ktdp.load %{{.*}} : <1x128x64xindex> -> tensor<1x128x64xf32>
-// The accumulator carries no marker, so it stays logical and composes the N
+// The accumulator carries no layout, so it stays logical and composes the N
 // split it does not carry.
 // CHECK:           %[[CL:.*]] = ktdp.load %{{.*}} : <64x64xindex> -> tensor<64x64xf32>
 // Two reduction loop dims for the split K; M and the N split are parallel.
@@ -339,15 +334,13 @@ module {
   tt.func @matmul_two_sticks(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: !tt.ptr<f32>) {
     %c0 = arith.constant 0 : index
     %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
-    %1 = ktdp.construct_memory_view %0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #seta, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-    %2 = builtin.unrealized_conversion_cast %1 : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
-    tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x128xf32>
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #seta, memory_space = #ktdp.memory_space<global>,
+        tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
     %3 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map, access_tile_set = #seta} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
     %4 = ktdp.load %3 : <64x128xindex> -> tensor<64x128xf32>
     %5 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
-    %6 = ktdp.construct_memory_view %5, sizes: [128, 64], strides: [64, 1] {coordinate_set = #setb, memory_space = #ktdp.memory_space<global>} : memref<128x64xf32>
-    %7 = builtin.unrealized_conversion_cast %6 : memref<128x64xf32> to !tt.tensordesc<128x64xf32>
-    tt.spyre_tensor_layout %7 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <128x64xf32>
+    %6 = ktdp.construct_memory_view %5, sizes: [128, 64], strides: [64, 1] {coordinate_set = #setb, memory_space = #ktdp.memory_space<global>,
+        tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<128x64xf32>
     %8 = ktdp.construct_access_tile %6[%c0, %c0] {access_tile_order = #map, access_tile_set = #setb} : memref<128x64xf32> -> !ktdp.access_tile<128x64xindex>
     %9 = ktdp.load %8 : <128x64xindex> -> tensor<128x64xf32>
     %10 = builtin.unrealized_conversion_cast %arg2 : !tt.ptr<f32> to index

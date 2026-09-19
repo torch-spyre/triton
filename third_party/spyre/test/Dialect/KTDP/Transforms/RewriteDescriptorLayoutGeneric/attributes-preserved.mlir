@@ -17,6 +17,18 @@
 // this same input drops both attributes below. The two attributes are invented
 // for the test precisely because neither pass has any reason to know them.
 //
+// THE ONE EXCEPTION, and it is not a hole in the claim. `tts.tensor_layout` is
+// dropped from the physical view on purpose: it is the instruction this pass
+// consumes, not a property of the data, so a physical view carrying it would be
+// an instruction to physicalize something already physical, and the second run
+// in no-op.mlir would do exactly that. The claim above is about attributes the
+// pass DOES NOT OWN; the layout is the one it owns, and it owns it by deleting
+// rather than by recomputing. isShapeOwnedAttr is where that is declared, which
+// is what lets the pass's own verifyAttributesCarried permit the drop -- so the
+// exception is stated in the code and not smuggled past the check. Its absence
+// from the physical views below is asserted by the CHECK lines naming their
+// attribute dictionaries in full, and by the CHECK-NOT in subscripts-indirect.mlir.
+//
 // Captures are hand-named and this file is hand-maintained: do not regenerate it
 // with generate-test-checks.py. The generated lines would still match if the
 // attributes were dropped from only one of the two ops, which is why both are
@@ -70,21 +82,18 @@ module {
 tt.func @unowned_attributes_survive(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.ptr<f32>) {
   %c0 = arith.constant 0 : index
   %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>, spyre.provenance = "kept"} : memref<64x128xf32>
-  %ad = builtin.unrealized_conversion_cast %av : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <64x128xf32>
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>, spyre.provenance = "kept",
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
   %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #s2, spyre.tile_note = 7 : i64} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf32>
   %bi = builtin.unrealized_conversion_cast %b : !tt.ptr<f32> to index
-  %bv = ktdp.construct_memory_view %bi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %bd = builtin.unrealized_conversion_cast %bv : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %bd {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <64x128xf32>
+  %bv = ktdp.construct_memory_view %bi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
   %bt = ktdp.construct_access_tile %bv[%c0, %c0] {access_tile_order = #id, access_tile_set = #s2} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %bl = ktdp.load %bt : <64x128xindex> -> tensor<64x128xf32>
   %ci = builtin.unrealized_conversion_cast %c : !tt.ptr<f32> to index
-  %cv = ktdp.construct_memory_view %ci, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %cd = builtin.unrealized_conversion_cast %cv : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %cd {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <64x128xf32>
+  %cv = ktdp.construct_memory_view %ci, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
   %ct = ktdp.construct_access_tile %cv[%c0, %c0] {access_tile_order = #id, access_tile_set = #s2} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %e = tensor.empty() : tensor<64x128xf32>
   %r = linalg.generic {indexing_maps = [#id, #id, #id], iterator_types = ["parallel", "parallel"]} ins(%al, %bl : tensor<64x128xf32>, tensor<64x128xf32>) outs(%e : tensor<64x128xf32>) {
@@ -129,9 +138,8 @@ tt.func @unowned_attribute_survives_on_indirect_tile(%data: !tt.ptr<f32>, %idx: 
   %ii = builtin.unrealized_conversion_cast %idx : !tt.ptr<i32> to index
   %iv = ktdp.construct_memory_view %ii, sizes: [32], strides: [1] {coordinate_set = #sidx, memory_space = #ktdp.memory_space<global>} : memref<32xi32>
   %di = builtin.unrealized_conversion_cast %data : !tt.ptr<f32> to index
-  %dv = ktdp.construct_memory_view %di, sizes: [512, 128], strides: [128, 1] {coordinate_set = #sdata, memory_space = #ktdp.memory_space<global>} : memref<512x128xf32>
-  %dd = builtin.unrealized_conversion_cast %dv : memref<512x128xf32> to !tt.tensordesc<512x128xf32>
-  tt.spyre_tensor_layout %dd {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <512x128xf32>
+  %dv = ktdp.construct_memory_view %di, sizes: [512, 128], strides: [128, 1] {coordinate_set = #sdata, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<512x128xf32>
   %dt = ktdp.construct_indirect_access_tile intermediate_variables(%v0, %v1) %dv[ind(%iv[%c0 + %v0]), (%c0 + %v1)] {variables_space_order = #varorder, variables_space_set = #stile, spyre.gather_note = "kept"} : memref<512x128xf32>, memref<32xi32> -> !ktdp.access_tile<32x128xindex>
   %dl = ktdp.load %dt : <32x128xindex> -> tensor<32x128xf32>
   tt.return

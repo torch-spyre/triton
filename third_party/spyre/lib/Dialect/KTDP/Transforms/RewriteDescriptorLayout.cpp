@@ -24,15 +24,21 @@
 // subdirectory, retiring inter_tile, and moving TT_SpyreTensorLayoutOp to the
 // tts dialect are sequenced together in the reorg issue.
 //
-// One thing the move has to settle: readCoordMap in
-// RewriteDescriptorLayoutGeneric.cpp re-checks most of what
-// SpyreTensorLayoutOp::verify() checks — the parallel array lengths, the
-// phys_src and phys_op ranges, and the stick-split and splat-companion pairing
-// rules — because that pass is invocable on hand-written IR. When the op becomes
-// a tts.tensor_layout attribute, the structural rules need an owner: an
-// attribute cannot enforce them the way the op's verifier did, so either the
-// checks live entirely in the consumer or the attribute grows a verifier of its
-// own. Decide it rather than letting the verifier's half disappear with the op.
+// That move had one thing to settle — who owns the structural rules the op's
+// verifier and RewriteDescriptorLayoutGeneric's readCoordMap both stated — and
+// it is settled: THE ATTRIBUTE GREW A VERIFIER, and there is exactly one checker
+// function. `tts::verifyTensorLayoutArrays` in third_party/spyre/lib/Dialect/TTS
+// holds the parallel array lengths, the phys_src and phys_op ranges, the
+// phys_arg positivity and the stick-split / splat-re-stick pairings; the tts
+// dialect's verifyOperationAttribute and readCoordMap both call it, so neither
+// can drift. The premise that an attribute cannot enforce them turned out to be
+// false for a DIALECT-PREFIXED discardable attribute: MLIR routes it to its
+// name's dialect at every verification point.
+//
+// SpyreTensorLayoutOp::verify() below is still a second copy of those rules,
+// because lib/Dialect/Triton/IR/Ops.cpp is an upstream file and cannot depend on
+// third_party/spyre. The duplication ends when the op is retired with this file,
+// not before; keep the two in step until then.
 //
 //===----------------------------------------------------------------------===//
 

@@ -45,6 +45,7 @@ add_triton_library(SpyreRegisterEverything
   TritonToKTIRIncGen
   KTDPTransformsIncGen
   SpyreTransformsIncGen
+  TTSIncGen
 
   LINK_LIBS PUBLIC
   TritonToKTIR
@@ -52,6 +53,10 @@ add_triton_library(SpyreRegisterEverything
   SpyreTransforms
   # For the two stage pipelines this file registers as CLI flags.
   SpyrePipeline
+  # The one dialect of ours that this file registers, for its attribute
+  # verifier. Reached transitively through KTDPTransforms too, but named here
+  # because RegisterEverything.cpp includes its header directly.
+  TTSIR
   KTIR::KtdpDialect
   KTIR::SpyreOpDialect
   MLIRIR

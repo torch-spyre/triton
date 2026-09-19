@@ -5,19 +5,21 @@
 
 // The two ways this pass does nothing, and they are the same way.
 //
-// The markers are the entire scope of the rewrite: Phase 1 physicalizes one
-// descriptor per marker and records the view it produced, and Phase 2 looks only
-// at generics adjacent to a recorded view. No marker therefore means no root,
-// nothing seeded as physical, and every op found consistent -- so an unannotated
-// kernel is a no-op rather than something the pass has an opinion about, and a
-// SECOND run is the same no-op, because Phase 3 erased the markers the first run
-// consumed.
+// The views carrying tts.tensor_layout are the entire scope of the rewrite:
+// physicalizeDescriptors physicalizes one view per annotation and records the
+// view it produced, and rewriteAdjacentGenerics looks only at generics adjacent
+// to a recorded view. No annotation therefore means no root, nothing seeded as
+// physical, and every op found consistent -- so an unannotated kernel is a no-op
+// rather than something the pass has an opinion about, and a SECOND run is the
+// same no-op, because the physical view the first run produced does not carry the
+// annotation: physicalizeMemView strips it from the clone.
 //
-// Idempotence here is structural, not a guard: it does not depend on how Phase
-// 2's driver behaves. (Within a single run the property is separately
-// guaranteed, by the consistency guard being exactly what the rewrite
-// establishes -- an op the rewrite has finished satisfies the guard and is not
-// re-fired.)
+// That strip is the whole of idempotence, and it is the same STRUCTURAL argument
+// the marker op's erasure used to make -- a second run finds no root -- so it
+// does not depend on how the rewrite's driver behaves. (Within a single run the
+// property is separately guaranteed, by the consistency guard being exactly what
+// the rewrite establishes -- an op the rewrite has finished satisfies the guard
+// and is not re-fired.)
 //
 // The diff on the third RUN line is the idempotence assertion, and it covers
 // BOTH modules below. FileCheck then reads the first run's output, so the
@@ -27,7 +29,7 @@
 // with generate-test-checks.py, which would rewrite the RUN block into a single
 // pipe and lose the diff.
 
-// Case 1 -- no marker anywhere, so nothing to physicalize.
+// Case 1 -- no annotation anywhere, so nothing to physicalize.
 //
 // Every shape below is the logical one it arrived as.
 
@@ -63,7 +65,8 @@ tt.func @no_marker(%in: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
 
 // -----
 
-// Case 2 -- markers, so a real rewrite, and running it again changes nothing.
+// Case 2 -- annotated views, so a real rewrite, and running it again changes
+// nothing.
 //
 // The reduced dim is the unsplit one (logical dim 0), and the surviving dim is
 // split on both operands -- so its two loops appear in both maps and neither map
@@ -115,15 +118,13 @@ module {
 tt.func @idempotent(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
   %c0 = arith.constant 0 : index
   %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #sin, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %ad = builtin.unrealized_conversion_cast %av : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <64x128xf32>
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #sin, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
   %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sin} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf32>
   %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
-  %ov = ktdp.construct_memory_view %oi, sizes: [128], strides: [1] {coordinate_set = #sout, memory_space = #ktdp.memory_space<global>} : memref<128xf32>
-  %od = builtin.unrealized_conversion_cast %ov : memref<128xf32> to !tt.tensordesc<128xf32>
-  tt.spyre_tensor_layout %od {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : <128xf32>
+  %ov = ktdp.construct_memory_view %oi, sizes: [128], strides: [1] {coordinate_set = #sout, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>}} : memref<128xf32>
   %ot = ktdp.construct_access_tile %ov[%c0] {access_tile_order = #id1, access_tile_set = #sout} : memref<128xf32> -> !ktdp.access_tile<128xindex>
   %zero = arith.constant 0.000000e+00 : f32
   %e0 = tensor.empty() : tensor<128xf32>

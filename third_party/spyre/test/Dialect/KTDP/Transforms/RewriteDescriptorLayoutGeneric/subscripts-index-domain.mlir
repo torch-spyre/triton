@@ -54,9 +54,8 @@ tt.func @pid_offset_lifted_to_index(%ptr: !tt.ptr<f16>) {
   %off = arith.muli %pid, %c64_i32 : i32
   %bi = builtin.unrealized_conversion_cast %ptr : !tt.ptr<f16> to index
   // [n=128] stick-on-n at width 64 -> physical [n/64, n%64] = [2, 64]
-  %v = ktdp.construct_memory_view %bi, sizes: [128], strides: [1] {coordinate_set = #sview, memory_space = #ktdp.memory_space<global>} : memref<128xf16>
-  %d = builtin.unrealized_conversion_cast %v : memref<128xf16> to !tt.tensordesc<128xf16>
-  tt.spyre_tensor_layout %d {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : <128xf16>
+  %v = ktdp.construct_memory_view %bi, sizes: [128], strides: [1] {coordinate_set = #sview, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>}} : memref<128xf16>
   %offx = arith.index_cast %off : i32 to index
   %lt = ktdp.construct_access_tile %v[%offx] {access_tile_order = #id, access_tile_set = #sblock} : memref<128xf16> -> !ktdp.access_tile<64xindex>
   %l = ktdp.load %lt : <64xindex> -> tensor<64xf16>
@@ -89,9 +88,8 @@ tt.func @runtime_scalar_offset_unchanged(%ptr: !tt.ptr<f16>, %n: i32) {
   %c64_i32 = arith.constant 64 : i32
   %off = arith.muli %n, %c64_i32 : i32
   %bi = builtin.unrealized_conversion_cast %ptr : !tt.ptr<f16> to index
-  %v = ktdp.construct_memory_view %bi, sizes: [128], strides: [1] {coordinate_set = #sview, memory_space = #ktdp.memory_space<global>} : memref<128xf16>
-  %d = builtin.unrealized_conversion_cast %v : memref<128xf16> to !tt.tensordesc<128xf16>
-  tt.spyre_tensor_layout %d {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : <128xf16>
+  %v = ktdp.construct_memory_view %bi, sizes: [128], strides: [1] {coordinate_set = #sview, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>}} : memref<128xf16>
   %offx = arith.index_cast %off : i32 to index
   %lt = ktdp.construct_access_tile %v[%offx] {access_tile_order = #id, access_tile_set = #sblock} : memref<128xf16> -> !ktdp.access_tile<64xindex>
   %l = ktdp.load %lt : <64xindex> -> tensor<64xf16>
@@ -128,9 +126,8 @@ tt.func @trunc_not_lifted(%ptr: !tt.ptr<f16>) {
   %big = arith.muli %pid64, %c64_i64 : i64
   %off = arith.trunci %big : i64 to i32
   %bi = builtin.unrealized_conversion_cast %ptr : !tt.ptr<f16> to index
-  %v = ktdp.construct_memory_view %bi, sizes: [128], strides: [1] {coordinate_set = #sview, memory_space = #ktdp.memory_space<global>} : memref<128xf16>
-  %d = builtin.unrealized_conversion_cast %v : memref<128xf16> to !tt.tensordesc<128xf16>
-  tt.spyre_tensor_layout %d {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : <128xf16>
+  %v = ktdp.construct_memory_view %bi, sizes: [128], strides: [1] {coordinate_set = #sview, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>}} : memref<128xf16>
   %offx = arith.index_cast %off : i32 to index
   %lt = ktdp.construct_access_tile %v[%offx] {access_tile_order = #id, access_tile_set = #sblock} : memref<128xf16> -> !ktdp.access_tile<64xindex>
   %l = ktdp.load %lt : <64xindex> -> tensor<64xf16>
@@ -170,9 +167,8 @@ tt.func @extui_into_signed_div_not_lifted(%ptr: !tt.ptr<f16>) {
   %off64 = arith.divsi %wide, %c64_i64 : i64
   %off = arith.trunci %off64 : i64 to i32
   %bi = builtin.unrealized_conversion_cast %ptr : !tt.ptr<f16> to index
-  %v = ktdp.construct_memory_view %bi, sizes: [128], strides: [1] {coordinate_set = #sview, memory_space = #ktdp.memory_space<global>} : memref<128xf16>
-  %d = builtin.unrealized_conversion_cast %v : memref<128xf16> to !tt.tensordesc<128xf16>
-  tt.spyre_tensor_layout %d {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : <128xf16>
+  %v = ktdp.construct_memory_view %bi, sizes: [128], strides: [1] {coordinate_set = #sview, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>}} : memref<128xf16>
   %offx = arith.index_cast %off : i32 to index
   %lt = ktdp.construct_access_tile %v[%offx] {access_tile_order = #id, access_tile_set = #sblock} : memref<128xf16> -> !ktdp.access_tile<64xindex>
   %l = ktdp.load %lt : <64xindex> -> tensor<64xf16>

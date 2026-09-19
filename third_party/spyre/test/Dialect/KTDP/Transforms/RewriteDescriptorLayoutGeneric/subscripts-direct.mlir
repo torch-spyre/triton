@@ -3,7 +3,7 @@
 // A direct access tile's subscripts are split arithmetically.
 //
 // ktdp.construct_access_tile names one `index` subscript per logical dim. When a
-// marker stick-splits a logical dim, that dim becomes two physical dims, and the
+// layout stick-splits a logical dim, that dim becomes two physical dims, and the
 // one subscript that named it has to become two: the pass emits an arith.divsi
 // for the stick half and an arith.remsi for the lane half, both over the stick
 // width read from phys_arg. Every other physical dim keeps the subscript it
@@ -49,13 +49,12 @@ tt.func @shared_index_value(%arg0: !tt.ptr<f32>) {
   // Use the SAME value for both logical indices.
   %idx = arith.constant 0 : index
   %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
-  %1 = ktdp.construct_memory_view %0, sizes: [128, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<128x128xf32>
-  %2 = builtin.unrealized_conversion_cast %1 : memref<128x128xf32> to !tt.tensordesc<128x128xf32>
   // phys_src=[1, 0, 1] phys_op=[1, 0, 2] phys_arg=[64, 0, 64]
   // Physical dim 0: logical dim 1, floordiv 64
   // Physical dim 1: logical dim 0, identity
   // Physical dim 2: logical dim 1, mod 64
-  tt.spyre_tensor_layout %2 {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <128x128xf32>
+  %1 = ktdp.construct_memory_view %0, sizes: [128, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<128x128xf32>
   // Both index operands are the same SSA value (%idx).
   %3 = ktdp.construct_access_tile %1[%idx, %idx] {access_tile_order = #map, access_tile_set = #set} : memref<128x128xf32> -> !ktdp.access_tile<128x128xindex>
   %4 = ktdp.load %3 : <128x128xindex> -> tensor<128x128xf32>
@@ -120,13 +119,11 @@ tt.func @loop_left_alone(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
   %c1 = arith.constant 1 : index
   %c4 = arith.constant 4 : index
   %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %ad = builtin.unrealized_conversion_cast %av : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <64x128xf32>
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
   %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
-  %ov = ktdp.construct_memory_view %oi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %odd = builtin.unrealized_conversion_cast %ov : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %odd {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <64x128xf32>
+  %ov = ktdp.construct_memory_view %oi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
   scf.for %i = %c0 to %c4 step %c1 {
     %at = ktdp.construct_access_tile %av[%c0, %i] {access_tile_order = #id, access_tile_set = #s} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
     %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf32>
