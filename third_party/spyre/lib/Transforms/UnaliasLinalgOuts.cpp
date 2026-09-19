@@ -62,7 +62,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Transforms/Passes.h"
-#include "Dialect/KTDP/Utils/Utility.h"
+#include "Utils/Utility.h"
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -83,6 +83,8 @@ namespace mlir::triton::spyre {
 } // namespace mlir::triton::spyre
 
 namespace {
+
+using mlir::triton::spyre::createEmptyTensor;
 
 /// Stack slots in the `ins`-operand sets below before they spill to the heap.
 /// An allocation hint only; any operand count behaves identically.
@@ -207,10 +209,8 @@ struct UnaliasLinalgOutsPass
       // size operands, so it is built from the type alone.
       Value empty =
           tensorType.hasStaticShape()
-              ? mlir::triton::ktdp::createEmptyTensor(rewriter, op.getLoc(),
-                                                      tensorType)
-              : mlir::triton::ktdp::createEmptyTensor(rewriter, op.getLoc(),
-                                                      tensorType, outValue);
+              ? createEmptyTensor(rewriter, op.getLoc(), tensorType)
+              : createEmptyTensor(rewriter, op.getLoc(), tensorType, outValue);
       out.set(empty);
     }
     return result;

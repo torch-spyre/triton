@@ -514,8 +514,8 @@ VARIANTS = {
     # naming the ``linalg.fill`` that LowerComputeOps puts on the reduction's
     # ``outs``. ``linalg.reduce`` itself is in that allowlist; the neutral-element
     # fill beside it is not. ``DropReductionInitFill`` removes exactly that fill,
-    # and ``_make_spyrecode`` installs it unconditionally, out of
-    # ``_SPYRECODE_STAGE_PASSES`` -- so what reaches the
+    # and the spyrecode stage installs it unconditionally, out of
+    # ``buildSpyrecodePipeline``'s own list -- so what reaches the
     # device is the emission with the fill already gone, which is what makes it
     # match torch-spyre's, whose emitter never writes one.
     #

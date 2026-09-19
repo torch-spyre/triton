@@ -110,6 +110,52 @@ def test_cache_files_include_the_artifact(compiled):
     assert {"ttir", "ktir", "spyrecode", "json"} <= exts
 
 
+def test_kernel_dump_writes_every_stage(dbo_opt, binary_source, spyrecode_options,
+                                        monkeypatch, tmp_path):
+    """TRITON_KERNEL_DUMP, and the warm-cache trap that makes it look broken.
+
+    Here rather than with the ``MLIR_ENABLE_DUMP`` tests because it needs a whole
+    compile, and a whole compile needs the tool -- so it belongs behind this file's
+    feature gate, where the absence is reported as ``Unsupported`` rather than
+    vanishing into a skip.
+
+    Takes ``dbo_opt`` for that gate even though it never names the path: the two
+    compiles below are the reason, and a test that compiles must be gated or it
+    fails instead of skipping under direct pytest.
+    """
+    monkeypatch.setattr(knobs.cache, "dump_dir", str(tmp_path))
+    monkeypatch.setattr(knobs.compilation, "dump_ir", True)
+
+    # A cache hit returns before any stage runs, so there is nothing to dump and
+    # nothing says so. This half is the trap; it is documented, so pin it.
+    monkeypatch.setattr(knobs.compilation, "always_compile", False)
+    triton_compile(binary_source, target=spyre_target(),
+                   options=spyrecode_options)
+    assert not list(tmp_path.rglob("*.ktir")), "a cache hit dumped something"
+
+    monkeypatch.setattr(knobs.compilation, "always_compile", True)
+    triton_compile(binary_source, target=spyre_target(),
+                   options=spyrecode_options)
+    dumped = {p.suffix[1:] for p in tmp_path.rglob("*") if p.is_file()}
+    assert {"ttir", "ktir", "spyrecode"} <= dumped, sorted(dumped)
+
+
+def test_the_archive_carries_the_module_dbo_opt_was_handed(compiled):
+    """Why nothing of ours needs to capture the boundary module.
+
+    ``knobs.spyre.dbo_debug`` is on by default, so every compile already ships
+    dbo-opt's own per-stage tree inside the artifact, and the module it was handed
+    is in there. ``test_artifact_holds_the_spyre_code_dir`` asserts the tree is
+    carried; this asserts what is *in* it, which is the part that makes a separate
+    artifact of our own unnecessary.
+    """
+    names = zipfile.ZipFile(io.BytesIO(compiled.kernel)).namelist()
+    debug = [n for n in names if n.startswith(f"{DEBUG_DIR}/")]
+    assert debug, sorted(names)
+    ktir = [n for n in debug if n.endswith(".mlir") or n.endswith(".ktir")]
+    assert ktir, f"no IR under {DEBUG_DIR}/: {sorted(debug)}"
+
+
 def test_recompile_hits_the_cache(compiled, spyrecode_options):
     again = triton_compile(compiled.src, target=spyre_target(),
                            options=spyrecode_options)

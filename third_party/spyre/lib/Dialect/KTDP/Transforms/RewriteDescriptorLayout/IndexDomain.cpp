@@ -23,7 +23,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "RewriteDescriptorLayout/IndexDomain.h"
-#include "Dialect/KTDP/Utils/Utility.h"
+#include "Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -74,8 +74,11 @@ BlockArgument traceToMLIRBlockArg(Value v) {
       continue;
     }
     if (isa<arith::MulIOp, arith::DivSIOp, arith::RemSIOp, arith::AddIOp>(op)) {
-      if (op->getNumOperands() == 2 && getConstantInt(op->getOperand(1)))
-        { v = op->getOperand(0); continue; }
+      if (op->getNumOperands() == 2 &&
+          triton::spyre::getConstantInt(op->getOperand(1))) {
+        v = op->getOperand(0);
+        continue;
+      }
     }
     return nullptr;
   }
@@ -124,7 +127,7 @@ bool isRebuildableIntArith(Operation *op) {
 /// Note this is not the question "does the value fit in i32". A run-time i32
 /// argument fits trivially, and lifting it is exactly what must not happen.
 bool canRebuildInIndexDomain(Value v) {
-  if (getConstantInt(v))
+  if (triton::spyre::getConstantInt(v))
     return true;
   Operation *op = v.getDefiningOp();
   if (!op)
@@ -175,7 +178,7 @@ bool hasFixedWidthIntArith(Value v) {
 /// Emit `v`'s expression with every step performed in `index`.
 /// Requires canRebuildInIndexDomain(v).
 Value emitInIndexDomain(OpBuilder &b, Location loc, Value v) {
-  if (auto cst = getConstantInt(v)) {
+  if (auto cst = triton::spyre::getConstantInt(v)) {
     if (v.getType().isIndex())
       return v;
     return arith::ConstantOp::create(b, loc, b.getIndexAttr(*cst)).getResult();

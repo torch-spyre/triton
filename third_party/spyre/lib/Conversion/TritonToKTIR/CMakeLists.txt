@@ -3,7 +3,7 @@
 # follow the rest of the stack -- upstream MLIR has Conversion/XToY and no
 # Dialect/*/Conversion*, and this repo already has lib/Conversion/TritonToTritonGPU.
 #
-# LINK_LIBS is derived from what these seven files actually #include, plus the
+# LINK_LIBS is derived from what these files actually #include, plus the
 # dependentDialects their Passes.td declares -- tablegen turns those into
 # registry.insert<> in the generated pass base, so a pass can need a dialect it
 # includes no header for.  MLIRSCFDialect is exactly that case: nothing here
@@ -20,12 +20,16 @@ add_triton_library(TritonToKTIR
   ConvertFunctions.cpp
   LowerInterTile.cpp
   DistributeWork.cpp
+  # Helpers used only by the files above; declared in ConversionUtils.h, which
+  # stays out of include/ for that reason.
+  ConversionUtils.cpp
 
   DEPENDS
   TritonToKTIRIncGen
 
   LINK_LIBS PUBLIC
   KTDPUtils
+  SpyreUtils
   KTIR::KtdpDialect
   KTIR::SpyreOpDialect
   TritonIR
@@ -44,4 +48,7 @@ add_triton_library(TritonToKTIR
   MLIRFunctionInterfaces
   # applyPartialConversion and DialectConversion.cpp.
   MLIRTransformUtils
+  # mlir/Interfaces/SideEffectInterfaces.h, for isOpTriviallyDead in
+  # ConversionUtils.cpp.
+  MLIRSideEffectInterfaces
 )

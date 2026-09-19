@@ -1694,7 +1694,7 @@ LogicalResult SpyreTensorLayoutOp::verify() {
 
   // Tallies per logical dim, for the stick-split check below.
   SmallVector<int64_t> numIdentity(logRank, 0), numFloorDiv(logRank, 0),
-      numMod(logRank, 0), numTotal(logRank, 0);
+      numMod(logRank, 0), numSplat(logRank, 0), numTotal(logRank, 0);
 
   for (unsigned k = 0; k < src.size(); ++k) {
     // Consumers index the logical shape/stride arrays with phys_src[k].
@@ -1704,44 +1704,65 @@ LogicalResult SpyreTensorLayoutOp::verify() {
 
     // phys_op[k] is static_cast to CoordOp and switched on without a default;
     // an unknown code leaves the derived coordinate expression unset.
-    if (op[k] < 0 || op[k] > 2)
+    if (op[k] < 0 || op[k] > 3)
       return emitOpError("phys_op[")
-             << k << "] must be 0 (identity), 1 (floordiv) or 2 (mod), got "
+             << k
+             << "] must be 0 (identity), 1 (floordiv), 2 (mod) or 3 "
+                "(splat), got "
              << op[k];
 
-    // phys_arg is the floordiv divisor / mod modulus; 0 divides by zero when
-    // deriving physical extents and yields a zero-width stick.
+    // phys_arg is the floordiv divisor / mod modulus / splat lane count;
+    // 0 divides by zero when deriving physical extents and yields a zero-width
+    // stick or a zero-lane splat.
     if (op[k] != 0 && arg[k] <= 0)
       return emitOpError("phys_arg[")
-             << k << "] must be > 0 for a floordiv/mod dim, got " << arg[k];
+             << k
+             << "] must be > 0 for a floordiv/mod/splat dim, got "
+             << arg[k];
 
     ++numTotal[src[k]];
     if (op[k] == 0)
       ++numIdentity[src[k]];
     else if (op[k] == 1)
       ++numFloorDiv[src[k]];
-    else
+    else if (op[k] == 2)
       ++numMod[src[k]];
+    else
+      ++numSplat[src[k]];
   }
 
-  // A logical dim may legitimately span two physical dims as a stick split:
-  // one floordiv (the stick-index dim) plus one mod (the lane dim). classify()
-  // routes the floordiv entry to floorDims and only the mod entry to
-  // opTileDims, so exactly one entry per logical dim reaches the op tile and
-  // computeTransposePerm can assign it a unique target position. Any other
-  // repetition puts two dims carrying the same role in opTileDims, leaving a
-  // -1 hole in the permutation that crashes the transpose emission.
+  // A logical dim may legitimately span two physical dims in two ways:
+  //
+  //   Stick split: one floordiv (stick-index) + one mod (lane). classify()
+  //   routes the floordiv entry to floorDims and only the mod entry to
+  //   opTileDims, so exactly one entry per logical dim reaches the op tile and
+  //   computeTransposePerm can assign it a unique target position. Any other
+  //   repetition puts two dims carrying the same role in opTileDims, leaving a
+  //   -1 hole in the permutation that crashes the transpose emission.
+  //
+  //   Splat re-stick: one identity (the dim itself, kept whole) + one
+  //   splat (the same dim replicated across a fresh lane axis). That is the
+  //   reduce-on-stick output layout, where a rank-1 logical result physicalizes
+  //   to (dim, lanes). Its two entries do not partition the dim between them the
+  //   way a split does, so it is a distinct pairing rather than a relaxation of
+  //   the one above: mixing halves across the two (floordiv + splat,
+  //   identity + mod) stays rejected.
   for (int64_t d = 0; d < logRank; ++d) {
     if (numTotal[d] < 2)
       continue;
     if (numTotal[d] == 2 && numFloorDiv[d] == 1 && numMod[d] == 1)
       continue;
+    if (numTotal[d] == 2 && numIdentity[d] == 1 && numSplat[d] == 1)
+      continue;
     return emitOpError("logical dim ")
            << d << " appears in " << numTotal[d]
            << " physical dims; a repeated logical dim is only valid as a stick "
-              "split (exactly one floordiv entry and one mod entry), got "
+              "split (exactly one floordiv entry and one mod entry) or a "
+              "splat re-stick (exactly one identity entry and one splat "
+              "entry), got "
            << numIdentity[d] << " identity, " << numFloorDiv[d]
-           << " floordiv, " << numMod[d] << " mod";
+           << " floordiv, " << numMod[d] << " mod, " << numSplat[d]
+           << " splat";
   }
 
   return success();

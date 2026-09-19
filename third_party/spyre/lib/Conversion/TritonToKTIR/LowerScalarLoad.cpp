@@ -48,7 +48,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "Conversion/TritonToKTIR/Passes.h"
+#include "ConversionUtils.h"
 #include "Dialect/KTDP/Utils/Utility.h"
+#include "Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
@@ -73,6 +75,10 @@ namespace mlir::triton::spyre {
 } // namespace mlir::triton::spyre
 
 namespace {
+
+using mlir::triton::spyre::cleanupDeadOps;
+using mlir::triton::spyre::getBasePtrAsIndex;
+using mlir::triton::spyre::getConstantInt;
 
 //===----------------------------------------------------------------------===//
 // Helpers
@@ -102,7 +108,7 @@ static bool isScalarPtr(Value ptr) {
 /// itself `arith.constant` counts. Thin bool-projecting wrapper around the
 /// shared `getConstantInt`.
 static std::optional<bool> getConstantMask(Value v) {
-  if (auto c = mlir::triton::ktdp::getConstantInt(v))
+  if (auto c = getConstantInt(v))
     return *c != 0;
   return std::nullopt;
 }
@@ -126,7 +132,7 @@ static Value resolveScalarAddress(OpBuilder &builder, Location loc,
     ptr = addPtr.getPtr();
   }
 
-  Value baseIndex = mlir::triton::ktdp::getBasePtrAsIndex(builder, loc, ptr);
+  Value baseIndex = getBasePtrAsIndex(builder, loc, ptr);
   for (Value offset : llvm::reverse(offsets))
     baseIndex =
         arith::AddIOp::create(builder, loc, baseIndex, offset).getResult();
@@ -280,8 +286,8 @@ struct LowerScalarLoadPass
     // chain, and any other type of dead-code fallout, is left for
     // canonicalize/CSE, same as `LowerDescriptorMemory.cpp` already does
     // for its own leftover dead casts.
-    mlir::triton::ktdp::cleanupDeadOps(
-        module, [](Operation *op) { return isa<triton::AddPtrOp>(op); });
+    cleanupDeadOps(module,
+                   [](Operation *op) { return isa<triton::AddPtrOp>(op); });
   }
 };
 

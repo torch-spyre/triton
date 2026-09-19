@@ -9,6 +9,7 @@
 # No func, math, memref or spyreop: this pass touches none of them.
 add_triton_library(KTDPTransforms
   RewriteDescriptorLayout.cpp
+  RewriteDescriptorLayoutGeneric.cpp
   RewriteDescriptorLayout/Classify.cpp
   RewriteDescriptorLayout/ContractionSynthesis.cpp
   RewriteDescriptorLayout/IndexDomain.cpp
@@ -20,6 +21,7 @@ add_triton_library(KTDPTransforms
 
   LINK_LIBS PUBLIC
   KTDPUtils
+  SpyreUtils
   KTIR::KtdpDialect
   TritonIR
   MLIRIR
