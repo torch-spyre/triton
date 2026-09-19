@@ -1469,6 +1469,21 @@ struct RewriteDescriptorLayoutGenericPass
       cst.getResult().setType(physTy);
       return success();
     }
+    // A linalg.fill writes one scalar into every element it is given, so it has
+    // no element order to preserve and no shape of its own: restating it is
+    // restating the tensor it writes into and letting its result follow. Its
+    // indexing maps are implicit in the operand shapes, so nothing has to be
+    // rebuilt for them.
+    //
+    // This is the init LowerComputeOps puts on every reduction's outs, and
+    // DropReductionInitFill does not run until the spyrecode stage, so it is
+    // present on every reduce this pass sees.
+    if (auto fill = dyn_cast_or_null<linalg::FillOp>(def)) {
+      if (failed(retypeToPhysical(fill.getDpsInitOperand(0)->get(), physTy, b)))
+        return failure();
+      fill.getResult(0).setType(physTy);
+      return success();
+    }
     LLVM_DEBUG({
       llvm::dbgs() << "    decline: cannot restate ";
       if (Operation *d = v.getDefiningOp())

@@ -55,13 +55,15 @@ module {
 // CHECK:           %[[VAL_15:.*]] = arith.constant 64 : index
 // CHECK:           %[[VAL_16:.*]] = arith.remsi %[[VAL_2]], %[[VAL_15]] : index
 // CHECK:           %[[VAL_17:.*]] = ktdp.construct_access_tile %[[VAL_12]]{{\[}}%[[VAL_14]], %[[VAL_16]]] {access_tile_order = #[[$ATTR_1]], access_tile_set = #[[$ATTR_4]]} : memref<2x64xf32> -> !ktdp.access_tile<2x64xindex>
-// CHECK:           %[[VAL_18:.*]] = tensor.empty() : tensor<2x64xf32>
-// CHECK:           %[[VAL_19:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_2]]], iterator_types = ["parallel", "reduction", "parallel"]} ins(%[[VAL_10]] : tensor<2x64x64xf32>) outs(%[[VAL_18]] : tensor<2x64xf32>) {
-// CHECK:           ^bb0(%[[VAL_20:.*]]: f32, %[[VAL_21:.*]]: f32):
-// CHECK:             %[[VAL_22:.*]] = arith.addf %[[VAL_20]], %[[VAL_21]] : f32
-// CHECK:             linalg.yield %[[VAL_22]] : f32
+// CHECK:           %[[VAL_18:.*]] = arith.constant 0.000000e+00 : f32
+// CHECK:           %[[VAL_19:.*]] = tensor.empty() : tensor<2x64xf32>
+// CHECK:           %[[VAL_20:.*]] = linalg.fill ins(%[[VAL_18]] : f32) outs(%[[VAL_19]] : tensor<2x64xf32>) -> tensor<2x64xf32>
+// CHECK:           %[[VAL_21:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_2]]], iterator_types = ["parallel", "reduction", "parallel"]} ins(%[[VAL_10]] : tensor<2x64x64xf32>) outs(%[[VAL_20]] : tensor<2x64xf32>) {
+// CHECK:           ^bb0(%[[VAL_22:.*]]: f32, %[[VAL_23:.*]]: f32):
+// CHECK:             %[[VAL_24:.*]] = arith.addf %[[VAL_22]], %[[VAL_23]] : f32
+// CHECK:             linalg.yield %[[VAL_24]] : f32
 // CHECK:           } -> tensor<2x64xf32>
-// CHECK:           ktdp.store %[[VAL_19]], %[[VAL_17]] : tensor<2x64xf32>, <2x64xindex>
+// CHECK:           ktdp.store %[[VAL_21]], %[[VAL_17]] : tensor<2x64xf32>, <2x64xindex>
 // CHECK:           tt.return
 // CHECK:         }
 tt.func @idempotent(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
@@ -77,7 +79,9 @@ tt.func @idempotent(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
   %od = builtin.unrealized_conversion_cast %ov : memref<128xf32> to !tt.tensordesc<128xf32>
   tt.spyre_tensor_layout %od {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : <128xf32>
   %ot = ktdp.construct_access_tile %ov[%c0] {access_tile_order = #id1, access_tile_set = #sout} : memref<128xf32> -> !ktdp.access_tile<128xindex>
-  %e = tensor.empty() : tensor<128xf32>
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<128xf32>
+  %e = linalg.fill ins(%zero : f32) outs(%e0 : tensor<128xf32>) -> tensor<128xf32>
   %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["reduction", "parallel"]} ins(%al : tensor<64x128xf32>) outs(%e : tensor<128xf32>) {
   ^bb0(%x: f32, %acc: f32):
     %s = arith.addf %x, %acc : f32

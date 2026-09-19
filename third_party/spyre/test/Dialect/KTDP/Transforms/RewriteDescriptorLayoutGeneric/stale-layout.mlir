@@ -59,7 +59,13 @@
 // two loops and the surviving dim rides as the third; the broadcast output adds a
 // fourth loop that only its own map names. Four loops here is CORRECT -- it is the
 // same shape one_tile_on_stick_bcast_max emits.
-// CHECK:       linalg.generic {indexing_maps = [#[[$RIN:.+]], #[[$ROUT:.+]]], iterator_types = ["reduction", "parallel", "reduction", "parallel"]} ins(%{{.*}} : tensor<2x64x32xf32>) outs(%{{.*}} : tensor<64x32xf32>)
+//
+// Its init is the neutral-element linalg.fill LowerComputeOps puts on every
+// reduction, and it follows the reduce to physical rank 2 along with the
+// tensor.empty underneath it.
+// CHECK:       %[[MAXINIT:.*]] = tensor.empty() : tensor<64x32xf32>
+// CHECK:       %[[MAXFILL:.*]] = linalg.fill ins(%{{.*}} : f32) outs(%[[MAXINIT]] : tensor<64x32xf32>) -> tensor<64x32xf32>
+// CHECK:       linalg.generic {indexing_maps = [#[[$RIN:.+]], #[[$ROUT:.+]]], iterator_types = ["reduction", "parallel", "reduction", "parallel"]} ins(%{{.*}} : tensor<2x64x32xf32>) outs(%[[MAXFILL]] : tensor<64x32xf32>)
 // CHECK:         arith.maximumf
 // CHECK:       ktdp.store %{{.*}} : tensor<64x32xf32>, <64x32xindex>
 
@@ -109,7 +115,9 @@ module {
     // G1: max(x, axis=1) stored stick-wide.
     %t0 = ktdp.construct_access_tile %x_view[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
     %x0 = ktdp.load %t0 : <64x64xindex> -> tensor<64x64xf32>
-    %e0 = tensor.empty() : tensor<64xf32>
+    %ninf = arith.constant 0xFF800000 : f32
+    %e0empty = tensor.empty() : tensor<64xf32>
+    %e0 = linalg.fill ins(%ninf : f32) outs(%e0empty : tensor<64xf32>) -> tensor<64xf32>
     %maxes = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "reduction"]} ins(%x0 : tensor<64x64xf32>) outs(%e0 : tensor<64xf32>) {
     ^bb0(%in: f32, %acc: f32):
       %m = arith.maximumf %in, %acc : f32
