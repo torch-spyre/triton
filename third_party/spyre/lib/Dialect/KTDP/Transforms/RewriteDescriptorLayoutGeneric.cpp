@@ -481,6 +481,16 @@ struct RebuildOperand {
 /// A piece is the unit the numbering orders, because it is the unit an operand's
 /// physical dim names: a physical dim carries exactly one of these, and that is
 /// what lets an operand's physical order be read as an order on pieces.
+///
+/// Which is why this is a type and not just an index into the domain. The
+/// rebuilt loop dims have to be put in SOME order, and the order is not free:
+/// the result operand's rebuilt map has to be a projected permutation taking the
+/// loop dims in the order the result's own physical type lays them out, or the
+/// generic would be writing its result transposed and the store would need a
+/// transpose this pass does not emit. So the ordering is derived from the
+/// operands' physical orders (see buildLoopDomain), and a physical dim's
+/// contribution to that is exactly one piece — hence the pair `(loop, lane)`,
+/// which is what "the half of logical dim `loop`" needs to be said with.
 struct DomainPiece {
   unsigned loop;
   /// True for the lane — the element offset within a stick — false for the
@@ -494,6 +504,23 @@ struct DomainPiece {
 
 /// The rebuilt loop domain: how many physical loop dims there are, and where
 /// each logical dim's pieces landed.
+///
+/// This is the NUMBERING the whole rebuild agrees on. The logical generic has
+/// some number of loop dims; physicalizing its operands splits some of those
+/// dims in two — a stick index and a lane within the stick — so the rebuilt
+/// generic has more loop dims than the logical one did, and the halves only mean
+/// anything if every operand names the same rebuilt loop dim for the same half.
+/// stickDim[d] and laneDim[d] are that agreement, one entry per LOGICAL dim;
+/// width[d] is what an operand holding d whole needs to recompose the two halves
+/// into the one index it addresses d with (composeStickSplit).
+///
+/// A logical dim is split here if ANY operand splits it, not only if all do —
+/// which is why an unsplit carrier needs the composite at all, and why width is
+/// part of the domain rather than of the operand that split the dim.
+///
+/// Splat physical dims are not in this numbering: a splat is an axis no logical
+/// loop dim accounts for, so it gets its own loop dim per operand, allocated
+/// after the pieces are ordered and recorded in RebuildOperand::splatDim.
 struct LoopDomain {
   /// Loop dim carrying logical dim d's stick index, or its whole extent when
   /// the dim is unsplit.
@@ -530,6 +557,30 @@ void collectPieces(const RebuildOperand &o,
 /// Build the loop domain over `logicalNumLoops` dims, splitting every logical
 /// dim that any operand splits. Fails when two operands split the same logical
 /// dim at different widths.
+///
+/// Two separate decisions, in this order:
+///
+/// WHICH dims are split, and at what width — read off the operands' layouts.
+/// Any one operand splitting a dim splits it for the whole domain; two operands
+/// splitting the same dim at different widths is the one way this fails, since
+/// no single composite would address it.
+///
+/// WHAT ORDER the resulting pieces are numbered in, which is the part that has a
+/// constraint on it. The result operand's map has to take the loop dims in the
+/// order its own physical type lays them out — anything else is a transposed
+/// write the store cannot absorb — so:
+///   1. seed the order from the result's physical order. Nothing below reorders
+///      what this places, because the result is the one operand whose coordinate
+///      order the generic does not get to choose.
+///   2. merge every other operand's physical order in at a cursor: a piece the
+///      result already placed just advances the cursor, and a piece it never
+///      named is inserted there, so that operand's own dims stay in its order
+///      relative to the ones already placed.
+///   3. append whatever no operand's walk named, in logical order. No operand's
+///      physical order placed it, so nothing constrains where it goes.
+///
+/// Splat physical dims are outside all of this: they name no piece, so each one
+/// gets a fresh loop dim appended after the ordering is fixed.
 FailureOr<LoopDomain>
 buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
                 unsigned logicalNumLoops,
@@ -621,6 +672,12 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
 }
 
 /// Rebuild one operand's indexing map over `dom`.
+///
+/// Mechanical, once the domain has decided the numbering and the order: walk this
+/// operand's physical dims and, per dim, emit the loop dim the domain assigned to
+/// the half that dim carries — the stick, the lane, or this operand's own splat
+/// loop — and where the operand holds whole a dim the domain split, the composite
+/// of that dim's two halves.
 AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
                      MLIRContext *ctx) {
   auto loopExpr = [&](int loopDim) { return getAffineDimExpr(loopDim, ctx); };
