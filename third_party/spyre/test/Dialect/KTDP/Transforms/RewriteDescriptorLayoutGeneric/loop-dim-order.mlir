@@ -12,11 +12,6 @@
 // refactor which changes them fails loudly instead of changing what dbo-opt is
 // handed in silence.
 //
-// Which means: a diff in this file is a QUESTION FOR DBO-OPT, not a test to
-// update. If a change makes a map here come out differently, the thing to
-// establish is whether dbo-opt still accepts the new shape. Relaxing the CHECK
-// lines to make them pass again destroys the only signal there is.
-//
 // The set spans the branches of buildLoopDomain, which is what makes it a guard
 // rather than a sample. Four of the five are already pinned elsewhere in this
 // directory and are not duplicated here; the same rule above applies to those
@@ -36,9 +31,6 @@
 //      comes out non-monotone.
 //
 // Branch 4 is the case below, which nothing else reached.
-//
-// TWO NOTES FOR WHOEVER READS DBO-OPT'S ACTUAL CONSTRAINTS. Neither is settled
-// here, and neither is a test to write yet.
 //
 // A DECLINE LAYER. There is no negative case in this file, and there cannot be
 // one while the rule constrains only the result: any set of inputs can be
