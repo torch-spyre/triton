@@ -18,6 +18,12 @@
 //             loads + stores)
 //   Phase 3 — erase all markers (and their now-dead bridge casts)
 //
+// This file, together with its subdirectory and SpyreTensorLayoutOp::verify()
+// in lib/Dialect/Triton/IR/Ops.cpp, is the planned deletion target once
+// RewriteDescriptorLayoutGeneric reaches parity. Deleting this file and its
+// subdirectory, retiring inter_tile, and moving TT_SpyreTensorLayoutOp to the
+// tts dialect are sequenced together in the reorg issue.
+//
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/KTDP/Transforms/Passes.h"
