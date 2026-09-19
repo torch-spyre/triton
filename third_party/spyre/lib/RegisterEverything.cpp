@@ -39,9 +39,7 @@ namespace {
 // The CLI face of TTIRToKTIRPipelineOptions. Two structs rather than one because
 // the members are different kinds of thing: these are llvm::cl objects that parse
 // themselves out of a string, and a builder taking them could not be called with
-// values. `required_fixes`' anchor hook has deliberately no entry here -- it is a
-// Python-side escape hatch on its way out, and giving it a CLI flag would be
-// publishing it.
+// values.
 struct TTIRToKTIRCLIOptions
     : public mlir::PassPipelineOptions<TTIRToKTIRCLIOptions> {
   Option<std::string> dataLayout{

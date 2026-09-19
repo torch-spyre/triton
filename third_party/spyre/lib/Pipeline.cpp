@@ -19,33 +19,22 @@
 
 void mlir::triton::spyre::buildTTIRToKTIRPipeline(
     OpPassManager &pm, const TTIRToKTIRPipelineOptions &options) {
-  // Anchor names are the pass names `required_fixes` uses, which are the
-  // snake_case pybind names rather than the CLI flags. Temporary, with the hook.
-  auto anchor = [&](llvm::StringRef name) {
-    if (options.anchorHook)
-      options.anchorHook(name);
-  };
-
   // tt.descriptor_load/store/gather/scatter -> ktdp memory ops.
   pm.addPass(createLowerDescriptorMemoryPass());
-  anchor("lower_descriptor_memory");
 
   // A scalar tt.load (plus its addptr chain) -> a single-element 1-D read.
   // [LowerPointerChainMemory would sit here -- planned, not implemented; it
   // would handle the tensor-of-pointers tt.load this one leaves legal.]
   pm.addPass(createLowerScalarLoadPass());
-  anchor("lower_scalar_load");
 
   // tt.reduce/broadcast/expand_dims/dot -> linalg + tensor, and a dead-op sweep.
   pm.addPass(createLowerComputeOpsPass());
-  anchor("lower_compute_ops");
 
   // tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery. After
   // LowerComputeOps, because the partials it consumes have to be linalg/tensor
   // by then; before the layout pass, which has no propagation pattern for a
   // !ktdp.tile_future and so must not be reached with one live.
   pm.addPass(createLowerInterTilePass());
-  anchor("lower_inter_tile");
 
   // Logical tensor descriptors -> physical (stick-tiled) layout, from the
   // tt.spyre_tensor_layout annotations. After LowerComputeOps so a tt.dot is
@@ -63,7 +52,6 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // ConvertElementwiseToLinalg creates.
   pm.addPass(mlir::createConvertElementwiseToLinalgPass());
   pm.addPass(createUnaliasLinalgOutsPass());
-  anchor("rewrite_descriptor_layout");
 
   // tt.func/tt.return -> func.func/func.return, !tt.ptr -> index. Last of the
   // conversions, because every memory pass above consumes !tt.ptr arguments
@@ -71,7 +59,6 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // function attributes this rewrites. metadata["name"] and the base-address
   // inference read the module before the pipeline for the same reason.
   pm.addPass(createConvertFunctionsPass());
-  anchor("convert_functions");
 
   // tt.get_program_id -> ktdp.get_compute_tile_id, tt.get_num_programs folded
   // against the grid, which is stamped on the entry function.

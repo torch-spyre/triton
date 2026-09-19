@@ -225,34 +225,56 @@ class TestBaseAddressesOverride:
     """``SpyreOptions.base_addresses``, set by a caller that has real addresses.
 
     dataflow-test-framework's ``dft triton-lower`` (``dftest/triton.py``) is the
-    live example, and it needs both halves: the field, and a ``required_fixes``
-    entry naming ``materialize_base_addresses`` so the pass runs at KTIR time.
+    live example. What it wants is a zero-argument entry function with its own
+    addresses folded in. That belongs to the ``spyrecode`` stage's pass pipeline,
+    which installs MaterializeBaseAddresses under its own flag rather than on a
+    caller's say-so -- so the field is all a caller supplies, and the stage decides
+    where the pass runs.
     """
 
-    def _materialized_entry(self, mod):
-        return next(line for line in str(mod).splitlines() if "func.func" in line)
+    def _entry(self, text):
+        return next(line for line in str(text).splitlines() if "func.func" in line)
 
-    def test_required_fixes_materializes_at_ktir_time(self):
-        # The dft path exactly: name the pass, anchored on the last core pass,
-        # and hand it the DTI addresses. Baked mode is stated explicitly —
-        # supplying base_addresses selects it anyway, but symbolic is the default
-        # now and baked must not be reached by accident.
+    def test_the_spyrecode_pipeline_materializes_them(self):
+        # What replaced `required_fixes`, and the reason nothing toggleable had to:
+        # the pass lives in the second stage's pipeline, which is reachable on its
+        # own -- here through the binding, and from the CLI as
+        # --spyre-prepare-spyrecode="bind-base-addresses base-addresses=...". Neither
+        # names a pass, and neither needs dbo-opt.
+        from triton._C.libtriton import ir, spyre
+
         ttir = compile_to_ttir(_EXAMPLE["kernel_fn"], _EXAMPLE["signature"],
                                _EXAMPLE["constexprs"])
         with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".mlir", delete_on_close=False) as f:
             f.write(ttir)
             f.flush()
-            mod = make_ktir_mod(
-                f.name, grid=_EXAMPLE["grid"], symbolic_args=False,
-                base_addresses=list(_DTI_ADDRESSES),
-                required_fixes={"materialize_base_addresses": "convert_functions"})
+            mod = make_ktir_mod(f.name, grid=_EXAMPLE["grid"],
+                                symbolic_args=False,
+                                base_addresses=list(_DTI_ADDRESSES))
+        # The ktir stage leaves the arguments alone: that artifact is cached, and
+        # dropping them there would change its calling convention.
+        assert self._entry(mod).count("index") == len(_DTI_ADDRESSES)
+
+        pm = ir.pass_manager(mod.context)
+        spyre.passes.ttir_to_ktdp.add_spyrecode_pipeline(
+            pm, bind_base_addresses=True, base_addresses=list(_DTI_ADDRESSES))
+        pm.run(mod, "materializes_them")
+
         text = str(mod)
         # A zero-argument entry function is what the dataflow scheduler wants.
-        assert "func.func" in text
-        assert self._materialized_entry(mod).count("index") == 0, text
+        assert self._entry(text).count("index") == 0, text
         for address in _DTI_ADDRESSES[1:]:
             assert str(address) in text, f"{address} missing from:\n{text}"
+
+    def test_the_option_surface_names_no_pass(self):
+        # `required_fixes` is gone and nothing toggleable replaced it: the
+        # pipelines take a fixed ordered list. A caller passing the old field now
+        # gets a loud failure from make_ktir_mod rather than a silently ignored
+        # request.
+        assert "required_fixes" not in SpyreOptions.__dataclass_fields__
+        with pytest.raises(ValueError, match="unknown SpyreOptions field"):
+            make_ktir_mod("unused.mlir", required_fixes={"a": "b"})
 
     def test_a_list_is_normalized_to_a_tuple(self):
         # SPYRE_OPTIONS arrives as JSON, so the field is handed a list; it has to
