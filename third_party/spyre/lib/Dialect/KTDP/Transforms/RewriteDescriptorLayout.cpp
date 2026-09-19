@@ -18,6 +18,22 @@
 //             loads + stores)
 //   Phase 3 — erase all markers (and their now-dead bridge casts)
 //
+// This file, together with its subdirectory and SpyreTensorLayoutOp::verify()
+// in lib/Dialect/Triton/IR/Ops.cpp, is the planned deletion target once
+// RewriteDescriptorLayoutGeneric reaches parity. Deleting this file and its
+// subdirectory, retiring inter_tile, and moving TT_SpyreTensorLayoutOp to the
+// tts dialect are sequenced together in the reorg issue.
+//
+// One thing the move has to settle: readCoordMap in
+// RewriteDescriptorLayoutGeneric.cpp re-checks most of what
+// SpyreTensorLayoutOp::verify() checks — the parallel array lengths, the
+// phys_src and phys_op ranges, and the stick-split and splat-companion pairing
+// rules — because that pass is invocable on hand-written IR. When the op becomes
+// a tts.tensor_layout attribute, the structural rules need an owner: an
+// attribute cannot enforce them the way the op's verifier did, so either the
+// checks live entirely in the consumer or the attribute grows a verifier of its
+// own. Decide it rather than letting the verifier's half disappear with the op.
+//
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/KTDP/Transforms/Passes.h"

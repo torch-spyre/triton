@@ -28,8 +28,9 @@ Value getDescriptorMemView(Value desc) {
 
 /// Build a range-set constraint for an N-D coordinate space.
 /// Static dims use arith constants; dynamic dims use IntegerSet symbols.
-/// Private to this file: the two builders below are its only callers.
-static IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape) {
+/// Declared in the header: the two builders below are its callers here, and a
+/// pass that rebuilds views and tiles of its own builds the same set.
+IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape) {
   unsigned rank = shape.size();
   unsigned symCount = 0;
   for (auto s : shape)
