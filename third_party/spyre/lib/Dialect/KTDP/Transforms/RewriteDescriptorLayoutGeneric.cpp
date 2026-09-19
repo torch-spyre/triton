@@ -49,6 +49,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -412,6 +413,11 @@ FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
     // physical dims per logical dim and would answer this in a line, but it only
     // constrains a dim named TWICE and lets a dim named zero times through.
     //
+    // It is also what makes collectPieces' skips safe, and with them the claim
+    // that buildLoopDomain needs no catch-all: because every logical dim is
+    // sourced, that walk visits every logical position of a marked operand. Both
+    // sites say so; keep the three in step.
+    //
     // That verifier is arguably the better home even so -- this is a property of
     // the marker alone, and the structural tallies are already there. It is here
     // to keep lib/Dialect/Triton/IR/Ops.cpp untouched, since that file is being
@@ -550,6 +556,11 @@ struct LoopDomain {
 
 /// The domain pieces one operand's physical dims name, in that operand's own
 /// physical order.
+///
+/// This walk is the whole source of the domain's pieces — buildLoopDomain adds
+/// none of its own — so the two dims it skips are what a reader has to be able to
+/// rule out. Both skips are safe, and each says why below; readCoordMap's
+/// completeness check is what makes the first one safe.
 void collectPieces(const RebuildOperand &o,
                    SmallVectorImpl<DomainPiece> &pieces) {
   unsigned numDims =
@@ -557,11 +568,22 @@ void collectPieces(const RebuildOperand &o,
   for (unsigned p = 0; p < numDims; ++p) {
     CoordOp coordOp = o.layout ? o.layout->opAt(p) : CoordOp::Identity;
     if (coordOp == CoordOp::Splat)
+      // A splat partitions nothing, so it names no piece — it gets a loop of its
+      // own once the pieces are ordered. Nothing is lost by skipping it: a splat
+      // dim's logical dim is carried whole by an identity dim too (readCoordMap's
+      // splat-companion rule), so that logical position is visited anyway, later
+      // in this same walk.
       continue;
     int64_t logDim = o.layout ? o.layout->src[p] : p;
     auto dimExpr = dyn_cast<AffineDimExpr>(o.logicalMap.getResult(logDim));
     if (!dimExpr)
-      continue; // a constant (a folded splat) names no loop dim
+      // A constant (a folded broadcast) names no loop dim, so there is no piece
+      // to make. Nothing is lost here either: buildLoopDomain's width scan skips
+      // the same result, so the dim is not recorded as split, and any loop dim
+      // this operand reaches only through a non-dim expression is named as a bare
+      // dim by some other operand — or the generic was non-invertible and never
+      // reached this pass. See buildLoopDomain.
+      continue;
     pieces.push_back({dimExpr.getPosition(), coordOp == CoordOp::Mod});
   }
 }
@@ -588,8 +610,8 @@ void collectPieces(const RebuildOperand &o,
 ///      result already placed just advances the cursor, and a piece it never
 ///      named is inserted there, so that operand's own dims stay in its order
 ///      relative to the ones already placed.
-///   3. append whatever no operand's walk named, in logical order. No operand's
-///      physical order placed it, so nothing constrains where it goes.
+/// There is no third step: between them those two name every piece, for the
+/// reasons set out at the assertion below.
 ///
 /// Splat physical dims are outside all of this: they name no piece, so each one
 /// gets a fresh loop dim appended after the ordering is fixed.
@@ -659,13 +681,37 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
     }
   }
 
-  // Step 3: anything no operand's walk named goes last, in logical order.
-  for (unsigned d = 0; d < logicalNumLoops; ++d) {
-    if (!seen({d, /*lane=*/false}))
-      order.push_back({d, /*lane=*/false});
-    if (dom.width[d] && !seen({d, /*lane=*/true}))
-      order.push_back({d, /*lane=*/true});
-  }
+  // The two merges above have named every piece there is, so there is no
+  // catch-all step: `order` is exactly the pieces, and its size is #logical +
+  // #split. The argument, in four parts:
+  //
+  //   - a marked operand sources every logical dim — readCoordMap rejects a
+  //     marker that leaves one out — so collectPieces visits every one of its
+  //     logical positions and emits a piece for each whose map result is a bare
+  //     AffineDimExpr;
+  //   - an unmarked operand's walk IS its map results, one per position, so
+  //     likewise;
+  //   - every loop dim is named by a bare AffineDimExpr in at least one
+  //     operand's map, or the generic handed to this pass was already
+  //     non-invertible and linalg rejected it before the pass ran. Linalg's
+  //     verifier needs each loop dim to appear as a bare dim in some map result
+  //     to invert the concatenated map — which is why a lone `(d0, d1) -> (d0 +
+  //     d1)` fails it while a convolution's `(d0 + d2, d1 + d3)` passes,
+  //     d2 and d3 being named bare by the kernel operand;
+  //   - a split dim's two halves name the same logical dim — readCoordMap's
+  //     pairing rule — so the stick piece and the lane piece are emitted
+  //     together, and dom.width above is set from the same walk under the same
+  //     skip, so no dim is marked split whose lane piece is absent.
+  //
+  // An assertion rather than a fallback, on the same footing as the
+  // postconditions below: if this can be violated by input the pass accepts,
+  // that is a bug in one of the four legs to fix, not a domain to patch up.
+  assert(llvm::all_of(llvm::seq(0u, logicalNumLoops),
+                      [&](unsigned d) {
+                        return seen({d, /*lane=*/false}) &&
+                               (!dom.width[d] || seen({d, /*lane=*/true}));
+                      }) &&
+         "a loop domain piece no operand's walk named");
 
   for (auto [n, pc] : llvm::enumerate(order))
     (pc.lane ? dom.laneDim : dom.stickDim)[pc.loop] = n;
