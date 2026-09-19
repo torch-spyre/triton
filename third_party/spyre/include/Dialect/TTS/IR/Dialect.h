@@ -1,11 +1,13 @@
 //===- Dialect.h - The tts dialect ----------------------------------------===//
 //
-// The `tts` dialect: the Spyre backend's authoring annotations. No ops, no
-// types, no attribute types — see the dialect's description in TTSDialect.td for
-// why a dialect that defines nothing is still the right shape for this.
+// The `tts` dialect: the Spyre backend's authoring annotations. No types and no
+// attribute types — see the dialect's description in TTSDialect.td for why a
+// dialect that defines almost nothing is still the right shape for this.
 //
-// What it publishes is one attribute contract, `tts.tensor_layout`, and the one
-// structural checker that contract is enforced by.
+// What it publishes is one layout contract in two spellings — the
+// `tts.tensor_layout` *op*, which a kernel authors on a `!tt.tensordesc`, and
+// the `tts.tensor_layout` *attribute*, which the lowered IR carries on the
+// memory view — and the one structural checker both are enforced by.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,26 +21,43 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 
+// For the generated op classes: ODS emits Op<> subclasses that need the op
+// definition machinery, and TensorLayoutOp's operand is a Triton type.
+#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/OpDefinition.h"
+#include "mlir/IR/OpImplementation.h"
+#include "triton/Dialect/Triton/IR/Types.h"
+
 #include "Dialect/TTS/IR/Dialect.h.inc"
+
+#define GET_OP_CLASSES
+#include "Dialect/TTS/IR/Ops.h.inc"
 
 namespace mlir::triton::tts {
 
 /// The structural rules a `tts.tensor_layout` coordinate map obeys, checked
-/// once for the two callers that need them: the dialect's own
-/// `verifyOperationAttribute`, which sees every annotated op at every
-/// verification point, and `readCoordMap` in RewriteDescriptorLayoutGeneric,
-/// which is invocable on hand-written IR and so cannot assume the verifier ran
-/// with the rank it measures against.
+/// once for the three callers that need them:
+///   - `TensorLayoutOp::verify`, the authoring op's own verifier;
+///   - the dialect's `verifyOperationAttribute`, which sees every annotated op
+///     at every verification point;
+///   - `readCoordMap` in RewriteDescriptorLayoutGeneric, which is invocable on
+///     hand-written IR and so cannot assume the verifier ran with the rank it
+///     measures against.
 ///
-/// One checker rather than two is the decision recorded here: when the layout
-/// was an op, its verifier and that pass re-stated the same rules in two
-/// places, and the pass's half would have quietly become the only half when the
-/// op went away.
+/// One checker rather than three is the decision recorded here: the rules were
+/// stated twice while the layout lived in the Triton dialect — in
+/// `SpyreTensorLayoutOp::verify` and again in that pass — and the pass's half
+/// would have quietly become the only half when the op went away. The op form
+/// moving into this dialect is what lets it share the checker instead of adding
+/// a third copy.
 ///
-/// `logicalRank` is the rank of the thing the layout describes — the
-/// `construct_memory_view`'s result memref for the attribute. `emitError`
-/// supplies the diagnostic's anchor; every message this emits names
-/// `tts.tensor_layout` itself, so the anchor only has to say *where*.
+/// `logicalRank` is the rank of the thing the layout describes, and it is read
+/// from a different place per caller: the descriptor's block type for the op,
+/// the `construct_memory_view`'s result memref for the attribute. The extents
+/// differ between those two; the rank does not. `emitError` supplies the
+/// diagnostic's anchor; every message this emits names `tts.tensor_layout`
+/// itself, so the anchor only has to say *where*.
 ///
 /// What it enforces, and nothing else:
 ///   - the three arrays are parallel (equal length) and non-empty;
