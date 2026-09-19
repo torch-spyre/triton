@@ -12,12 +12,14 @@
 //       ... %a ... %b ...                     %1 = arith.constant 12288 : index
 //                                             ... %0 ... %1 ...
 //
-// This is an **opt-in** mode. It is absent from buildTTIRToKTIRPipeline, so the
-// cached .ktir artifact keeps its arguments; buildSpyrecodePipeline installs it
-// under its own flag, and a caller wanting it during the earlier stage instead
-// reaches it through the `required_fixes` mechanism in
-// third_party/spyre/backend/compiler.py. With no addresses supplied it is a
-// no-op, so the default argument-passing path is unchanged.
+// This is an **opt-in** mode, and it belongs to one stage. It is absent from
+// buildTTIRToKTIRPipeline, so the cached .ktir artifact keeps its arguments;
+// buildSpyrecodePipeline installs it under its own flag. A caller wanting a
+// zero-argument entry function therefore reads the `spyrecode` stage's module,
+// with addresses supplied; there is no way to ask for this pass earlier, which is
+// deliberate -- the calling convention is the stage boundary's, not a knob's.
+// With no addresses supplied it is a no-op, so the default argument-passing path
+// is unchanged.
 //
 // Indexing: the address list is positional over the entry block's **`index`
 // arguments**, not over all arguments. ConvertFunctions retypes only

@@ -9,6 +9,12 @@
 // `spyrecode` (KTIR in, KTIR out, then dbo-opt). The stage boundary is here
 // rather than in Python, so moving a pass across it is one edit to one list.
 //
+// Each takes a FIXED ordered list. There is deliberately no hook for a caller to
+// add a pass at a chosen point: what one looked like is `SpyreOptions
+// .required_fixes`, which named a pass and an anchor as strings, and a wrong
+// anchor was silently never installed -- which is exactly the failure mode a
+// pass moving between these two lists would create.
+//
 // Options are plain values, not tablegen'd or llvm::cl members: both callers
 // have them as typed values already -- the Python stage through pybind, the CLI
 // through the registration in RegisterEverything.cpp, which is where a string
@@ -19,9 +25,7 @@
 #ifndef TRITON_SPYRE_PIPELINE_H
 #define TRITON_SPYRE_PIPELINE_H
 
-#include "llvm/ADT/StringRef.h"
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <vector>
 
@@ -30,16 +34,6 @@ class OpPassManager;
 } // namespace mlir
 
 namespace mlir::triton::spyre {
-
-/// Called by buildTTIRToKTIRPipeline once after each pass that a caller can
-/// anchor an extra pass on, naming that pass.
-///
-/// TEMPORARY. It exists only for `SpyreOptions.required_fixes`, which names a
-/// pass and an anchor as strings and so has to resolve the pass name on the
-/// Python side. The hook appends to the same pass manager, in place, which is
-/// what keeps the fix in the position the anchor asks for. It goes when that
-/// option does: a fixed ordered list has nothing to anchor to.
-using PipelineAnchorHook = std::function<void(llvm::StringRef anchorName)>;
 
 struct TTIRToKTIRPipelineOptions {
   /// RewriteDescriptorLayout's HBM layout: "device" (stickified row-major
@@ -50,9 +44,6 @@ struct TTIRToKTIRPipelineOptions {
   /// DistributeWork's per-axis partition of the hardware grid. Empty leaves
   /// the pass's own default.
   std::vector<int64_t> grid;
-
-  /// Unset for a plain compile; see PipelineAnchorHook.
-  PipelineAnchorHook anchorHook;
 };
 
 struct SpyrecodePipelineOptions {

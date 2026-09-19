@@ -39,22 +39,20 @@ Spyre options
 -------------
 ``--spyre-options`` takes a JSON object — either inline or ``@path.json`` —
 merged over the driver's ``SPYRE_OPTIONS`` (CLI wins on key collisions) and
-forwarded as keyword arguments to ``make_ktir_mod``. JSON rather than
-repeated ``KEY=VALUE`` flags because ``required_fixes`` is a mapping and a
-flat grammar would need a fragile nested syntax for it.
-
-Unknown keys raise — ``make_ktir_mod`` validates against
-``SpyreOptions.__dataclass_fields__`` so a typo doesn't silently no-op.
-
-The pair that materializes pointer arguments into constants, for feeding
-the dataflow scheduler a zero-argument entry function::
-
-    --spyre-options '{"required_fixes": {"materialize_base_addresses":
-                                         "convert_functions"},
-                      "base_addresses": [0, 8589934592, 17179869184]}'
+forwarded as keyword arguments to ``make_ktir_mod``. Unknown keys raise —
+``make_ktir_mod`` validates against ``SpyreOptions.__dataclass_fields__`` so a
+typo doesn't silently no-op.
 
 ``base_addresses`` values are **ELEMENTS, not bytes** — divide a device
 byte address by the element width before putting it here.
+
+This script stops at the ``ktir`` stage, so the addresses are recorded in the
+options and not yet folded into the IR: ``MaterializeBaseAddresses`` runs in the
+``spyrecode`` stage. For a **zero-argument entry function**, run that stage's
+pipeline over the ``.ktir`` this writes::
+
+    spyre-triton-opt <key>.ktir \\
+      --spyre-prepare-spyrecode="bind-base-addresses base-addresses=0,8589934592"
 
 Usage::
 

@@ -9,9 +9,9 @@ import zipfile
 
 from triton import knobs
 from triton.backends.compiler import BaseBackend, GPUTarget
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Optional, Tuple
 from types import ModuleType
 
 # ---------------------------------------------------------------------------
@@ -198,65 +198,6 @@ def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
     return _segment_addresses(mod.get_function_signature(mod.get_function(entry)))
 
 
-# Passes that need more than the pass manager, as {pass name: SpyreOptions
-# fields to forward}. Names must match the py::arg names on the binding in
-# third_party/spyre/triton_spyre.cc and the field names on SpyreOptions, since
-# they are passed as keyword arguments.
-_PASS_OPTIONS = {
-    "distribute_work": ("grid",),
-    "materialize_base_addresses": ("base_addresses",),
-    "rewrite_descriptor_layout": ("data_layout",),
-}
-
-
-def _add_ktdp_pass(pm, name, options, **overrides):
-    """Add the KTDP pass *name* to *pm*, forwarding the options it declares.
-
-    Turns a pass *name* into a pass, which is what ``required_fixes`` needs and
-    the only thing it is used for: the stage pipelines themselves are built in
-    C++ from typed factories, where a name cannot be misspelled. Passes are
-    exposed as ``add_<name>`` on ``spyre.passes.ttir_to_ktdp``, taking the pass
-    manager plus any :class:`SpyreOptions` fields named in ``_PASS_OPTIONS``. A
-    missing binding means a requested pass would silently never run, so raise.
-
-    ``overrides`` supplies a value the *stage* computed rather than one the
-    caller set.
-
-    Goes with ``required_fixes``, along with the per-pass bindings it reaches.
-    """
-    from triton._C.libtriton import spyre
-
-    adder = getattr(spyre.passes.ttir_to_ktdp, f"add_{name}", None)
-    if adder is None:
-        raise ValueError(
-            f"no pass binding 'add_{name}' on "
-            "spyre.passes.ttir_to_ktdp; declare it in "
-            "third_party/spyre/triton_spyre.cc and rebuild libtriton"
-        )
-    kwargs = {opt: getattr(options, opt) for opt in _PASS_OPTIONS.get(name, ())}
-    kwargs.update(overrides)
-    adder(pm, **kwargs)
-
-
-def _fix_installer(pm, options):
-    """The callback ``buildTTIRToKTIRPipeline`` invokes at each of its anchors.
-
-    It is handed the anchor's pass name and appends to *pm* -- the same pass
-    manager the builder is filling -- so a fix lands exactly where its anchor
-    says. The builder decides which passes are anchors, by calling this after
-    each one; a fix naming anything else is silently never installed, which is
-    what ``required_fixes``' own comment warns about.
-
-    Temporary, with the option.
-    """
-    def install(anchor):
-        for fix, fix_anchor in options.required_fixes.items():
-            if fix_anchor == anchor:
-                _add_ktdp_pass(pm, fix, options)
-
-    return install
-
-
 @dataclass
 class SpyreOptions:
     # Per-axis partition of the Spyre hardware grid. One entry per
@@ -308,28 +249,6 @@ class SpyreOptions:
     # therefore in the cache key. Its default comes from the BUNDLE_SYMBOLIC_ARGS
     # environment variable, read once in parse_options.
     symbolic_args: bool = False
-
-    # Optional extra passes to splice into the TTIR→KTIR pipeline, as
-    # {pass name: pipeline pass it runs after}. Both are binding names on
-    # spyre.passes.ttir_to_ktdp.
-    #
-    #   required_fixes = {"materialize_base_addresses": "convert_functions"}
-    #
-    # Choose the anchor by what the pass depends on. A pass that repairs IR its
-    # anchor produces must run after it, and anchoring earlier silently does
-    # nothing. Others may instead need to land before a later consumer.
-    #
-    # The anchor must be one the pipeline builder announces — the anchor() calls
-    # in third_party/spyre/lib/Pipeline.cpp, which are the six conversions and not
-    # the passes between them. Any other name, a typo or a plausible-looking
-    # "distribute_work", is silently ignored and the pass never runs. A missing
-    # pass *binding* raises; a bad *anchor* does not.
-    #
-    # Nothing needs this to get a correct pipeline: the passes dbo-opt requires
-    # are in the builders' own lists. It is an escape hatch for a caller that
-    # wants one more pass at a chosen point, and it is on its way out precisely
-    # because a silently-ignored anchor is not a good way to ask for one.
-    required_fixes: Mapping[str, str] = field(default_factory=dict)
 
     # HBM data layout: "device" (stickified row-major physical strides) or
     # "host" (strides derived from logical strides via the coordinate map).
@@ -524,15 +443,10 @@ class SpyreBackend(BaseBackend):
         if parsed.get("base_addresses") and "symbolic_args" not in options:
             parsed["symbolic_args"] = False
 
-        # No default required_fixes. convert_elementwise_to_linalg and
-        # unalias_linalg_outs used to be injected here, on every compile, which
-        # made the field non-empty for every caller and so made the pipeline's
-        # other spelling -- the fused C++ helper that knew nothing about them --
-        # permanently unreachable and free to drift. They are now entries in
-        # buildTTIRToKTIRPipeline's own list, in the same position: after the
-        # layout pass, because a linalg.generic built before the descriptor is
-        # physicalized carries logical types and the pipeline then aborts on the
-        # disagreement.
+        # Nothing else is injected here. Every pass either stage needs is in that
+        # stage's own list in third_party/spyre/lib/Pipeline.cpp, which is the
+        # whole of what a caller can ask for: the pipelines take a fixed ordered
+        # list and there is no knob to add to it.
         return SpyreOptions(**parsed)
 
     def compile_time_launch_options(self, grid, specialization) -> dict:
@@ -619,6 +533,11 @@ class SpyreBackend(BaseBackend):
         from triton._C.libtriton import ir, passes
 
         pm = ir.pass_manager(mod.context)
+        # MLIR_ENABLE_DUMP, honoured for the first time on this backend: the GPU
+        # backends call this on every pass manager they build and ours never did,
+        # so the variable was silently inert here. One call per pass manager, and
+        # every stage needs its own.
+        pm.enable_debug()
         passes.common.add_inliner(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
@@ -648,10 +567,11 @@ class SpyreBackend(BaseBackend):
         signature, which the cache key already covers.
 
         Inferring them does not install MaterializeBaseAddresses — _make_spyrecode
-        does that, so the cached .ktir keeps its arguments. A caller that wants
-        the materialization to happen *here* instead, against addresses of its
-        own, names the pass in options.required_fixes and sets
-        options.base_addresses; `dft triton-lower` does exactly that.
+        does that, so the cached .ktir keeps its arguments. A caller wanting a
+        zero-argument entry function against addresses of its own sets
+        options.base_addresses and reads the *spyrecode* stage's module; the
+        materialization does not happen in this stage, and cannot be asked for
+        here.
         """
         from triton._C.libtriton import ir, spyre
 
@@ -676,13 +596,13 @@ class SpyreBackend(BaseBackend):
             metadata["base_addresses"] = infer_base_addresses_from_ptr_types(mod)
 
         pm = ir.pass_manager(mod.context)
+        pm.enable_debug()  # MLIR_ENABLE_DUMP
         # The grid is passed as a list because the binding takes a
         # std::vector<int64_t>; SpyreOptions keeps it a tuple to stay hashable.
         spyre.passes.ttir_to_ktdp.add_ttir_to_ktir_pipeline(
             pm,
             data_layout=options.data_layout,
             grid=list(options.grid),
-            fixes_at=_fix_installer(pm, options),
         )
         pm.run(mod, "make_ktir")
 
@@ -721,15 +641,7 @@ class SpyreBackend(BaseBackend):
         """
         from triton._C.libtriton import ir, spyre
 
-        # Bind the addresses unless the caller asked for symbolic, or
-        # required_fixes already installed MaterializeBaseAddresses at an anchor
-        # of its own -- in which case the pointer arguments are gone, and
-        # installing the pass a second time would hand it more addresses than
-        # there are `index` arguments left to put them in. It fails on exactly
-        # that (MaterializeBaseAddresses.cpp, step 2a).
-        bind = (not options.symbolic_args
-                and "materialize_base_addresses" not in options.required_fixes)
-
+        bind = not options.symbolic_args
         base_addresses = ()
         if bind:
             base_addresses = options.base_addresses or metadata.get("base_addresses")
@@ -746,6 +658,7 @@ class SpyreBackend(BaseBackend):
                 )
 
         pm = ir.pass_manager(mod.context)
+        pm.enable_debug()  # MLIR_ENABLE_DUMP
         spyre.passes.ttir_to_ktdp.add_spyrecode_pipeline(
             pm,
             bind_base_addresses=bind,

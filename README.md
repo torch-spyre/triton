@@ -183,6 +183,83 @@ passing them silently. If instead you see a failure naming an unknown `ktdp`
 attribute, an older `dbo-opt` was found on `PATH` — the error says which binary ran
 and how it was chosen.
 
+## Compile Stages
+
+A compile runs three stages, and knowing which one you are looking at is most of
+debugging this backend. Each stage's output is cached under its own name, and
+`CompiledKernel.asm` is keyed the same way, so `asm["ttir"]`, `asm["ktir"]` and
+`asm["spyrecode"]` are the three artifacts a compile produces.
+
+| Stage | In → out | What it does |
+|-------|----------|--------------|
+| `ttir` | Triton IR → Triton IR | The standard upstream optimization passes: inline, canonicalize, combine, reorder broadcasts, CSE, symbol DCE. |
+| `ktir` | Triton IR → KTIR | The lowering: `tt` memory and compute ops become `ktdp` memory views, access tiles and `linalg`, the entry point becomes a `func.func`, and the grid is distributed. |
+| `spyrecode` | KTIR → a loadable binary | Two halves. A KTIR → KTIR round trip that shapes the module for the device, then `dbo-opt`, which schedules and emits the SpyreCode directory. The stage's artifact is that directory as a ZIP. |
+
+The first two are pure IR-to-IR; only `spyrecode` shells out to another tool.
+
+**The two IR pipelines are addressable from the command line.** Each stage's pass
+list is built once in C++ and registered as an MLIR pass pipeline, so
+`spyre-triton-opt` can run a whole stage rather than a single pass:
+
+```bash
+spyre-triton-opt kernel.ttir --spyre-ttir-to-ktir="grid=32"
+spyre-triton-opt kernel.ktir --spyre-prepare-spyrecode
+```
+
+Feed it a `kernel.ttir` that has been through the `ttir` stage — the one in the
+cache or the dump directory, which is that stage's *output*. Raw
+`ASTSource.make_ir` output has not been inlined yet, and `--spyre-ttir-to-ktir`
+does not inline: a kernel calling a `tl.*` helper fails on the surviving
+`tt.call`. The `ttir` stage is upstream Triton's passes, so there is no
+`spyre-triton-opt` flag for it.
+
+Two things follow. A `lit` test can cover a stage end to end, which no per-pass
+test could. And **the module `dbo-opt` receives is reproducible**: run both
+pipelines in sequence, with the options the compile used, and you have exactly the
+IR the tool was handed — with no tool and no device needed.
+
+```bash
+spyre-triton-opt kernel.ttir \
+  --spyre-ttir-to-ktir="grid=32" \
+  --spyre-prepare-spyrecode="bind-base-addresses base-addresses=0,4294967296"
+```
+
+The options that determine that module — the grid, the data layout, the base
+addresses — are recorded in the compile's `metadata` and folded into its cache
+key, so there is nothing to guess: read them off the compile you are reproducing.
+`--spyre-prepare-spyrecode` alone leaves the addresses symbolic, which is the
+default mode for a launch.
+
+## Seeing Inside a Compile
+
+Three environment variables cover the whole pipeline, and they are the whole
+story — there is no Spyre-specific dump flag to look for, and two of the three are
+upstream Triton's rather than ours. They meet at the module `dbo-opt` receives:
+ours cover everything up to it, `DBO_DEBUG` covers it and everything after.
+
+| Variable | Whose | What you get |
+|----------|-------|--------------|
+| `MLIR_ENABLE_DUMP=1` | upstream | The whole module printed before every pass, for all three stages. Set it to a function name instead to restrict the dump to that kernel. |
+| `TRITON_KERNEL_DUMP=1` with `TRITON_DUMP_DIR=<dir>` | upstream | Every stage's artifact written under `<dir>`, one file per stage. |
+| `TRITON_SPYRE_DBO_DEBUG` | ours | Passed to `dbo-opt` as `DBO_DEBUG`; it writes its own tree of per-stage artifacts, which the `spyrecode` archive carries. **On by default.** |
+
+`MLIR_ENABLE_DUMP` prints "before" only on a successful run: upstream passes
+`printAfterOnlyOnFailure=true`, so an "after" dump means that pass failed.
+
+`TRITON_KERNEL_DUMP` **silently does nothing on a warm cache** — a cache hit
+returns before any stage runs, so there is nothing to dump. Add
+`TRITON_ALWAYS_COMPILE=1`:
+
+```bash
+TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/dump TRITON_ALWAYS_COMPILE=1 python kernel.py
+```
+
+`DBO_DEBUG` is why nothing of ours needs to capture the module handed to
+`dbo-opt`: its tree's first entry *is* that module, and it is packed into the
+`spyrecode` artifact on every compile. To obtain that module without running the
+tool at all, use the two-pipeline recipe above.
+
 ## Device Launch Dependency
 
 `kernel[grid](x, y, out, ...)` runs on hardware in the calling process:

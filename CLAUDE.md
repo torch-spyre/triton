@@ -118,8 +118,25 @@ Current upstream touch points:
 
 ## Where the Spyre code lives
 
-- `third_party/spyre/backend/compiler.py` — `SpyreBackend`; `add_stages()`
-  defines the `ttir` and `ktir` stages. `_make_ktir` runs the KTDP passes.
+- `third_party/spyre/backend/compiler.py` — `SpyreBackend`. `add_stages()`
+  registers **three** stages, and which one you are looking at is most of
+  debugging this backend:
+
+  | Stage | In → out | Method | Notes |
+  |-------|----------|--------|-------|
+  | `ttir` | Triton IR → Triton IR | `_make_ttir` | The standard upstream optimization passes. |
+  | `ktir` | Triton IR → KTIR | `_make_ktir` | The lowering. Also reads `metadata["name"]` and infers the base addresses, both of which have to happen before `ConvertFunctions` retypes the entry point. |
+  | `spyrecode` | KTIR → a loadable binary | `_make_spyrecode` | A KTIR → KTIR round trip that shapes the module for the device, then `dbo-opt`. Returns the export directory as ZIP bytes. |
+
+  The first two are pure IR-to-IR; only `spyrecode` shells out. Each artifact is
+  cached under the stage name and reachable as `asm["<stage>"]` on a
+  `CompiledKernel`.
+
+  **The two IR pipelines are registered MLIR pass pipelines**, built once in C++
+  (`lib/Pipeline.cpp`) and reachable as `spyre-triton-opt --spyre-ttir-to-ktir`
+  and `--spyre-prepare-spyrecode`. So a lit test can drive a whole stage rather
+  than one pass (`test/Pipeline/stage-pipelines.mlir`), and the module `dbo-opt`
+  receives can be reproduced by hand — see below.
 - The C++ passes live in three libraries, split by what each pass's subject is.
   See the spyre / spyre-ktir agents for the pass pipeline.
   - `third_party/spyre/lib/Conversion/TritonToKTIR/` — passes that cross a
@@ -140,6 +157,59 @@ Current upstream touch points:
   gather).
 - `third_party/spyre/ktir-mlir-frontend/` — KTIR MLIR frontend submodule
   (provides the `mlir_ktdp` bindings; supplies LLVM).
+
+## Seeing what the compiler did
+
+Three environment variables, and they are the whole story — **two of the three are
+upstream Triton's, not ours**, so do not go looking for a Spyre-specific dump flag.
+
+| Variable | Whose | Gives you |
+|----------|-------|-----------|
+| `MLIR_ENABLE_DUMP` | upstream | The module before each pass, all three stages |
+| `TRITON_KERNEL_DUMP` + `TRITON_DUMP_DIR` | upstream | One artifact file per stage |
+| `TRITON_SPYRE_DBO_DEBUG` | ours | `dbo-opt`'s own tree, inside the archive. On by default |
+
+**Between passes.** All three stages, since `_make_ttir` / `_make_ktir` /
+`_make_spyrecode` each call `pm.enable_debug()` — one call per pass manager, and a
+new pass manager needs its own or it is silently quiet.
+
+```bash
+MLIR_ENABLE_DUMP=1 python kernel.py           # every pass, every kernel
+MLIR_ENABLE_DUMP=my_kernel python kernel.py   # a function name narrows it
+```
+
+You get **"before" only** on a successful run: upstream passes
+`printAfterOnlyOnFailure=true`. An "IR Dump After" line therefore means *that pass
+failed* — read it as a diagnostic, not as ordinary output.
+
+**Per-stage artifacts.** `TRITON_ALWAYS_COMPILE=1` is not optional: a cache hit
+returns before any stage runs, so on a warm cache the dump directory stays empty
+and nothing says why.
+
+```bash
+TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/dump TRITON_ALWAYS_COMPILE=1 python kernel.py
+```
+
+**The module `dbo-opt` was handed.** Already recorded, on every compile: `dbo-opt`
+writes a `debug/` tree that `_make_spyrecode` packs into the archive, and its first
+entry *is* that module. Unpack `asm["spyrecode"]` (a ZIP) and read it — which is
+why no flag of ours exists for this.
+
+**Reproducing that module without the tool.** Run the two registered pipelines in
+sequence, with the options the compile recorded in its `metadata` (grid, data
+layout, base addresses):
+
+```bash
+spyre-triton-opt kernel.ttir \
+  --spyre-ttir-to-ktir="grid=32" \
+  --spyre-prepare-spyrecode="bind-base-addresses base-addresses=0,4294967296"
+```
+
+Use the **dumped** `kernel.ttir`, i.e. the `ttir` stage's *output*.
+`--spyre-ttir-to-ktir` does not inline, so raw `ASTSource.make_ir` output fails on
+a surviving `tt.call` from any `tl.*` helper. There is no flag for the `ttir` stage
+because it is upstream Triton's passes. Omit `bind-base-addresses` for the
+symbolic mode, which is what a launch uses.
 
 ## Tests
 
