@@ -15,11 +15,13 @@
 // on the chain, so it follows the reduce to physical shape along with the
 // tensor.empty underneath it.
 //
-// Three cases: the reduction off the stick axis, the reduction on it (where the
+// Four cases: the reduction off the stick axis, the reduction on it (where the
 // output has to be re-stuck by a broadcast because reducing the split dim
-// destroys the stick structure), and a three-generic chain that composes the two
-// -- a reduce whose broadcast statistic is read back by a rank-3 elementwise which
-// feeds another. rebuild-contraction.mlir is this same rule with a second input.
+// destroys the stick structure), that same re-stuck output with the broadcast
+// axis FIRST in its physical order rather than last, and a three-generic chain
+// that composes the first two -- a reduce whose broadcast statistic is read back
+// by a rank-3 elementwise which feeds another. rebuild-contraction.mlir is this
+// same rule with a second input.
 //
 // Captures are hand-named and this file is hand-maintained: do not regenerate it
 // with generate-test-checks.py, which emits only positive CHECKs and would drop
@@ -203,7 +205,90 @@ tt.func @red_on_restick(%a: !tt.ptr<f32>, %c: !tt.ptr<f32>) {
 
 // -----
 
-// Case 3 -- the two above composed: a reduce whose broadcast statistic is read
+// Case 3 -- case 2 with the broadcast axis FIRST in the output's physical order.
+//
+// One field differs from case 2: the output marker's phys_op is [broadcast,
+// identity] over phys_src [0, 0] rather than [identity, broadcast], so the
+// replication axis is physical dim 0 and the logical dim rides behind it --
+// physical 64x256, not 256x64.
+//
+// The loop domain does not see that field. A broadcast names no domain piece, so
+// it takes no part in the ordering and gets its loop AFTER the pieces are
+// numbered -- d3, the last loop dim, whatever position the broadcast occupies in
+// the operand's physical order. The output map therefore names d3 before d1 and
+// is NOT monotone: (d0, d1, d2, d3) -> (d3, d1). That is correct and it verifies.
+// A projected permutation need not take the loop dims in increasing order, and
+// each of the output's physical dims still names the loop carrying the half it
+// holds -- lane first, row second, exactly as its own physical type lays them
+// out. Case 2, where the broadcast is last, is the same emission with the two
+// results the other way round.
+//
+// The one thing to hold on to: every OTHER positive case in this directory has a
+// monotone output map, and this is the only shape that breaks that -- so a
+// monotonicity claim about the output map has to exclude the broadcast axis. The
+// invariant asserted in the pass is stated that way.
+
+// CHECK: #[[$BF_ID3:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+// CHECK: #[[$BF_ID2:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK: #[[$BF_IN:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
+// CHECK: #[[$BF_OUT:.+]] = affine_map<(d0, d1, d2, d3) -> (d3, d1)>
+// CHECK: #[[$BF_SET3:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+// CHECK: #[[$BF_SET2:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 255 >= 0)>
+
+#in  = affine_map<(d0, d1) -> (d0, d1)>
+#out = affine_map<(d0, d1) -> (d0)>
+#sin  = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#sout = affine_set<(d0) : (d0 >= 0, -d0 + 255 >= 0)>
+#id2 = affine_map<(d0, d1) -> (d0, d1)>
+#id1 = affine_map<(d0) -> (d0)>
+module {
+// CHECK-LABEL:   tt.func @red_on_restick_broadcast_first(
+// The input is unchanged from case 2: stick-on-K, two sticks.
+// CHECK:           ktdp.construct_memory_view %{{.*}}, sizes: [2, 256, 64], strides: [16384, 64, 1] {coordinate_set = #[[$BF_SET3]], memory_space = #ktdp.memory_space<global>} : memref<2x256x64xf32>
+// CHECK:           %[[AL:.*]] = ktdp.load %{{.*}} : <2x256x64xindex> -> tensor<2x256x64xf32>
+// The output's physical shape is the marker's order: the 64 lanes first.
+// CHECK:           %[[OV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [64, 256], strides: [256, 1] {coordinate_set = #[[$BF_SET2]], memory_space = #ktdp.memory_space<global>} : memref<64x256xf32>
+// The broadcast dim's subscript is the axis's own origin, and it comes first.
+// CHECK:           %[[BZERO:.*]] = arith.constant 0 : index
+// CHECK:           %[[OT:.*]] = ktdp.construct_access_tile %[[OV]]{{\[}}%[[BZERO]], %{{.*}}] {access_tile_order = #[[$BF_ID2]], access_tile_set = #[[$BF_SET2]]} : memref<64x256xf32> -> !ktdp.access_tile<64x256xindex>
+// CHECK:           %[[FILL:.*]] = linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<64x256xf32>) -> tensor<64x256xf32>
+// The non-monotone output map, and the iterators unchanged from case 2.
+// CHECK:           %[[R:.*]] = linalg.generic {indexing_maps = [#[[$BF_IN]], #[[$BF_OUT]]], iterator_types = ["reduction", "parallel", "reduction", "parallel"]} ins(%[[AL]] : tensor<2x256x64xf32>) outs(%[[FILL]] : tensor<64x256xf32>) {
+// CHECK:           } -> tensor<64x256xf32>
+// CHECK:           ktdp.store %[[R]], %[[OT]] : tensor<64x256xf32>, <64x256xindex>
+// CHECK:           tt.return
+tt.func @red_on_restick_broadcast_first(%a: !tt.ptr<f32>, %c: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [256, 128], strides: [128, 1] {coordinate_set = #sin, memory_space = #ktdp.memory_space<global>} : memref<256x128xf32>
+  %ad = builtin.unrealized_conversion_cast %av : memref<256x128xf32> to !tt.tensordesc<256x128xf32>
+  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <256x128xf32>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sin} : memref<256x128xf32> -> !ktdp.access_tile<256x128xindex>
+  %al = ktdp.load %at : <256x128xindex> -> tensor<256x128xf32>
+
+  %ci = builtin.unrealized_conversion_cast %c : !tt.ptr<f32> to index
+  %cv = ktdp.construct_memory_view %ci, sizes: [256], strides: [1] {coordinate_set = #sout, memory_space = #ktdp.memory_space<global>} : memref<256xf32>
+  %cd = builtin.unrealized_conversion_cast %cv : memref<256xf32> to !tt.tensordesc<256xf32>
+  // The one field that differs from case 2: broadcast first, identity second.
+  tt.spyre_tensor_layout %cd {phys_src = array<i64: 0, 0>, phys_op = array<i64: 3, 0>, phys_arg = array<i64: 64, 0>} : <256xf32>
+  %ct = ktdp.construct_access_tile %cv[%c0] {access_tile_order = #id1, access_tile_set = #sout} : memref<256xf32> -> !ktdp.access_tile<256xindex>
+
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<256xf32>
+  %e = linalg.fill ins(%zero : f32) outs(%e0 : tensor<256xf32>) -> tensor<256xf32>
+  %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["parallel", "reduction"]} ins(%al : tensor<256x128xf32>) outs(%e : tensor<256xf32>) {
+  ^bb0(%x: f32, %acc: f32):
+    %s = arith.addf %x, %acc : f32
+    linalg.yield %s : f32
+  } -> tensor<256xf32>
+  ktdp.store %r, %ct : tensor<256xf32>, <256xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 4 -- cases 1 and 2 composed: a reduce whose broadcast statistic is read
 // back by a rank-3 elementwise, which feeds another.
 //
 // The only three-generic chain in this directory, and the only place a rank-2
