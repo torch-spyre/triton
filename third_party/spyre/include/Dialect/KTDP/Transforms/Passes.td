@@ -108,7 +108,10 @@ def RewriteDescriptorLayoutGeneric
       ktdp.load / store.
     The marker holds the physical layout as the OpSpec device_coordinates form
     (phys_src / phys_op / phys_arg i64 arrays; op 0=identity, 1=floordiv,
-    2=mod, 3=splat).
+    2=mod, 3=splat).  phys_src must name every logical dim at least once: a dim
+    named by none would have its extent dropped from the physical type, and the
+    pass declines such a marker rather than emitting a layout that cannot
+    address the dim.
 
     Phase 1  Physicalize each annotated descriptor: rebuild
              construct_memory_view with physical sizes and with strides laid out
