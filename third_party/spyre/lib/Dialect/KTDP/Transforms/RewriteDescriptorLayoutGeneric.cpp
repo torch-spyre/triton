@@ -75,37 +75,6 @@ using namespace mlir::triton::ktdp;
 // CoordOp: use Splat (value 3), NOT Broadcast
 enum class CoordOp : int64_t { Identity = 0, FloorDiv = 1, Mod = 2, Splat = 3 };
 
-// Local copy of buildRangeSetND from Utility.cpp, which keeps it static.
-// Reproduced here so this pass is self-contained and does not depend on
-// that function becoming part of the public API.
-static IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape) {
-  unsigned rank = shape.size();
-  unsigned symCount = 0;
-  for (auto s : shape)
-    if (s == ShapedType::kDynamic)
-      ++symCount;
-  SmallVector<AffineExpr> constraints;
-  SmallVector<bool> eqFlags;
-  unsigned symIdx = 0;
-  for (unsigned i = 0; i < rank; ++i) {
-    auto di = getAffineDimExpr(i, ctx);
-    AffineExpr upper;
-    if (shape[i] == ShapedType::kDynamic)
-      upper = getAffineSymbolExpr(symIdx++, ctx) - 1;
-    else
-      upper = getAffineConstantExpr(shape[i] - 1, ctx);
-    constraints.push_back(di);
-    eqFlags.push_back(false);
-    constraints.push_back(upper - di);
-    eqFlags.push_back(false);
-  }
-  if (constraints.empty()) {
-    constraints.push_back(getAffineConstantExpr(0, ctx));
-    eqFlags.push_back(false);
-  }
-  return IntegerSet::get(rank, symCount, constraints, eqFlags);
-}
-
 /// Is `set` the dense range of `shape` — for every dim, the pair of constraints
 /// that bounds it to [0, extent)?
 ///
@@ -176,7 +145,19 @@ inline bool applyCoordMap(ArrayRef<int64_t> logSizes, ArrayRef<int64_t> physSrc,
 }
 
 //===----------------------------------------------------------------------===//
-// IndexDomain lifting helpers (local static copies from IndexDomain.cpp)
+// IndexDomain lifting helpers
+//
+// Copies, and deliberately so. The originals are in IndexDomain.cpp under
+// RewriteDescriptorLayout/, the named pass's own subdirectory, and that whole
+// subdirectory goes away when the named pass does — the deletion note at the top
+// of RewriteDescriptorLayout.cpp sequences it. Sharing these would make this
+// pass, the one that survives, depend on a directory scheduled for deletion. So
+// these are the copies that outlive it.
+//
+// Not the same judgement as buildRangeSetND, which this pass calls from
+// Dialect/KTDP/Utils instead of copying: that one is shared infrastructure in a
+// settled home. These only look like duplication because their current home is
+// doomed.
 //===----------------------------------------------------------------------===//
 
 static bool isIdentityTracingIntCast(Operation *op) {

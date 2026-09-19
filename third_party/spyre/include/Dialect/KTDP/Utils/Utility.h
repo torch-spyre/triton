@@ -5,15 +5,17 @@
 // mlir::triton::ktdp -- which is why the TritonToKTIR conversions, being in
 // mlir::triton::spyre, call them qualified.
 //
-// Published because each has a consumer in both pass libraries.  Helpers that
-// are about no dialect live in Utils/Utility.h; helpers with a single consuming
-// library are private to it and not published at all.
+// Published because each has a consumer outside this library -- most of them in
+// both pass libraries.  Helpers that are about no dialect live in
+// Utils/Utility.h; helpers with a single consuming library are private to it and
+// not published at all.
 
 #ifndef TRITON_SPYRE_DIALECT_KTDP_UTILS_UTILITY_H
 #define TRITON_SPYRE_DIALECT_KTDP_UTILS_UTILITY_H
 
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/IntegerSet.h"
 
 namespace mlir::triton::ktdp {
 
@@ -23,6 +25,18 @@ bool isLoweredDescriptor(Value desc);
 
 /// Unwrap the bridge cast to recover the ktdp.construct_memory_view result.
 Value getDescriptorMemView(Value desc);
+
+/// Build the dense range set of an N-D coordinate space: per dim, the pair of
+/// constraints bounding it to [0, extent). An entry equal to
+/// `ShapedType::kDynamic` contributes an IntegerSet symbol in place of a
+/// constant upper bound, in dim order. A rank-0 shape gives the single
+/// always-true constraint `0 >= 0`, because an IntegerSet cannot be built with
+/// no constraints at all.
+///
+/// This is the coordinate set `buildMemoryView` and `buildAccessTile` derive,
+/// published because a pass that rebuilds views and tiles itself has to build
+/// the same set.
+IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape);
 
 /// Build a `ktdp.construct_memory_view` of `staticSizes`/`staticStrides`
 /// anchored at `baseIndex`. `staticSizes`/`staticStrides` may be empty for a
