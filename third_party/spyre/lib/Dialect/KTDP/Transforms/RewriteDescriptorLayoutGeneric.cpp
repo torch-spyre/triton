@@ -1,0 +1,1533 @@
+//===- RewriteDescriptorLayoutGeneric.cpp ---------------------------------===//
+//
+// Rewrites logical tensor descriptors to their physical (stick-tiled) layout,
+// driven by tt.spyre_tensor_layout markers, and retypes the compute ops on the
+// annotated chain — which are all linalg.generic.
+//
+// The marker carries the physical layout as the OpSpec `device_coordinates`
+// form, three i64 arrays with one entry per physical dim:
+//   phys_src[p] : the logical dim physical dim p derives from
+//   phys_op[p]  : 0 = identity, 1 = floordiv, 2 = mod, 3 = splat
+//   phys_arg[p] : divisor (floordiv) / modulus (mod) / lane count (splat);
+//                 ignored for identity
+// e.g. [M,N] stick-on-N -> phys_src=[1,0,1] phys_op=[1,0,2] phys_arg=[64,0,64]
+//   => physical size [ceil(N/64), M, 64].
+// A splat dim replicates its source logical dim across `phys_arg` lanes
+// instead of partitioning it, so [M] -> phys_src=[0,0] phys_op=[0,3]
+// phys_arg=[0,64] gives physical size [M, 64].
+//
+//   Phase 1  physicalize each annotated descriptor: memory view, access tiles,
+//            loads. Stores have their access tile redirected.
+//   Phase 2  one rewrite over generics, applied greedily.
+//   Phase 3  erase the markers and their now-dead bridge casts.
+//
+//===----------------------------------------------------------------------===//
+
+#include "Dialect/KTDP/Transforms/Passes.h"
+#include "Dialect/KTDP/Utils/Utility.h"
+#include "Utils/Utility.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
+#include "ktir/Dialect/KTDP/KTDPDialect.h"
+#include "ktir/Dialect/KTDP/KTDPTypes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Debug.h"
+
+#include <optional>
+
+#define DEBUG_TYPE "rewrite-descriptor-layout-generic"
+
+namespace mlir::triton::ktdp {
+
+#define GEN_PASS_DEF_REWRITEDESCRIPTORLAYOUTGENERIC
+#include "Dialect/KTDP/Transforms/Passes.h.inc"
+
+} // namespace mlir::triton::ktdp
+
+namespace {
+
+using namespace mlir;
+using namespace mlir::triton::ktdp;
+
+//===----------------------------------------------------------------------===//
+// Local CoordOp, applyStatic, applyCoordMap
+//===----------------------------------------------------------------------===//
+
+// CoordOp: use Splat (value 3), NOT Broadcast
+enum class CoordOp : int64_t { Identity = 0, FloorDiv = 1, Mod = 2, Splat = 3 };
+
+// Local copy of buildRangeSetND from Utility.cpp, which keeps it static.
+// Reproduced here so this pass is self-contained and does not depend on
+// that function becoming part of the public API.
+static IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape) {
+  unsigned rank = shape.size();
+  unsigned symCount = 0;
+  for (auto s : shape)
+    if (s == ShapedType::kDynamic)
+      ++symCount;
+  SmallVector<AffineExpr> constraints;
+  SmallVector<bool> eqFlags;
+  unsigned symIdx = 0;
+  for (unsigned i = 0; i < rank; ++i) {
+    auto di = getAffineDimExpr(i, ctx);
+    AffineExpr upper;
+    if (shape[i] == ShapedType::kDynamic)
+      upper = getAffineSymbolExpr(symIdx++, ctx) - 1;
+    else
+      upper = getAffineConstantExpr(shape[i] - 1, ctx);
+    constraints.push_back(di);
+    eqFlags.push_back(false);
+    constraints.push_back(upper - di);
+    eqFlags.push_back(false);
+  }
+  if (constraints.empty()) {
+    constraints.push_back(getAffineConstantExpr(0, ctx));
+    eqFlags.push_back(false);
+  }
+  return IntegerSet::get(rank, symCount, constraints, eqFlags);
+}
+
+// applyStatic: apply one coord op to a static extent
+inline std::optional<int64_t> applyStatic(int64_t logical, CoordOp op,
+                                          int64_t arg) {
+  switch (op) {
+  case CoordOp::Identity:
+    return (logical == mlir::ShapedType::kDynamic)
+               ? std::nullopt
+               : std::optional<int64_t>(logical);
+  case CoordOp::FloorDiv:
+    if (logical == mlir::ShapedType::kDynamic)
+      return std::nullopt;
+    return arg == 0 ? std::optional<int64_t>(std::nullopt)
+                    : std::optional<int64_t>((logical + arg - 1) / arg);
+  case CoordOp::Mod:
+    return arg;
+  case CoordOp::Splat:
+    return arg;
+  }
+  return std::nullopt;
+}
+
+// applyCoordMap: compute physical extents from logical extents
+inline bool applyCoordMap(ArrayRef<int64_t> logSizes, ArrayRef<int64_t> physSrc,
+                          ArrayRef<int64_t> physOp, ArrayRef<int64_t> physArg,
+                          SmallVectorImpl<int64_t> &out) {
+  unsigned physRank = physSrc.size();
+  out.resize(physRank);
+  for (unsigned k = 0; k < physRank; ++k) {
+    auto sz = applyStatic(logSizes[physSrc[k]], static_cast<CoordOp>(physOp[k]),
+                          physArg[k]);
+    if (!sz)
+      return false;
+    out[k] = *sz;
+  }
+  return true;
+}
+
+//===----------------------------------------------------------------------===//
+// IndexDomain lifting helpers (local static copies from IndexDomain.cpp)
+//===----------------------------------------------------------------------===//
+
+static bool isIdentityTracingIntCast(Operation *op) {
+  return isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::TruncIOp,
+             arith::ExtSIOp, arith::ExtUIOp>(op);
+}
+
+static bool isValuePreservingIntCast(Operation *op) {
+  return isa<arith::IndexCastOp, arith::ExtSIOp>(op);
+}
+
+[[maybe_unused]] static BlockArgument traceToMLIRBlockArg(Value v) {
+  while (true) {
+    if (auto ba = dyn_cast<BlockArgument>(v))
+      return ba;
+    auto *op = v.getDefiningOp();
+    if (!op)
+      return nullptr;
+    if (isIdentityTracingIntCast(op)) {
+      v = op->getOperand(0);
+      continue;
+    }
+    if (isa<arith::MulIOp, arith::DivSIOp, arith::RemSIOp, arith::AddIOp>(op)) {
+      if (op->getNumOperands() == 2 &&
+          triton::spyre::getConstantInt(op->getOperand(1))) {
+        v = op->getOperand(0);
+        continue;
+      }
+    }
+    return nullptr;
+  }
+}
+
+static bool isArithIntOp(Operation *op) {
+  return isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp,
+             arith::DivUIOp, arith::RemSIOp, arith::RemUIOp, arith::AndIOp,
+             arith::OrIOp, arith::XOrIOp, arith::ShLIOp, arith::ShRSIOp,
+             arith::ShRUIOp, arith::MaxSIOp, arith::MaxUIOp, arith::MinSIOp,
+             arith::MinUIOp>(op);
+}
+
+static bool isRebuildableIntArith(Operation *op) {
+  return isa<arith::MulIOp, arith::DivSIOp, arith::RemSIOp, arith::AddIOp,
+             arith::SubIOp>(op);
+}
+
+static bool canRebuildInIndexDomain(Value v) {
+  if (triton::spyre::getConstantInt(v))
+    return true;
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return false;
+  if (isa<mlir::ktdp::GetComputeTileIdOp, triton::GetProgramIdOp>(op))
+    return true;
+  if (isValuePreservingIntCast(op))
+    return canRebuildInIndexDomain(op->getOperand(0));
+  if (!isRebuildableIntArith(op))
+    return false;
+  if (op->getNumOperands() != 2)
+    return false;
+  return canRebuildInIndexDomain(op->getOperand(0)) &&
+         canRebuildInIndexDomain(op->getOperand(1));
+}
+
+static bool hasFixedWidthIntArith(Value v) {
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return false;
+  if (isValuePreservingIntCast(op))
+    return hasFixedWidthIntArith(op->getOperand(0));
+  if (!isArithIntOp(op))
+    return false;
+  if (!v.getType().isIndex())
+    return true;
+  if (!isRebuildableIntArith(op) || op->getNumOperands() != 2)
+    return false;
+  return hasFixedWidthIntArith(op->getOperand(0)) ||
+         hasFixedWidthIntArith(op->getOperand(1));
+}
+
+static Value emitInIndexDomain(OpBuilder &b, Location loc, Value v) {
+  if (auto cst = triton::spyre::getConstantInt(v)) {
+    if (v.getType().isIndex())
+      return v;
+    return arith::ConstantOp::create(b, loc, b.getIndexAttr(*cst)).getResult();
+  }
+
+  Operation *op = v.getDefiningOp();
+
+  if (isa<mlir::ktdp::GetComputeTileIdOp, triton::GetProgramIdOp>(op)) {
+    if (v.getType().isIndex())
+      return v;
+    return arith::IndexCastOp::create(b, loc, b.getIndexType(), v).getResult();
+  }
+
+  if (isValuePreservingIntCast(op))
+    return emitInIndexDomain(b, loc, op->getOperand(0));
+
+  Value lhs = emitInIndexDomain(b, loc, op->getOperand(0));
+  Value rhs = emitInIndexDomain(b, loc, op->getOperand(1));
+
+  if (v.getType().isIndex() && lhs == op->getOperand(0) &&
+      rhs == op->getOperand(1))
+    return v;
+
+  if (isa<arith::MulIOp>(op))
+    return arith::MulIOp::create(b, loc, lhs, rhs).getResult();
+  if (isa<arith::DivSIOp>(op))
+    return arith::DivSIOp::create(b, loc, lhs, rhs).getResult();
+  if (isa<arith::RemSIOp>(op))
+    return arith::RemSIOp::create(b, loc, lhs, rhs).getResult();
+  if (isa<arith::AddIOp>(op))
+    return arith::AddIOp::create(b, loc, lhs, rhs).getResult();
+  return arith::SubIOp::create(b, loc, lhs, rhs).getResult();
+}
+
+static Value rebuildInIndexDomain(OpBuilder &b, Location loc, Value v) {
+  if (!hasFixedWidthIntArith(v) || !canRebuildInIndexDomain(v))
+    return v;
+  return emitInIndexDomain(b, loc, v);
+}
+
+//===----------------------------------------------------------------------===//
+// The coordinate map, read off a marker
+//===----------------------------------------------------------------------===//
+
+/// One descriptor's physical layout: the marker's three arrays, plus the
+/// logical rank they index into.
+///
+/// The marker is an *instruction* — it says how to split logical dims. It is
+/// not a source of truth about the tensor: element type, memory space, base
+/// offset, strides, coordinate set and dynamic extents all come from the ops
+/// being rewritten, and where the two could disagree the op wins.
+struct CoordMap {
+  ArrayRef<int64_t> src, op, arg;
+  unsigned logicalRank = 0;
+
+  unsigned physRank() const { return src.size(); }
+  CoordOp opAt(unsigned p) const { return static_cast<CoordOp>(op[p]); }
+
+  /// Is logical dim `d` split into a (stick, elem) pair by this layout?
+  ///
+  /// A splat names `d` too, but it partitions nothing — it replicates `d`
+  /// across a fresh axis — so it is not a split and the dim stays whole. Asking
+  /// for the floordiv half is therefore the question, not "is some dim of `d`
+  /// non-identity".
+  bool splits(int64_t d) const {
+    return findPhys(d, CoordOp::FloorDiv) >= 0;
+  }
+
+  /// The physical dim carrying `wanted` for logical dim `d`, or -1.
+  int findPhys(int64_t d, CoordOp wanted) const {
+    for (unsigned p = 0, e = physRank(); p < e; ++p)
+      if (src[p] == d && opAt(p) == wanted)
+        return p;
+    return -1;
+  }
+
+  /// The stick width of the split of logical dim `d`. Only meaningful when
+  /// `splits(d)`; read off the mod dim, which is where the width is the extent.
+  int64_t stickWidth(int64_t d) const {
+    int p = findPhys(d, CoordOp::Mod);
+    return p < 0 ? 0 : arg[p];
+  }
+};
+
+/// Name of a coord op, for the trace.
+const char *coordOpName(CoordOp op) {
+  switch (op) {
+  case CoordOp::Identity:
+    return "id";
+  case CoordOp::FloorDiv:
+    return "stick";
+  case CoordOp::Mod:
+    return "lane";
+  case CoordOp::Splat:
+    return "splat";
+  }
+  return "?";
+}
+
+/// Print a coord map as one physical dim per entry, each naming the logical dim
+/// it came from, the coord op that made it, and the op's argument where the
+/// argument means something. This is the whole layout in one line, which is what
+/// lets a reader check the marker against the shape derived from it below.
+///
+/// Reached only from an LLVM_DEBUG body, so a release build has no caller left;
+/// [[maybe_unused]] keeps that from warning.
+[[maybe_unused]] void printCoordMap(llvm::raw_ostream &os, const CoordMap &cm) {
+  os << "logical rank " << cm.logicalRank << " -> phys [";
+  for (unsigned p = 0, e = cm.physRank(); p < e; ++p) {
+    if (p)
+      os << ", ";
+    os << "d" << cm.src[p] << ":" << coordOpName(cm.opAt(p));
+    if (cm.opAt(p) != CoordOp::Identity)
+      os << "(" << cm.arg[p] << ")";
+  }
+  os << "]";
+}
+
+/// Read the coord map off a marker, checking phys_src against `logicalRank`.
+FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
+                                 unsigned logicalRank) {
+  CoordMap cm{marker.getPhysSrc(), marker.getPhysOp(), marker.getPhysArg(),
+              logicalRank};
+  if (cm.op.size() != cm.physRank() || cm.arg.size() != cm.physRank())
+    return marker.emitError("spyre_tensor_layout: phys_src, phys_op and "
+                            "phys_arg must have the same length");
+  for (unsigned p = 0, e = cm.physRank(); p < e; ++p) {
+    if (cm.src[p] < 0 || cm.src[p] >= (int64_t)logicalRank)
+      return marker.emitError("spyre_tensor_layout: phys_src out of range for "
+                              "logical rank ")
+             << logicalRank;
+    if (cm.op[p] < 0 || cm.op[p] > 3)
+      return marker.emitError("spyre_tensor_layout: phys_op must be 0 "
+                              "(identity), 1 (floordiv), 2 (mod) or 3 "
+                              "(splat)");
+  }
+  // A split names the same logical dim twice, once floordiv and once mod. A
+  // lone half would leave the rebuild unable to state where the dim's elements
+  // live, so reject it here rather than emitting a map that cannot address
+  // them.
+  for (unsigned d = 0; d < logicalRank; ++d) {
+    bool hasFloor = cm.findPhys(d, CoordOp::FloorDiv) >= 0;
+    bool hasMod = cm.findPhys(d, CoordOp::Mod) >= 0;
+    if (hasFloor != hasMod)
+      return marker.emitError("spyre_tensor_layout: logical dim ")
+             << d << " has a " << (hasFloor ? "floordiv" : "mod")
+             << " physical dim without the matching "
+             << (hasFloor ? "mod" : "floordiv") << " half";
+    // A splat replicates the dim it names, so that dim must also be present
+    // whole for the replication to have something to replicate. It cannot be
+    // present as a split: the elements would then live in the floordiv/mod pair
+    // and the splat axis would name a third copy of them.
+    if (cm.findPhys(d, CoordOp::Splat) >= 0 &&
+        cm.findPhys(d, CoordOp::Identity) < 0)
+      return marker.emitError("spyre_tensor_layout: logical dim ")
+             << d
+             << " is splat but has no identity physical dim; a splat "
+                "replicates a dim that is also carried whole";
+  }
+  return cm;
+}
+
+/// The composite that recovers logical dim `d`'s index from the two physical
+/// dims a stick split gave it: the stick index counts whole sticks of `width`
+/// elements, and the element offset picks one out of the stick it lands in.
+///
+/// This is the *only* arithmetic either carrier introduces, and both introduce
+/// the same one. Phase 2 names its two halves after loop dims of the rebuilt
+/// linalg domain; the indirect access tile names them after intermediate
+/// variables of its own variable space. Different numbering, identical algebra —
+/// so the algebra lives here once and each carrier passes in the exprs it
+/// numbers the halves with.
+inline AffineExpr composeStickSplit(AffineExpr stick, int64_t width,
+                                    AffineExpr elem) {
+  return stick * width + elem;
+}
+
+/// The physical tensor type `cm` prescribes for a logical shape.
+/// Fails when a physical extent cannot be stated statically.
+FailureOr<RankedTensorType> physicalTensorType(const CoordMap &cm,
+                                               RankedTensorType logicalType) {
+  SmallVector<int64_t> physShape;
+  if (!applyCoordMap(logicalType.getShape(), cm.src, cm.op, cm.arg, physShape))
+    return failure();
+  return RankedTensorType::get(physShape, logicalType.getElementType());
+}
+
+//===----------------------------------------------------------------------===//
+// Phase 2's map rebuild
+//===----------------------------------------------------------------------===//
+
+/// One value's place in the rebuild: its logical indexing map, and the layout
+/// it is physicalized under. `layout` is null for a value that carries no
+/// marker and therefore stays logical.
+struct RebuildOperand {
+  AffineMap logicalMap;
+  const CoordMap *layout = nullptr;
+  /// Loop dim assigned to each of this operand's SPLAT physical dims, keyed
+  /// by physical dim; -1 for every dim that is not a splat. Filled by
+  /// buildLoopDomain, because a splat axis is the one physical dim that no
+  /// logical loop dim accounts for — see LoopDomain.
+  SmallVector<int> broadcastDim;
+};
+
+/// One piece of the refined loop domain: a logical dim's stick index, its
+/// element offset within a stick, or — when nothing splits the dim — the whole
+/// dim, which is spelled as the stick half.
+///
+/// A piece is the unit the numbering orders, because it is the unit an operand's
+/// physical dim names: a physical dim carries exactly one of these, and that is
+/// what lets an operand's physical order be read as an order on pieces.
+struct DomainPiece {
+  unsigned loop;
+  /// True for the element offset within a stick, false for the stick index (or
+  /// for an unsplit dim held whole).
+  bool elem;
+
+  bool operator==(const DomainPiece &o) const {
+    return loop == o.loop && elem == o.elem;
+  }
+};
+
+/// The rebuilt loop domain: how many physical loop dims there are, and where
+/// each logical dim's pieces landed.
+struct LoopDomain {
+  /// Loop dim carrying logical dim d's stick index, or its whole extent when
+  /// the dim is unsplit.
+  SmallVector<int> stickDim;
+  /// Loop dim carrying logical dim d's element offset within a stick; -1 when
+  /// the dim is unsplit.
+  SmallVector<int> elemDim;
+  /// The stick width to compose with, per logical dim; 0 when unsplit. Taken
+  /// from the operands, which must agree — see buildLoopDomain.
+  SmallVector<int64_t> width;
+  unsigned numLoopDims = 0;
+
+  bool isSplit(int64_t d) const { return elemDim[d] >= 0; }
+};
+
+/// The domain pieces one operand's physical dims name, in that operand's own
+/// physical order.
+void collectPieces(const RebuildOperand &o,
+                   SmallVectorImpl<DomainPiece> &pieces) {
+  unsigned numDims =
+      o.layout ? o.layout->physRank() : o.logicalMap.getNumResults();
+  for (unsigned p = 0; p < numDims; ++p) {
+    CoordOp coordOp = o.layout ? o.layout->opAt(p) : CoordOp::Identity;
+    if (coordOp == CoordOp::Splat)
+      continue;
+    int64_t logDim = o.layout ? o.layout->src[p] : p;
+    auto dimExpr = dyn_cast<AffineDimExpr>(o.logicalMap.getResult(logDim));
+    if (!dimExpr)
+      continue; // a constant (a folded splat) names no loop dim
+    pieces.push_back({dimExpr.getPosition(), coordOp == CoordOp::Mod});
+  }
+}
+
+/// Build the loop domain over `logicalNumLoops` dims, splitting every logical
+/// dim that any operand splits. Fails when two operands split the same logical
+/// dim at different widths.
+FailureOr<LoopDomain>
+buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
+                unsigned logicalNumLoops,
+                llvm::function_ref<InFlightDiagnostic()> emitError) {
+  LoopDomain dom;
+  dom.stickDim.assign(logicalNumLoops, -1);
+  dom.elemDim.assign(logicalNumLoops, -1);
+  dom.width.assign(logicalNumLoops, 0);
+
+  // Which logical loop dims are split, and at what width.
+  for (const RebuildOperand &o : operands) {
+    if (!o.layout)
+      continue;
+    for (unsigned r = 0, e = o.logicalMap.getNumResults(); r < e; ++r) {
+      auto dimExpr = dyn_cast<AffineDimExpr>(o.logicalMap.getResult(r));
+      if (!dimExpr)
+        continue; // a constant (a folded splat) names no loop dim
+      unsigned loop = dimExpr.getPosition();
+      if (!o.layout->splits(r))
+        continue;
+      int64_t w = o.layout->stickWidth(r);
+      if (dom.width[loop] && dom.width[loop] != w)
+        return emitError() << "loop dim " << loop
+                           << " is split at two different stick widths ("
+                           << dom.width[loop] << " and " << w
+                           << "), so no single composite addresses it";
+      dom.width[loop] = w;
+    }
+  }
+
+  // Step 1: the result's physical order seeds the numbering. The result is the
+  // one operand whose coordinate order the generic does not get to choose, since
+  // its elements are written where its own type says they live, so nothing below
+  // reorders what this places.
+  SmallVector<DomainPiece> order;
+  auto seen = [&](DomainPiece pc) { return llvm::is_contained(order, pc); };
+  {
+    SmallVector<DomainPiece> walk;
+    collectPieces(operands[resultIdx], walk);
+    for (DomainPiece pc : walk)
+      if (!seen(pc))
+        order.push_back(pc);
+  }
+
+  // Step 2: merge each remaining operand's physical order in. A piece the result
+  // already placed only advances the cursor; a piece the result never named is
+  // inserted AT the cursor.
+  for (auto [i, o] : llvm::enumerate(operands)) {
+    if (i == resultIdx)
+      continue;
+    SmallVector<DomainPiece> walk;
+    collectPieces(o, walk);
+    unsigned cursor = 0;
+    for (DomainPiece pc : walk) {
+      auto it = llvm::find(order, pc);
+      if (it != order.end()) {
+        unsigned idx = std::distance(order.begin(), it);
+        if (idx >= cursor)
+          cursor = idx + 1;
+        continue;
+      }
+      order.insert(order.begin() + cursor, pc);
+      ++cursor;
+    }
+  }
+
+  // Step 3: anything no operand's walk named goes last, in logical order.
+  for (unsigned d = 0; d < logicalNumLoops; ++d) {
+    if (!seen({d, /*elem=*/false}))
+      order.push_back({d, /*elem=*/false});
+    if (dom.width[d] && !seen({d, /*elem=*/true}))
+      order.push_back({d, /*elem=*/true});
+  }
+
+  for (auto [n, pc] : llvm::enumerate(order))
+    (pc.elem ? dom.elemDim : dom.stickDim)[pc.loop] = n;
+  dom.numLoopDims = order.size();
+
+  // One loop per splat physical dim, after the refinement.
+  for (RebuildOperand &o : operands) {
+    if (!o.layout)
+      continue;
+    o.broadcastDim.assign(o.layout->physRank(), -1);
+    for (unsigned p = 0, e = o.layout->physRank(); p < e; ++p)
+      if (o.layout->opAt(p) == CoordOp::Splat)
+        o.broadcastDim[p] = dom.numLoopDims++;
+  }
+  return dom;
+}
+
+/// Rebuild one operand's indexing map over `dom`.
+AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
+                     MLIRContext *ctx) {
+  auto loopExpr = [&](int loopDim) { return getAffineDimExpr(loopDim, ctx); };
+
+  unsigned numResults =
+      o.layout ? o.layout->physRank() : o.logicalMap.getNumResults();
+
+  SmallVector<AffineExpr> results;
+  for (unsigned p = 0; p < numResults; ++p) {
+    int64_t logDim = o.layout ? o.layout->src[p] : p;
+    CoordOp coordOp = o.layout ? o.layout->opAt(p) : CoordOp::Identity;
+
+    AffineExpr logResult = o.logicalMap.getResult(logDim);
+    auto dimExpr = dyn_cast<AffineDimExpr>(logResult);
+    if (!dimExpr) {
+      // A constant survives every physical dim it is named by.
+      results.push_back(logResult);
+      continue;
+    }
+    unsigned loop = dimExpr.getPosition();
+
+    switch (coordOp) {
+    case CoordOp::FloorDiv:
+      results.push_back(loopExpr(dom.stickDim[loop]));
+      break;
+    case CoordOp::Mod:
+      results.push_back(loopExpr(dom.elemDim[loop]));
+      break;
+    case CoordOp::Splat:
+      // The replication axis, named by the loop the domain allocated for it.
+      results.push_back(loopExpr(o.broadcastDim[p]));
+      break;
+    case CoordOp::Identity:
+      // This operand holds the dim whole. If the domain split it, the two
+      // halves must be recombined here.
+      results.push_back(
+          dom.isSplit(loop)
+              ? composeStickSplit(loopExpr(dom.stickDim[loop]),
+                                  dom.width[loop], loopExpr(dom.elemDim[loop]))
+              : loopExpr(dom.stickDim[loop]));
+      break;
+    }
+  }
+  return AffineMap::get(dom.numLoopDims, /*symbolCount=*/0, results, ctx);
+}
+
+/// Rebuild the iterator types over `dom`.
+SmallVector<utils::IteratorType>
+rebuildIterators(ArrayRef<utils::IteratorType> logicalIterators,
+                 const LoopDomain &dom) {
+  // Parallel is the default so that a splat loop gets it without being
+  // singled out.
+  SmallVector<utils::IteratorType> out(dom.numLoopDims,
+                                      utils::IteratorType::parallel);
+  for (unsigned d = 0, e = logicalIterators.size(); d < e; ++d) {
+    out[dom.stickDim[d]] = logicalIterators[d];
+    if (dom.isSplit(d))
+      out[dom.elemDim[d]] = logicalIterators[d];
+  }
+  return out;
+}
+
+//===----------------------------------------------------------------------===//
+// The pass
+//===----------------------------------------------------------------------===//
+
+struct RewriteDescriptorLayoutGenericPass
+    : public mlir::triton::ktdp::impl::RewriteDescriptorLayoutGenericBase<
+          RewriteDescriptorLayoutGenericPass> {
+
+  using RewriteDescriptorLayoutGenericBase::
+      RewriteDescriptorLayoutGenericBase;
+
+  /// True = "device" (physical row-major strides), false = "host" (derive
+  /// the physical strides from the logical ones through the coord map).
+  bool hwDataLayout = false;
+
+  /// Physicalized ConstructMemoryViewOp → its coord map. Keyed on the
+  /// Operation* of the PHYSICALIZED (new) view op, set in physicalizeDescriptor
+  /// after physicalizeMemView returns. Phase 2 traces each generic's ins/outs
+  /// operands back to a physicalized view directly, one lookup per operand.
+  DenseMap<Operation *, CoordMap> physViewOf;
+
+  /// Logical construct_memory_view ops superseded in Phase 1. They cannot be
+  /// erased there: the marker's bridge cast still holds them, and that cast
+  /// only dies in Phase 3.
+  SmallVector<mlir::ktdp::ConstructMemoryViewOp> deadLogicalMemViews;
+
+  //===--------------------------------------------------------------------===//
+  // Phase 1 — physicalize one descriptor
+  //===--------------------------------------------------------------------===//
+
+  /// Physical sizes for a view, as static extents plus the dynamic values the
+  /// kDynamic entries draw from, in order.
+  struct PhysicalSizes {
+    SmallVector<int64_t> staticSizes;
+    SmallVector<Value> dynSizes;
+  };
+
+  /// Compute the physical sizes of `memViewOp` under `cm`.
+  FailureOr<PhysicalSizes>
+  physicalSizes(const CoordMap &cm, mlir::ktdp::ConstructMemoryViewOp memViewOp,
+                OpBuilder &b, triton::SpyreTensorLayoutOp marker) {
+    ArrayRef<int64_t> logStatic = memViewOp.getStaticSizes();
+    ValueRange logDyn = memViewOp.getSizes();
+    Location loc = memViewOp.getLoc();
+
+    SmallVector<int> dynPos(logStatic.size(), -1);
+    for (unsigned d = 0, n = 0; d < logStatic.size(); ++d)
+      if (logStatic[d] == ShapedType::kDynamic)
+        dynPos[d] = n++;
+
+    PhysicalSizes out;
+    for (unsigned p = 0, e = cm.physRank(); p < e; ++p) {
+      int64_t d = cm.src[p];
+      CoordOp op = cm.opAt(p);
+      if (auto stat = applyStatic(logStatic[d], op, cm.arg[p])) {
+        out.staticSizes.push_back(*stat);
+        continue;
+      }
+      if (dynPos[d] < 0)
+        return marker.emitError("spyre_tensor_layout: physical dim ")
+               << p << " has no static extent and logical dim " << d
+               << " supplies no dynamic one";
+      out.staticSizes.push_back(ShapedType::kDynamic);
+      Value logExtent = logDyn[dynPos[d]];
+      // ceildiv, not floordiv: a partial boundary stick still needs a stick.
+      out.dynSizes.push_back(
+          op == CoordOp::FloorDiv
+              ? arith::CeilDivSIOp::create(
+                    b, loc, logExtent,
+                    arith::ConstantOp::create(b, loc,
+                                              b.getIndexAttr(cm.arg[p])))
+                    .getResult()
+              : logExtent);
+    }
+    return out;
+  }
+
+  /// Physical strides for a view under `cm`.
+  FailureOr<PhysicalSizes>
+  physicalStrides(const CoordMap &cm,
+                  mlir::ktdp::ConstructMemoryViewOp memViewOp,
+                  const PhysicalSizes &sizes, OpBuilder &b,
+                  triton::SpyreTensorLayoutOp marker) {
+    Location loc = memViewOp.getLoc();
+    unsigned physRank = cm.physRank();
+    PhysicalSizes out;
+
+    auto asValue = [&](int64_t c) {
+      return arith::ConstantOp::create(b, loc, b.getIndexAttr(c)).getResult();
+    };
+
+    if (hwDataLayout) {
+      bool allStatic = llvm::none_of(sizes.staticSizes, ShapedType::isDynamic);
+      if (allStatic) {
+        out.staticSizes.assign(physRank, 1);
+        for (int p = (int)physRank - 2; p >= 0; --p)
+          out.staticSizes[p] =
+              out.staticSizes[p + 1] * sizes.staticSizes[p + 1];
+        return out;
+      }
+      // Any dynamic size makes every outer stride dynamic.
+      SmallVector<Value> strides(physRank);
+      strides[physRank - 1] = asValue(1);
+      auto sizeValue = [&](unsigned p) -> Value {
+        if (!ShapedType::isDynamic(sizes.staticSizes[p]))
+          return asValue(sizes.staticSizes[p]);
+        unsigned n = 0;
+        for (unsigned q = 0; q < p; ++q)
+          if (ShapedType::isDynamic(sizes.staticSizes[q]))
+            ++n;
+        return sizes.dynSizes[n];
+      };
+      for (int p = (int)physRank - 2; p >= 0; --p)
+        strides[p] = arith::MulIOp::create(b, loc, strides[p + 1],
+                                           sizeValue(p + 1))
+                         .getResult();
+      out.staticSizes.assign(physRank, ShapedType::kDynamic);
+      out.dynSizes.assign(strides.begin(), strides.end());
+      return out;
+    }
+
+    ArrayRef<int64_t> logStatic = memViewOp.getStaticStrides();
+    ValueRange logDyn = memViewOp.getStrides();
+    SmallVector<int> dynPos(logStatic.size(), -1);
+    for (unsigned d = 0, n = 0; d < logStatic.size(); ++d)
+      if (logStatic[d] == ShapedType::kDynamic)
+        dynPos[d] = n++;
+
+    for (unsigned p = 0; p < physRank; ++p) {
+      int64_t d = cm.src[p];
+      if (cm.opAt(p) == CoordOp::Splat)
+        return marker.emitError("spyre_tensor_layout: physical dim ")
+               << p
+               << " is a splat, which has no stride in a host row-major "
+                  "buffer; splat dims need data-layout=device";
+      // A stick index advances by a whole stick of the logical dim.
+      int64_t scale = cm.opAt(p) == CoordOp::FloorDiv ? cm.arg[p] : 1;
+      if (logStatic[d] != ShapedType::kDynamic) {
+        out.staticSizes.push_back(logStatic[d] * scale);
+        continue;
+      }
+      if (dynPos[d] < 0)
+        return marker.emitError("spyre_tensor_layout: logical dim ")
+               << d << " has neither a static nor a dynamic stride";
+      out.staticSizes.push_back(ShapedType::kDynamic);
+      Value logStride = logDyn[dynPos[d]];
+      out.dynSizes.push_back(
+          scale == 1 ? logStride
+                     : arith::MulIOp::create(b, loc, logStride, asValue(scale))
+                           .getResult());
+    }
+    return out;
+  }
+
+  /// Attributes this pass owns on a physicalized op — the ones whose value is a
+  /// function of the shape, and so must be recomputed rather than carried.
+  static bool isShapeOwnedAttr(StringRef name, Operation *op) {
+    if (isa<mlir::ktdp::ConstructMemoryViewOp>(op))
+      return name == "static_sizes" || name == "static_strides" ||
+             name == "coordinate_set" || name == "operandSegmentSizes";
+    if (isa<mlir::ktdp::ConstructAccessTilesOp>(op))
+      return name == "base_map" || name == "access_tile_set" ||
+             name == "access_tile_order" || name == "operandSegmentSizes";
+    if (isa<linalg::GenericOp>(op))
+      return name == "indexing_maps" || name == "iterator_types" ||
+             name == "operandSegmentSizes";
+    return false;
+  }
+
+  /// Assert that cloning carried everything this pass does not own.
+  LogicalResult verifyNothingDropped(Operation *original, Operation *rewritten) {
+    for (NamedAttribute attr : original->getAttrs()) {
+      StringRef name = attr.getName().strref();
+      if (isShapeOwnedAttr(name, original))
+        continue;
+      Attribute got = rewritten->getAttr(name);
+      if (!got)
+        return rewritten->emitError("rewrite-descriptor-layout-generic: "
+                                    "physicalizing dropped attribute '")
+               << name << "'; it is not one this pass owns";
+      if (got != attr.getValue())
+        return rewritten->emitError("rewrite-descriptor-layout-generic: "
+                                    "physicalizing changed attribute '")
+               << name << "'; it is not one this pass owns";
+    }
+    return success();
+  }
+
+  /// Physicalize the memory view behind `marker`.
+  FailureOr<Value>
+  physicalizeMemView(mlir::ktdp::ConstructMemoryViewOp memViewOp,
+                     const CoordMap &cm,
+                     triton::SpyreTensorLayoutOp marker) {
+    OpBuilder b(memViewOp);
+    Location loc = memViewOp.getLoc();
+
+    // The physical view's coordinate set is the dense range of its own sizes,
+    // recomputed below. Reject a set that says more than that.
+    if (memViewOp.getCoordinateSetAttr().getValue() !=
+        buildRangeSetND(b.getContext(), memViewOp.getStaticSizes()))
+      return memViewOp.emitError(
+          "spyre_tensor_layout: coordinate_set must be the dense range of the "
+          "view's sizes to physicalize it; a partitioned set would be "
+          "overwritten");
+
+    auto sizes = physicalSizes(cm, memViewOp, b, marker);
+    if (failed(sizes))
+      return failure();
+    auto strides = physicalStrides(cm, memViewOp, *sizes, b, marker);
+    if (failed(strides))
+      return failure();
+
+    // Clone rather than build: the offset operand, the memory space, the
+    // element type and any attribute this pass has never heard of all come
+    // across without being named.
+    auto physOp = cast<mlir::ktdp::ConstructMemoryViewOp>(b.clone(*memViewOp));
+    physOp.getSizesMutable().assign(sizes->dynSizes);
+    physOp.getStridesMutable().assign(strides->dynSizes);
+    physOp.setStaticSizes(sizes->staticSizes);
+    physOp.setStaticStrides(strides->staticSizes);
+    physOp.setCoordinateSetAttr(IntegerSetAttr::get(
+        buildRangeSetND(b.getContext(), sizes->staticSizes)));
+    physOp.getResult().setType(
+        MemRefType::get(sizes->staticSizes,
+                        cast<MemRefType>(memViewOp.getResult().getType())
+                            .getElementType()));
+
+    if (failed(verifyNothingDropped(memViewOp, physOp)))
+      return failure();
+    (void)loc;
+    return physOp.getResult();
+  }
+
+  /// Physicalize one direct access tile over the already-physical `physMemView`.
+  LogicalResult physicalizeAccessTile(mlir::ktdp::ConstructAccessTilesOp tileOp,
+                                      Value physMemView, const CoordMap &cm,
+                                      triton::SpyreTensorLayoutOp marker) {
+    OpBuilder b(tileOp);
+    Location loc = tileOp.getLoc();
+
+    ArrayRef<int64_t> logBlock = tileOp.getResult().getType().getShape();
+    unsigned logRank = logBlock.size();
+    SmallVector<int64_t> physBlock;
+    if (!applyCoordMap(logBlock, cm.src, cm.op, cm.arg, physBlock))
+      return tileOp.emitError("spyre_tensor_layout: cannot derive a static "
+                              "physical block shape for this access tile");
+
+    for (unsigned p = 0, e = cm.physRank(); p < e; ++p) {
+      if (cm.opAt(p) != CoordOp::Mod)
+        continue;
+      int64_t logExtent = logBlock[cm.src[p]];
+      if (logExtent != ShapedType::kDynamic && logExtent < cm.arg[p])
+        return tileOp.emitError(
+                   "spyre_tensor_layout: block extent of stick dim (")
+               << logExtent << ") is smaller than the stick size (" << cm.arg[p]
+               << "); a stick dim cannot be sub-stick";
+    }
+
+    // Recover one index per logical dim. base_map may have fewer inputs than
+    // results when the parser deduplicated identical SSA operands, so read the
+    // per-dim value through the map rather than off the operand list.
+    SmallVector<Value> raw(tileOp.getIndices().begin(),
+                           tileOp.getIndices().end());
+    AffineMap baseMap = tileOp.getBaseMap();
+    SmallVector<Value> logIdx(logRank);
+    if (baseMap.getNumResults() == logRank &&
+        baseMap.getNumInputs() == raw.size()) {
+      for (unsigned d = 0; d < logRank; ++d) {
+        auto dimExpr = dyn_cast<AffineDimExpr>(baseMap.getResult(d));
+        logIdx[d] = dimExpr ? raw[dimExpr.getPosition()] : raw[0];
+      }
+    } else {
+      logIdx.assign(raw.begin(), raw.end());
+    }
+
+    if (!tileOp.getAccessTileOrder().isIdentity())
+      return tileOp.emitError(
+          "spyre_tensor_layout: access_tile_order must be the identity to "
+          "physicalize this tile; a permuted order would be overwritten");
+    if (tileOp.getAccessTileSetAttr().getValue() !=
+        buildRangeSetND(b.getContext(), logBlock))
+      return tileOp.emitError(
+          "spyre_tensor_layout: access_tile_set must be the dense range of the "
+          "block shape to physicalize this tile; a non-dense set would be "
+          "overwritten");
+
+    SmallVector<Value> physIdx;
+    for (unsigned p = 0, e = cm.physRank(); p < e; ++p) {
+      if (cm.opAt(p) == CoordOp::Splat) {
+        physIdx.push_back(
+            arith::ConstantOp::create(b, loc, b.getIndexAttr(0)).getResult());
+        continue;
+      }
+      Value idx = rebuildInIndexDomain(b, loc, logIdx[cm.src[p]]);
+      if (idx.getType() != b.getIndexType())
+        idx = arith::IndexCastOp::create(b, loc, b.getIndexType(), idx)
+                  .getResult();
+      switch (cm.opAt(p)) {
+      case CoordOp::Identity:
+        break;
+      case CoordOp::FloorDiv:
+        idx = arith::DivSIOp::create(
+                  b, loc, idx,
+                  arith::ConstantOp::create(b, loc, b.getIndexAttr(cm.arg[p])))
+                  .getResult();
+        break;
+      case CoordOp::Mod:
+        idx = arith::RemSIOp::create(
+                  b, loc, idx,
+                  arith::ConstantOp::create(b, loc, b.getIndexAttr(cm.arg[p])))
+                  .getResult();
+        break;
+      case CoordOp::Splat:
+        llvm_unreachable("splat dims are handled before this switch");
+      }
+      physIdx.push_back(idx);
+    }
+
+    auto identity =
+        AffineMap::getMultiDimIdentityMap(cm.physRank(), b.getContext());
+    auto physTile = cast<mlir::ktdp::ConstructAccessTilesOp>(b.clone(*tileOp));
+    physTile.getBaseMutable().assign(physMemView);
+    physTile.getIndicesMutable().assign(physIdx);
+    physTile.setBaseMapAttr(AffineMapAttr::get(identity));
+    physTile.setAccessTileOrderAttr(AffineMapAttr::get(identity));
+    physTile.setAccessTileSetAttr(
+        IntegerSetAttr::get(buildRangeSetND(b.getContext(), physBlock)));
+    physTile.getResult().setType(
+        mlir::ktdp::AccessTileType::get(physBlock, b.getIndexType()));
+
+    if (failed(verifyNothingDropped(tileOp, physTile)))
+      return failure();
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "    access tile " << tileOp.getResult().getType() << " -> "
+               << physTile.getResult().getType() << "\n");
+
+    for (Operation *user :
+         llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
+      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
+        ld.getAccessTileMutable().assign(physTile.getResult());
+        auto logResTy = cast<RankedTensorType>(ld.getResult().getType());
+        ld.getResult().setType(
+            RankedTensorType::get(physBlock, logResTy.getElementType()));
+      } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
+        st.getAccessTileMutable().assign(physTile.getResult());
+      } else {
+        return user->emitError(
+            "spyre_tensor_layout: unexpected user of an access tile");
+      }
+    }
+
+    tileOp.erase();
+    return success();
+  }
+
+  /// Physicalize one indirect access tile over the already-physical
+  /// `physMemView`.
+  LogicalResult
+  physicalizeIndirectAccessTile(
+      mlir::ktdp::ConstructIndirectAccessTilesOp tileOp,
+      Value physMemView, const CoordMap &cm) {
+    OpBuilder b(tileOp);
+    MLIRContext *ctx = b.getContext();
+
+    ArrayRef<int64_t> logBlock = tileOp.getResult().getType().getShape();
+    unsigned logRank = logBlock.size();
+    unsigned physRank = cm.physRank();
+
+    auto oldKinds = tileOp.getPerDimSubscriptKinds();
+    auto oldMaps = tileOp.getPerDimSubscriptMaps();
+    unsigned numCaptured = tileOp.getCapturedVariables().size();
+
+    // An indirect subscript's coord is loaded from the index memref, so
+    // floordiv/mod cannot apply to it — there is nowhere to write the split.
+    for (unsigned p = 0; p < physRank; ++p) {
+      if (cm.opAt(p) == CoordOp::Identity)
+        continue;
+      int64_t logDim = cm.src[p];
+      if (!cast<BoolAttr>(oldKinds[logDim]).getValue())
+        continue;
+      return tileOp.emitError("spyre_tensor_layout: logical dim ")
+             << logDim
+             << " is an indirect (gather) subscript, so it cannot be "
+                "stick-split";
+    }
+
+    SmallVector<int64_t> physBlock;
+    if (!applyCoordMap(logBlock, cm.src, cm.op, cm.arg, physBlock))
+      return tileOp.emitError("spyre_tensor_layout: cannot derive a static "
+                              "physical block shape for this indirect access "
+                              "tile");
+
+    if (!tileOp.getVariablesSpaceOrder().isIdentity())
+      return tileOp.emitError(
+          "spyre_tensor_layout: variables_space_order must be the identity to "
+          "physicalize this tile; a permuted order would be overwritten");
+    if (tileOp.getVariablesSpaceSetAttr().getValue() !=
+        buildRangeSetND(ctx, logBlock))
+      return tileOp.emitError(
+          "spyre_tensor_layout: variables_space_set must be the dense range of "
+          "the tile shape to physicalize this tile; a non-dense set would be "
+          "overwritten");
+
+    auto physVar = [&](unsigned p) {
+      return getAffineDimExpr(numCaptured + p, ctx);
+    };
+
+    // Recover each logical variable from the physical ones.
+    SmallVector<AffineExpr> logicalFromPhysical(logRank);
+    SmallVector<int64_t> width(logRank, 0);
+    SmallVector<AffineExpr> stickHalf(logRank), elemHalf(logRank);
+    for (unsigned p = 0; p < physRank; ++p) {
+      int64_t logDim = cm.src[p];
+      switch (cm.opAt(p)) {
+      case CoordOp::Identity:
+        logicalFromPhysical[logDim] = physVar(p);
+        break;
+      case CoordOp::FloorDiv:
+        stickHalf[logDim] = physVar(p);
+        break;
+      case CoordOp::Mod:
+        elemHalf[logDim] = physVar(p);
+        width[logDim] = cm.arg[p];
+        break;
+      case CoordOp::Splat:
+        // A splat axis addresses no element of the logical dim, so it
+        // contributes nothing to recovering it.
+        break;
+      }
+    }
+    for (unsigned d = 0; d < logRank; ++d)
+      if (width[d])
+        logicalFromPhysical[d] =
+            composeStickSplit(stickHalf[d], width[d], elemHalf[d]);
+
+    SmallVector<AffineExpr> oldToNew(numCaptured + logRank);
+    for (unsigned c = 0; c < numCaptured; ++c)
+      oldToNew[c] = getAffineDimExpr(c, ctx);
+    for (unsigned d = 0; d < logRank; ++d) {
+      if (!logicalFromPhysical[d])
+        return tileOp.emitError("spyre_tensor_layout: logical dim ")
+               << d << " is named by no physical dim, so its subscript cannot "
+                       "be restated";
+      oldToNew[numCaptured + d] = logicalFromPhysical[d];
+    }
+
+    unsigned newNumDims = numCaptured + physRank;
+    SmallVector<Attribute> newKinds, newMaps;
+    for (unsigned p = 0; p < physRank; ++p) {
+      int64_t logDim = cm.src[p];
+      AffineMap oldMap = cast<AffineMapAttr>(oldMaps[logDim]).getValue();
+
+      SmallVector<AffineExpr> results;
+      for (AffineExpr r : oldMap.getResults()) {
+        AffineExpr e = r.replaceDims(oldToNew);
+        switch (cm.opAt(p)) {
+        case CoordOp::Identity:
+          break;
+        case CoordOp::FloorDiv:
+          e = e.floorDiv(cm.arg[p]);
+          break;
+        case CoordOp::Mod:
+          e = e % cm.arg[p];
+          break;
+        case CoordOp::Splat:
+          e = getAffineConstantExpr(0, ctx);
+          break;
+        }
+        results.push_back(e);
+      }
+
+      newKinds.push_back(cast<BoolAttr>(oldKinds[logDim]));
+      newMaps.push_back(AffineMapAttr::get(
+          AffineMap::get(newNumDims, /*symbolCount=*/0, results, ctx)));
+    }
+
+    // Rebuild the indirect memref list in physical dim order.
+    SmallVector<Value> newIndirect;
+    for (unsigned p = 0; p < physRank; ++p) {
+      int64_t logDim = cm.src[p];
+      if (!cast<BoolAttr>(oldKinds[logDim]).getValue())
+        continue;
+      unsigned oldIndirectIdx = 0;
+      for (int64_t d = 0; d < logDim; ++d)
+        if (cast<BoolAttr>(oldKinds[d]).getValue())
+          ++oldIndirectIdx;
+      newIndirect.push_back(tileOp.getIndirectMemrefs()[oldIndirectIdx]);
+    }
+
+    auto physTile = mlir::ktdp::ConstructIndirectAccessTilesOp::create(
+        b, tileOp.getLoc(),
+        mlir::ktdp::AccessTileType::get(physBlock, b.getIndexType()),
+        physMemView, ArrayAttr::get(ctx, newKinds),
+        ArrayAttr::get(ctx, newMaps), newIndirect,
+        tileOp.getCapturedVariables(), tileOp.getSymbolOperands(),
+        buildRangeSetND(ctx, physBlock),
+        AffineMap::getMultiDimIdentityMap(physRank, ctx));
+
+    for (Operation *user :
+         llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
+      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
+        ld.getAccessTileMutable().assign(physTile.getResult());
+        auto logResTy = cast<RankedTensorType>(ld.getResult().getType());
+        ld.getResult().setType(
+            RankedTensorType::get(physBlock, logResTy.getElementType()));
+      } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
+        st.getAccessTileMutable().assign(physTile.getResult());
+      } else {
+        return user->emitError(
+            "spyre_tensor_layout: unexpected user of an indirect access tile");
+      }
+    }
+
+    tileOp.erase();
+    return success();
+  }
+
+  LogicalResult physicalizeDescriptor(triton::SpyreTensorLayoutOp marker) {
+    Value desc = marker.getDesc();
+    if (!isLoweredDescriptor(desc))
+      return marker.emitError(
+          "spyre_tensor_layout: desc operand is not a lowered descriptor");
+    Value memView = getDescriptorMemView(desc);
+    auto memViewOp = memView.getDefiningOp<mlir::ktdp::ConstructMemoryViewOp>();
+    if (!memViewOp)
+      return marker.emitError("spyre_tensor_layout: cannot locate "
+                              "construct_memory_view behind the bridge cast");
+
+    auto cm = readCoordMap(marker, memViewOp.getStaticSizes().size());
+    if (failed(cm))
+      return failure();
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "  descriptor at " << marker.getLoc() << ": ";
+      printCoordMap(llvm::dbgs(), *cm);
+      llvm::dbgs() << "\n";
+    });
+
+    SmallVector<mlir::ktdp::ConstructAccessTilesOp> tiles;
+    SmallVector<mlir::ktdp::ConstructIndirectAccessTilesOp> indirectTiles;
+    for (Operation *user : memView.getUsers())
+      if (auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(user))
+        tiles.push_back(tile);
+      else if (auto indirect =
+                   dyn_cast<mlir::ktdp::ConstructIndirectAccessTilesOp>(user))
+        indirectTiles.push_back(indirect);
+
+    auto physMemView = physicalizeMemView(memViewOp, *cm, marker);
+    if (failed(physMemView))
+      return failure();
+
+    // Record the physicalized view → coord map for Phase 2 tracing.
+    if (Operation *physViewOp = (*physMemView).getDefiningOp())
+      physViewOf.try_emplace(physViewOp, *cm);
+
+    for (auto tile : tiles)
+      if (failed(physicalizeAccessTile(tile, *physMemView, *cm, marker)))
+        return failure();
+    for (auto tile : indirectTiles)
+      if (failed(physicalizeIndirectAccessTile(tile, *physMemView, *cm)))
+        return failure();
+
+    deadLogicalMemViews.push_back(memViewOp);
+    return success();
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Phase 2 — the one rewrite
+  //===--------------------------------------------------------------------===//
+
+  /// Trace a generic's input operand back to the physicalized view it was
+  /// loaded from, returning its coord map, or null if not on a physicalized
+  /// chain.
+  const CoordMap *findLayoutForInput(mlir::Value ins) const {
+    auto load = ins.getDefiningOp<mlir::ktdp::LoadOp>();
+    if (!load)
+      return nullptr;
+    Operation *tileOp = load.getAccessTile().getDefiningOp();
+    if (!tileOp)
+      return nullptr;
+    mlir::Value base;
+    if (auto direct = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(tileOp))
+      base = direct.getBase();
+    else if (auto indirect =
+                 dyn_cast<mlir::ktdp::ConstructIndirectAccessTilesOp>(tileOp))
+      base = indirect.getBase();
+    else
+      return nullptr;
+    auto view = base.getDefiningOp<mlir::ktdp::ConstructMemoryViewOp>();
+    if (!view)
+      return nullptr;
+    auto it = physViewOf.find(view.getOperation());
+    return it == physViewOf.end() ? nullptr : &it->second;
+  }
+
+  /// Trace a generic's result back to the physicalized view it will be stored
+  /// into, returning its coord map, or null if not on a physicalized chain.
+  const CoordMap *findLayoutForResult(mlir::Value result) const {
+    for (Operation *user : result.getUsers()) {
+      auto st = dyn_cast<mlir::ktdp::StoreOp>(user);
+      if (!st)
+        continue;
+      Operation *tileOp = st.getAccessTile().getDefiningOp();
+      if (!tileOp)
+        continue;
+      mlir::Value base;
+      if (auto direct = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(tileOp))
+        base = direct.getBase();
+      else if (auto indirect =
+                   dyn_cast<mlir::ktdp::ConstructIndirectAccessTilesOp>(tileOp))
+        base = indirect.getBase();
+      else
+        continue;
+      auto view = base.getDefiningOp<mlir::ktdp::ConstructMemoryViewOp>();
+      if (!view)
+        continue;
+      auto it = physViewOf.find(view.getOperation());
+      if (it != physViewOf.end())
+        return &it->second;
+    }
+    return nullptr;
+  }
+
+  //===--------------------------------------------------------------------===//
+  // The rewrite
+  //===--------------------------------------------------------------------===//
+
+  LogicalResult rewriteGeneric(linalg::GenericOp op) {
+    MLIRContext *ctx = op.getContext();
+    unsigned numLoops = op.getNumLoops();
+
+    // Collect layouts for all operands by tracing back to physicalized views.
+    SmallVector<const CoordMap *> layouts;
+    unsigned numIns = op.getNumDpsInputs();
+    unsigned numOps = op->getNumOperands();
+    bool anyPhys = false;
+    for (unsigned i = 0; i < numOps; ++i) {
+      const CoordMap *cm = nullptr;
+      if (i < numIns)
+        cm = findLayoutForInput(op->getOperand(i));
+      else {
+        unsigned outIdx = i - numIns;
+        if (outIdx < op.getNumResults())
+          cm = findLayoutForResult(op.getResult(outIdx));
+      }
+      layouts.push_back(cm);
+      if (cm)
+        anyPhys = true;
+    }
+    if (!anyPhys)
+      return success();
+
+    // Check that all consumers of physicalized results are rewritable generics
+    // or stores. A non-generic non-store consumer (e.g. tensor.extract_slice)
+    // would still name the logical type after the rewrite, silently producing
+    // bad IR — diagnose it now with a pass-attributed message.
+    for (unsigned i = numIns; i < numOps; ++i) {
+      if (!layouts[i])
+        continue;
+      unsigned outIdx = i - numIns;
+      for (Operation *user : op.getResult(outIdx).getUsers()) {
+        if (isa<linalg::GenericOp, mlir::ktdp::StoreOp>(user))
+          continue;
+        return user->emitError(
+            "rewrite-descriptor-layout-generic: this op reads a value the "
+            "rewrite retyped, but the rewrite restates only linalg.generic, "
+            "so this op still names the logical type");
+      }
+    }
+
+    SmallVector<RebuildOperand> rebuildOperands;
+    SmallVector<AffineMap> logicalMaps = op.getIndexingMapsArray();
+    for (auto [i, m] : llvm::enumerate(logicalMaps))
+      rebuildOperands.push_back(RebuildOperand{m, layouts[i]});
+
+    unsigned resultIdx = op.getDpsInitOperand(0)->getOperandNumber();
+    if (resultIdx >= rebuildOperands.size())
+      return op.emitError("rewrite-descriptor-layout-generic: the outs operand "
+                          "backing result 0 is outside the indexing maps");
+
+    auto dom = buildLoopDomain(rebuildOperands, resultIdx, numLoops,
+                               [&]() { return op.emitError(); });
+    if (failed(dom))
+      return failure();
+
+    SmallVector<AffineMap> physMaps;
+    for (const RebuildOperand &o : rebuildOperands)
+      physMaps.push_back(rebuildMap(o, *dom, ctx));
+
+    SmallVector<utils::IteratorType> physIterators =
+        rebuildIterators(op.getIteratorTypesArray(), *dom);
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "    rebuilding at " << op.getLoc() << ": " << numLoops
+                   << " logical loop dim(s) -> " << dom->numLoopDims << "\n";
+      for (unsigned d = 0; d < numLoops; ++d) {
+        llvm::dbgs() << "      logical d" << d << " -> ";
+        if (dom->isSplit(d))
+          llvm::dbgs() << "stick d" << dom->stickDim[d] << " + lane d"
+                       << dom->elemDim[d] << " at width " << dom->width[d];
+        else
+          llvm::dbgs() << "whole d" << dom->stickDim[d];
+        llvm::dbgs() << "\n";
+      }
+      for (auto [i, o] : llvm::enumerate(rebuildOperands)) {
+        for (unsigned p = 0, e = o.broadcastDim.size(); p < e; ++p)
+          if (o.broadcastDim[p] >= 0)
+            llvm::dbgs() << "      operand " << i << " splat phys dim " << p
+                         << " -> fresh loop d" << o.broadcastDim[p] << "\n";
+        llvm::dbgs() << "      operand " << i << " " << o.logicalMap << " -> "
+                     << physMaps[i];
+        if (!o.layout)
+          llvm::dbgs() << " (no layout, stays logical)";
+        llvm::dbgs() << "\n";
+      }
+      llvm::dbgs() << "      iterators [";
+      llvm::interleaveComma(physIterators, llvm::dbgs(),
+                            [&](utils::IteratorType t) {
+                              llvm::dbgs() << utils::stringifyIteratorType(t);
+                            });
+      llvm::dbgs() << "]\n";
+    });
+
+    OpBuilder b(op);
+    for (auto [i, operand] : llvm::enumerate(op->getOpOperands())) {
+      if (!layouts[i])
+        continue;
+      auto ty = dyn_cast<RankedTensorType>(operand.get().getType());
+      if (!ty || ty.getRank() == (int64_t)layouts[i]->physRank())
+        continue;
+      auto physTy = physicalTensorType(
+          *layouts[i], cast<RankedTensorType>(operand.get().getType()));
+      if (failed(physTy))
+        return op.emitError("rewrite-descriptor-layout-generic: operand ")
+               << i << " has no static physical shape under its layout";
+      if (failed(retypeToPhysical(operand.get(), *physTy, b)))
+        return failure();
+    }
+
+    // Clone rather than build: the body, the attributes, the location and
+    // anything added to linalg.generic later all ride along.
+    auto physOp = cast<linalg::GenericOp>(b.clone(*op));
+    physOp.setIndexingMapsAttr(b.getAffineMapArrayAttr(physMaps));
+    physOp.setIteratorTypesAttr(
+        b.getArrayAttr(llvm::to_vector(llvm::map_range(
+            physIterators, [&](utils::IteratorType t) -> Attribute {
+              return linalg::IteratorTypeAttr::get(ctx, t);
+            }))));
+    for (auto [res, out] :
+         llvm::zip_equal(physOp.getResults(), physOp.getDpsInits()))
+      res.setType(out.getType());
+
+    if (failed(verifyNothingDropped(op, physOp)))
+      return failure();
+
+    op.getResults().replaceAllUsesWith(physOp.getResults());
+    op.erase();
+    return success();
+  }
+
+  /// Give `v` the physical type `physTy`, by retyping its producer.
+  LogicalResult retypeToPhysical(Value v, RankedTensorType physTy,
+                                 OpBuilder &b) {
+    Operation *def = v.getDefiningOp();
+    if (isa_and_nonnull<linalg::GenericOp>(def))
+      return success();
+    if (auto empty = dyn_cast_or_null<tensor::EmptyOp>(def)) {
+      if (!empty.getType().hasStaticShape())
+        return empty.emitError("rewrite-descriptor-layout-generic: cannot "
+                               "physicalize a dynamically shaped tensor.empty");
+      empty.getResult().setType(physTy);
+      return success();
+    }
+    if (auto cst = dyn_cast_or_null<arith::ConstantOp>(def)) {
+      auto splat = dyn_cast<SplatElementsAttr>(cst.getValue());
+      if (!splat)
+        return cst.emitError("rewrite-descriptor-layout-generic: cannot "
+                             "physicalize a non-splat constant; its elements "
+                             "would have to be reordered into stick layout");
+      cst.setValueAttr(SplatElementsAttr::get(physTy,
+                                              splat.getSplatValue<Attribute>()));
+      cst.getResult().setType(physTy);
+      return success();
+    }
+    LLVM_DEBUG({
+      llvm::dbgs() << "    decline: cannot restate ";
+      if (Operation *d = v.getDefiningOp())
+        llvm::dbgs() << d->getName() << " at " << d->getLoc();
+      else
+        llvm::dbgs() << "block argument " << v;
+      llvm::dbgs() << " as " << physTy << "\n";
+    });
+    return v.getDefiningOp()
+               ? v.getDefiningOp()->emitError(
+                     "rewrite-descriptor-layout-generic: this op produces a "
+                     "value on a physicalized chain but the rewrite cannot "
+                     "restate it at physical shape")
+               : failure();
+  }
+
+  /// Before Phase 1 mutates anything, check that every consumer of a
+  /// to-be-physicalized load is a linalg.generic or a ktdp.store.
+  LogicalResult checkConsumersAreRewritable(ModuleOp module) {
+    LogicalResult result = success();
+    module.walk([&](triton::SpyreTensorLayoutOp marker) {
+      Value desc = marker.getDesc();
+      if (!isLoweredDescriptor(desc))
+        return;
+      Value memView = getDescriptorMemView(desc);
+      for (Operation *tile : memView.getUsers())
+        for (Value tileRes : tile->getResults())
+          for (Operation *user : tileRes.getUsers()) {
+            auto ld = dyn_cast<mlir::ktdp::LoadOp>(user);
+            if (!ld)
+              continue;
+            for (Operation *consumer : ld.getResult().getUsers())
+              if (!isa<linalg::GenericOp, mlir::ktdp::StoreOp>(consumer)) {
+                consumer->emitError(
+                    "rewrite-descriptor-layout-generic: this op reads a value "
+                    "on a physicalized chain, but the rewrite restates only "
+                    "linalg.generic; spell this op as one");
+                result = failure();
+              }
+          }
+    });
+    return result;
+  }
+
+  LogicalResult runPhase2(ModuleOp module) {
+    SmallVector<linalg::GenericOp> generics;
+    module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+    for (auto g : generics)
+      if (failed(rewriteGeneric(g)))
+        return failure();
+    return success();
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Phase 3 — marker cleanup
+  //===--------------------------------------------------------------------===//
+
+  void eraseMarker(triton::SpyreTensorLayoutOp marker) {
+    if (!marker->getBlock())
+      return;
+    auto castOp = marker.getDesc().getDefiningOp<UnrealizedConversionCastOp>();
+    marker.erase();
+    if (castOp && castOp.use_empty())
+      castOp.erase();
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+
+    if (dataLayout != "device" && dataLayout != "host") {
+      module.emitError("rewrite-descriptor-layout-generic: data-layout must be "
+                       "'device' or 'host', got '")
+          << dataLayout << "'";
+      return signalPassFailure();
+    }
+    hwDataLayout = (dataLayout == "device");
+
+    SmallVector<triton::SpyreTensorLayoutOp> markers;
+    module.walk([&](triton::SpyreTensorLayoutOp op) { markers.push_back(op); });
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "[rewrite-descriptor-layout-generic] " << markers.size()
+               << " layout marker(s), data-layout=" << dataLayout << "\n");
+
+    if (failed(checkConsumersAreRewritable(module)))
+      return signalPassFailure();
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "[rewrite-descriptor-layout-generic] Phase 1: physicalizing "
+               << "descriptors\n");
+    for (auto marker : markers)
+      if (failed(physicalizeDescriptor(marker)))
+        return signalPassFailure();
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "[rewrite-descriptor-layout-generic] Phase 2: greedy "
+               << "rewrite\n");
+    if (failed(runPhase2(module)))
+      return signalPassFailure();
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "[rewrite-descriptor-layout-generic] Phase 3: erasing "
+               << markers.size() << " marker(s)\n");
+    for (auto marker : markers)
+      eraseMarker(marker);
+
+    for (auto memViewOp : deadLogicalMemViews)
+      if (memViewOp->getBlock() && memViewOp.use_empty())
+        memViewOp.erase();
+  }
+};
+
+} // namespace

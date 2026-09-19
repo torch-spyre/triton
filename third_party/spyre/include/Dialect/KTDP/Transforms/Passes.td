@@ -94,4 +94,50 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
     ];
 }
 
+def RewriteDescriptorLayoutGeneric
+    : Pass<"rewrite-descriptor-layout-generic", "mlir::ModuleOp"> {
+  let summary = "Rewrite logical descriptors to physical (stick-tiled) layout "
+                "for kernels whose compute ops are linalg.generic.";
+  let description = [{
+    Input: lowered KTDP IR (after LowerDescriptorMemory + LowerComputeOps +
+    FoldDataMovementGenerics).  Each annotated descriptor has been lowered to:
+      ktdp.construct_memory_view (logical shape / strides, wrapped in an
+      UnrealizedConversionCast bridging back to !tt.tensordesc so the marker's
+      desc operand stays valid) →
+      ktdp.construct_access_tile (logical block shape) →
+      ktdp.load / store.
+    The marker holds the physical layout as the OpSpec device_coordinates form
+    (phys_src / phys_op / phys_arg i64 arrays; op 0=identity, 1=floordiv,
+    2=mod, 3=broadcast).
+
+    Phase 1  Physicalize each annotated descriptor: rebuild
+             construct_memory_view with physical sizes and strides, rebuild
+             each access tile with physical block shape and remapped subscripts,
+             retype load results and seed the layout map.
+
+    Phase 2  Greedy rewrite: walk stores and generics until every op on a
+             physicalized chain is consistent.  A generic is consistent when
+             all its operands and results are at their prescribed physical rank
+             and its indexing maps are stated over the physical loop domain.
+             The loop domain is built from the markers — splitting any logical
+             dim any operand splits — and each map is restated over it.
+
+    Phase 3  Erase the markers and their now-dead bridge casts.
+
+    Unannotated kernels are left unchanged.
+  }];
+  let options = [
+    Option<"dataLayout", "data-layout", "std::string",
+           /*default=*/"\"device\"",
+           "Format of tensors: \"device\" (stickified) or \"host\" (row-major)">
+  ];
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::ktdp::KtdpDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::tensor::TensorDialect"
+  ];
+}
+
 #endif // KTDP_TRANSFORMS_PASSES
