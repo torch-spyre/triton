@@ -1,11 +1,14 @@
-// RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic | FileCheck %s
+// RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic -split-input-file | FileCheck %s
 
 // Attributes this pass does not own must survive physicalization.
 //
 // Physicalizing an op is a clone-and-retype, not a rebuild: the original op is
 // cloned and only the shape it states is replaced. So every field the pass never
 // enumerated rides along, including one added to either op after this pass was
-// written.
+// written. The one op the pass cannot clone -- the indirect access tile, whose
+// region's block arguments are the variable space it is changing the arity of --
+// has to carry those fields across by hand instead, and case 2 holds it to the
+// same standard.
 //
 // That is stated as a regression test because the alternative was tried and
 // reported as a bug. RewriteDescriptorLayout, the named-op pass, builds each
@@ -18,6 +21,8 @@
 // with generate-test-checks.py. The generated lines would still match if the
 // attributes were dropped from only one of the two ops, which is why both are
 // spelled out in full below.
+
+// Case 1 -- the two cloned ops: a memory view and a direct access tile.
 
 // CHECK: #[[$ID3:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 // CHECK: #[[$SET3:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
@@ -88,6 +93,47 @@ tt.func @unowned_attributes_survive(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %c: !tt.
     linalg.yield %s : f32
   } -> tensor<64x128xf32>
   ktdp.store %r, %ct : tensor<64x128xf32>, <64x128xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 2 -- the op that cannot be cloned: an indirect access tile.
+//
+// Physicalizing this one changes how many intermediate variables its variable
+// space has, and those are its region's block arguments, so it is built fresh
+// rather than cloned and retyped. Nothing the builder takes as a parameter can
+// therefore be an attribute the pass has never heard of, and spyre.gather_note
+// below is exactly that -- carried across explicitly, and checked here because
+// the explicit step is what a later edit can forget.
+
+#varorder = affine_map<(d0, d1) -> (d0, d1)>
+#sidx = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
+#sdata = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#stile = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+// The assertion: spyre.gather_note on the physical construct_indirect_access_tile,
+// named in full on the op's own line below.
+// CHECK-LABEL:   tt.func @unowned_attribute_survives_on_indirect_tile(
+// CHECK-SAME:      %[[DATA:.*]]: !tt.ptr<f32>, %[[IDX:.*]]: !tt.ptr<i32>) {
+// CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[IDXV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [32], strides: [1]
+// CHECK-SAME:        : memref<32xi32>
+// CHECK:           %[[DATAV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [2, 512, 64], strides: [32768, 64, 1]
+// CHECK-SAME:        : memref<2x512x64xf32>
+// CHECK:           %[[TILE:.*]] = ktdp.construct_indirect_access_tile intermediate_variables(%[[V0:.*]], %[[V1:.*]], %[[V2:.*]]) %[[DATAV]]{{\[}}((%[[C0]] + %[[V0]] * 64 + %[[V2]]) floordiv 64), ind(%[[IDXV]]{{\[}}%[[C0]] + %[[V1]]]), ((%[[C0]] + %[[V0]] * 64 + %[[V2]]) mod 64)] {spyre.gather_note = "kept", variables_space_order = #{{.*}}, variables_space_set = #{{.*}}} : memref<2x512x64xf32>, memref<32xi32> -> !ktdp.access_tile<2x32x64xindex>
+// CHECK:           ktdp.load %[[TILE]] : <2x32x64xindex> -> tensor<2x32x64xf32>
+tt.func @unowned_attribute_survives_on_indirect_tile(%data: !tt.ptr<f32>, %idx: !tt.ptr<i32>) {
+  %c0 = arith.constant 0 : index
+  %ii = builtin.unrealized_conversion_cast %idx : !tt.ptr<i32> to index
+  %iv = ktdp.construct_memory_view %ii, sizes: [32], strides: [1] {coordinate_set = #sidx, memory_space = #ktdp.memory_space<global>} : memref<32xi32>
+  %di = builtin.unrealized_conversion_cast %data : !tt.ptr<f32> to index
+  %dv = ktdp.construct_memory_view %di, sizes: [512, 128], strides: [128, 1] {coordinate_set = #sdata, memory_space = #ktdp.memory_space<global>} : memref<512x128xf32>
+  %dd = builtin.unrealized_conversion_cast %dv : memref<512x128xf32> to !tt.tensordesc<512x128xf32>
+  tt.spyre_tensor_layout %dd {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : <512x128xf32>
+  %dt = ktdp.construct_indirect_access_tile intermediate_variables(%v0, %v1) %dv[ind(%iv[%c0 + %v0]), (%c0 + %v1)] {variables_space_order = #varorder, variables_space_set = #stile, spyre.gather_note = "kept"} : memref<512x128xf32>, memref<32xi32> -> !ktdp.access_tile<32x128xindex>
+  %dl = ktdp.load %dt : <32x128xindex> -> tensor<32x128xf32>
   tt.return
 }
 }
