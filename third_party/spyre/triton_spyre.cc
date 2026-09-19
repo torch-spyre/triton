@@ -8,10 +8,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "RegisterEverything.h"
+// The two stage pipelines this file exposes.
+#include "Pipeline.h"
 // All three pass groups: this file reaches create* entry points from each --
 // the conversions and the top-level transforms by their hand-declared
 // factories, RewriteDescriptorLayout through the options struct tablegen
-// generates into the KTDP transforms header.
+// generates into the KTDP transforms header. Only the individual pass bindings
+// need these now; the pipelines come from Pipeline.h.
 #include "Conversion/TritonToKTIR/Passes.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
 #include "Transforms/Passes.h"
@@ -22,66 +25,67 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/PassManager.h"
+#include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 namespace py = pybind11;
 
 void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
-  // Pass order built by add_convert_ttir_to_ktdp:
+  // One entry point per compile stage. The pass lists are in
+  // third_party/spyre/lib/Pipeline.cpp, spelled once: this file used to carry a
+  // fused `add_convert_ttir_to_ktdp` alongside a pass-by-pass loop in
+  // backend/compiler.py, and the two drifted -- the fused one never learned
+  // about the two passes the Python loop always spliced in, and no test could
+  // see it, because every .mlir test drives a single pass. The same lists are
+  // reachable as `spyre-triton-opt --spyre-ttir-to-ktir` /
+  // `--spyre-prepare-spyrecode`, which is what lets a lit test cover a whole
+  // stage.
   //
-  //     LowerDescriptorMemory      [LowerPointerChainMemory — planned,
-  //              │                  not yet implemented; would handle the
-  //              │                  tensor-of-pointers tt.load that
-  //              │                  LowerScalarLoad leaves legal]
-  //              ↓
-  //       LowerScalarLoad
-  //              ↓
-  //       LowerComputeOps
-  //              ↓
-  //        LowerInterTile          [runs before RewriteDescriptorLayout so the
-  //              │                  layout pass never sees a
-  //              │                  tt.inter_tile_reduce]
-  //              ↓
-  //   RewriteDescriptorLayout      [runs after LowerComputeOps so tt.dot is
-  //              │                  already linalg.matmul before its operands
-  //              │                  are physicalized]
-  //              ↓
-  //       ConvertFunctions
-  //
-  // This is only the nested pipeline. DistributeWork and canonicalize + CSE
-  // run after it, added separately by the `ktir` stage in
-  // third_party/spyre/backend/compiler.py.
-  //
-  // Ordering constraints (each pass also states its own, in the Passes.td of
-  // whichever of the three libraries it belongs to):
-  // ConvertFunctions runs last because it replaces !tt.ptr args with index;
-  // memory passes must consume !tt.ptr via getBasePtrAsIndex/ptrToIndex first.
-  // LowerInterTile runs after LowerComputeOps (partials are linalg/tensor),
-  // before RewriteDescriptorLayout (which has no propagation pattern for
-  // tt.inter_tile_reduce, so it must not be reached with one live) and before
-  // ConvertFunctions (reads work-slice function attributes that
-  // ConvertFunctions would rewrite).
+  // Options arrive as values rather than as an options string. Pipeline
+  // registration parses a string, which suits `grid` and suits the base
+  // addresses badly: they are element indices up to 2^35, positional, and the
+  // empty list means "this kernel has no pointer arguments" rather than
+  // "unset".
   m.def(
-      "add_convert_ttir_to_ktdp",
-      [](mlir::PassManager &pm, const std::string &data_layout) {
-        pm.addPass(mlir::triton::spyre::createLowerDescriptorMemoryPass());
-        pm.addPass(mlir::triton::spyre::createLowerScalarLoadPass());
-        pm.addPass(mlir::triton::spyre::createLowerComputeOpsPass());
-        pm.addPass(mlir::triton::spyre::createLowerInterTilePass());
-        pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
-            mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
-        pm.addPass(mlir::triton::spyre::createConvertFunctionsPass());
+      "add_ttir_to_ktir_pipeline",
+      [](mlir::PassManager &pm, const std::string &data_layout,
+         const std::vector<int64_t> &grid,
+         const std::function<void(const std::string &)> &fixes_at) {
+        mlir::triton::spyre::TTIRToKTIRPipelineOptions options;
+        options.dataLayout = data_layout;
+        options.grid = grid;
+        // `fixes_at` appends to this same pass manager, from Python, at each
+        // anchor the builder announces -- which is how SpyreOptions
+        // .required_fixes lands a pass in the position its anchor names. The
+        // pass manager is not handed back across the boundary: the caller
+        // already holds it, so the callback takes only the anchor name. Both go
+        // when required_fixes does.
+        if (fixes_at)
+          options.anchorHook = [&](llvm::StringRef anchor) {
+            fixes_at(anchor.str());
+          };
+        mlir::triton::spyre::buildTTIRToKTIRPipeline(pm, options);
       },
-      py::arg("pm"), py::arg("data_layout") = "device");
-  // Individual pass bindings. add_convert_ttir_to_ktdp above is the default
-  // order, but a caller that needs a different one — a subset of the passes,
-  // a repeat, or an extra pass slotted between two of them — builds the
-  // sequence from these instead. Used by the `required_fixes` mechanism in
-  // third_party/spyre/backend/compiler.py to insert correctness patches at a
-  // chosen point in the pipeline, and by the per-pass unit tests that run one
-  // pass over inline MLIR. Every pass in the default order has a binding here,
-  // so any reordering expressible in C++ is also expressible from Python.
+      py::arg("pm"), py::arg("data_layout") = "device",
+      py::arg("grid") = std::vector<int64_t>{},
+      py::arg("fixes_at") = std::function<void(const std::string &)>{});
+  m.def(
+      "add_spyrecode_pipeline",
+      [](mlir::PassManager &pm, bool bind_base_addresses,
+         const std::vector<int64_t> &base_addresses) {
+        mlir::triton::spyre::SpyrecodePipelineOptions options;
+        options.bindBaseAddresses = bind_base_addresses;
+        options.baseAddresses = base_addresses;
+        mlir::triton::spyre::buildSpyrecodePipeline(pm, options);
+      },
+      py::arg("pm"), py::arg("bind_base_addresses") = false,
+      py::arg("base_addresses") = std::vector<int64_t>{});
+  // Individual pass bindings. They are no longer how the pipeline is built --
+  // see the two entry points above -- and exist now for one reason only: they
+  // are the table that turns a `SpyreOptions.required_fixes` pass *name* into a
+  // pass. Keeping one is what lets a caller name it; removing one turns naming
+  // it into a loud ValueError from _add_ktdp_pass. They go with that option.
   //
   m.def("add_convert_elementwise_to_linalg", [](mlir::PassManager &pm) {
     pm.addPass(mlir::createConvertElementwiseToLinalgPass());
@@ -93,19 +97,12 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
             mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
       },
       py::arg("pm"), py::arg("data_layout") = "device");
-  // Not in add_convert_ttir_to_ktdp above: this is a fix pass, spliced into the
-  // pipeline from Python via SpyreOptions.required_fixes. It must be anchored on
-  // convert_elementwise_to_linalg, which is the pass that creates the ins/outs
-  // aliasing it removes; anchoring it on anything earlier is a silent no-op,
-  // since the pass only rewrites aliasing that already exists.
+  // Both of these are in buildTTIRToKTIRPipeline's own list now; the bindings
+  // remain because a caller can still name either as a fix, and because they
+  // are what the per-pass unit tests drive over inline MLIR.
   m.def("add_unalias_linalg_outs", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::spyre::createUnaliasLinalgOutsPass());
   });
-  // Also a fix pass, and also anchored on the pass that creates what it removes:
-  // lower_compute_ops is what gives every tt.reduce a linalg.fill init. The
-  // scheduler's allowlist has no linalg.fill, so without this the KTIR is
-  // rejected at pass 00; see the pass description for why the gate is zero
-  // rather than the combiner's neutral element.
   m.def("add_drop_reduction_init_fill", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::spyre::createDropReductionInitFillPass());
   });
@@ -133,11 +130,11 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
         pm.addPass(mlir::triton::spyre::createDistributeWorkPass(grid));
       },
       py::arg("pm"), py::arg("grid"));
-  // Opt-in only: MaterializeBaseAddresses is deliberately absent from
-  // add_convert_ttir_to_ktdp above. It changes the kernel's calling
-  // convention (base-address arguments become arith.constant and leave the
-  // signature), which only the dataflow-scheduler path wants; the default
-  // argument-passing path must stay byte-identical. Reached via
+  // MaterializeBaseAddresses is deliberately absent from the `ktir` stage's
+  // list: it changes the kernel's calling convention, so the cached .ktir
+  // artifact would lose its arguments. buildSpyrecodePipeline installs it, under
+  // its own flag. This binding is for a caller that wants it during the `ktir`
+  // stage instead, via
   // required_fixes = {"materialize_base_addresses": "convert_functions"}.
   m.def(
       "add_materialize_base_addresses",
