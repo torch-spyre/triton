@@ -14,7 +14,8 @@
 // diagnostic below looks like a verifier check, it is reachable precisely
 // because the pass measures against something the verifier cannot see (the
 // memory view's rank rather than the descriptor's) or checks something the
-// verifier does not (a lone half of a split).
+// verifier does not (a lone half of a split, or a logical dim the marker
+// leaves out altogether).
 
 // Case 1 -- the marker's desc is not a lowered descriptor.
 module {
@@ -100,7 +101,29 @@ tt.func @lone_mod_half(%arg0: !tt.ptr<f32>) {
 
 // -----
 
-// Case 6 -- a partitioned coordinate_set on the memory view.
+// Case 6 -- a logical dim named by no physical dim.
+//
+// The marker here splits logical dim 1 and says nothing about logical dim 0, so
+// the physical type it prescribes is [2, 64] -- dim 0's extent of 64 is simply
+// gone. The op verifier permits it: it constrains a logical dim named TWICE and
+// says nothing about one named zero times. The pass rejects it because the
+// physical layout would no longer address the dim's elements, and because a dim
+// no operand's map can name is how a loop dim enters the rebuilt domain unnamed.
+#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+tt.func @logical_dim_named_by_nothing(%arg0: !tt.ptr<f32>) {
+  %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
+  %1 = ktdp.construct_memory_view %0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
+  %2 = builtin.unrealized_conversion_cast %1 : memref<64x128xf32> to !tt.tensordesc<64x128xf32>
+  // expected-error @below {{spyre_tensor_layout: logical dim 0 is named by no phys_src entry, so its extent would be dropped from the physical layout}}
+  tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 64>, phys_op = array<i64: 1, 2>, phys_src = array<i64: 1, 1>} : <64x128xf32>
+  tt.return
+}
+}
+
+// -----
+
+// Case 7 -- a partitioned coordinate_set on the memory view.
 //
 // The physical view's set is recomputed as the dense range of its own physical
 // sizes, so a set saying anything more than the dense range of the logical ones
@@ -119,7 +142,7 @@ tt.func @partitioned_coordinate_set(%arg0: !tt.ptr<f32>) {
 
 // -----
 
-// Case 7 -- an access tile whose block shape has no static physical form.
+// Case 8 -- an access tile whose block shape has no static physical form.
 //
 // The block extent is a runtime symbol, so no physical extent can be stated in
 // the rebuilt tile's type.
@@ -142,7 +165,7 @@ tt.func @dynamic_block_shape(%arg0: !tt.ptr<f32>, %n: index) {
 
 // -----
 
-// Case 8 -- a permuted access_tile_order.
+// Case 9 -- a permuted access_tile_order.
 //
 // The rebuilt tile states its order over the PHYSICAL dims and so recomputes it
 // as the identity. A permutation on the input says something about the logical
@@ -165,9 +188,9 @@ tt.func @permuted_access_tile_order(%arg0: !tt.ptr<f32>) {
 
 // -----
 
-// Case 9 -- a non-dense access_tile_set.
+// Case 10 -- a non-dense access_tile_set.
 //
-// Same reason as case 8 for the set rather than the order: it is recomputed as
+// Same reason as case 9 for the set rather than the order: it is recomputed as
 // the dense range of the physical block, so a strided set on the input would be
 // lost. This one is a stride-2 subset of the same range.
 #id = affine_map<(d0, d1) -> (d0, d1)>
@@ -189,7 +212,7 @@ tt.func @non_dense_access_tile_set(%arg0: !tt.ptr<f32>) {
 
 // -----
 
-// Case 10 -- an access tile user that is neither a load nor a store.
+// Case 11 -- an access tile user that is neither a load nor a store.
 //
 // Phase 1 re-points loads and stores at the physical tile; it has nothing to
 // re-point for anything else, and leaving the user on the erased logical tile
@@ -213,7 +236,7 @@ tt.func @unexpected_access_tile_user(%arg0: !tt.ptr<f32>) {
 
 // -----
 
-// Case 11 -- a non-splat constant on a physicalized chain.
+// Case 12 -- a non-splat constant on a physicalized chain.
 //
 // The accumulator inherits the store destination's layout, so the constant
 // behind it has to be restated at physical shape. A splat is a relabelling and
@@ -249,7 +272,7 @@ tt.func @non_splat_accumulator(%a: !tt.ptr<f32>, %c: !tt.ptr<f32>) {
 
 // -----
 
-// Case 12 -- a producer the rewrite cannot restate at physical shape.
+// Case 13 -- a producer the rewrite cannot restate at physical shape.
 //
 // tensor.empty, a splat constant and linalg.generic are the producers a shape
 // change propagates cleanly through. tensor.insert is not one: its result shape
@@ -287,7 +310,7 @@ tt.func @unrestatable_producer(%a: !tt.ptr<f32>, %c: !tt.ptr<f32>) {
 
 // -----
 
-// Case 13 -- a value the rewrite retyped, read by something that is not a
+// Case 14 -- a value the rewrite retyped, read by something that is not a
 // linalg.generic.
 //
 // tensor.extract_slice is the reachable shape of this: LowerComputeOps lowers

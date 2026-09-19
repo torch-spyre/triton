@@ -314,6 +314,10 @@ struct CoordMap {
     return findPhys(d, CoordOp::FloorDiv) >= 0;
   }
 
+  /// Is logical dim `d` named by any physical dim at all? Every dim must be,
+  /// or the layout drops it — see readCoordMap.
+  bool names(int64_t d) const { return llvm::is_contained(src, d); }
+
   /// The physical dim carrying `wanted` for logical dim `d`, or -1.
   int findPhys(int64_t d, CoordOp wanted) const {
     for (unsigned p = 0, e = physRank(); p < e; ++p)
@@ -396,6 +400,28 @@ FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
   // live, so reject it here rather than emitting a map that cannot address
   // them.
   for (unsigned d = 0; d < logicalRank; ++d) {
+    // Every logical dim has to be named by some physical dim. A dim named by
+    // none loses its extent from the physical type altogether -- data loss, and
+    // silent, because what is left still verifies. It is also the one way a loop
+    // dim could enter the rebuilt domain named by no operand's map, since
+    // collectPieces emits a piece for logical position d only when some physical
+    // dim has src[p] == d.
+    //
+    // Nothing upstream rejects it: SpyreTensorLayoutOp::verify() tallies the
+    // physical dims per logical dim and would answer this in a line, but it only
+    // constrains a dim named TWICE and lets a dim named zero times through.
+    //
+    // That verifier is arguably the better home even so -- this is a property of
+    // the marker alone, and the structural tallies are already there. It is here
+    // to keep lib/Dialect/Triton/IR/Ops.cpp untouched, since that file is being
+    // reverted to upstream when the op moves to the tts dialect; the deletion
+    // note at the top of RewriteDescriptorLayout.cpp records the same ownership
+    // question for the rest of this function's overlap.
+    if (!cm.names(d))
+      return marker.emitError("spyre_tensor_layout: logical dim ")
+             << d
+             << " is named by no phys_src entry, so its extent would be "
+                "dropped from the physical layout";
     bool hasFloor = cm.findPhys(d, CoordOp::FloorDiv) >= 0;
     bool hasMod = cm.findPhys(d, CoordOp::Mod) >= 0;
     if (hasFloor != hasMod)
