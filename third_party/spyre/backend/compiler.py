@@ -619,6 +619,11 @@ class SpyreBackend(BaseBackend):
         from triton._C.libtriton import ir, passes
 
         pm = ir.pass_manager(mod.context)
+        # MLIR_ENABLE_DUMP, honoured for the first time on this backend: the GPU
+        # backends call this on every pass manager they build and ours never did,
+        # so the variable was silently inert here. One call per pass manager, and
+        # every stage needs its own.
+        pm.enable_debug()
         passes.common.add_inliner(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
@@ -676,6 +681,7 @@ class SpyreBackend(BaseBackend):
             metadata["base_addresses"] = infer_base_addresses_from_ptr_types(mod)
 
         pm = ir.pass_manager(mod.context)
+        pm.enable_debug()  # MLIR_ENABLE_DUMP
         # The grid is passed as a list because the binding takes a
         # std::vector<int64_t>; SpyreOptions keeps it a tuple to stay hashable.
         spyre.passes.ttir_to_ktdp.add_ttir_to_ktir_pipeline(
@@ -746,6 +752,7 @@ class SpyreBackend(BaseBackend):
                 )
 
         pm = ir.pass_manager(mod.context)
+        pm.enable_debug()  # MLIR_ENABLE_DUMP
         spyre.passes.ttir_to_ktdp.add_spyrecode_pipeline(
             pm,
             bind_base_addresses=bind,
