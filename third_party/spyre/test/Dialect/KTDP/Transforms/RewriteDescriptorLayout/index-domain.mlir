@@ -1,4 +1,4 @@
-// RUN: spyre-triton-opt %s --lower-descriptor-memory --lower-scalar-load --lower-compute-ops --rewrite-descriptor-layout -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s --rewrite-descriptor-layout -split-input-file | FileCheck %s
 
 // Triton computes offsets in i32, so a pid-derived subscript arrives as
 // index_cast(muli(index_cast(pid), c) : i32).  The coordinate split is emitted
@@ -26,18 +26,24 @@
 // CHECK:           %[[PIDX2:.*]] = arith.index_cast %[[PID]] : i32 to index
 // CHECK:           %[[OFF2:.*]] = arith.muli %[[PIDX2]], %{{.*}} : index
 // CHECK:           arith.remsi %[[OFF2]], %{{.*}} : index
-tt.func @pid_offset_lifted_to_index(%ptr: !tt.ptr<f16>) {
+#map = affine_map<(d0) -> (d0)>
+#set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>
+#set1 = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+tt.func @pid_offset_lifted_to_index(%arg0: !tt.ptr<f16>) {
   %c64_i32 = arith.constant 64 : i32
-  %c128_i32 = arith.constant 128 : i32
-  %c1_i64 = arith.constant 1 : i64
-  %pid = tt.get_program_id x : i32
-  %off = arith.muli %pid, %c64_i32 : i32
+  %0 = tt.get_program_id x : i32
+  %1 = arith.muli %0, %c64_i32 : i32
   // [n=128] stick-on-n with stick_size=64 -> physical [n/64, n%64] = [2, 64]
-  %desc = tt.make_tensor_descriptor %ptr, [%c128_i32], [%c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<64xf16>
-  tt.spyre_tensor_layout %desc {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : !tt.tensordesc<64xf16>
-  %d = tt.descriptor_load %desc[%off] : !tt.tensordesc<64xf16> -> tensor<64xf16>
-  tt.descriptor_store %desc[%off], %d : !tt.tensordesc<64xf16>, tensor<64xf16>
+  %2 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f16> to index
+  %3 = ktdp.construct_memory_view %2, sizes: [128], strides: [1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<128xf16>
+  %4 = builtin.unrealized_conversion_cast %3 : memref<128xf16> to !tt.tensordesc<64xf16>
+  tt.spyre_tensor_layout %4 {phys_arg = array<i64: 64, 64>, phys_op = array<i64: 1, 2>, phys_src = array<i64: 0, 0>} : <64xf16>
+  %5 = arith.index_cast %1 : i32 to index
+  %6 = ktdp.construct_access_tile %3[%5] {access_tile_order = #map, access_tile_set = #set1} : memref<128xf16> -> !ktdp.access_tile<64xindex>
+  %7 = ktdp.load %6 : <64xindex> -> tensor<64xf16>
+  %8 = arith.index_cast %1 : i32 to index
+  %9 = ktdp.construct_access_tile %3[%8] {access_tile_order = #map, access_tile_set = #set1} : memref<128xf16> -> !ktdp.access_tile<64xindex>
+  ktdp.store %7, %9 : tensor<64xf16>, <64xindex>
   tt.return
 }
 
@@ -54,16 +60,22 @@ tt.func @pid_offset_lifted_to_index(%ptr: !tt.ptr<f16>) {
 // CHECK:           %[[OFFX:.*]] = arith.index_cast %[[OFF]] : i32 to index
 // CHECK:           arith.divsi %[[OFFX]], %{{.*}} : index
 // CHECK:           arith.remsi %[[OFFX]], %{{.*}} : index
-tt.func @runtime_scalar_offset_unchanged(%ptr: !tt.ptr<f16>, %n: i32) {
+#map = affine_map<(d0) -> (d0)>
+#set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>
+#set1 = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+tt.func @runtime_scalar_offset_unchanged(%arg0: !tt.ptr<f16>, %arg1: i32) {
   %c64_i32 = arith.constant 64 : i32
-  %c128_i32 = arith.constant 128 : i32
-  %c1_i64 = arith.constant 1 : i64
-  %off = arith.muli %n, %c64_i32 : i32
-  %desc = tt.make_tensor_descriptor %ptr, [%c128_i32], [%c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<64xf16>
-  tt.spyre_tensor_layout %desc {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : !tt.tensordesc<64xf16>
-  %d = tt.descriptor_load %desc[%off] : !tt.tensordesc<64xf16> -> tensor<64xf16>
-  tt.descriptor_store %desc[%off], %d : !tt.tensordesc<64xf16>, tensor<64xf16>
+  %0 = arith.muli %arg1, %c64_i32 : i32
+  %1 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f16> to index
+  %2 = ktdp.construct_memory_view %1, sizes: [128], strides: [1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<128xf16>
+  %3 = builtin.unrealized_conversion_cast %2 : memref<128xf16> to !tt.tensordesc<64xf16>
+  tt.spyre_tensor_layout %3 {phys_arg = array<i64: 64, 64>, phys_op = array<i64: 1, 2>, phys_src = array<i64: 0, 0>} : <64xf16>
+  %4 = arith.index_cast %0 : i32 to index
+  %5 = ktdp.construct_access_tile %2[%4] {access_tile_order = #map, access_tile_set = #set1} : memref<128xf16> -> !ktdp.access_tile<64xindex>
+  %6 = ktdp.load %5 : <64xindex> -> tensor<64xf16>
+  %7 = arith.index_cast %0 : i32 to index
+  %8 = ktdp.construct_access_tile %2[%7] {access_tile_order = #map, access_tile_set = #set1} : memref<128xf16> -> !ktdp.access_tile<64xindex>
+  ktdp.store %6, %8 : tensor<64xf16>, <64xindex>
   tt.return
 }
 
@@ -84,19 +96,25 @@ tt.func @runtime_scalar_offset_unchanged(%ptr: !tt.ptr<f16>, %n: i32) {
 // The multiply stays in i64 above the trunc; nothing re-multiplies in `index`.
 // CHECK-NOT:       arith.muli %{{.*}} : index
 // CHECK:           arith.divsi %[[IDX]], %{{.*}} : index
-tt.func @trunc_not_lifted(%ptr: !tt.ptr<f16>) {
+#map = affine_map<(d0) -> (d0)>
+#set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>
+#set1 = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+tt.func @trunc_not_lifted(%arg0: !tt.ptr<f16>) {
   %c64_i64 = arith.constant 64 : i64
-  %c128_i32 = arith.constant 128 : i32
-  %c1_i64 = arith.constant 1 : i64
-  %pid = tt.get_program_id x : i32
-  %pid64 = arith.extsi %pid : i32 to i64
-  %big = arith.muli %pid64, %c64_i64 : i64
-  %off = arith.trunci %big : i64 to i32
-  %desc = tt.make_tensor_descriptor %ptr, [%c128_i32], [%c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<64xf16>
-  tt.spyre_tensor_layout %desc {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : !tt.tensordesc<64xf16>
-  %d = tt.descriptor_load %desc[%off] : !tt.tensordesc<64xf16> -> tensor<64xf16>
-  tt.descriptor_store %desc[%off], %d : !tt.tensordesc<64xf16>, tensor<64xf16>
+  %0 = tt.get_program_id x : i32
+  %1 = arith.extsi %0 : i32 to i64
+  %2 = arith.muli %1, %c64_i64 : i64
+  %3 = arith.trunci %2 : i64 to i32
+  %4 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f16> to index
+  %5 = ktdp.construct_memory_view %4, sizes: [128], strides: [1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<128xf16>
+  %6 = builtin.unrealized_conversion_cast %5 : memref<128xf16> to !tt.tensordesc<64xf16>
+  tt.spyre_tensor_layout %6 {phys_arg = array<i64: 64, 64>, phys_op = array<i64: 1, 2>, phys_src = array<i64: 0, 0>} : <64xf16>
+  %7 = arith.index_cast %3 : i32 to index
+  %8 = ktdp.construct_access_tile %5[%7] {access_tile_order = #map, access_tile_set = #set1} : memref<128xf16> -> !ktdp.access_tile<64xindex>
+  %9 = ktdp.load %8 : <64xindex> -> tensor<64xf16>
+  %10 = arith.index_cast %3 : i32 to index
+  %11 = ktdp.construct_access_tile %5[%10] {access_tile_order = #map, access_tile_set = #set1} : memref<128xf16> -> !ktdp.access_tile<64xindex>
+  ktdp.store %9, %11 : tensor<64xf16>, <64xindex>
   tt.return
 }
 
@@ -116,20 +134,26 @@ tt.func @trunc_not_lifted(%ptr: !tt.ptr<f16>) {
 // No part of that chain is re-emitted in `index`.
 // CHECK-NOT:       arith.muli %{{.*}} : index
 // CHECK:           arith.divsi %[[IDX]], %{{.*}} : index
-tt.func @extui_into_signed_div_not_lifted(%ptr: !tt.ptr<f16>) {
-  %cneg = arith.constant -3 : i32
+#map = affine_map<(d0) -> (d0)>
+#set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>
+#set1 = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+tt.func @extui_into_signed_div_not_lifted(%arg0: !tt.ptr<f16>) {
+  %c-3_i32 = arith.constant -3 : i32
   %c64_i64 = arith.constant 64 : i64
-  %c128_i32 = arith.constant 128 : i32
-  %c1_i64 = arith.constant 1 : i64
-  %pid = tt.get_program_id x : i32
-  %neg = arith.muli %pid, %cneg : i32
-  %wide = arith.extui %neg : i32 to i64
-  %off64 = arith.divsi %wide, %c64_i64 : i64
-  %off = arith.trunci %off64 : i64 to i32
-  %desc = tt.make_tensor_descriptor %ptr, [%c128_i32], [%c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<64xf16>
-  tt.spyre_tensor_layout %desc {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : !tt.tensordesc<64xf16>
-  %d = tt.descriptor_load %desc[%off] : !tt.tensordesc<64xf16> -> tensor<64xf16>
-  tt.descriptor_store %desc[%off], %d : !tt.tensordesc<64xf16>, tensor<64xf16>
+  %0 = tt.get_program_id x : i32
+  %1 = arith.muli %0, %c-3_i32 : i32
+  %2 = arith.extui %1 : i32 to i64
+  %3 = arith.divsi %2, %c64_i64 : i64
+  %4 = arith.trunci %3 : i64 to i32
+  %5 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f16> to index
+  %6 = ktdp.construct_memory_view %5, sizes: [128], strides: [1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<128xf16>
+  %7 = builtin.unrealized_conversion_cast %6 : memref<128xf16> to !tt.tensordesc<64xf16>
+  tt.spyre_tensor_layout %7 {phys_arg = array<i64: 64, 64>, phys_op = array<i64: 1, 2>, phys_src = array<i64: 0, 0>} : <64xf16>
+  %8 = arith.index_cast %4 : i32 to index
+  %9 = ktdp.construct_access_tile %6[%8] {access_tile_order = #map, access_tile_set = #set1} : memref<128xf16> -> !ktdp.access_tile<64xindex>
+  %10 = ktdp.load %9 : <64xindex> -> tensor<64xf16>
+  %11 = arith.index_cast %4 : i32 to index
+  %12 = ktdp.construct_access_tile %6[%11] {access_tile_order = #map, access_tile_set = #set1} : memref<128xf16> -> !ktdp.access_tile<64xindex>
+  ktdp.store %10, %12 : tensor<64xf16>, <64xindex>
   tt.return
 }

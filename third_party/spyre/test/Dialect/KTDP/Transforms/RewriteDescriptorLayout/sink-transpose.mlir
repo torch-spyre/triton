@@ -16,7 +16,7 @@
 // a test case fast, it is *not* designed to be authoritative
 // minimized and named to reflect the test intent.
 
-// RUN: spyre-triton-opt %s --lower-descriptor-memory --lower-scalar-load --lower-compute-ops --rewrite-descriptor-layout -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s --rewrite-descriptor-layout -split-input-file | FileCheck %s
 
 // Regression test: a user transpose between a contraction and an
 // annotated-output ktdp.store must SURVIVE verbatim — neither erased nor
@@ -33,7 +33,7 @@
 // -----
 
 // Case 1 (primary): rank-3 batch matmul, user 3-cycle transpose, multi-stick D.
-// bmm A[4,64,128] @ B[4,128,96] -> [4,64,96]; tt.trans order [2,0,1] -> [96,4,64];
+// bmm A[4,64,128] @ B[4,128,96] -> [4,64,96]; linalg.transpose [2,0,1] -> [96,4,64];
 // D stick-on-dim0(96) stick 32 -> phys [3,4,64,32], so 3 parallel sticks.
 // A 3-cycle is not its own inverse, so a wrong erase-or-compose is a SHAPE error.
 
@@ -45,35 +45,26 @@
 // value bug.
 // CHECK-LABEL:   tt.func @sink_trans_3cycle_bmm(
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f32>, %[[VAL_1:.*]]: !tt.ptr<f32>, %[[VAL_2:.*]]: !tt.ptr<f32>) {
-// CHECK:           %[[VAL_3:.*]] = arith.constant 0 : i32
+// CHECK:           %[[VAL_3:.*]] = arith.constant 0 : index
 // CHECK:           %[[VAL_4:.*]] = arith.constant dense<0.000000e+00> : tensor<4x64x96xf32>
 // CHECK:           %[[VAL_5:.*]] = builtin.unrealized_conversion_cast %[[VAL_0]] : !tt.ptr<f32> to index
 // CHECK:           %[[VAL_6:.*]] = ktdp.construct_memory_view %[[VAL_5]], sizes: [4, 64, 128], strides: [8192, 128, 1] {coordinate_set = #[[$ATTR_2]], memory_space = #ktdp.memory_space<global>} : memref<4x64x128xf32>
-// CHECK:           %[[VAL_7:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_8:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_9:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_10:.*]] = ktdp.construct_access_tile %[[VAL_6]]{{\[}}%[[VAL_7]], %[[VAL_8]], %[[VAL_9]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_2]]} : memref<4x64x128xf32> -> !ktdp.access_tile<4x64x128xindex>
+// CHECK:           %[[VAL_10:.*]] = ktdp.construct_access_tile %[[VAL_6]]{{\[}}%[[VAL_3]], %[[VAL_3]], %[[VAL_3]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_2]]} : memref<4x64x128xf32> -> !ktdp.access_tile<4x64x128xindex>
 // CHECK:           %[[VAL_11:.*]] = ktdp.load %[[VAL_10]] : <4x64x128xindex> -> tensor<4x64x128xf32>
 // CHECK:           %[[VAL_12:.*]] = builtin.unrealized_conversion_cast %[[VAL_1]] : !tt.ptr<f32> to index
 // CHECK:           %[[VAL_13:.*]] = ktdp.construct_memory_view %[[VAL_12]], sizes: [4, 128, 96], strides: [12288, 96, 1] {coordinate_set = #[[$ATTR_3]], memory_space = #ktdp.memory_space<global>} : memref<4x128x96xf32>
-// CHECK:           %[[VAL_14:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_15:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_16:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_17:.*]] = ktdp.construct_access_tile %[[VAL_13]]{{\[}}%[[VAL_14]], %[[VAL_15]], %[[VAL_16]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_3]]} : memref<4x128x96xf32> -> !ktdp.access_tile<4x128x96xindex>
+// CHECK:           %[[VAL_17:.*]] = ktdp.construct_access_tile %[[VAL_13]]{{\[}}%[[VAL_3]], %[[VAL_3]], %[[VAL_3]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_3]]} : memref<4x128x96xf32> -> !ktdp.access_tile<4x128x96xindex>
 // CHECK:           %[[VAL_18:.*]] = ktdp.load %[[VAL_17]] : <4x128x96xindex> -> tensor<4x128x96xf32>
 // CHECK:           %[[VAL_19:.*]] = linalg.batch_matmul ins(%[[VAL_11]], %[[VAL_18]] : tensor<4x64x128xf32>, tensor<4x128x96xf32>) outs(%[[VAL_4]] : tensor<4x64x96xf32>) -> tensor<4x64x96xf32>
 // CHECK:           %[[VAL_20:.*]] = tensor.empty() : tensor<96x4x64xf32>
 // CHECK:           %[[VAL_21:.*]] = linalg.transpose ins(%[[VAL_19]] : tensor<4x64x96xf32>) outs(%[[VAL_20]] : tensor<96x4x64xf32>) permutation = [2, 0, 1]
 // CHECK:           %[[VAL_22:.*]] = builtin.unrealized_conversion_cast %[[VAL_2]] : !tt.ptr<f32> to index
 // CHECK:           %[[VAL_23:.*]] = ktdp.construct_memory_view %[[VAL_22]], sizes: [3, 4, 64, 32], strides: [8192, 2048, 32, 1] {coordinate_set = #[[$ATTR_4]], memory_space = #ktdp.memory_space<global>} : memref<3x4x64x32xf32>
-// CHECK:           %[[VAL_24:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_25:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_26:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
 // CHECK:           %[[VAL_27:.*]] = arith.constant 32 : index
-// CHECK:           %[[VAL_28:.*]] = arith.divsi %[[VAL_24]], %[[VAL_27]] : index
+// CHECK:           %[[VAL_28:.*]] = arith.divsi %[[VAL_3]], %[[VAL_27]] : index
 // CHECK:           %[[VAL_29:.*]] = arith.constant 32 : index
-// CHECK:           %[[VAL_30:.*]] = arith.remsi %[[VAL_24]], %[[VAL_29]] : index
-// CHECK:           %[[VAL_31:.*]] = ktdp.construct_access_tile %[[VAL_23]]{{\[}}%[[VAL_28]], %[[VAL_25]], %[[VAL_26]], %[[VAL_30]]] {access_tile_order = #[[$ATTR_1]], access_tile_set = #[[$ATTR_4]]} : memref<3x4x64x32xf32> -> !ktdp.access_tile<3x4x64x32xindex>
+// CHECK:           %[[VAL_30:.*]] = arith.remsi %[[VAL_3]], %[[VAL_29]] : index
+// CHECK:           %[[VAL_31:.*]] = ktdp.construct_access_tile %[[VAL_23]]{{\[}}%[[VAL_28]], %[[VAL_3]], %[[VAL_3]], %[[VAL_30]]] {access_tile_order = #[[$ATTR_1]], access_tile_set = #[[$ATTR_4]]} : memref<3x4x64x32xf32> -> !ktdp.access_tile<3x4x64x32xindex>
 // CHECK:           %[[VAL_32:.*]] = tensor.empty() : tensor<4x64x96xf32>
 // CHECK:           %[[VAL_33:.*]] = linalg.transpose ins(%[[VAL_21]] : tensor<96x4x64xf32>) outs(%[[VAL_32]] : tensor<4x64x96xf32>) permutation = [1, 2, 0]
 // CHECK:           %[[VAL_34:.*]] = tensor.empty() : tensor<3x4x64x32xf32>
@@ -95,56 +86,50 @@
 // CHECK: #[[$ATTR_7:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
 // CHECK: #[[$ATTR_8:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 95 >= 0)>
 // CHECK: #[[$ATTR_9:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 2 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 31 >= 0)>
-tt.func @sink_trans_3cycle_bmm(%a_ptr: !tt.ptr<f32>, %b_ptr: !tt.ptr<f32>, %d_ptr: !tt.ptr<f32>) {
-  %c0_i32 = arith.constant 0 : i32
-  %c1_i64 = arith.constant 1 : i64
-  %c4_i32 = arith.constant 4 : i32
-  %c64_i32 = arith.constant 64 : i32
-  %c96_i32 = arith.constant 96 : i32
-  %c128_i32 = arith.constant 128 : i32
-  %c8192_i64 = arith.constant 8192 : i64
-  %c128_i64 = arith.constant 128 : i64
-  %c12288_i64 = arith.constant 12288 : i64
-  %c96_i64 = arith.constant 96 : i64
-  %c256_i64 = arith.constant 256 : i64
-  %c64_i64 = arith.constant 64 : i64
-  %zero = arith.constant dense<0.0> : tensor<4x64x96xf32>
-
-  %a_desc = tt.make_tensor_descriptor %a_ptr, [%c4_i32, %c64_i32, %c128_i32], [%c8192_i64, %c128_i64, %c1_i64] : <f32>, <4x64x128xf32>
-  %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32, %c0_i32] : !tt.tensordesc<4x64x128xf32> -> tensor<4x64x128xf32>
-  %b_desc = tt.make_tensor_descriptor %b_ptr, [%c4_i32, %c128_i32, %c96_i32], [%c12288_i64, %c96_i64, %c1_i64] : <f32>, <4x128x96xf32>
-  %b = tt.descriptor_load %b_desc[%c0_i32, %c0_i32, %c0_i32] : !tt.tensordesc<4x128x96xf32> -> tensor<4x128x96xf32>
-
-  %d0 = tt.dot %a, %b, %zero : tensor<4x64x128xf32> * tensor<4x128x96xf32> -> tensor<4x64x96xf32>
-  %t = tt.trans %d0 {order = array<i32: 2, 0, 1>} : tensor<4x64x96xf32> -> tensor<96x4x64xf32>
-
-  %d_desc = tt.make_tensor_descriptor %d_ptr, [%c96_i32, %c4_i32, %c64_i32], [%c256_i64, %c64_i64, %c1_i64] : <f32>, <96x4x64xf32>
-  tt.spyre_tensor_layout %d_desc {phys_arg = array<i64: 32, 0, 0, 32>, phys_op = array<i64: 1, 0, 0, 2>, phys_src = array<i64: 0, 1, 2, 0>} : <96x4x64xf32>
-  tt.descriptor_store %d_desc[%c0_i32, %c0_i32, %c0_i32], %t : !tt.tensordesc<96x4x64xf32>, tensor<96x4x64xf32>
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 127 >= 0)>
+#set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 95 >= 0)>
+#set2 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 3 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+tt.func @sink_trans_3cycle_bmm(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %cst = arith.constant dense<0.000000e+00> : tensor<4x64x96xf32>
+  %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
+  %1 = ktdp.construct_memory_view %0, sizes: [4, 64, 128], strides: [8192, 128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<4x64x128xf32>
+  %2 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<4x64x128xf32> -> !ktdp.access_tile<4x64x128xindex>
+  %3 = ktdp.load %2 : <4x64x128xindex> -> tensor<4x64x128xf32>
+  %4 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
+  %5 = ktdp.construct_memory_view %4, sizes: [4, 128, 96], strides: [12288, 96, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<4x128x96xf32>
+  %6 = ktdp.construct_access_tile %5[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<4x128x96xf32> -> !ktdp.access_tile<4x128x96xindex>
+  %7 = ktdp.load %6 : <4x128x96xindex> -> tensor<4x128x96xf32>
+  %8 = linalg.batch_matmul ins(%3, %7 : tensor<4x64x128xf32>, tensor<4x128x96xf32>) outs(%cst : tensor<4x64x96xf32>) -> tensor<4x64x96xf32>
+  %9 = tensor.empty() : tensor<96x4x64xf32>
+  %transposed = linalg.transpose ins(%8 : tensor<4x64x96xf32>) outs(%9 : tensor<96x4x64xf32>) permutation = [2, 0, 1] 
+  %10 = builtin.unrealized_conversion_cast %arg2 : !tt.ptr<f32> to index
+  %11 = ktdp.construct_memory_view %10, sizes: [96, 4, 64], strides: [256, 64, 1] {coordinate_set = #set2, memory_space = #ktdp.memory_space<global>} : memref<96x4x64xf32>
+  %12 = builtin.unrealized_conversion_cast %11 : memref<96x4x64xf32> to !tt.tensordesc<96x4x64xf32>
+  tt.spyre_tensor_layout %12 {phys_arg = array<i64: 32, 0, 0, 32>, phys_op = array<i64: 1, 0, 0, 2>, phys_src = array<i64: 0, 1, 2, 0>} : <96x4x64xf32>
+  %13 = ktdp.construct_access_tile %11[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set2} : memref<96x4x64xf32> -> !ktdp.access_tile<96x4x64xindex>
+  ktdp.store %transposed, %13 : tensor<96x4x64xf32>, <96x4x64xindex>
   tt.return
 }
 
 // -----
 
 // Case 2: rank-2 matmul with multiple parallel sticks, pinning the multi-stick
-// scatter loop. matmul -> [64,96]; tt.trans -> [96,64]; D stick-on-M(32) -> [3,64,32].
+// scatter loop. matmul -> [64,96]; linalg.transpose -> [96,64]; D stick-on-M(32) -> [3,64,32].
 
 // Sink layout transpose. Both [1, 0]s must remain (user semantics + layout);
 // at rank 2 a wrong fold stays shape-correct, which is why case 1 exists.
 // CHECK-LABEL:   tt.func @sink_trans_multistick(
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f32>, %[[VAL_1:.*]]: !tt.ptr<f32>, %[[VAL_2:.*]]: !tt.ptr<f32>) {
-// CHECK:           %[[VAL_3:.*]] = arith.constant 0 : i32
+// CHECK:           %[[VAL_3:.*]] = arith.constant 0 : index
 // CHECK:           %[[VAL_4:.*]] = builtin.unrealized_conversion_cast %[[VAL_0]] : !tt.ptr<f32> to index
 // CHECK:           %[[VAL_5:.*]] = ktdp.construct_memory_view %[[VAL_4]], sizes: [64, 128], strides: [128, 1] {coordinate_set = #[[$ATTR_7]], memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-// CHECK:           %[[VAL_6:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_7:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_8:.*]] = ktdp.construct_access_tile %[[VAL_5]]{{\[}}%[[VAL_6]], %[[VAL_7]]] {access_tile_order = #[[$ATTR_5]], access_tile_set = #[[$ATTR_7]]} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+// CHECK:           %[[VAL_8:.*]] = ktdp.construct_access_tile %[[VAL_5]]{{\[}}%[[VAL_3]], %[[VAL_3]]] {access_tile_order = #[[$ATTR_5]], access_tile_set = #[[$ATTR_7]]} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
 // CHECK:           %[[VAL_9:.*]] = ktdp.load %[[VAL_8]] : <64x128xindex> -> tensor<64x128xf32>
 // CHECK:           %[[VAL_10:.*]] = builtin.unrealized_conversion_cast %[[VAL_1]] : !tt.ptr<f32> to index
 // CHECK:           %[[VAL_11:.*]] = ktdp.construct_memory_view %[[VAL_10]], sizes: [128, 96], strides: [96, 1] {coordinate_set = #[[$ATTR_8]], memory_space = #ktdp.memory_space<global>} : memref<128x96xf32>
-// CHECK:           %[[VAL_12:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_13:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_14:.*]] = ktdp.construct_access_tile %[[VAL_11]]{{\[}}%[[VAL_12]], %[[VAL_13]]] {access_tile_order = #[[$ATTR_5]], access_tile_set = #[[$ATTR_8]]} : memref<128x96xf32> -> !ktdp.access_tile<128x96xindex>
+// CHECK:           %[[VAL_14:.*]] = ktdp.construct_access_tile %[[VAL_11]]{{\[}}%[[VAL_3]], %[[VAL_3]]] {access_tile_order = #[[$ATTR_5]], access_tile_set = #[[$ATTR_8]]} : memref<128x96xf32> -> !ktdp.access_tile<128x96xindex>
 // CHECK:           %[[VAL_15:.*]] = ktdp.load %[[VAL_14]] : <128x96xindex> -> tensor<128x96xf32>
 // CHECK:           %[[VAL_16:.*]] = arith.constant dense<0.000000e+00> : tensor<64x96xf32>
 // CHECK:           %[[VAL_17:.*]] = linalg.matmul ins(%[[VAL_9]], %[[VAL_15]] : tensor<64x128xf32>, tensor<128x96xf32>) outs(%[[VAL_16]] : tensor<64x96xf32>) -> tensor<64x96xf32>
@@ -152,13 +137,11 @@ tt.func @sink_trans_3cycle_bmm(%a_ptr: !tt.ptr<f32>, %b_ptr: !tt.ptr<f32>, %d_pt
 // CHECK:           %[[VAL_19:.*]] = linalg.transpose ins(%[[VAL_17]] : tensor<64x96xf32>) outs(%[[VAL_18]] : tensor<96x64xf32>) permutation = [1, 0]
 // CHECK:           %[[VAL_20:.*]] = builtin.unrealized_conversion_cast %[[VAL_2]] : !tt.ptr<f32> to index
 // CHECK:           %[[VAL_21:.*]] = ktdp.construct_memory_view %[[VAL_20]], sizes: [3, 64, 32], strides: [2048, 32, 1] {coordinate_set = #[[$ATTR_9]], memory_space = #ktdp.memory_space<global>} : memref<3x64x32xf32>
-// CHECK:           %[[VAL_22:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
-// CHECK:           %[[VAL_23:.*]] = arith.index_cast %[[VAL_3]] : i32 to index
 // CHECK:           %[[VAL_24:.*]] = arith.constant 32 : index
-// CHECK:           %[[VAL_25:.*]] = arith.divsi %[[VAL_22]], %[[VAL_24]] : index
+// CHECK:           %[[VAL_25:.*]] = arith.divsi %[[VAL_3]], %[[VAL_24]] : index
 // CHECK:           %[[VAL_26:.*]] = arith.constant 32 : index
-// CHECK:           %[[VAL_27:.*]] = arith.remsi %[[VAL_22]], %[[VAL_26]] : index
-// CHECK:           %[[VAL_28:.*]] = ktdp.construct_access_tile %[[VAL_21]]{{\[}}%[[VAL_25]], %[[VAL_23]], %[[VAL_27]]] {access_tile_order = #[[$ATTR_6]], access_tile_set = #[[$ATTR_9]]} : memref<3x64x32xf32> -> !ktdp.access_tile<3x64x32xindex>
+// CHECK:           %[[VAL_27:.*]] = arith.remsi %[[VAL_3]], %[[VAL_26]] : index
+// CHECK:           %[[VAL_28:.*]] = ktdp.construct_access_tile %[[VAL_21]]{{\[}}%[[VAL_25]], %[[VAL_3]], %[[VAL_27]]] {access_tile_order = #[[$ATTR_6]], access_tile_set = #[[$ATTR_9]]} : memref<3x64x32xf32> -> !ktdp.access_tile<3x64x32xindex>
 // CHECK:           %[[VAL_29:.*]] = tensor.empty() : tensor<64x96xf32>
 // CHECK:           %[[VAL_30:.*]] = linalg.transpose ins(%[[VAL_19]] : tensor<96x64xf32>) outs(%[[VAL_29]] : tensor<64x96xf32>) permutation = [1, 0]
 // CHECK:           %[[VAL_31:.*]] = tensor.empty() : tensor<3x64x32xf32>
@@ -175,27 +158,29 @@ tt.func @sink_trans_3cycle_bmm(%a_ptr: !tt.ptr<f32>, %b_ptr: !tt.ptr<f32>, %d_pt
 // CHECK:           ktdp.store %[[VAL_36]], %[[VAL_28]] : tensor<3x64x32xf32>, <3x64x32xindex>
 // CHECK:           tt.return
 // CHECK:         }
-tt.func @sink_trans_multistick(%a_ptr: !tt.ptr<f32>, %b_ptr: !tt.ptr<f32>, %d_ptr: !tt.ptr<f32>) {
-  %c0_i32 = arith.constant 0 : i32
-  %c64_i32 = arith.constant 64 : i32
-  %c96_i32 = arith.constant 96 : i32
-  %c128_i32 = arith.constant 128 : i32
-  %c128_i64 = arith.constant 128 : i64
-  %c96_i64 = arith.constant 96 : i64
-  %c64_i64 = arith.constant 64 : i64
-  %c1_i64 = arith.constant 1 : i64
-
-  %a_desc = tt.make_tensor_descriptor %a_ptr, [%c64_i32, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<64x128xf32>
-  %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<64x128xf32> -> tensor<64x128xf32>
-  %b_desc = tt.make_tensor_descriptor %b_ptr, [%c128_i32, %c96_i32], [%c96_i64, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<128x96xf32>
-  %b = tt.descriptor_load %b_desc[%c0_i32, %c0_i32] : !tt.tensordesc<128x96xf32> -> tensor<128x96xf32>
-
-  %zero = arith.constant dense<0.0> : tensor<64x96xf32>
-  %d = tt.dot %a, %b, %zero : tensor<64x128xf32> * tensor<128x96xf32> -> tensor<64x96xf32>
-  %dt = tt.trans %d {order = array<i32: 1, 0>} : tensor<64x96xf32> -> tensor<96x64xf32>
-
-  %d_desc = tt.make_tensor_descriptor %d_ptr, [%c96_i32, %c64_i32], [%c64_i64, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<96x64xf32>
-  tt.spyre_tensor_layout %d_desc {phys_src = array<i64: 0, 1, 0>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>} : !tt.tensordesc<96x64xf32>
-  tt.descriptor_store %d_desc[%c0_i32, %c0_i32], %dt : !tt.tensordesc<96x64xf32>, tensor<96x64xf32>
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#set1 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 95 >= 0)>
+#set2 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+tt.func @sink_trans_multistick(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
+  %1 = ktdp.construct_memory_view %0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
+  %2 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+  %3 = ktdp.load %2 : <64x128xindex> -> tensor<64x128xf32>
+  %4 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
+  %5 = ktdp.construct_memory_view %4, sizes: [128, 96], strides: [96, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<128x96xf32>
+  %6 = ktdp.construct_access_tile %5[%c0, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<128x96xf32> -> !ktdp.access_tile<128x96xindex>
+  %7 = ktdp.load %6 : <128x96xindex> -> tensor<128x96xf32>
+  %cst = arith.constant dense<0.000000e+00> : tensor<64x96xf32>
+  %8 = linalg.matmul ins(%3, %7 : tensor<64x128xf32>, tensor<128x96xf32>) outs(%cst : tensor<64x96xf32>) -> tensor<64x96xf32>
+  %9 = tensor.empty() : tensor<96x64xf32>
+  %transposed = linalg.transpose ins(%8 : tensor<64x96xf32>) outs(%9 : tensor<96x64xf32>) permutation = [1, 0] 
+  %10 = builtin.unrealized_conversion_cast %arg2 : !tt.ptr<f32> to index
+  %11 = ktdp.construct_memory_view %10, sizes: [96, 64], strides: [64, 1] {coordinate_set = #set2, memory_space = #ktdp.memory_space<global>} : memref<96x64xf32>
+  %12 = builtin.unrealized_conversion_cast %11 : memref<96x64xf32> to !tt.tensordesc<96x64xf32>
+  tt.spyre_tensor_layout %12 {phys_arg = array<i64: 32, 0, 32>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 0, 1, 0>} : <96x64xf32>
+  %13 = ktdp.construct_access_tile %11[%c0, %c0] {access_tile_order = #map, access_tile_set = #set2} : memref<96x64xf32> -> !ktdp.access_tile<96x64xindex>
+  ktdp.store %transposed, %13 : tensor<96x64xf32>, <96x64xindex>
   tt.return
 }

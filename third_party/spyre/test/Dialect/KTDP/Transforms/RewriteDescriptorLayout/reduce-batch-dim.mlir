@@ -1,4 +1,4 @@
-// RUN: spyre-triton-opt %s --lower-descriptor-memory --lower-scalar-load --lower-compute-ops --rewrite-descriptor-layout --canonicalize -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s --rewrite-descriptor-layout --canonicalize -split-input-file | FileCheck %s
 
 // A surviving stick-index dim as a BATCH dim of the reduce.
 //
@@ -51,6 +51,10 @@
 //   - the surviving stick index is dim 0 of both ins and outs — the batch dim;
 //   - no scf.for and no extract_slice/insert_slice around it;
 //   - ktdp.store takes the reduce result itself.
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#map1 = affine_map<(d0) -> (d0)>
+#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#set1 = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>
 module {
 // CHECK-LABEL:   tt.func @reduce_surviving_stick_is_a_batch_dim(
 // CHECK:           %[[LOAD:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf16>
@@ -74,31 +78,30 @@ module {
 // CHECK-NOT:       tensor.extract_slice
 // CHECK-NOT:       tensor.insert_slice
 // CHECK:           ktdp.store %[[RED]], %{{.*}} : tensor<2x64xf16>, <2x64xindex>
-tt.func @reduce_surviving_stick_is_a_batch_dim(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>) {
-  %c0_i32 = arith.constant 0 : i32
-  %c64_i32 = arith.constant 64 : i32
-  %c128_i32 = arith.constant 128 : i32
-  %c128_i64 = arith.constant 128 : i64
-  %c1_i64 = arith.constant 1 : i64
-
-  %a_desc = tt.make_tensor_descriptor %a_ptr, [%c64_i32, %c128_i32], [%c128_i64, %c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<64x128xf16>
-  tt.spyre_tensor_layout %a_desc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf16>
-  %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
-
-  %c_desc = tt.make_tensor_descriptor %c_ptr, [%c128_i32], [%c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<128xf16>
-  tt.spyre_tensor_layout %c_desc {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : !tt.tensordesc<128xf16>
-
-  %r = "tt.reduce"(%a) ({
-  ^bb0(%arg0: f16, %arg1: f16):
-    %add = arith.addf %arg0, %arg1 : f16
-    tt.reduce.return %add : f16
-  }) {axis = 0 : i32} : (tensor<64x128xf16>) -> tensor<128xf16>
-
-  tt.descriptor_store %c_desc[%c0_i32], %r : !tt.tensordesc<128xf16>, tensor<128xf16>
-  tt.return
-}
+  tt.func @reduce_surviving_stick_is_a_batch_dim(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>) {
+    %c0 = arith.constant 0 : index
+    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f16> to index
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x128xf16>
+    %2 = builtin.unrealized_conversion_cast %1 : memref<64x128xf16> to !tt.tensordesc<64x128xf16>
+    tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x128xf16>
+    %3 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+    %4 = ktdp.load %3 : <64x128xindex> -> tensor<64x128xf16>
+    %5 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f16> to index
+    %6 = ktdp.construct_memory_view %5, sizes: [128], strides: [1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<128xf16>
+    %7 = builtin.unrealized_conversion_cast %6 : memref<128xf16> to !tt.tensordesc<128xf16>
+    tt.spyre_tensor_layout %7 {phys_arg = array<i64: 64, 64>, phys_op = array<i64: 1, 2>, phys_src = array<i64: 0, 0>} : <128xf16>
+    %cst = arith.constant 0.000000e+00 : f16
+    %8 = tensor.empty() : tensor<128xf16>
+    %9 = linalg.fill ins(%cst : f16) outs(%8 : tensor<128xf16>) -> tensor<128xf16>
+    %reduced = linalg.reduce ins(%4 : tensor<64x128xf16>) outs(%9 : tensor<128xf16>) dimensions = [0] 
+      (%in: f16, %init: f16) {
+        %10 = arith.addf %in, %init : f16
+        linalg.yield %10 : f16
+      }
+    %11 = ktdp.construct_access_tile %6[%c0] {access_tile_order = #map1, access_tile_set = #set1} : memref<128xf16> -> !ktdp.access_tile<128xindex>
+    ktdp.store %reduced, %11 : tensor<128xf16>, <128xindex>
+    tt.return
+  }
 }
 
 // -----
@@ -109,6 +112,10 @@ tt.func @reduce_surviving_stick_is_a_batch_dim(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt
 // The Logical output-axis space is the answer, and it is the form it always was:
 // one reduce naming both stick dims, then the store's widen stage re-tiling the
 // rank-1 result into the rank-2 physical block. Guards the non-regression.
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#map1 = affine_map<(d0) -> (d0)>
+#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#set1 = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
 module {
 // CHECK-LABEL:   tt.func @reduce_folds_the_stick_axis(
 // CHECK:           %[[LOAD:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf16>
@@ -121,32 +128,31 @@ module {
 // scatter into; the rank change is the whole of the widen here.
 // CHECK:           %[[TILE:.*]] = tensor.insert_slice %[[RED]] into %{{.*}} : tensor<64xf16> into tensor<1x64xf16>
 // CHECK:           ktdp.store %[[TILE]], %{{.*}} : tensor<1x64xf16>, <1x64xindex>
-tt.func @reduce_folds_the_stick_axis(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>) {
-  %c0_i32 = arith.constant 0 : i32
-  %c64_i32 = arith.constant 64 : i32
-  %c128_i32 = arith.constant 128 : i32
-  %c128_i64 = arith.constant 128 : i64
-  %c1_i64 = arith.constant 1 : i64
-
-  %a_desc = tt.make_tensor_descriptor %a_ptr, [%c64_i32, %c128_i32], [%c128_i64, %c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<64x128xf16>
-  tt.spyre_tensor_layout %a_desc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf16>
-  %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
-
-  // C[64] stick(64) -> phys [1, 64].
-  %c_desc = tt.make_tensor_descriptor %c_ptr, [%c64_i32], [%c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<64xf16>
-  tt.spyre_tensor_layout %c_desc {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : !tt.tensordesc<64xf16>
-
-  %r = "tt.reduce"(%a) ({
-  ^bb0(%arg0: f16, %arg1: f16):
-    %add = arith.addf %arg0, %arg1 : f16
-    tt.reduce.return %add : f16
-  }) {axis = 1 : i32} : (tensor<64x128xf16>) -> tensor<64xf16>
-
-  tt.descriptor_store %c_desc[%c0_i32], %r : !tt.tensordesc<64xf16>, tensor<64xf16>
-  tt.return
-}
+  tt.func @reduce_folds_the_stick_axis(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>) {
+    %c0 = arith.constant 0 : index
+    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f16> to index
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x128xf16>
+    %2 = builtin.unrealized_conversion_cast %1 : memref<64x128xf16> to !tt.tensordesc<64x128xf16>
+    tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x128xf16>
+    %3 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+    %4 = ktdp.load %3 : <64x128xindex> -> tensor<64x128xf16>
+    // C[64] stick(64) -> phys [1, 64].
+    %5 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f16> to index
+    %6 = ktdp.construct_memory_view %5, sizes: [64], strides: [1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<64xf16>
+    %7 = builtin.unrealized_conversion_cast %6 : memref<64xf16> to !tt.tensordesc<64xf16>
+    tt.spyre_tensor_layout %7 {phys_arg = array<i64: 64, 64>, phys_op = array<i64: 1, 2>, phys_src = array<i64: 0, 0>} : <64xf16>
+    %cst = arith.constant 0.000000e+00 : f16
+    %8 = tensor.empty() : tensor<64xf16>
+    %9 = linalg.fill ins(%cst : f16) outs(%8 : tensor<64xf16>) -> tensor<64xf16>
+    %reduced = linalg.reduce ins(%4 : tensor<64x128xf16>) outs(%9 : tensor<64xf16>) dimensions = [1] 
+      (%in: f16, %init: f16) {
+        %10 = arith.addf %in, %init : f16
+        linalg.yield %10 : f16
+      }
+    %11 = ktdp.construct_access_tile %6[%c0] {access_tile_order = #map1, access_tile_set = #set1} : memref<64xf16> -> !ktdp.access_tile<64xindex>
+    ktdp.store %reduced, %11 : tensor<64xf16>, <64xindex>
+    tt.return
+  }
 }
 
 // -----
@@ -161,6 +167,10 @@ tt.func @reduce_folds_the_stick_axis(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>)
 // stick index and the untouched D0. This is what a role numbered per logical dim
 // cannot express — physical dims 0 and 3 both carry logical D2 — and it is why
 // the accumulator is keyed by output axis instead.
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#map1 = affine_map<(d0, d1) -> (d0, d1)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 127 >= 0)>
+#set1 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 127 >= 0)>
 module {
 // CHECK-LABEL:   tt.func @reduce_two_batch_dims(
 // CHECK:           %[[LOAD:.*]] = ktdp.load %{{.*}} : <2x2x64x64xindex> -> tensor<2x2x64x64xf16>
@@ -179,33 +189,30 @@ module {
 // CHECK-NOT:       scf.for
 // CHECK-NOT:       tensor.extract_slice
 // CHECK:           ktdp.store %[[RED]], %{{.*}} : tensor<2x2x64xf16>, <2x2x64xindex>
-tt.func @reduce_two_batch_dims(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>) {
-  %c0_i32 = arith.constant 0 : i32
-  %c2_i32 = arith.constant 2 : i32
-  %c64_i32 = arith.constant 64 : i32
-  %c128_i32 = arith.constant 128 : i32
-  %c1_i64 = arith.constant 1 : i64
-  %c128_i64 = arith.constant 128 : i64
-  %c8192_i64 = arith.constant 8192 : i64
-
-  %a_desc = tt.make_tensor_descriptor %a_ptr, [%c2_i32, %c64_i32, %c128_i32], [%c8192_i64, %c128_i64, %c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<2x64x128xf16>
-  tt.spyre_tensor_layout %a_desc {phys_src = array<i64: 2, 0, 1, 2>, phys_op = array<i64: 1, 0, 0, 2>, phys_arg = array<i64: 64, 0, 0, 64>} : !tt.tensordesc<2x64x128xf16>
-  %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32, %c0_i32] : !tt.tensordesc<2x64x128xf16> -> tensor<2x64x128xf16>
-
-  %c_desc = tt.make_tensor_descriptor %c_ptr, [%c2_i32, %c128_i32], [%c128_i64, %c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<2x128xf16>
-  tt.spyre_tensor_layout %c_desc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<2x128xf16>
-
-  %r = "tt.reduce"(%a) ({
-  ^bb0(%arg0: f16, %arg1: f16):
-    %add = arith.addf %arg0, %arg1 : f16
-    tt.reduce.return %add : f16
-  }) {axis = 1 : i32} : (tensor<2x64x128xf16>) -> tensor<2x128xf16>
-
-  tt.descriptor_store %c_desc[%c0_i32, %c0_i32], %r : !tt.tensordesc<2x128xf16>, tensor<2x128xf16>
-  tt.return
-}
+  tt.func @reduce_two_batch_dims(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>) {
+    %c0 = arith.constant 0 : index
+    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f16> to index
+    %1 = ktdp.construct_memory_view %0, sizes: [2, 64, 128], strides: [8192, 128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<2x64x128xf16>
+    %2 = builtin.unrealized_conversion_cast %1 : memref<2x64x128xf16> to !tt.tensordesc<2x64x128xf16>
+    tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 0, 64>, phys_op = array<i64: 1, 0, 0, 2>, phys_src = array<i64: 2, 0, 1, 2>} : <2x64x128xf16>
+    %3 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<2x64x128xf16> -> !ktdp.access_tile<2x64x128xindex>
+    %4 = ktdp.load %3 : <2x64x128xindex> -> tensor<2x64x128xf16>
+    %5 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f16> to index
+    %6 = ktdp.construct_memory_view %5, sizes: [2, 128], strides: [128, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<2x128xf16>
+    %7 = builtin.unrealized_conversion_cast %6 : memref<2x128xf16> to !tt.tensordesc<2x128xf16>
+    tt.spyre_tensor_layout %7 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <2x128xf16>
+    %cst = arith.constant 0.000000e+00 : f16
+    %8 = tensor.empty() : tensor<2x128xf16>
+    %9 = linalg.fill ins(%cst : f16) outs(%8 : tensor<2x128xf16>) -> tensor<2x128xf16>
+    %reduced = linalg.reduce ins(%4 : tensor<2x64x128xf16>) outs(%9 : tensor<2x128xf16>) dimensions = [1] 
+      (%in: f16, %init: f16) {
+        %10 = arith.addf %in, %init : f16
+        linalg.yield %10 : f16
+      }
+    %11 = ktdp.construct_access_tile %6[%c0, %c0] {access_tile_order = #map1, access_tile_set = #set1} : memref<2x128xf16> -> !ktdp.access_tile<2x128xindex>
+    ktdp.store %reduced, %11 : tensor<2x128xf16>, <2x128xindex>
+    tt.return
+  }
 }
 
 // -----
@@ -220,6 +227,10 @@ tt.func @reduce_two_batch_dims(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>) {
 // is the backward elementwise rule carrying it back across the math.exp. If that
 // rule ever terminates here instead, the reduce falls back to Logical and the
 // CHECK-NOTs below catch the stick loop that replaces it.
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#map1 = affine_map<(d0) -> (d0)>
+#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#set1 = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>
 module {
 // CHECK-LABEL:   tt.func @reduce_batch_dim_through_elementwise(
 // CHECK:           %[[LOAD:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf16>
@@ -237,31 +248,29 @@ module {
 // CHECK-NOT:       tensor.extract_slice
 // CHECK-NOT:       tensor.insert_slice
 // CHECK:           ktdp.store %[[EXP]], %{{.*}} : tensor<2x64xf16>, <2x64xindex>
-tt.func @reduce_batch_dim_through_elementwise(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>) {
-  %c0_i32 = arith.constant 0 : i32
-  %c64_i32 = arith.constant 64 : i32
-  %c128_i32 = arith.constant 128 : i32
-  %c128_i64 = arith.constant 128 : i64
-  %c1_i64 = arith.constant 1 : i64
-
-  %a_desc = tt.make_tensor_descriptor %a_ptr, [%c64_i32, %c128_i32], [%c128_i64, %c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<64x128xf16>
-  tt.spyre_tensor_layout %a_desc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf16>
-  %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
-
-  %c_desc = tt.make_tensor_descriptor %c_ptr, [%c128_i32], [%c1_i64]
-      : !tt.ptr<f16>, !tt.tensordesc<128xf16>
-  tt.spyre_tensor_layout %c_desc {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>} : !tt.tensordesc<128xf16>
-
-  %r = "tt.reduce"(%a) ({
-  ^bb0(%arg0: f16, %arg1: f16):
-    %add = arith.addf %arg0, %arg1 : f16
-    tt.reduce.return %add : f16
-  }) {axis = 0 : i32} : (tensor<64x128xf16>) -> tensor<128xf16>
-
-  %e = math.exp %r : tensor<128xf16>
-
-  tt.descriptor_store %c_desc[%c0_i32], %e : !tt.tensordesc<128xf16>, tensor<128xf16>
-  tt.return
-}
+  tt.func @reduce_batch_dim_through_elementwise(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>) {
+    %c0 = arith.constant 0 : index
+    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f16> to index
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x128xf16>
+    %2 = builtin.unrealized_conversion_cast %1 : memref<64x128xf16> to !tt.tensordesc<64x128xf16>
+    tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x128xf16>
+    %3 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+    %4 = ktdp.load %3 : <64x128xindex> -> tensor<64x128xf16>
+    %5 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f16> to index
+    %6 = ktdp.construct_memory_view %5, sizes: [128], strides: [1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<128xf16>
+    %7 = builtin.unrealized_conversion_cast %6 : memref<128xf16> to !tt.tensordesc<128xf16>
+    tt.spyre_tensor_layout %7 {phys_arg = array<i64: 64, 64>, phys_op = array<i64: 1, 2>, phys_src = array<i64: 0, 0>} : <128xf16>
+    %cst = arith.constant 0.000000e+00 : f16
+    %8 = tensor.empty() : tensor<128xf16>
+    %9 = linalg.fill ins(%cst : f16) outs(%8 : tensor<128xf16>) -> tensor<128xf16>
+    %reduced = linalg.reduce ins(%4 : tensor<64x128xf16>) outs(%9 : tensor<128xf16>) dimensions = [0] 
+      (%in: f16, %init: f16) {
+        %10 = arith.addf %in, %init : f16
+        linalg.yield %10 : f16
+      }
+    %11 = math.exp %reduced : tensor<128xf16>
+    %12 = ktdp.construct_access_tile %6[%c0] {access_tile_order = #map1, access_tile_set = #set1} : memref<128xf16> -> !ktdp.access_tile<128xindex>
+    ktdp.store %11, %12 : tensor<128xf16>, <128xindex>
+    tt.return
+  }
 }

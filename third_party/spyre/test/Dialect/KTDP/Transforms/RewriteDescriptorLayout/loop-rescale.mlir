@@ -14,7 +14,7 @@
 // a test case fast, it is *not* designed to be authoritative
 // minimized and named to reflect the test intent.
 
-// RUN: spyre-triton-opt %s --lower-descriptor-memory --lower-scalar-load --lower-compute-ops --rewrite-descriptor-layout -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s --rewrite-descriptor-layout -split-input-file | FileCheck %s
 
 // Tests for rescaleEnclosingLoop: converting a user loop whose IV feeds the
 // floor (stick) dim of an annotated descriptor from block units to stick units.
@@ -28,10 +28,13 @@
 // N=768, BLOCK_N=128, stick=64 => 2 sticks per block => factor 2.
 // Loop `for n = 2 to 6 step 1` covers blocks {2,3,4,5} = sticks [4, 12).
 // Rescaled loop must be `for = 4 to 12 step 2`.
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 767 >= 0)>
+#set1 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
 module {
 // CHECK-LABEL:   tt.func @rescale_nonzero_lower(
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f32>, %[[VAL_1:.*]]: !tt.ptr<f32>) {
-// CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+// CHECK:           %[[VAL_2:.*]] = arith.constant 0 : index
 // CHECK:           %[[VAL_3:.*]] = arith.constant 128 : i32
 // CHECK:           %[[VAL_4:.*]] = arith.constant 2 : i32
 // CHECK:           %[[VAL_5:.*]] = arith.constant 6 : i32
@@ -47,19 +50,17 @@ module {
 // CHECK:           scf.for %[[VAL_15:.*]] = %[[VAL_12]] to %[[VAL_13]] step %[[VAL_14]]  : i32 {
 // CHECK:             %[[VAL_16:.*]] = arith.constant 64 : i32
 // CHECK:             %[[VAL_17:.*]] = arith.muli %[[VAL_15]], %[[VAL_16]] : i32
-// CHECK:             %[[VAL_18:.*]] = arith.index_cast %[[VAL_2]] : i32 to index
 // CHECK:             %[[VAL_19:.*]] = arith.index_cast %[[VAL_17]] : i32 to index
 // CHECK:             %[[VAL_20:.*]] = arith.index_cast %[[VAL_15]] : i32 to index
 // CHECK:             %[[VAL_21:.*]] = arith.constant 64 : index
 // CHECK:             %[[VAL_22:.*]] = arith.remsi %[[VAL_19]], %[[VAL_21]] : index
-// CHECK:             %[[VAL_23:.*]] = ktdp.construct_access_tile %[[VAL_8]]{{\[}}%[[VAL_20]], %[[VAL_18]], %[[VAL_22]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_2]]} : memref<12x64x64xf32> -> !ktdp.access_tile<2x64x64xindex>
+// CHECK:             %[[VAL_23:.*]] = ktdp.construct_access_tile %[[VAL_8]]{{\[}}%[[VAL_20]], %[[VAL_2]], %[[VAL_22]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_2]]} : memref<12x64x64xf32> -> !ktdp.access_tile<2x64x64xindex>
 // CHECK:             %[[VAL_24:.*]] = ktdp.load %[[VAL_23]] : <2x64x64xindex> -> tensor<2x64x64xf32>
-// CHECK:             %[[VAL_25:.*]] = arith.index_cast %[[VAL_2]] : i32 to index
 // CHECK:             %[[VAL_26:.*]] = arith.index_cast %[[VAL_17]] : i32 to index
 // CHECK:             %[[VAL_27:.*]] = arith.index_cast %[[VAL_15]] : i32 to index
 // CHECK:             %[[VAL_28:.*]] = arith.constant 64 : index
 // CHECK:             %[[VAL_29:.*]] = arith.remsi %[[VAL_26]], %[[VAL_28]] : index
-// CHECK:             %[[VAL_30:.*]] = ktdp.construct_access_tile %[[VAL_10]]{{\[}}%[[VAL_27]], %[[VAL_25]], %[[VAL_29]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_2]]} : memref<12x64x64xf32> -> !ktdp.access_tile<2x64x64xindex>
+// CHECK:             %[[VAL_30:.*]] = ktdp.construct_access_tile %[[VAL_10]]{{\[}}%[[VAL_27]], %[[VAL_2]], %[[VAL_29]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_2]]} : memref<12x64x64xf32> -> !ktdp.access_tile<2x64x64xindex>
 // CHECK:             ktdp.store %[[VAL_24]], %[[VAL_30]] : tensor<2x64x64xf32>, <2x64x64xindex>
 // CHECK:           }
 // CHECK:           tt.return
@@ -67,30 +68,31 @@ module {
 // CHECK: #[[$ATTR_3:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 // CHECK: #[[$ATTR_4:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 11 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 // CHECK: #[[$ATTR_5:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
-tt.func @rescale_nonzero_lower(%ptr: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
-  %c0_i32 = arith.constant 0 : i32
-  %c64_i32 = arith.constant 64 : i32
-  %c128_i32 = arith.constant 128 : i32
-  %c768_i32 = arith.constant 768 : i32
-  %c768_i64 = arith.constant 768 : i64
-  %c1_i64 = arith.constant 1 : i64
-  %lb = arith.constant 2 : i32
-  %ub = arith.constant 6 : i32
-  %st = arith.constant 1 : i32
-  %desc = tt.make_tensor_descriptor %ptr, [%c64_i32, %c768_i32], [%c768_i64, %c1_i64]
-      : !tt.ptr<f32>, !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %desc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf32>
-  %odesc = tt.make_tensor_descriptor %out, [%c64_i32, %c768_i32], [%c768_i64, %c1_i64]
-      : !tt.ptr<f32>, !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %odesc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf32>
-  scf.for %n = %lb to %ub step %st : i32 {
-    %off = arith.muli %n, %c128_i32 : i32
-    %d = tt.descriptor_load %desc[%c0_i32, %off] : !tt.tensordesc<64x128xf32> -> tensor<64x128xf32>
-    tt.descriptor_store %odesc[%c0_i32, %off], %d : !tt.tensordesc<64x128xf32>, tensor<64x128xf32>
-    scf.yield
+  tt.func @rescale_nonzero_lower(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+    %c0 = arith.constant 0 : index
+    %c128_i32 = arith.constant 128 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %c6_i32 = arith.constant 6 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 768], strides: [768, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x768xf32>
+    %2 = builtin.unrealized_conversion_cast %1 : memref<64x768xf32> to !tt.tensordesc<64x128xf32>
+    tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x128xf32>
+    %3 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
+    %4 = ktdp.construct_memory_view %3, sizes: [64, 768], strides: [768, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x768xf32>
+    %5 = builtin.unrealized_conversion_cast %4 : memref<64x768xf32> to !tt.tensordesc<64x128xf32>
+    tt.spyre_tensor_layout %5 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x128xf32>
+    scf.for %arg2 = %c2_i32 to %c6_i32 step %c1_i32  : i32 {
+      %6 = arith.muli %arg2, %c128_i32 : i32
+      %7 = arith.index_cast %6 : i32 to index
+      %8 = ktdp.construct_access_tile %1[%c0, %7] {access_tile_order = #map, access_tile_set = #set1} : memref<64x768xf32> -> !ktdp.access_tile<64x128xindex>
+      %9 = ktdp.load %8 : <64x128xindex> -> tensor<64x128xf32>
+      %10 = arith.index_cast %6 : i32 to index
+      %11 = ktdp.construct_access_tile %4[%c0, %10] {access_tile_order = #map, access_tile_set = #set1} : memref<64x768xf32> -> !ktdp.access_tile<64x128xindex>
+      ktdp.store %9, %11 : tensor<64x128xf32>, <64x128xindex>
+    }
+    tt.return
   }
-  tt.return
-}
 }
 
 // -----
@@ -101,10 +103,13 @@ tt.func @rescale_nonzero_lower(%ptr: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
 // Rescaled loop must be `for = 0 to 12 step 4` — still 3 iterations, landing
 // on sticks {0,4,8}.  Assigning `step = factor` instead of `step * factor`
 // would double the trip count.
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 767 >= 0)>
+#set1 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
 module {
 // CHECK-LABEL:   tt.func @rescale_nonunit_step(
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f32>, %[[VAL_1:.*]]: !tt.ptr<f32>) {
-// CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+// CHECK:           %[[VAL_2:.*]] = arith.constant 0 : index
 // CHECK:           %[[VAL_3:.*]] = arith.constant 128 : i32
 // CHECK:           %[[VAL_4:.*]] = arith.constant 0 : i32
 // CHECK:           %[[VAL_5:.*]] = arith.constant 6 : i32
@@ -120,19 +125,17 @@ module {
 // CHECK:           scf.for %[[VAL_15:.*]] = %[[VAL_12]] to %[[VAL_13]] step %[[VAL_14]]  : i32 {
 // CHECK:             %[[VAL_16:.*]] = arith.constant 64 : i32
 // CHECK:             %[[VAL_17:.*]] = arith.muli %[[VAL_15]], %[[VAL_16]] : i32
-// CHECK:             %[[VAL_18:.*]] = arith.index_cast %[[VAL_2]] : i32 to index
 // CHECK:             %[[VAL_19:.*]] = arith.index_cast %[[VAL_17]] : i32 to index
 // CHECK:             %[[VAL_20:.*]] = arith.index_cast %[[VAL_15]] : i32 to index
 // CHECK:             %[[VAL_21:.*]] = arith.constant 64 : index
 // CHECK:             %[[VAL_22:.*]] = arith.remsi %[[VAL_19]], %[[VAL_21]] : index
-// CHECK:             %[[VAL_23:.*]] = ktdp.construct_access_tile %[[VAL_8]]{{\[}}%[[VAL_20]], %[[VAL_18]], %[[VAL_22]]] {access_tile_order = #[[$ATTR_3]], access_tile_set = #[[$ATTR_5]]} : memref<12x64x64xf32> -> !ktdp.access_tile<2x64x64xindex>
+// CHECK:             %[[VAL_23:.*]] = ktdp.construct_access_tile %[[VAL_8]]{{\[}}%[[VAL_20]], %[[VAL_2]], %[[VAL_22]]] {access_tile_order = #[[$ATTR_3]], access_tile_set = #[[$ATTR_5]]} : memref<12x64x64xf32> -> !ktdp.access_tile<2x64x64xindex>
 // CHECK:             %[[VAL_24:.*]] = ktdp.load %[[VAL_23]] : <2x64x64xindex> -> tensor<2x64x64xf32>
-// CHECK:             %[[VAL_25:.*]] = arith.index_cast %[[VAL_2]] : i32 to index
 // CHECK:             %[[VAL_26:.*]] = arith.index_cast %[[VAL_17]] : i32 to index
 // CHECK:             %[[VAL_27:.*]] = arith.index_cast %[[VAL_15]] : i32 to index
 // CHECK:             %[[VAL_28:.*]] = arith.constant 64 : index
 // CHECK:             %[[VAL_29:.*]] = arith.remsi %[[VAL_26]], %[[VAL_28]] : index
-// CHECK:             %[[VAL_30:.*]] = ktdp.construct_access_tile %[[VAL_10]]{{\[}}%[[VAL_27]], %[[VAL_25]], %[[VAL_29]]] {access_tile_order = #[[$ATTR_3]], access_tile_set = #[[$ATTR_5]]} : memref<12x64x64xf32> -> !ktdp.access_tile<2x64x64xindex>
+// CHECK:             %[[VAL_30:.*]] = ktdp.construct_access_tile %[[VAL_10]]{{\[}}%[[VAL_27]], %[[VAL_2]], %[[VAL_29]]] {access_tile_order = #[[$ATTR_3]], access_tile_set = #[[$ATTR_5]]} : memref<12x64x64xf32> -> !ktdp.access_tile<2x64x64xindex>
 // CHECK:             ktdp.store %[[VAL_24]], %[[VAL_30]] : tensor<2x64x64xf32>, <2x64x64xindex>
 // CHECK:           }
 // CHECK:           tt.return
@@ -140,30 +143,31 @@ module {
 // CHECK: #[[$ATTR_6:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 // CHECK: #[[$ATTR_7:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 11 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 // CHECK: #[[$ATTR_8:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
-tt.func @rescale_nonunit_step(%ptr: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
-  %c0_i32 = arith.constant 0 : i32
-  %c64_i32 = arith.constant 64 : i32
-  %c128_i32 = arith.constant 128 : i32
-  %c768_i32 = arith.constant 768 : i32
-  %c768_i64 = arith.constant 768 : i64
-  %c1_i64 = arith.constant 1 : i64
-  %lb = arith.constant 0 : i32
-  %ub = arith.constant 6 : i32
-  %st = arith.constant 2 : i32
-  %desc = tt.make_tensor_descriptor %ptr, [%c64_i32, %c768_i32], [%c768_i64, %c1_i64]
-      : !tt.ptr<f32>, !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %desc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf32>
-  %odesc = tt.make_tensor_descriptor %out, [%c64_i32, %c768_i32], [%c768_i64, %c1_i64]
-      : !tt.ptr<f32>, !tt.tensordesc<64x128xf32>
-  tt.spyre_tensor_layout %odesc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x128xf32>
-  scf.for %n = %lb to %ub step %st : i32 {
-    %off = arith.muli %n, %c128_i32 : i32
-    %d = tt.descriptor_load %desc[%c0_i32, %off] : !tt.tensordesc<64x128xf32> -> tensor<64x128xf32>
-    tt.descriptor_store %odesc[%c0_i32, %off], %d : !tt.tensordesc<64x128xf32>, tensor<64x128xf32>
-    scf.yield
+  tt.func @rescale_nonunit_step(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+    %c0 = arith.constant 0 : index
+    %c128_i32 = arith.constant 128 : i32
+    %c0_i32_0 = arith.constant 0 : i32
+    %c6_i32 = arith.constant 6 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 768], strides: [768, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x768xf32>
+    %2 = builtin.unrealized_conversion_cast %1 : memref<64x768xf32> to !tt.tensordesc<64x128xf32>
+    tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x128xf32>
+    %3 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
+    %4 = ktdp.construct_memory_view %3, sizes: [64, 768], strides: [768, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x768xf32>
+    %5 = builtin.unrealized_conversion_cast %4 : memref<64x768xf32> to !tt.tensordesc<64x128xf32>
+    tt.spyre_tensor_layout %5 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x128xf32>
+    scf.for %arg2 = %c0_i32_0 to %c6_i32 step %c2_i32  : i32 {
+      %6 = arith.muli %arg2, %c128_i32 : i32
+      %7 = arith.index_cast %6 : i32 to index
+      %8 = ktdp.construct_access_tile %1[%c0, %7] {access_tile_order = #map, access_tile_set = #set1} : memref<64x768xf32> -> !ktdp.access_tile<64x128xindex>
+      %9 = ktdp.load %8 : <64x128xindex> -> tensor<64x128xf32>
+      %10 = arith.index_cast %6 : i32 to index
+      %11 = ktdp.construct_access_tile %4[%c0, %10] {access_tile_order = #map, access_tile_set = #set1} : memref<64x768xf32> -> !ktdp.access_tile<64x128xindex>
+      ktdp.store %9, %11 : tensor<64x128xf32>, <64x128xindex>
+    }
+    tt.return
   }
-  tt.return
-}
 }
 
 // -----
@@ -172,10 +176,13 @@ tt.func @rescale_nonunit_step(%ptr: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
 // N=768, BLOCK_N=64, stick=64 => 1 stick per block => factor 1.
 // Block units and stick units already agree, so the loop must be left
 // completely untouched: `for n = 0 to 9 step 3` stays as-is.
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 767 >= 0)>
+#set1 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
 module {
 // CHECK-LABEL:   tt.func @rescale_factor_one_noop(
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f32>, %[[VAL_1:.*]]: !tt.ptr<f32>) {
-// CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+// CHECK:           %[[VAL_2:.*]] = arith.constant 0 : index
 // CHECK:           %[[VAL_3:.*]] = arith.constant 64 : i32
 // CHECK:           %[[VAL_4:.*]] = arith.constant 0 : i32
 // CHECK:           %[[VAL_5:.*]] = arith.constant 9 : i32
@@ -186,44 +193,44 @@ module {
 // CHECK:           %[[VAL_10:.*]] = ktdp.construct_memory_view %[[VAL_9]], sizes: [12, 64, 64], strides: [4096, 64, 1] {coordinate_set = #[[$ATTR_7]], memory_space = #ktdp.memory_space<global>} : memref<12x64x64xf32>
 // CHECK:           scf.for %[[VAL_11:.*]] = %[[VAL_4]] to %[[VAL_5]] step %[[VAL_6]]  : i32 {
 // CHECK:             %[[VAL_12:.*]] = arith.muli %[[VAL_11]], %[[VAL_3]] : i32
-// CHECK:             %[[VAL_13:.*]] = arith.index_cast %[[VAL_2]] : i32 to index
 // CHECK:             %[[VAL_14:.*]] = arith.index_cast %[[VAL_12]] : i32 to index
 // CHECK:             %[[VAL_15:.*]] = arith.index_cast %[[VAL_11]] : i32 to index
 // CHECK:             %[[VAL_16:.*]] = arith.constant 64 : index
 // CHECK:             %[[VAL_17:.*]] = arith.remsi %[[VAL_14]], %[[VAL_16]] : index
-// CHECK:             %[[VAL_18:.*]] = ktdp.construct_access_tile %[[VAL_8]]{{\[}}%[[VAL_15]], %[[VAL_13]], %[[VAL_17]]] {access_tile_order = #[[$ATTR_6]], access_tile_set = #[[$ATTR_8]]} : memref<12x64x64xf32> -> !ktdp.access_tile<1x64x64xindex>
+// CHECK:             %[[VAL_18:.*]] = ktdp.construct_access_tile %[[VAL_8]]{{\[}}%[[VAL_15]], %[[VAL_2]], %[[VAL_17]]] {access_tile_order = #[[$ATTR_6]], access_tile_set = #[[$ATTR_8]]} : memref<12x64x64xf32> -> !ktdp.access_tile<1x64x64xindex>
 // CHECK:             %[[VAL_19:.*]] = ktdp.load %[[VAL_18]] : <1x64x64xindex> -> tensor<1x64x64xf32>
-// CHECK:             %[[VAL_20:.*]] = arith.index_cast %[[VAL_2]] : i32 to index
 // CHECK:             %[[VAL_21:.*]] = arith.index_cast %[[VAL_12]] : i32 to index
 // CHECK:             %[[VAL_22:.*]] = arith.index_cast %[[VAL_11]] : i32 to index
 // CHECK:             %[[VAL_23:.*]] = arith.constant 64 : index
 // CHECK:             %[[VAL_24:.*]] = arith.remsi %[[VAL_21]], %[[VAL_23]] : index
-// CHECK:             %[[VAL_25:.*]] = ktdp.construct_access_tile %[[VAL_10]]{{\[}}%[[VAL_22]], %[[VAL_20]], %[[VAL_24]]] {access_tile_order = #[[$ATTR_6]], access_tile_set = #[[$ATTR_8]]} : memref<12x64x64xf32> -> !ktdp.access_tile<1x64x64xindex>
+// CHECK:             %[[VAL_25:.*]] = ktdp.construct_access_tile %[[VAL_10]]{{\[}}%[[VAL_22]], %[[VAL_2]], %[[VAL_24]]] {access_tile_order = #[[$ATTR_6]], access_tile_set = #[[$ATTR_8]]} : memref<12x64x64xf32> -> !ktdp.access_tile<1x64x64xindex>
 // CHECK:             ktdp.store %[[VAL_19]], %[[VAL_25]] : tensor<1x64x64xf32>, <1x64x64xindex>
 // CHECK:           }
 // CHECK:           tt.return
 // CHECK:         }
-tt.func @rescale_factor_one_noop(%ptr: !tt.ptr<f32>, %out: !tt.ptr<f32>) {
-  %c0_i32 = arith.constant 0 : i32
-  %c64_i32 = arith.constant 64 : i32
-  %c768_i32 = arith.constant 768 : i32
-  %c768_i64 = arith.constant 768 : i64
-  %c1_i64 = arith.constant 1 : i64
-  %lb = arith.constant 0 : i32
-  %ub = arith.constant 9 : i32
-  %st = arith.constant 3 : i32
-  %desc = tt.make_tensor_descriptor %ptr, [%c64_i32, %c768_i32], [%c768_i64, %c1_i64]
-      : !tt.ptr<f32>, !tt.tensordesc<64x64xf32>
-  tt.spyre_tensor_layout %desc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x64xf32>
-  %odesc = tt.make_tensor_descriptor %out, [%c64_i32, %c768_i32], [%c768_i64, %c1_i64]
-      : !tt.ptr<f32>, !tt.tensordesc<64x64xf32>
-  tt.spyre_tensor_layout %odesc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x64xf32>
-  scf.for %n = %lb to %ub step %st : i32 {
-    %off = arith.muli %n, %c64_i32 : i32
-    %d = tt.descriptor_load %desc[%c0_i32, %off] : !tt.tensordesc<64x64xf32> -> tensor<64x64xf32>
-    tt.descriptor_store %odesc[%c0_i32, %off], %d : !tt.tensordesc<64x64xf32>, tensor<64x64xf32>
-    scf.yield
+  tt.func @rescale_factor_one_noop(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+    %c0 = arith.constant 0 : index
+    %c64_i32 = arith.constant 64 : i32
+    %c0_i32_0 = arith.constant 0 : i32
+    %c9_i32 = arith.constant 9 : i32
+    %c3_i32 = arith.constant 3 : i32
+    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 768], strides: [768, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x768xf32>
+    %2 = builtin.unrealized_conversion_cast %1 : memref<64x768xf32> to !tt.tensordesc<64x64xf32>
+    tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x64xf32>
+    %3 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
+    %4 = ktdp.construct_memory_view %3, sizes: [64, 768], strides: [768, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x768xf32>
+    %5 = builtin.unrealized_conversion_cast %4 : memref<64x768xf32> to !tt.tensordesc<64x64xf32>
+    tt.spyre_tensor_layout %5 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x64xf32>
+    scf.for %arg2 = %c0_i32_0 to %c9_i32 step %c3_i32  : i32 {
+      %6 = arith.muli %arg2, %c64_i32 : i32
+      %7 = arith.index_cast %6 : i32 to index
+      %8 = ktdp.construct_access_tile %1[%c0, %7] {access_tile_order = #map, access_tile_set = #set1} : memref<64x768xf32> -> !ktdp.access_tile<64x64xindex>
+      %9 = ktdp.load %8 : <64x64xindex> -> tensor<64x64xf32>
+      %10 = arith.index_cast %6 : i32 to index
+      %11 = ktdp.construct_access_tile %4[%c0, %10] {access_tile_order = #map, access_tile_set = #set1} : memref<64x768xf32> -> !ktdp.access_tile<64x64xindex>
+      ktdp.store %9, %11 : tensor<64x64xf32>, <64x64xindex>
+    }
+    tt.return
   }
-  tt.return
-}
 }
