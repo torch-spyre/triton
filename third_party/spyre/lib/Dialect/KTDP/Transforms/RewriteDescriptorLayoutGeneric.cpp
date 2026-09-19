@@ -99,6 +99,38 @@ static IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape) {
   return IntegerSet::get(rank, symCount, constraints, eqFlags);
 }
 
+/// Is `set` the dense range of `shape` — for every dim, the pair of constraints
+/// that bounds it to [0, extent)?
+///
+/// Asked constraint by constraint through simplifyAffineExpr rather than by
+/// comparing the whole IntegerSet against buildRangeSetND, because an
+/// IntegerSet compares by uniqued identity and a dynamic extent's upper bound
+/// is not identical across a round trip through IR text: the bound is built as
+/// `(sym - 1) - d`, MLIR prints that as `-d + sym - 1`, and the parser reads
+/// that text back as `((-d) + sym) - 1`. The two trees print the same and mean
+/// the same but are not the same attribute, so an identity comparison rejects a
+/// view whose set was parsed rather than built — every view in a hand-written
+/// test, and every view in a module handed between two tool invocations. The
+/// question here is what the set means, so ask it of the canonical form.
+static bool isDenseRangeSet(IntegerSet set, MLIRContext *ctx,
+                            ArrayRef<int64_t> shape) {
+  IntegerSet want = buildRangeSetND(ctx, shape);
+  if (set.getNumDims() != want.getNumDims() ||
+      set.getNumSymbols() != want.getNumSymbols() ||
+      set.getNumConstraints() != want.getNumConstraints())
+    return false;
+  for (unsigned i = 0, e = want.getNumConstraints(); i < e; ++i) {
+    if (set.isEq(i) != want.isEq(i))
+      return false;
+    if (simplifyAffineExpr(set.getConstraint(i), set.getNumDims(),
+                           set.getNumSymbols()) !=
+        simplifyAffineExpr(want.getConstraint(i), want.getNumDims(),
+                           want.getNumSymbols()))
+      return false;
+  }
+  return true;
+}
+
 // applyStatic: apply one coord op to a static extent
 inline std::optional<int64_t> applyStatic(int64_t logical, CoordOp op,
                                           int64_t arg) {
@@ -831,8 +863,8 @@ struct RewriteDescriptorLayoutGenericPass
 
     // The physical view's coordinate set is the dense range of its own sizes,
     // recomputed below. Reject a set that says more than that.
-    if (memViewOp.getCoordinateSetAttr().getValue() !=
-        buildRangeSetND(b.getContext(), memViewOp.getStaticSizes()))
+    if (!isDenseRangeSet(memViewOp.getCoordinateSetAttr().getValue(),
+                         b.getContext(), memViewOp.getStaticSizes()))
       return memViewOp.emitError(
           "spyre_tensor_layout: coordinate_set must be the dense range of the "
           "view's sizes to physicalize it; a partitioned set would be "
@@ -912,8 +944,8 @@ struct RewriteDescriptorLayoutGenericPass
       return tileOp.emitError(
           "spyre_tensor_layout: access_tile_order must be the identity to "
           "physicalize this tile; a permuted order would be overwritten");
-    if (tileOp.getAccessTileSetAttr().getValue() !=
-        buildRangeSetND(b.getContext(), logBlock))
+    if (!isDenseRangeSet(tileOp.getAccessTileSetAttr().getValue(),
+                         b.getContext(), logBlock))
       return tileOp.emitError(
           "spyre_tensor_layout: access_tile_set must be the dense range of the "
           "block shape to physicalize this tile; a non-dense set would be "
@@ -1030,8 +1062,8 @@ struct RewriteDescriptorLayoutGenericPass
       return tileOp.emitError(
           "spyre_tensor_layout: variables_space_order must be the identity to "
           "physicalize this tile; a permuted order would be overwritten");
-    if (tileOp.getVariablesSpaceSetAttr().getValue() !=
-        buildRangeSetND(ctx, logBlock))
+    if (!isDenseRangeSet(tileOp.getVariablesSpaceSetAttr().getValue(), ctx,
+                         logBlock))
       return tileOp.emitError(
           "spyre_tensor_layout: variables_space_set must be the dense range of "
           "the tile shape to physicalize this tile; a non-dense set would be "
