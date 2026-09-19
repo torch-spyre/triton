@@ -4,17 +4,26 @@
 //
 // A ktdp.construct_access_tile subscript is `index` by the op's own definition,
 // so every one of these kernels reaches the pass with its Triton-side i32
-// arithmetic already terminated by one arith.index_cast. The question this file
-// answers is whether the pass leaves that cast between the arithmetic and the
-// split it emits, or rebuilds the arithmetic above it in `index`: the
-// scheduler's symbolic start-address analysis treats a cast as opaque and
+// arithmetic already terminated by one arith.index_cast. The question is whether
+// the pass leaves that cast between the arithmetic and the split it emits, or
+// rebuilds the arithmetic above it in `index` -- so every case below comes out as
+// one of exactly two shapes:
+//
+//   arrives:   %o = arith.muli %pid, 64 : i32
+//              %x = arith.index_cast %o : i32 to index
+//   rebuilt:   %p = arith.index_cast %pid : i32 to index
+//              %x = arith.muli %p, 64 : index      <- the split reads this
+//
+// The scheduler's symbolic start-address analysis treats a cast as opaque and
 // rejects an address computed through one, so a grid-derived subscript must be
-// rebuilt and anything whose value a rebuild would change must not be.
+// rebuilt -- and anything whose value a rebuild would change must not be. Case 1
+// is "rebuilt"; cases 2 to 4 are "arrives, unchanged", each for its own reason
+// why lifting would not preserve the value.
 //
 // Checks are hand-written and minimal on purpose: the claim is which domain the
 // subscript arithmetic lands in, not the whole module.
 
-// Case 1 -- a pid-derived subscript is rebuilt in `index`.
+// Case 1 -- rebuilt: the subscript is pid-derived.
 //
 // Triton computes offsets in i32, so the subscript arrives as
 // index_cast(muli(pid, c) : i32). The multiply is re-emitted in `index` over a
@@ -60,7 +69,7 @@ tt.func @pid_offset_lifted_to_index(%ptr: !tt.ptr<f16>) {
 
 // -----
 
-// Case 2 -- a run-time i32 scalar is not rebuilt.
+// Case 2 -- arrives, unchanged: a run-time i32 scalar.
 //
 // It is not a grid coordinate, so its arithmetic keeps the width Triton gave it
 // -- rebuilding in 64-bit `index` would change what the expression means on
@@ -94,7 +103,7 @@ tt.func @runtime_scalar_offset_unchanged(%ptr: !tt.ptr<f16>, %n: i32) {
 
 // -----
 
-// Case 3 -- a truncation is not lifted past.
+// Case 3 -- arrives, unchanged: a truncation sits in the chain.
 //
 // A truncation is not value-preserving, so lifting past it would feed the
 // *untruncated* 64-bit product to the subscript and address a different tile
@@ -133,7 +142,7 @@ tt.func @trunc_not_lifted(%ptr: !tt.ptr<f16>) {
 
 // -----
 
-// Case 4 -- an unsigned widening feeding signed division is not lifted.
+// Case 4 -- arrives, unchanged: an unsigned widening feeds a signed division.
 //
 // A zero-extended negative i32 is a large positive i64, so `divsi` on the wide
 // value and on a rebuilt narrow value disagree. The whole chain reaches the
