@@ -17,8 +17,13 @@
 // phys_arg=[0,64] gives physical size [M, 64].
 //
 //   Phase 1  physicalize each annotated descriptor: memory view, access tiles,
-//            loads. Stores have their access tile redirected.
-//   Phase 2  one rewrite over generics, applied greedily.
+//            loads. Stores have their access tile redirected. Each physicalized
+//            view is recorded against the layout it was physicalized under.
+//   Phase 2  for each recorded view, find the generics that read its loads or
+//            supply its stores, and restate each one over the physical loop
+//            domain. Every generic the pass considers is reached this way, so
+//            the recorded views are the scope; no fixpoint, no pattern driver,
+//            and each generic is rewritten at most once.
 //   Phase 3  erase the markers and their now-dead bridge casts.
 //
 //===----------------------------------------------------------------------===//
@@ -42,6 +47,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 
@@ -682,9 +688,18 @@ struct RewriteDescriptorLayoutGenericPass
 
   /// Physicalized ConstructMemoryViewOp → its coord map. Keyed on the
   /// Operation* of the PHYSICALIZED (new) view op, set in physicalizeDescriptor
-  /// after physicalizeMemView returns. Phase 2 traces each generic's ins/outs
-  /// operands back to a physicalized view directly, one lookup per operand.
-  DenseMap<Operation *, CoordMap> physViewOf;
+  /// after physicalizeMemView returns.
+  ///
+  /// This is what Phase 2 iterates: the physicalized views ARE the scope of the
+  /// rewrite, so the traversal starts here and reaches generics through the
+  /// loads and stores over each view. It is also what the rewrite looks an
+  /// operand up in, once it has a generic in hand.
+  ///
+  /// A MapVector, not a DenseMap, because Phase 2's order comes off this
+  /// container and a DenseMap's iteration order is not the order the markers
+  /// were physicalized in — the rewrite would be run in an order that varied
+  /// with the pointer values.
+  llvm::MapVector<Operation *, CoordMap> physViewOf;
 
   /// Logical construct_memory_view ops superseded in Phase 1. They cannot be
   /// erased there: the marker's bridge cast still holds them, and that cast
@@ -958,10 +973,14 @@ struct RewriteDescriptorLayoutGenericPass
             arith::ConstantOp::create(b, loc, b.getIndexAttr(0)).getResult());
         continue;
       }
+      // The subscript arrives as `index`: construct_access_tile's indices are
+      // Variadic<Index>, so the op's own definition guarantees it. And
+      // rebuildInIndexDomain either hands the value back unchanged or re-emits
+      // its arithmetic in that same domain. So the div/rem below is emitted at
+      // the type the subscript already has, and there is no cast to insert.
       Value idx = rebuildInIndexDomain(b, loc, logIdx[cm.src[p]]);
-      if (idx.getType() != b.getIndexType())
-        idx = arith::IndexCastOp::create(b, loc, b.getIndexType(), idx)
-                  .getResult();
+      assert(idx.getType().isIndex() &&
+             "an access tile subscript is index by the op's definition");
       switch (cm.opAt(p)) {
       case CoordOp::Identity:
         break;
@@ -1494,9 +1513,48 @@ struct RewriteDescriptorLayoutGenericPass
     return result;
   }
 
-  LogicalResult runPhase2(ModuleOp module) {
+  /// The generics adjacent to a physicalized view: for each view Phase 1
+  /// recorded, every generic that reads one of its loads or supplies one of its
+  /// stores. Listed once each, in the order the views were physicalized.
+  ///
+  /// This is the whole scope of the rewrite, and starting from the views is what
+  /// makes that legible: a generic on no physicalized chain is never looked at,
+  /// rather than looked at and found to have no layout on any operand. The
+  /// collection is separate from the rewriting below because rewriteGeneric
+  /// replaces the op it is given, which would invalidate a user iterator held
+  /// across the call.
+  void collectAdjacentGenerics(SmallVectorImpl<linalg::GenericOp> &out) {
+    SmallPtrSet<Operation *, 8> seen;
+    auto note = [&](Operation *op) {
+      if (auto g = dyn_cast_or_null<linalg::GenericOp>(op))
+        if (seen.insert(g).second)
+          out.push_back(g);
+    };
+    for (const auto &entry : physViewOf) {
+      for (Operation *tile : entry.first->getResult(0).getUsers()) {
+        if (!isa<mlir::ktdp::ConstructAccessTilesOp,
+                 mlir::ktdp::ConstructIndirectAccessTilesOp>(tile))
+          continue;
+        for (Operation *user : tile->getResult(0).getUsers()) {
+          if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
+            for (Operation *consumer : ld.getResult().getUsers())
+              note(consumer);
+          } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
+            note(st.getDataTile().getDefiningOp());
+          }
+        }
+      }
+    }
+  }
+
+  /// No ModuleOp parameter: the recorded views are the entry points now, so
+  /// nothing here needs the module to walk.
+  LogicalResult runPhase2() {
     SmallVector<linalg::GenericOp> generics;
-    module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+    collectAdjacentGenerics(generics);
+    LLVM_DEBUG(llvm::dbgs()
+               << "    " << generics.size()
+               << " generic(s) adjacent to a physicalized view\n");
     for (auto g : generics)
       if (failed(rewriteGeneric(g)))
         return failure();
@@ -1545,9 +1603,10 @@ struct RewriteDescriptorLayoutGenericPass
         return signalPassFailure();
 
     LLVM_DEBUG(llvm::dbgs()
-               << "[rewrite-descriptor-layout-generic] Phase 2: greedy "
-               << "rewrite\n");
-    if (failed(runPhase2(module)))
+               << "[rewrite-descriptor-layout-generic] Phase 2: rewriting the "
+               << "generics adjacent to " << physViewOf.size()
+               << " physicalized view(s)\n");
+    if (failed(runPhase2()))
       return signalPassFailure();
 
     LLVM_DEBUG(llvm::dbgs()
