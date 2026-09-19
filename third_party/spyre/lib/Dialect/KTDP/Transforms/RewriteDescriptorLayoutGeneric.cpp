@@ -303,15 +303,21 @@ static Value rebuildInIndexDomain(OpBuilder &b, Location loc, Value v) {
 // The coordinate map, read off a marker
 //===----------------------------------------------------------------------===//
 
-/// One descriptor's physical layout: the marker's three arrays, plus the
-/// logical rank they index into.
+/// One descriptor's physical layout: a copy of the marker's three arrays, plus
+/// the logical rank they index into.
 ///
 /// The marker is an *instruction* — it says how to split logical dims. It is
 /// not a source of truth about the tensor: element type, memory space, base
 /// offset, strides, coordinate set and dynamic extents all come from the ops
 /// being rewritten, and where the two could disagree the op wins.
+///
+/// A copy, not a view of the marker's attribute storage: a CoordMap is recorded
+/// against a physicalized view and read for the whole rewrite, which outlives
+/// the marker it came from. Borrowing would make that lifetime a constraint on
+/// the order the phases run in, and the ranks here are a handful of dims, so
+/// there is nothing to save by it.
 struct CoordMap {
-  ArrayRef<int64_t> src, op, arg;
+  SmallVector<int64_t, 4> src, op, arg;
   unsigned logicalRank = 0;
 
   unsigned physRank() const { return src.size(); }
@@ -380,8 +386,13 @@ const char *coordOpName(CoordOp op) {
 /// Read the coord map off a marker, checking phys_src against `logicalRank`.
 FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
                                  unsigned logicalRank) {
-  CoordMap cm{marker.getPhysSrc(), marker.getPhysOp(), marker.getPhysArg(),
-              logicalRank};
+  CoordMap cm;
+  ArrayRef<int64_t> physSrc = marker.getPhysSrc(), physOp = marker.getPhysOp(),
+                    physArg = marker.getPhysArg();
+  cm.src.assign(physSrc.begin(), physSrc.end());
+  cm.op.assign(physOp.begin(), physOp.end());
+  cm.arg.assign(physArg.begin(), physArg.end());
+  cm.logicalRank = logicalRank;
   if (cm.op.size() != cm.physRank() || cm.arg.size() != cm.physRank())
     return marker.emitError("spyre_tensor_layout: phys_src, phys_op and "
                             "phys_arg must have the same length");
