@@ -30,6 +30,9 @@ add_triton_library(TritonToKTIR
   LINK_LIBS PUBLIC
   KTDPUtils
   SpyreUtils
+  # For the tts.tensor_layout op and attribute name: LowerDescriptorMemory
+  # consumes the one and writes the other.
+  TTSIR
   KTIR::KtdpDialect
   KTIR::SpyreOpDialect
   TritonIR

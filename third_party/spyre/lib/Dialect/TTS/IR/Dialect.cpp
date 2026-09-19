@@ -1,9 +1,9 @@
 //===- Dialect.cpp - The tts dialect --------------------------------------===//
 //
-// The dialect defines nothing, so this file is the two things that make it worth
-// existing: the structural checker for a `tts.tensor_layout` coordinate map, and
-// the `verifyOperationAttribute` hook that gates the attribute on any op
-// carrying it.
+// The dialect registration, the structural checker for a `tts.tensor_layout`
+// coordinate map, and the `verifyOperationAttribute` hook that gates the
+// attribute on any op carrying it. The authoring op's own verifier is in
+// Ops.cpp, and calls the same checker.
 //
 //===----------------------------------------------------------------------===//
 
@@ -20,8 +20,13 @@
 namespace mlir::triton::tts {
 
 void TTSDialect::initialize() {
-  // Nothing to register: no ops, no types, no attribute types. The dialect is
-  // here to own an attribute NAME and the verifier hook that name routes to.
+  // One op and nothing else: no types, no attribute types. Most of what the
+  // dialect is for is the attribute NAME and the verifier hook that name routes
+  // to, neither of which is registered here.
+  addOperations<
+#define GET_OP_LIST
+#include "Dialect/TTS/IR/Ops.cpp.inc"
+      >();
 }
 
 LogicalResult verifyTensorLayoutArrays(

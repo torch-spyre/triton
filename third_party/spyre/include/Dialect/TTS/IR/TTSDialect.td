@@ -16,9 +16,9 @@ def TTS_Dialect : Dialect {
     which are neither Triton's (they mean nothing to a GPU backend) nor KTIR's
     (they are consumed before any artifact is emitted).
 
-    At present the dialect defines **no ops, no types and no attribute types**.
-    It exists to own a *name* and the verifier that name gets: a discardable
-    attribute whose prefix is a registered dialect is routed to that dialect's
+    The dialect defines **no types and no attribute types**. What it owns is a
+    *name* and the verifier that name gets: a discardable attribute whose prefix
+    is a registered dialect is routed to that dialect's
     `verifyOperationAttribute` hook, on any op, at every verification point. An
     undialected name (`tensor_layout = ...`) gets no hook at all, and a name
     prefixed with a dialect that does not implement the hook (`ktdp.…`) is
@@ -30,6 +30,14 @@ def TTS_Dialect : Dialect {
     parameter — needs its dialect loaded, and neither the KTIR scheduler nor
     `dbo-opt` loads ours. So the value of `tts.tensor_layout` is built out of
     builtin attributes only, and must stay that way.
+
+    The one op the dialect does define, `tts.tensor_layout`, is the *authoring*
+    form of that same layout and is bound by the same rule from the other side:
+    it is fully consumed before any artifact is written, by
+    `LowerDescriptorMemory`, which turns it into the attribute. An op does have
+    to be constructed, so one surviving into an artifact would fail at parse in
+    a consumer that does not load us — which is why the op and the attribute are
+    a before/after pair and never a choice of encoding for the same IR.
   }];
 
   let extraClassDeclaration = [{

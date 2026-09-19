@@ -7,11 +7,17 @@
 //   tt.descriptor_gather/scatter -> ktdp.construct_indirect_access_tile +
 //                                   ktdp.load/store
 //
+// It is also the writer of the `tts.tensor_layout` attribute: a descriptor
+// annotated with the `tts.tensor_layout` *op* has its layout moved onto the
+// memory view built for it, and the op and its bridge cast are erased. See
+// `LayoutAnnotation` below.
+//
 //===----------------------------------------------------------------------===//
 
 #include "Conversion/TritonToKTIR/Passes.h"
 #include "ConversionUtils.h"
 #include "Dialect/KTDP/Utils/Utility.h"
+#include "Dialect/TTS/IR/Dialect.h"
 #include "Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
@@ -521,6 +527,36 @@ struct ConvertDescriptorScatter
 };
 
 //===----------------------------------------------------------------------===//
+// Layout annotations
+//===----------------------------------------------------------------------===//
+
+/// One descriptor's `tts.tensor_layout` op, paired with the two ops walk 1 built
+/// for that descriptor.  Collected during walk 1 and applied after the partial
+/// conversion, because the cast is what the access-op patterns reach the memref
+/// *through* — it cannot go before they have run.
+///
+/// Only the `tts` op is collected. A descriptor annotated with
+/// `tt.spyre_tensor_layout` gets no entry and is left exactly as it was: its op
+/// and its cast both survive this pass, and the named
+/// `rewrite-descriptor-layout` consumes them later. The two spellings are
+/// discriminated here and nowhere else, structurally, with no flag.
+struct LayoutAnnotation {
+  mlir::triton::tts::TensorLayoutOp layoutOp;
+  Operation *memViewOp; ///< the ktdp.construct_memory_view to annotate
+  Operation *castOp;    ///< the memref -> !tt.tensordesc bridge to erase
+};
+
+/// Find the `tts.tensor_layout` op annotating `desc`, if any.  Called before
+/// walk 1's RAUW, so the users are still the descriptor's own.
+static mlir::triton::tts::TensorLayoutOp
+findLayoutOp(triton::MakeTensorDescOp descOp) {
+  for (Operation *user : descOp.getResult().getUsers())
+    if (auto layout = dyn_cast<mlir::triton::tts::TensorLayoutOp>(user))
+      return layout;
+  return {};
+}
+
+//===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
 
@@ -554,12 +590,17 @@ struct LowerDescriptorMemoryPass
     // ktdp.construct_access_tile + ktdp.load/store.
     OpBuilder builder(ctx);
     SmallVector<triton::MakeTensorDescOp> descOps;
+    SmallVector<LayoutAnnotation> annotations;
     module.walk([&](triton::MakeTensorDescOp op) { descOps.push_back(op); });
     for (auto descOp : descOps) {
       if (descOp.getResult().use_empty()) {
         descOp.erase();
         continue;
       }
+
+      // Read the annotation while the descriptor's users are still its own:
+      // after the RAUW below they are the cast's, and this op is one of them.
+      auto layoutOp = findLayoutOp(descOp);
 
       builder.setInsertionPoint(descOp);
       // Use the signless block element type, not raw `getBlockType()`.
@@ -586,6 +627,10 @@ struct LowerDescriptorMemoryPass
                          .getResult(0);
       descOp.getResult().replaceAllUsesWith(casted);
       descOp.erase();
+
+      if (layoutOp)
+        annotations.push_back({layoutOp, memView.getDefiningOp(),
+                               casted.getDefiningOp()});
     }
 
     // ---- Precondition check: every remaining access op's `desc` operand
@@ -633,8 +678,10 @@ struct LowerDescriptorMemoryPass
     //      verifying.  The access-op patterns then reach *through* the
     //      cast (via `getDescriptorMemView`) and consume the memref
     //      directly.  After all access ops are rewritten, the
-    //      descriptor side of the cast has no real consumers and is
-    //      cleaned up by canonicalize/DCE in the next pipeline stage.
+    //      descriptor side of the cast has no real consumers.  For a
+    //      descriptor carrying a `tts.tensor_layout` op this pass erases
+    //      it below; otherwise it is left for canonicalize/DCE in the
+    //      next pipeline stage.
     //
     //   2. `getBasePtrAsIndex` uses one to convert a `!tt.ptr` base
     //      pointer to `index`.  This cast survives this pass and is
@@ -644,8 +691,19 @@ struct LowerDescriptorMemoryPass
     //
     // Marking it legal here prevents `applyPartialConversion` from
     // treating either cast as an unconverted op and failing the pass.
+    //
+    // The two layout markers are legal for opposite reasons, and both
+    // entries are load-bearing:
+    //
+    //   * `tt.spyre_tensor_layout` is legal because it SURVIVES this pass
+    //     untouched, all the way to the named `rewrite-descriptor-layout`.
+    //   * `tts.tensor_layout` is legal because this pass erases it itself,
+    //     after the conversion rather than during it -- the conversion
+    //     driver would otherwise call it unconverted and fail the pass
+    //     before the erasure runs.
     target.addLegalOp<ModuleOp, UnrealizedConversionCastOp,
-                      triton::SpyreTensorLayoutOp>();
+                      triton::SpyreTensorLayoutOp,
+                      mlir::triton::tts::TensorLayoutOp>();
 
     RewritePatternSet patterns(ctx);
     patterns.add<ConvertDescriptorLoad, ConvertDescriptorStore,
@@ -655,6 +713,43 @@ struct LowerDescriptorMemoryPass
       module.emitError("LowerDescriptorMemory: failed to convert descriptor ops");
       signalPassFailure();
       return;
+    }
+
+    // ---- The layout moves onto its subject.
+    //
+    // Now, and not in walk 1, because the bridge cast is this pass's own
+    // intra-pass handoff: the access-op patterns reach the memref through it.
+    // Only once they have run is the cast dead and the layout's last reason to
+    // be carried beside the view instead of on it gone.
+    //
+    // Each annotation becomes three things: the attribute on the view, no
+    // marker op, and no cast. The attribute's value is built out of builtin
+    // attributes only -- a dictionary of the op's three dense i64 arrays,
+    // reused as-is -- which is what lets a consumer that does not load the
+    // `tts` dialect still parse it.
+    for (LayoutAnnotation &ann : annotations) {
+      ann.memViewOp->setAttr(
+          mlir::triton::tts::TTSDialect::kTensorLayoutAttrName,
+          builder.getDictionaryAttr({
+              builder.getNamedAttr(
+                  mlir::triton::tts::TTSDialect::kPhysSrcName,
+                  ann.layoutOp.getPhysSrcAttr()),
+              builder.getNamedAttr(
+                  mlir::triton::tts::TTSDialect::kPhysOpName,
+                  ann.layoutOp.getPhysOpAttr()),
+              builder.getNamedAttr(
+                  mlir::triton::tts::TTSDialect::kPhysArgName,
+                  ann.layoutOp.getPhysArgAttr()),
+          }));
+      ann.layoutOp.erase();
+      // The marker was the cast's last user on every path this pass admits --
+      // the pre-check refuses a descriptor whose access ops it cannot lower, and
+      // the conversion above rewrote the ones it could. Guarded rather than
+      // asserted so a future op taking a `!tt.tensordesc` leaves a live cast
+      // behind instead of tripping over an erase; the writer's lit tests pin the
+      // absence, which is where that regression would show up.
+      if (ann.castOp->use_empty())
+        ann.castOp->erase();
     }
   }
 };
