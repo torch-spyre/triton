@@ -365,6 +365,10 @@ const char *coordOpName(CoordOp op) {
 }
 
 /// Read the coord map off a marker, checking phys_src against `logicalRank`.
+///
+/// Most of what this checks, SpyreTensorLayoutOp::verify() checks too; the
+/// deletion note at the top of RewriteDescriptorLayout.cpp records that the
+/// overlap needs an owner when the op becomes a tts attribute.
 FailureOr<CoordMap> readCoordMap(triton::SpyreTensorLayoutOp marker,
                                  unsigned logicalRank) {
   CoordMap cm;
