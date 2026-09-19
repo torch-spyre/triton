@@ -70,7 +70,7 @@ tt.func @shared_index_value(%arg0: !tt.ptr<f32>) {
 // The divsi/remsi land inside the loop body, over the IV, and the loop itself is
 // left exactly as it is.
 //
-// This replaces rewrite-descriptor-layout-loop-rescale.mlir, whose whole subject
+// This replaces RewriteDescriptorLayout/loop-rescale.mlir, whose whole subject
 // was rescaling such a loop from block units to stick units. The old pass needed
 // that because it consumed the IV directly as a physical stick index, having
 // synthesized its own stick loops. Here the split is built at the subscript, so
