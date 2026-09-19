@@ -1,9 +1,12 @@
 // RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic -split-input-file -verify-diagnostics
 
+// A malformed marker, or a malformed KTIR chain beneath a well-formed one.
+//
 // Hand-crafted post-LowerDescriptorMemory KTIR, fed straight to the pass. These
 // diagnostics are unreachable from Triton-level input: the earlier passes
 // normalize the shapes, orders and sets involved, so only a module written at
-// this level can present them.
+// this level can present them. A marker that is well formed and merely ill-fitting
+// -- the kind the backend's own lowering does produce -- is in invalid-layout.mlir.
 //
 // Several of the marker's own fields are checked twice over -- once by
 // tt.spyre_tensor_layout's verifier and once by the pass -- and the verifier
@@ -139,30 +142,7 @@ tt.func @dynamic_block_shape(%arg0: !tt.ptr<f32>, %n: index) {
 
 // -----
 
-// Case 8 -- a sub-stick block on the split dim.
-//
-// The same rejection as case 1 of rewrite-descriptor-layout-generic-invalid.mlir,
-// reached here on a tile whose block is narrower than the view it reads, which
-// the earlier passes never produce.
-#id = affine_map<(d0, d1) -> (d0, d1)>
-#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 31 >= 0)>
-module {
-tt.func @sub_stick_block(%arg0: !tt.ptr<f32>) {
-  %c0 = arith.constant 0 : index
-  %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
-  %1 = ktdp.construct_memory_view %0, sizes: [64, 32], strides: [32, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<64x32xf32>
-  %2 = builtin.unrealized_conversion_cast %1 : memref<64x32xf32> to !tt.tensordesc<64x32xf32>
-  tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x32xf32>
-  // expected-error @below {{spyre_tensor_layout: block extent of stick dim (32) is smaller than the stick size (64); a stick dim cannot be sub-stick}}
-  %3 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #id, access_tile_set = #set} : memref<64x32xf32> -> !ktdp.access_tile<64x32xindex>
-  %4 = ktdp.load %3 : <64x32xindex> -> tensor<64x32xf32>
-  tt.return
-}
-}
-
-// -----
-
-// Case 9 -- a permuted access_tile_order.
+// Case 8 -- a permuted access_tile_order.
 //
 // The rebuilt tile states its order over the PHYSICAL dims and so recomputes it
 // as the identity. A permutation on the input says something about the logical
@@ -185,9 +165,9 @@ tt.func @permuted_access_tile_order(%arg0: !tt.ptr<f32>) {
 
 // -----
 
-// Case 10 -- a non-dense access_tile_set.
+// Case 9 -- a non-dense access_tile_set.
 //
-// Same reason as case 9 for the set rather than the order: it is recomputed as
+// Same reason as case 8 for the set rather than the order: it is recomputed as
 // the dense range of the physical block, so a strided set on the input would be
 // lost. This one is a stride-2 subset of the same range.
 #id = affine_map<(d0, d1) -> (d0, d1)>
@@ -209,7 +189,7 @@ tt.func @non_dense_access_tile_set(%arg0: !tt.ptr<f32>) {
 
 // -----
 
-// Case 11 -- an access tile user that is neither a load nor a store.
+// Case 10 -- an access tile user that is neither a load nor a store.
 //
 // Phase 1 re-points loads and stores at the physical tile; it has nothing to
 // re-point for anything else, and leaving the user on the erased logical tile
@@ -233,7 +213,7 @@ tt.func @unexpected_access_tile_user(%arg0: !tt.ptr<f32>) {
 
 // -----
 
-// Case 12 -- a non-splat constant on a physicalized chain.
+// Case 11 -- a non-splat constant on a physicalized chain.
 //
 // The accumulator inherits the store destination's layout, so the constant
 // behind it has to be restated at physical shape. A splat is a relabelling and
@@ -269,7 +249,7 @@ tt.func @non_splat_accumulator(%a: !tt.ptr<f32>, %c: !tt.ptr<f32>) {
 
 // -----
 
-// Case 13 -- a producer the rewrite cannot restate at physical shape.
+// Case 12 -- a producer the rewrite cannot restate at physical shape.
 //
 // tensor.empty, a splat constant and linalg.generic are the producers a shape
 // change propagates cleanly through. tensor.insert is not one: its result shape
@@ -307,7 +287,8 @@ tt.func @unrestatable_producer(%a: !tt.ptr<f32>, %c: !tt.ptr<f32>) {
 
 // -----
 
-// A value the rewrite retyped, read by something that is not a linalg.generic.
+// Case 13 -- a value the rewrite retyped, read by something that is not a
+// linalg.generic.
 //
 // tensor.extract_slice is the reachable shape of this: LowerComputeOps lowers
 // tt.split to a pair of them, so the op arrives from the same pipeline that
