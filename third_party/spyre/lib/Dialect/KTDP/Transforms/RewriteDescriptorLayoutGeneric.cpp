@@ -49,6 +49,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 
@@ -733,6 +734,83 @@ AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
     }
   }
   return AffineMap::get(dom.numLoopDims, /*symbolCount=*/0, results, ctx);
+}
+
+//===----------------------------------------------------------------------===//
+// Postconditions on the rebuilt maps
+//
+// Two properties of this pass's OWN OUTPUT, so they are assertions rather than
+// diagnostics: valid input that violates either is a bug in the rebuild to fix,
+// not an input to decline. Neither is therefore reachable from a negative lit
+// test, which is the same character verifyAttributesCarried has -- a self-check
+// on the rewrite, checkable only by running the rewrite on input it accepts, so
+// what covers them is the positive cases, all of them at once.
+//===----------------------------------------------------------------------===//
+
+/// The loop dims `e` names, left to right — a linearized composite reading as
+/// its stick half then its lane half. Constants name none.
+void collectNamedLoopDims(AffineExpr e, SmallVectorImpl<unsigned> &out) {
+  if (auto dim = dyn_cast<AffineDimExpr>(e)) {
+    out.push_back(dim.getPosition());
+    return;
+  }
+  if (auto bin = dyn_cast<AffineBinaryOpExpr>(e)) {
+    collectNamedLoopDims(bin.getLHS(), out);
+    collectNamedLoopDims(bin.getRHS(), out);
+  }
+}
+
+/// (i) Every loop dim of the rebuilt domain is named by at least one operand's
+/// rebuilt map.
+///
+/// Linalg's own verifier would catch a violation — a loop dim named by no map
+/// makes the concatenated map non-invertible — but it catches it as `invalid
+/// indexing maps are non-invertible` several stages downstream, attributed to
+/// nobody. This pass built the domain, so asserting it here attributes it here.
+[[maybe_unused]] bool everyLoopDimIsNamed(ArrayRef<AffineMap> maps,
+                                          unsigned numLoopDims) {
+  llvm::SmallBitVector named(numLoopDims);
+  SmallVector<unsigned> dims;
+  for (AffineMap m : maps)
+    for (AffineExpr r : m.getResults()) {
+      dims.clear();
+      collectNamedLoopDims(r, dims);
+      for (unsigned d : dims)
+        named.set(d);
+    }
+  return named.all();
+}
+
+/// (ii) The result operand's map names the loop dims in strictly increasing
+/// order, reading each linearized composite left to right — EXCEPT for the
+/// splat physical dims, which are excluded.
+///
+/// The ordering exists for this: the result's coordinate order is the one the
+/// generic does not get to choose, so its map has to take the loop dims in the
+/// order its own physical type lays them out, and buildLoopDomain seeds the
+/// numbering from exactly that.
+///
+/// The splat dims are excluded because the code does not establish the property
+/// for them and is right not to. A splat names no domain piece, so it takes no
+/// part in the ordering and is given its loop AFTER the pieces are numbered —
+/// the last loop dim, wherever the splat sits in the operand's physical order.
+/// A result whose splat is not last therefore has a non-monotone map by
+/// construction: rebuild-reduction.mlir case 3 pins `(d0, d1, d2, d3) -> (d3,
+/// d1)`, which is correct and which linalg accepts, since a projected
+/// permutation need not be monotone. Asserting monotonicity over the splat dims
+/// too would be asserting something this pass never promised.
+[[maybe_unused]] bool resultMapIsMonotone(const RebuildOperand &result,
+                                          AffineMap map) {
+  SmallVector<unsigned> dims;
+  for (unsigned p = 0, e = map.getNumResults(); p < e; ++p) {
+    if (result.layout && result.layout->opAt(p) == CoordOp::Splat)
+      continue;
+    collectNamedLoopDims(map.getResult(p), dims);
+  }
+  for (unsigned i = 1; i < dims.size(); ++i)
+    if (dims[i - 1] >= dims[i])
+      return false;
+  return true;
 }
 
 /// Rebuild the iterator types over `dom`.
@@ -1460,6 +1538,11 @@ struct RewriteDescriptorLayoutGenericPass
     SmallVector<AffineMap> physMaps;
     for (const RebuildOperand &o : rebuildOperands)
       physMaps.push_back(rebuildMap(o, *dom, ctx));
+
+    assert(everyLoopDimIsNamed(physMaps, dom->numLoopDims) &&
+           "a rebuilt loop dim is named by no operand's map");
+    assert(resultMapIsMonotone(rebuildOperands[resultIdx], physMaps[resultIdx]) &&
+           "the result's map takes the loop dims out of order");
 
     SmallVector<utils::IteratorType> physIterators =
         rebuildIterators(op.getIteratorTypesArray(), *dom);
