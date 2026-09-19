@@ -872,6 +872,9 @@ struct RewriteDescriptorLayoutGenericPass
 
   /// Attributes this pass owns on a physicalized op — the ones whose value is a
   /// function of the shape, and so must be recomputed rather than carried.
+  ///
+  /// Per op, this is also the only place that says which attributes the rewrite
+  /// of that op restates.
   static bool isShapeOwnedAttr(StringRef name, Operation *op) {
     if (isa<mlir::ktdp::ConstructMemoryViewOp>(op))
       return name == "static_sizes" || name == "static_strides" ||
@@ -879,14 +882,28 @@ struct RewriteDescriptorLayoutGenericPass
     if (isa<mlir::ktdp::ConstructAccessTilesOp>(op))
       return name == "base_map" || name == "access_tile_set" ||
              name == "access_tile_order" || name == "operandSegmentSizes";
+    if (isa<mlir::ktdp::ConstructIndirectAccessTilesOp>(op))
+      return name == "per_dim_subscript_kinds" ||
+             name == "per_dim_subscript_maps" ||
+             name == "variables_space_set" ||
+             name == "variables_space_order" || name == "operandSegmentSizes";
     if (isa<linalg::GenericOp>(op))
       return name == "indexing_maps" || name == "iterator_types" ||
              name == "operandSegmentSizes";
     return false;
   }
 
-  /// Assert that cloning carried everything this pass does not own.
-  LogicalResult verifyNothingDropped(Operation *original, Operation *rewritten) {
+  /// Check that physicalizing an op carried every attribute this pass does not
+  /// own, unchanged.
+  ///
+  /// Attributes only — not operands, not the location, not the region. That is
+  /// the scope worth checking, because attribute loss is the loss that is
+  /// invisible: each physicalize function clones its op and mutates the fields it
+  /// owns, so an attribute nobody thought to carry is simply absent and the
+  /// result still verifies. A dropped operand, by contrast, fails the op's own
+  /// verifier on the spot.
+  LogicalResult verifyAttributesCarried(Operation *original,
+                                        Operation *rewritten) {
     for (NamedAttribute attr : original->getAttrs()) {
       StringRef name = attr.getName().strref();
       if (isShapeOwnedAttr(name, original))
@@ -941,7 +958,7 @@ struct RewriteDescriptorLayoutGenericPass
                         cast<MemRefType>(memViewOp.getResult().getType())
                             .getElementType()));
 
-    if (failed(verifyNothingDropped(memViewOp, physOp)))
+    if (failed(verifyAttributesCarried(memViewOp, physOp)))
       return failure();
     (void)loc;
     return physOp.getResult();
@@ -1048,7 +1065,7 @@ struct RewriteDescriptorLayoutGenericPass
     physTile.getResult().setType(
         mlir::ktdp::AccessTileType::get(physBlock, b.getIndexType()));
 
-    if (failed(verifyNothingDropped(tileOp, physTile)))
+    if (failed(verifyAttributesCarried(tileOp, physTile)))
       return failure();
 
     LLVM_DEBUG(llvm::dbgs()
@@ -1216,6 +1233,18 @@ struct RewriteDescriptorLayoutGenericPass
         tileOp.getCapturedVariables(), tileOp.getSymbolOperands(),
         buildRangeSetND(ctx, physBlock),
         AffineMap::getMultiDimIdentityMap(physRank, ctx));
+
+    // Built rather than cloned: the physical tile's variable space has a
+    // different number of intermediate variables, which are this op's region's
+    // block arguments, so there is no clone-and-retype to do. Everything the
+    // builder does not take is therefore carried across by hand — and then held
+    // to the same standard as the cloned ops below.
+    for (NamedAttribute attr : tileOp->getAttrs())
+      if (!isShapeOwnedAttr(attr.getName().strref(), tileOp))
+        physTile->setAttr(attr.getName(), attr.getValue());
+
+    if (failed(verifyAttributesCarried(tileOp, physTile)))
+      return failure();
 
     for (Operation *user :
          llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
@@ -1484,7 +1513,7 @@ struct RewriteDescriptorLayoutGenericPass
          llvm::zip_equal(physOp.getResults(), physOp.getDpsInits()))
       res.setType(out.getType());
 
-    if (failed(verifyNothingDropped(op, physOp)))
+    if (failed(verifyAttributesCarried(op, physOp)))
       return failure();
 
     op.getResults().replaceAllUsesWith(physOp.getResults());
