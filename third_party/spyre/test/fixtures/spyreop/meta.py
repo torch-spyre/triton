@@ -13,8 +13,8 @@ not an oversight:
 package (``ls`` its ``dialects/`` only lists ``arith``, ``math``, ``linalg``,
 ``tensor``, ``scf``, ``ktdp``; grepping the whole package for
 ``spyreop``/``SpyreOp`` returns nothing). And ``lower_spyre_ops`` (the pass
-this fixture is named for) only runs as part of ``_SPYRECODE_STAGE_PASSES``
-(see ``backend/compiler.py``), applied only to compiles that go on to build a
+this fixture is named for) only runs as part of ``buildSpyrecodePipeline``
+(see ``lib/Pipeline.cpp``), applied only to compiles that go on to build a
 real Spyre binary via ``dbo-opt`` -- i.e. only to Level D compiles. Put those
 two facts together: a Level A/B variant here can only ever see
 ``math.<op>``/``arith.divf``/``arith.addi``/``arith.muli`` -- pre-

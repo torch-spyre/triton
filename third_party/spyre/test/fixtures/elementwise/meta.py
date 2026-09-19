@@ -714,7 +714,7 @@ VARIANTS = {
     # The op x dtype product on ktir_cpu. Deliberately the simplest shape in
     # the file -- 1D, static, one tile, no layout -- so arithmetic is the only
     # thing that differs between its entries. LowerSpyreOps (#107) only runs
-    # at the spyrecode stage (_SPYRECODE_STAGE_PASSES), after ktir_cpu's own
+    # at the spyrecode stage (buildSpyrecodePipeline), after ktir_cpu's own
     # module is already built, so this variant's math/arith ops stay in their
     # plain dialect spelling and every combo is reachable end to end.
     # -----------------------------------------------------------------------

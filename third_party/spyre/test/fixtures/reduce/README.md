@@ -113,9 +113,10 @@ V1 only supports add/mul/sub/reduce compute ops; found unsupported compute op
 naming the neutral-element `linalg.fill` that `LowerComputeOps` puts on the
 reduction's `outs`. `linalg.reduce` is itself in that allowlist; the fill beside
 it is not. `DropReductionInitFill` removes exactly that fill, and the backend runs
-it unconditionally in `_make_spyrecode`, out of `_SPYRECODE_STAGE_PASSES` — the
-binary path only, since nothing that stops at KTIR cares. With it, our emission
-matches torch-spyre's, whose emitter never writes a fill in the first place.
+it unconditionally in the spyrecode stage, out of `buildSpyrecodePipeline`'s own
+list — the binary path only, since nothing that stops at KTIR cares. With it, our
+emission matches torch-spyre's, whose emitter never writes a fill in the first
+place.
 
 It lives on the binary path rather than in the pipeline every path crosses because
 it is a requirement of dbo-opt, not of the IR — and because the pass refuses any

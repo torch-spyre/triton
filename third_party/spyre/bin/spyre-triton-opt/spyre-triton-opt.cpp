@@ -13,6 +13,7 @@ int main(int argc, char **argv) {
   mlir::registerAllPasses();
   mlir::triton::registerTritonPasses();
   mlir::triton::spyre::registerPasses();
+  mlir::triton::spyre::registerPipelines();
 
   mlir::DialectRegistry registry;
   registry.insert<mlir::triton::TritonDialect>();

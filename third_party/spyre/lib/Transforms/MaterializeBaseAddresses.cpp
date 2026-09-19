@@ -12,9 +12,10 @@
 //       ... %a ... %b ...                     %1 = arith.constant 12288 : index
 //                                             ... %0 ... %1 ...
 //
-// This is an **opt-in** mode for scheduler testing. The pass is not
-// in _CORE_PIPELINE_PASSES nor in the fused add_convert_ttir_to_ktdp binding;
-// it is reached only via the `required_fixes` mechanism in
+// This is an **opt-in** mode. It is absent from buildTTIRToKTIRPipeline, so the
+// cached .ktir artifact keeps its arguments; buildSpyrecodePipeline installs it
+// under its own flag, and a caller wanting it during the earlier stage instead
+// reaches it through the `required_fixes` mechanism in
 // third_party/spyre/backend/compiler.py. With no addresses supplied it is a
 // no-op, so the default argument-passing path is unchanged.
 //

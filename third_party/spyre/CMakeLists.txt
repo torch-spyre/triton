@@ -27,6 +27,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
   add_triton_plugin(TritonSpyre
     ${CMAKE_CURRENT_SOURCE_DIR}/triton_spyre.cc
     LINK_LIBS SpyreRegisterEverything
+              SpyrePipeline
               TritonToKTIR KTDPTransforms SpyreTransforms
               MLIRLinalgTransforms)
   target_link_libraries(TritonSpyre PRIVATE Python3::Module pybind11::headers)
