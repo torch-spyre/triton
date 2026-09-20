@@ -12,6 +12,12 @@
 // an individual pass any more, so the create* factories are reached only from
 // Pipeline.cpp and from each group's own registration.
 #include "Pipeline.h"
+// The one dialect of ours a kernel is authored in, for the op builder below.
+#include "Dialect/TTS/IR/Dialect.h"
+// TritonOpBuilder, defined header-only under python/src/. That directory is on
+// the include path here because the top-level CMakeLists adds it before it adds
+// third_party/<backend>, so a backend can reach it without naming a path.
+#include "ir.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/IntegerSet.h"
@@ -67,6 +73,44 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // factories, where a name cannot be misspelled. A single pass is still
   // drivable, from `spyre-triton-opt` by its registered CLI flag, which is where
   // the .mlir tests reach it.
+}
+
+void init_triton_spyre_ir_builders(py::module &&m) {
+  // Op builders for the `tts` dialect, called from the Triton frontend --
+  // tl.spyre_tensor_layout, through triton.language.semantic.
+  //
+  // The frontend reaches this as `from triton._C.libtriton import spyre`, lazily
+  // -- an import at module scope in semantic.py would make every backend's
+  // frontend depend on a submodule only a Spyre build has.
+  //
+  // TritonOpBuilder crosses from ir.cc's bindings into this function's signature
+  // even though it is bound `py::module_local()`, because module-local means the
+  // pybind *module*, and this file is compiled into the same libtriton as ir.cc
+  // -- one PYBIND11_MODULE, this a submodule of it. `pass_manager` above is the
+  // same arrangement and has always worked.
+  m.def("create_tensor_layout",
+        [](TritonOpBuilder &self, mlir::Value &desc,
+           std::vector<int64_t> &physSrc, std::vector<int64_t> &physOp,
+           std::vector<int64_t> &physArg) -> void {
+          // LOAD, not register. `spyre.load_dialects` has already put tts in the
+          // context's registry -- but a registry entry only makes a dialect
+          // *loadable*, and constructing an op needs it *loaded*. Every other
+          // producer of one of our ops is a pass, where the pass manager loads
+          // `dependentDialects` for us; the frontend has no pass manager, so this
+          // is the one place that has to ask. Without it the failure is
+          // `LLVM ERROR: tts.tensor_layout created with unregistered dialect`,
+          // an abort with no Python traceback to the kernel line. Idempotent, so
+          // per-op is the right granularity: it costs a map lookup and there is
+          // no earlier hook in this module that the frontend is guaranteed to
+          // cross.
+          self.getContext()->loadDialect<mlir::triton::tts::TTSDialect>();
+
+          auto &builder = self.getBuilder();
+          self.create<mlir::triton::tts::TensorLayoutOp>(
+              desc, builder.getDenseI64ArrayAttr(physSrc),
+              builder.getDenseI64ArrayAttr(physOp),
+              builder.getDenseI64ArrayAttr(physArg));
+        });
 }
 
 void init_triton_spyre_ir_utils(py::module &&m) {
@@ -129,7 +173,9 @@ void init_triton_spyre(py::module &&m) {
   init_triton_spyre_passes_ttir_to_ktdp(
       passes.def_submodule("ttir_to_ktdp"));
 
-  // IR utilities submodule
+  // Op builders the frontend calls, and IR introspection the tests call. Two
+  // submodules because the first writes IR and the second only reads it.
+  init_triton_spyre_ir_builders(m.def_submodule("ir_builders"));
   init_triton_spyre_ir_utils(m.def_submodule("ir_utils"));
 
   // Dialect registration. Appends to a context Triton has already populated

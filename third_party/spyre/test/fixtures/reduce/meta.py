@@ -449,7 +449,16 @@ VARIANTS = {
             "M": [64], "BLOCK_M": [64], "OP": ["sum"],
         },
         "grid":        [1],
-        "data_layout": "host",
+        # No "data_layout". It selected the NAMED RewriteDescriptorLayout's
+        # "device"/"host" stride mode, and that pass roots on a
+        # tt.spyre_tensor_layout op. tl.spyre_tensor_layout authors
+        # tts.tensor_layout now, so the named pass no-ops on every kernel in this
+        # tree and the option reached nothing. The generic pass that physicalizes
+        # these -- in the spyrecode stage -- has no equivalent option and needs
+        # none: a caller wanting the logical form reads the ktir artifact, which
+        # is logical. Removed rather than left as dead config, because conftest
+        # forwards any key naming a SpyreOptions field and the field still
+        # exists, so it would have kept being passed and kept doing nothing.
         "output_key":  "out_ptr",
         "rtol":        1e-2,
         "atol":        5e-2,
@@ -481,7 +490,6 @@ VARIANTS = {
             "OUT_LAYOUT": [None], "OP": ["sum"],
         },
         "grid":        [1],
-        "data_layout": "host",
         "output_key":  "out_ptr",
         "rtol":        1e-4,
         # linalg.reduce accumulates the 96 terms in a different order than
@@ -555,7 +563,6 @@ VARIANTS = {
         "grid":        [1],
         # No tl.program_id, so DistributeWork has nothing to place and the
         # presence check would fail on a kernel that is correct.
-        "data_layout": "host",
         "compiles_to_binary": True,
         "output_key":  "out_ptr",
         "rtol":        1e-2,
