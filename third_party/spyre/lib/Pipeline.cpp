@@ -139,12 +139,26 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   //
   // Why DropReductionInitFill exists at all: LowerComputeOps gives every reduction
   // a zero `linalg.fill` on its `outs` per upstream linalg semantics, and the
-  // scheduler's allowlist is add/mul/sub/reduce. Device-only in both senses the
-  // stage's rule names -- it admits addf/subf alone, because the scheduler resets
-  // an accumulator to zero whatever the combiner is, so mul and max/min would get
-  // the wrong answer and are refused rather than silently lowered. A reduce
-  // stripped of its neutral element is correct only given that same zero-reset
-  // guarantee, which no KTIR reader can see.
+  // scheduler's allowlist is add/mul/sub/reduce, which rejects the fill.
+  //
+  // Device-only by the SECOND half of the stage's rule in Pipeline.h -- its output
+  // is not standalone KTIR. A reduce stripped of its neutral element means what it
+  // says only because a downstream pass writes the accumulator before it is read,
+  // and that pass is MapReductionPartials' initializer, which ktir_cpu never runs.
+  // No KTIR reader can see that.
+  //
+  // NOT by the first half, which used to be stated here and is false: the
+  // scheduler does not reset an accumulator to zero whatever the combiner is.
+  // MapReductionPartials' lowerIterArgInitializer asks getNeutralAttr and fills
+  // with the answer -- 0.0 for addf/subf, 1.0 for mulf, -inf for maximumf, +inf
+  // for minimumf, and the integer counterparts. So the combiner a reduction uses
+  // is not by itself a reason to refuse it, and the reason the pass admits
+  // addf/subf alone is narrower and per-combiner: see isZeroNeutralCombiner in
+  // DropReductionInitFill.cpp, which states it correctly.
+  //
+  // The conclusion is unchanged and the pass does not move. Recorded because the
+  // wrong reason is the more memorable one, and it is the reason that would
+  // justify moving the pass back.
   pm.addPass(createDropReductionInitFillPass());
   pm.addPass(mlir::createConvertElementwiseToLinalgPass());
   pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
