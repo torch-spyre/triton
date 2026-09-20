@@ -221,12 +221,21 @@ struct DropReductionInitFillPass
         continue;
 
       if (!isZeroNeutralCombiner(payload)) {
+        // Says only what isZeroNeutralCombiner justifies, and no longer that the
+        // scheduler resets to zero regardless of the combiner. It does not:
+        // MapReductionPartials' lowerIterArgInitializer asks getNeutralAttr and
+        // fills with the per-combiner answer. The refusals are per-combiner too --
+        // a wrong neutral for mul, a mis-lowering for maxnumf, a float-attribute
+        // reset that aborts on the integer ops -- and reporting them as one rule
+        // named a reason that is false for every arm, `arith.addi` most visibly,
+        // whose neutral IS zero.
         op->emitError("reduction 'outs' operand #")
             << out.getOperandNumber() << " is combined with '"
             << payload->getName().getStringRef()
-            << "', whose neutral element is not zero; the dataflow-scheduler "
-               "resets a reduction accumulator to zero regardless of the "
-               "combiner, so this reduction cannot be lowered correctly at all";
+            << "', which the dataflow scheduler does not lower correctly against "
+               "a dropped neutral element; only arith.addf and arith.subf do. See "
+               "isZeroNeutralCombiner (DropReductionInitFill.cpp) for why each of "
+               "the others is refused -- the reasons differ per combiner";
         result = failure();
         continue;
       }
