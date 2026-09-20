@@ -75,7 +75,7 @@ def UnaliasLinalgOuts : Pass<"unalias-linalg-outs", "mlir::ModuleOp"> {
 }
 
 def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
-    let summary = "Drop a zero linalg.fill that initialises a reduction's outs.";
+    let summary = "Drop the linalg.fill that initialises a reduction's outs.";
     let description = [{
         Input: any IR containing linalg ops on ranked tensors. Matches the
         LinalgOp interface but only ops with at least one reduction iterator, so
@@ -85,23 +85,30 @@ def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
         pipeline, tt.splat.
 
         Lowering:
-        - reduction whose outs[i] is defined by a linalg.fill of a constant zero
-          (float or integer, +0.0 and -0.0 alike) writing into a tensor.empty
-          → outs[i] repointed at that tensor.empty, and the fill erased once
-          dead.
-        - Same shape, but the fill value is not zero → rejected with a
-          diagnostic.
+        - single-ins, single-init reduction with a simple body (payload + yield,
+          init read by the payload) whose outs[i] is defined by a linalg.fill
+          writing into a tensor.empty → outs[i] repointed at that tensor.empty,
+          and the fill erased once dead. Any fill value, any combiner.
+        - Any other shape — matmul or another multi-operand contraction, a
+          multi-result reduction, a compound body → left alone, silently. The
+          fill is load-bearing there because nothing downstream re-establishes
+          the accumulator.
         - A fill writing into anything other than tensor.empty → left alone;
           repointing outs at it would substitute live contents for the stated
           initial value.
 
+        The pass never fails: it either rewrites or leaves the IR alone.
+
         A reduction's payload reads its outs operand, so dropping the init is
-        sound only because the scheduler emits its own accumulator reset ahead of
-        the reduction loop. That reset is hardcoded to zero, which is why the
-        gate is the literal value zero rather than the combiner's neutral
-        element: a mulf reduction initialised to 1.0 would be reset to zero by
-        the scheduler whatever this pass does, so it is reported instead of
-        silently lowered.
+        sound only because the scheduler re-establishes the accumulator ahead of
+        the reduction loop, with the neutral element of that reduction's own
+        combiner (MapReductionPartials, via getNeutralAttr). That is a claim
+        about the backend which this IR cannot express and this pass cannot
+        verify, so the gate is shape only — a combiner the backend does not
+        handle is the backend's diagnostic to emit, not a reason to refuse here.
+        The residual unsoundness is a *seeded* reduction (a non-neutral fill,
+        e.g. addf over 2.5), which no neutral element can recover; nothing above
+        this pass can express one, since tt.reduce has no init operand.
 
         That makes this a deliberate, narrow exception to the rule
         UnaliasLinalgOuts enforces. That pass refuses exactly this rewrite,
@@ -115,7 +122,8 @@ def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
         and rejects the fill; widening that allowlist alone turns the rejection
         into an assertion failure in ConstructThreeStagePipeline, which admits
         one compute op per group and cannot fuse a producer feeding an init
-        operand.
+        operand. The pass becomes unnecessary once downstream consumes that fill
+        directly, and deletion is the intended end state rather than more gates.
 
         Ordering: must run after LowerComputeOps, the pass that creates the fill;
         anchored earlier it is a silent no-op. Independent of
