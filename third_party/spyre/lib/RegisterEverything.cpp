@@ -45,12 +45,11 @@ namespace {
 // values.
 struct TTIRToKTIRCLIOptions
     : public mlir::PassPipelineOptions<TTIRToKTIRCLIOptions> {
-  Option<std::string> dataLayout{
-      *this, "data-layout",
-      llvm::cl::desc("HBM data layout: 'device' for stickified row-major "
-                     "physical strides, 'host' for strides derived from the "
-                     "logical ones through the coordinate map"),
-      llvm::cl::init("device")};
+  // No data-layout. It selected the named RewriteDescriptorLayout's stride mode,
+  // which no longer reaches a compiled artifact -- that pass roots on
+  // tt.spyre_tensor_layout and the frontend authors tts.tensor_layout. Reach the
+  // pass's own option directly (--rewrite-descriptor-layout=data-layout=...) to
+  // exercise both modes.
   ListOption<int64_t> grid{
       *this, "grid",
       llvm::cl::desc("Per-axis partition of the Spyre hardware grid, one entry "
@@ -84,7 +83,6 @@ void mlir::triton::spyre::registerPipelines() {
       "The backend's `ktir` compile stage, whole: Triton IR in, KTIR out.",
       [](OpPassManager &pm, const TTIRToKTIRCLIOptions &cli) {
         TTIRToKTIRPipelineOptions options;
-        options.dataLayout = cli.dataLayout;
         options.grid.assign(cli.grid.begin(), cli.grid.end());
         buildTTIRToKTIRPipeline(pm, options);
       });

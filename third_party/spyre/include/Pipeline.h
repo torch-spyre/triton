@@ -36,20 +36,6 @@ class OpPassManager;
 namespace mlir::triton::spyre {
 
 struct TTIRToKTIRPipelineOptions {
-  /// The named RewriteDescriptorLayout's HBM layout: "device" (stickified
-  /// row-major physical strides) or "host" (strides derived from the logical
-  /// ones). Anything else is read as "host" by the pass itself.
-  ///
-  /// It reaches the named pass and nothing else, and that pass is inert for every
-  /// kernel the Triton frontend produces: the frontend authors `tts.tensor_layout`
-  /// and the named pass roots on `tt.spyre_tensor_layout`. So this selects nothing
-  /// for a real compile today. Kept rather than dropped because the pass is kept,
-  /// on device coverage rather than on a date -- and because dropping it would
-  /// change every kernel's options hash, and so its cache key, for no change in
-  /// the artifact. The generic layout pass that replaced it, in the `spyrecode`
-  /// stage, has no equivalent option and needs none.
-  std::string dataLayout = "device";
-
   /// DistributeWork's per-axis partition of the hardware grid. Empty leaves
   /// the pass's own default.
   std::vector<int64_t> grid;

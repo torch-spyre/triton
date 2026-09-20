@@ -47,15 +47,12 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // "unset".
   m.def(
       "add_ttir_to_ktir_pipeline",
-      [](mlir::PassManager &pm, const std::string &data_layout,
-         const std::vector<int64_t> &grid) {
+      [](mlir::PassManager &pm, const std::vector<int64_t> &grid) {
         mlir::triton::spyre::TTIRToKTIRPipelineOptions options;
-        options.dataLayout = data_layout;
         options.grid = grid;
         mlir::triton::spyre::buildTTIRToKTIRPipeline(pm, options);
       },
-      py::arg("pm"), py::arg("data_layout") = "device",
-      py::arg("grid") = std::vector<int64_t>{});
+      py::arg("pm"), py::arg("grid") = std::vector<int64_t>{});
   m.def(
       "add_spyrecode_pipeline",
       [](mlir::PassManager &pm, bool bind_base_addresses,

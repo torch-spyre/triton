@@ -102,10 +102,6 @@ tier. Nothing numerical covers it. Closing that needs a fixture able to ask for
 the `spyrecode` stage's artifact, which no field does today; until then, do not
 read a green Level C variant as evidence about a layout.
 
-It also means an `xfail_numerical` reason can legitimately be about the
-interpreter meeting *logical* IR it has no case for, with nothing wrong in the
-compiler — `elementwise__1d_compute_intdiv` is exactly that.
-
 Structural claims about the lowered IR are **not** made here. They live in the
 lit/FileCheck suite, whose layout mirrors `lib/` -- `test/Conversion/`,
 `test/Dialect/` and `test/Transforms/` -- which pins the exact IR a
