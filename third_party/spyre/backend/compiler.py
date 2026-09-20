@@ -587,10 +587,7 @@ class SpyreBackend(BaseBackend):
         # !tt.ptr arguments the footprint is attributed to, so after this pipeline
         # there is neither a marker to read nor a pointer to key it by.
         #
-        # NOT gated on options.symbolic_args, unlike the base addresses below. The
-        # footprint is a property of the layout rather than of how addresses reach
-        # the kernel, and symbolic mode is where it matters most: there is no
-        # 16 GiB segment gap for an overrun to land harmlessly in.
+        # NOT gated on options.symbolic_args, unlike the base addresses below.
         metadata["device_layouts"] = tensor_layout.capture_device_layouts(mod)
 
         # Only the address-binding mode has any use for these. Inferring them in
