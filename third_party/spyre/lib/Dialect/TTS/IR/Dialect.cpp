@@ -29,6 +29,17 @@ void TTSDialect::initialize() {
       >();
 }
 
+std::optional<CoordOp> symbolizeCoordOp(int64_t code) {
+  switch (static_cast<CoordOp>(code)) {
+  case CoordOp::Identity:
+  case CoordOp::FloorDiv:
+  case CoordOp::Mod:
+  case CoordOp::Splat:
+    return static_cast<CoordOp>(code);
+  }
+  return std::nullopt;
+}
+
 std::optional<int64_t> applyStatic(int64_t logical, CoordOp op, int64_t arg) {
   switch (op) {
   case CoordOp::Identity:
@@ -179,30 +190,42 @@ LogicalResult verifyTensorLayoutArrays(
 
     // phys_op[k] is static_cast to a CoordOp enum and switched on without a
     // default; an unknown code leaves the derived coordinate expression unset.
-    if (op[k] < 0 || op[k] > 3)
+    // Through symbolizeCoordOp, and the codes in the message through the enum,
+    // so that the numbering is stated once -- in CoordOp -- rather than spelled
+    // as literals a few lines from the enum that owns it.
+    std::optional<CoordOp> coordOp = symbolizeCoordOp(op[k]);
+    if (!coordOp)
       return emitError()
-             << "tts.tensor_layout: phys_op[" << k
-             << "] must be 0 (identity), 1 (floordiv), 2 (mod) or 3 (splat), "
-                "got "
+             << "tts.tensor_layout: phys_op[" << k << "] must be "
+             << static_cast<int64_t>(CoordOp::Identity) << " (identity), "
+             << static_cast<int64_t>(CoordOp::FloorDiv) << " (floordiv), "
+             << static_cast<int64_t>(CoordOp::Mod) << " (mod) or "
+             << static_cast<int64_t>(CoordOp::Splat) << " (splat), got "
              << op[k];
 
     // phys_arg is the floordiv divisor / mod modulus / splat lane count; 0
     // divides by zero when deriving physical extents and yields a zero-width
     // stick or a zero-lane splat.
-    if (op[k] != 0 && arg[k] <= 0)
+    if (*coordOp != CoordOp::Identity && arg[k] <= 0)
       return emitError() << "tts.tensor_layout: phys_arg[" << k
                          << "] must be > 0 for a floordiv/mod/splat dim, got "
                          << arg[k];
 
     ++numTotal[src[k]];
-    if (op[k] == 0)
+    switch (*coordOp) {
+    case CoordOp::Identity:
       ++numIdentity[src[k]];
-    else if (op[k] == 1)
+      break;
+    case CoordOp::FloorDiv:
       ++numFloorDiv[src[k]];
-    else if (op[k] == 2)
+      break;
+    case CoordOp::Mod:
       ++numMod[src[k]];
-    else
+      break;
+    case CoordOp::Splat:
       ++numSplat[src[k]];
+      break;
+    }
   }
 
   // A logical dim may legitimately span two physical dims in two ways:

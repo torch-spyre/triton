@@ -43,6 +43,15 @@ namespace mlir::triton::tts {
 /// attribute's own numbering.
 enum class CoordOp : int64_t { Identity = 0, FloorDiv = 1, Mod = 2, Splat = 3 };
 
+/// `code` as a CoordOp, or `std::nullopt` if it names none.
+///
+/// The range check and the enum in one place, so that a consumer validating
+/// `phys_op[k]` cannot spell the bound as a literal that a new enumerator would
+/// silently invalidate — which is what `verifyTensorLayoutArrays` used to do.
+/// Written as a switch rather than as `code <= 3` for the same reason: adding an
+/// enumerator makes the compiler ask about this function.
+std::optional<CoordOp> symbolizeCoordOp(int64_t code);
+
 /// The physical extent one coordinate op gives one logical extent, or
 /// `std::nullopt` when it is not a compile-time answer.
 ///
@@ -206,7 +215,8 @@ bool evaluateDeviceLayout(ArrayRef<int64_t> logSizes,
 /// What it enforces, and nothing else:
 ///   - the three arrays are parallel (equal length) and non-empty;
 ///   - `phys_src[k]` is in `[0, logicalRank)`;
-///   - `phys_op[k]` is one of 0 identity, 1 floordiv, 2 mod, 3 splat;
+///   - `phys_op[k]` names a `CoordOp` (checked through `symbolizeCoordOp`, so
+///     the numbering is not restated here);
 ///   - `phys_arg[k] > 0` wherever `phys_op[k]` is not identity;
 ///   - a logical dim named by more than one physical dim is named either as a
 ///     stick split (one floordiv + one mod) or a splat re-stick (one identity +
