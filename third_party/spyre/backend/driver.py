@@ -10,6 +10,7 @@ from triton import knobs
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import DriverBase
 
+from . import tensor_layout
 from .compiler import SPYRE_CODE_DIR, SPYRECODE_JSON
 
 
@@ -236,6 +237,13 @@ class SpyreLauncher:
         Order is the binding, not merely a convention: the correction flit is
         built by walking these positionally, so segment *i* belongs to argument
         *i* and a reordering silently patches the wrong segments.
+
+        That ordering is also what makes this the place the device-layout claims
+        are checked. The compile recorded them keyed by pointer *ordinal*, because
+        the IR carries no argument names; this loop produces exactly that sequence,
+        and it is the one place that has both the ordinal and the name a diagnostic
+        needs. See ``backend/tensor_layout.py`` for what the claim is and why the
+        two numbers it compares never met before.
         """
         names = list(self.src.signature)
         if len(args) != len(names):
@@ -244,6 +252,12 @@ class SpyreLauncher:
                 f"of {len(names)} ({names}). These are positionally paired, so "
                 "there is no safe way to guess which is which."
             )
+        # Absent, for a kernel compiled before this key existed or one entered at
+        # the .ktir stage, means no claim rather than no annotation -- so the
+        # lookup below simply finds nothing and every argument passes.
+        claims = tensor_layout.entries_by_ptr_index(
+            getattr(self.metadata, "device_layouts", None))
+
         tensors = []
         for name, arg in zip(names, args):
             if not str(self.src.signature[name]).startswith("*"):
@@ -259,6 +273,11 @@ class SpyreLauncher:
                     f"{getattr(arg, 'device', None)!r}. Move it with "
                     '.to("spyre") — there is no implicit host staging.'
                 )
+            # After the device check and before the launch: the claim is about a
+            # Spyre tensor's device storage, and a host tensor has none to measure.
+            claim = claims.get(len(tensors))
+            if claim is not None:
+                tensor_layout.check_fits(claim, name, arg)
             tensors.append(arg)
         return tensors
 

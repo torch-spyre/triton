@@ -40,6 +40,8 @@ if(TRITON_BUILD_PYTHON_MODULE)
               SpyrePipeline
               TritonToKTIR KTDPTransforms SpyreTransforms
               TTSIR
+              # getDescriptorLogicalLayout, for the descriptor-layout query.
+              SpyreUtils
               MLIRLinalgTransforms)
   target_link_libraries(TritonSpyre PRIVATE Python3::Module pybind11::headers)
 endif()
