@@ -33,45 +33,28 @@ def LowerDescriptorMemory : Pass<"lower-descriptor-memory", "mlir::ModuleOp"> {
     let summary = "Lower tt.descriptor_* ops to ktdp memory ops.";
     let description = [{
         Input: TTIR — triton, arith, scf dialects; !tt.ptr and !tt.tensordesc types.
-        Optionally a layout annotation per descriptor, in either of two
-        spellings (see below).
 
         Lowering:
         - tt.descriptor_load/store → ktdp.construct_memory_view + ktdp.construct_access_tile + ktdp.load/store
         - tt.descriptor_gather/scatter → ktdp.construct_indirect_access_tile + ktdp.load/store
         - tt.make_tensor_descriptor — dead after uses are lowered, erased by cleanup
-        - tts.tensor_layout (op) → the tts.tensor_layout ATTRIBUTE on the
-          ktdp.construct_memory_view built for that descriptor; the op and the
-          builtin.unrealized_conversion_cast bridging that view's memref back to
-          !tt.tensordesc are both erased
 
-        The two layout spellings are discriminated here, structurally, with no
-        option or flag: a descriptor carrying the `tts.tensor_layout` op is
-        lowered to the attribute as above, while one carrying
-        `tt.spyre_tensor_layout` is left completely alone — that op and its
-        bridge cast both survive this pass, and the named
-        [RewriteDescriptorLayout] consumes them. A descriptor carrying neither
-        also keeps its cast, which is dead at this point and swept by the next
-        stage's canonicalize.
-
-        The cast cannot go earlier than this: it is the pass's own intra-pass
-        handoff, since the access-op conversion patterns reach the memref
-        *through* it.
+        A layout marker on a descriptor — `tt.spyre_tensor_layout` or
+        `tts.tensor_layout` — is left untouched, along with the
+        builtin.unrealized_conversion_cast bridging the new view's memref back
+        to !tt.tensordesc so the marker's operand keeps verifying. Consuming
+        either is someone else's job: [RewriteDescriptorLayout] for the former,
+        [LowerTTSMarkers] for the latter.
 
         Output: triton ops that this pass doesn't handle (tt.reduce, tt.broadcast,
         tt.expand_dims, tt.func, tt.return, tt.get_program_id) remain unchanged.
-        New ktdp, memref, and arith ops are introduced. No tts.tensor_layout op
-        remains.
+        New ktdp, memref, and arith ops are introduced.
     }];
 
     let dependentDialects = [
         "mlir::ktdp::KtdpDialect",
         "mlir::arith::ArithDialect",
-        "mlir::memref::MemRefDialect",
-        // For the tts.tensor_layout op this pass consumes and the attribute
-        // name it writes. The dialect must be loaded for the attribute to be
-        // verified at all -- an unregistered prefix is accepted unchecked.
-        "mlir::triton::tts::TTSDialect"
+        "mlir::memref::MemRefDialect"
     ];
 }
 
@@ -101,7 +84,9 @@ def LowerScalarLoad : Pass<"lower-scalar-load", "mlir::ModuleOp"> {
 
         Output: tensor-of-pointers tt.load, and all other triton ops this
         pass doesn't handle, remain unchanged. New ktdp, arith, and tensor
-        ops are introduced.
+        ops are introduced. A layout marker left standing by
+        [LowerDescriptorMemory] — `tt.spyre_tensor_layout` or
+        `tts.tensor_layout` — passes through here too.
     }];
 
     let dependentDialects = [

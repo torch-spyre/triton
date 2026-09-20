@@ -11,6 +11,7 @@
 
 #include "Conversion/TritonToKTIR/Passes.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
+#include "Dialect/TTS/Transforms/Passes.h"
 #include "Transforms/Passes.h"
 
 #include "mlir/Dialect/Linalg/Passes.h"
@@ -26,6 +27,15 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // [LowerPointerChainMemory would sit here -- planned, not implemented; it
   // would handle the tensor-of-pointers tt.load this one leaves legal.]
   pm.addPass(createLowerScalarLoadPass());
+
+  // Each tts marker op's annotation -> an attribute on the op the value it
+  // names resolved to. Bounded on both sides: after LowerDescriptorMemory,
+  // because the op a tts.tensor_layout lands on is the memory view that pass
+  // builds and the bridge cast it resolves through is that pass's; before
+  // LowerComputeOps, which is a partial conversion that knows nothing of tts
+  // and would fail the marker as unconverted. LowerScalarLoad in between is
+  // indifferent to markers and merely keeps them legal.
+  pm.addPass(tts::createLowerTTSMarkersPass());
 
   // tt.reduce/broadcast/expand_dims/dot -> linalg + tensor, and a dead-op sweep.
   pm.addPass(createLowerComputeOpsPass());

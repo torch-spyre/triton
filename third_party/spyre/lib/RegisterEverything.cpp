@@ -21,6 +21,7 @@
 #include "Conversion/TritonToKTIR/Passes.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
 #include "Dialect/TTS/IR/Dialect.h"
+#include "Dialect/TTS/Transforms/Passes.h"
 #include "Pipeline.h"
 #include "Transforms/Passes.h"
 
@@ -28,10 +29,11 @@ void mlir::triton::spyre::registerPasses() {
   // One call per tablegen'd pass group. A pass left unregistered has no CLI
   // flag, so it vanishes from --help and lit tests driving it fail with an
   // unknown-option error rather than anything that points at the cause.
-  // Unqualified names are ours; ktdp:: is the one group whose subject is the
-  // dialect, and which keeps its name.
+  // Unqualified names are ours; ktdp:: and tts:: are the two groups whose
+  // subject is a dialect, and which keep its name.
   registerTritonToKTIRPasses();
   ktdp::registerKTDPPasses();
+  tts::registerTTSTransformsPasses();
   registerSpyreTransformsPasses();
 }
 

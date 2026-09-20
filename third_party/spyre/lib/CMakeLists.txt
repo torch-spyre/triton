@@ -14,17 +14,19 @@ add_subdirectory(Utils)
 add_triton_library(SpyrePipeline
   Pipeline.cpp
 
-  # This file includes all three generated Passes.h.inc, one of them for the
+  # This file includes all four generated Passes.h.inc, one of them for the
   # RewriteDescriptorLayout options struct, so a clean parallel build must not
   # rely on the link edge to order tablegen ahead of it.
   DEPENDS
   TritonToKTIRIncGen
   KTDPTransformsIncGen
+  TTSTransformsIncGen
   SpyreTransformsIncGen
 
   LINK_LIBS PUBLIC
   TritonToKTIR
   KTDPTransforms
+  TTSTransforms
   SpyreTransforms
   MLIRIR
   MLIRPass
@@ -39,17 +41,19 @@ add_triton_library(SpyreRegisterEverything
   RegisterEverything.cpp
 
   # Named directly rather than left to the pass libraries' own DEPENDS: this
-  # file includes all three generated Passes.h.inc, so a clean parallel build
+  # file includes all four generated Passes.h.inc, so a clean parallel build
   # must not rely on the link edge to order tablegen ahead of it.
   DEPENDS
   TritonToKTIRIncGen
   KTDPTransformsIncGen
+  TTSTransformsIncGen
   SpyreTransformsIncGen
   TTSIncGen
 
   LINK_LIBS PUBLIC
   TritonToKTIR
   KTDPTransforms
+  TTSTransforms
   SpyreTransforms
   # For the two stage pipelines this file registers as CLI flags.
   SpyrePipeline

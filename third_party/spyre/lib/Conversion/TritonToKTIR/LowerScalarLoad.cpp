@@ -50,6 +50,8 @@
 #include "Conversion/TritonToKTIR/Passes.h"
 #include "ConversionUtils.h"
 #include "Dialect/KTDP/Utils/Utility.h"
+// For `tts::TensorLayoutOp`, which this pass only has to keep legal.
+#include "Dialect/TTS/IR/Dialect.h"
 #include "Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
@@ -262,8 +264,16 @@ struct LowerScalarLoadPass
     // `UnrealizedConversionCastOp` is used by `getBasePtrAsIndex` to convert
     // a `!tt.ptr` base pointer to `index`; the cast survives this pass and
     // is consumed by the later `ConvertFunctions` pass.
+    //
+    // Both layout markers pass through untouched, and for different
+    // reasons: `tt.spyre_tensor_layout` survives to the named
+    // `rewrite-descriptor-layout`, while `tts.tensor_layout` survives only
+    // to `lower-tts-markers`, the very next pass. Neither is this pass's
+    // business; the entries exist so the conversion driver does not call
+    // them unconverted.
     target.addLegalOp<ModuleOp, UnrealizedConversionCastOp,
-                      triton::SpyreTensorLayoutOp>();
+                      triton::SpyreTensorLayoutOp,
+                      mlir::triton::tts::TensorLayoutOp>();
 
     RewritePatternSet patterns(ctx);
     patterns.add<ConvertScalarLoad>(ctx);
