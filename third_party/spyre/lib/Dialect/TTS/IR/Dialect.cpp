@@ -29,6 +29,41 @@ void TTSDialect::initialize() {
       >();
 }
 
+std::optional<int64_t> applyStatic(int64_t logical, CoordOp op, int64_t arg) {
+  switch (op) {
+  case CoordOp::Identity:
+    return (logical == ShapedType::kDynamic) ? std::nullopt
+                                             : std::optional<int64_t>(logical);
+  case CoordOp::FloorDiv:
+    if (logical == ShapedType::kDynamic)
+      return std::nullopt;
+    // Ceiling, not floor -- see the header. arg == 0 is refused rather than
+    // divided by; verifyTensorLayoutArrays already requires arg > 0 here, so
+    // this only catches a caller that skipped it.
+    return arg == 0 ? std::nullopt
+                    : std::optional<int64_t>((logical + arg - 1) / arg);
+  case CoordOp::Mod:
+  case CoordOp::Splat:
+    // Neither reads `logical`: both give exactly `arg` extents.
+    return arg;
+  }
+  return std::nullopt;
+}
+
+bool applyCoordMap(ArrayRef<int64_t> logSizes, ArrayRef<int64_t> physSrc,
+                   ArrayRef<int64_t> physOp, ArrayRef<int64_t> physArg,
+                   SmallVectorImpl<int64_t> &out) {
+  out.resize(physSrc.size());
+  for (unsigned k = 0, e = physSrc.size(); k < e; ++k) {
+    auto sz = applyStatic(logSizes[physSrc[k]], static_cast<CoordOp>(physOp[k]),
+                          physArg[k]);
+    if (!sz)
+      return false;
+    out[k] = *sz;
+  }
+  return true;
+}
+
 LogicalResult verifyTensorLayoutArrays(
     ArrayRef<int64_t> src, ArrayRef<int64_t> op, ArrayRef<int64_t> arg,
     unsigned logicalRank,

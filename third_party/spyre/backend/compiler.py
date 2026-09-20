@@ -9,6 +9,8 @@ import zipfile
 
 from triton import knobs
 from triton.backends.compiler import BaseBackend, GPUTarget
+
+from . import tensor_layout
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -577,6 +579,19 @@ class SpyreBackend(BaseBackend):
         # utils.load_binary, and what torch-spyre puts in its log lines, profiler
         # event names and failure reports. 
         metadata["name"] = entry_func_name(mod)
+
+        # The device footprint each annotated descriptor claims, for the launcher
+        # to bounds-check a tensor against and for a caller to allocate from. Read
+        # here for two reasons at once: LowerTTSMarkers turns every
+        # tts.tensor_layout op into an attribute, and ConvertFunctions retypes the
+        # !tt.ptr arguments the footprint is attributed to, so after this pipeline
+        # there is neither a marker to read nor a pointer to key it by.
+        #
+        # NOT gated on options.symbolic_args, unlike the base addresses below. The
+        # footprint is a property of the layout rather than of how addresses reach
+        # the kernel, and symbolic mode is where it matters most: there is no
+        # 16 GiB segment gap for an overrun to land harmlessly in.
+        metadata["device_layouts"] = tensor_layout.capture_device_layouts(mod)
 
         # Only the address-binding mode has any use for these. Inferring them in
         # symbolic mode would also mean reporting a pointer-width or pointer-count

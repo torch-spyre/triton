@@ -20,6 +20,9 @@
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallVector.h"
+
+#include <optional>
 
 // For the generated op classes: ODS emits Op<> subclasses that need the op
 // definition machinery, and TensorLayoutOp's operand is a Triton type.
@@ -35,6 +38,52 @@
 #include "Dialect/TTS/IR/Ops.h.inc"
 
 namespace mlir::triton::tts {
+
+/// The coordinate op a `tts.tensor_layout`'s `phys_op[k]` names, by the
+/// attribute's own numbering.
+///
+/// Here rather than in a consumer because the numbering is the dialect's
+/// contract: `verifyTensorLayoutArrays` is what admits 0 through 3, the
+/// frontend's `_COORD_OPS` table is what authors them, and a consumer that
+/// spells the enum itself is a second definition of a rule it does not own. The
+/// rewrite pass did exactly that, with a comment warning the reader to use
+/// `Splat` and not the retired `Broadcast` spelling -- a warning that only
+/// existed because the enum had no single home.
+enum class CoordOp : int64_t { Identity = 0, FloorDiv = 1, Mod = 2, Splat = 3 };
+
+/// The physical extent one coordinate op gives one logical extent, or
+/// `std::nullopt` when it is not a compile-time answer.
+///
+/// `logical` may be `ShapedType::kDynamic`; `arg` is the op's `phys_arg[k]`, and
+/// is read only by the three non-identity ops.
+///
+/// Two behaviours here are load-bearing and neither is obvious from the name:
+///
+///   - **FloorDiv rounds UP.** The name is the coordinate map's, not this
+///     function's: the *coordinate* of an element is `i floordiv arg`, and the
+///     number of distinct such coordinates over `[0, logical)` is
+///     `ceil(logical / arg)`. A floor here would drop the partial last stick.
+///   - **Mod and Splat do not read `logical` at all.** Both give exactly `arg`
+///     extents, so both answer even for a dynamic logical extent -- which is
+///     why a dynamic dim can still have a statically known stick width.
+std::optional<int64_t> applyStatic(int64_t logical, CoordOp op, int64_t arg);
+
+/// The physical extents a coordinate map gives `logSizes`, one per physical dim.
+///
+/// Returns false, leaving `out` unspecified, if any physical dim's extent is not
+/// a compile-time answer -- which makes a partial result impossible to mistake
+/// for a whole one. The three arrays must already satisfy
+/// `verifyTensorLayoutArrays`; this indexes `logSizes` with `physSrc[k]` without
+/// rechecking the bound.
+///
+/// This is the one evaluator of a coordinate map in the tree, and that is the
+/// point of it being here: the rewrite pass derives a physical memref from it,
+/// and `SpyreBackend` derives the device footprint it records in the compiled
+/// metadata from it, so the footprint a launcher bounds-checks against and the
+/// extents the IR is actually built with cannot disagree.
+bool applyCoordMap(ArrayRef<int64_t> logSizes, ArrayRef<int64_t> physSrc,
+                   ArrayRef<int64_t> physOp, ArrayRef<int64_t> physArg,
+                   SmallVectorImpl<int64_t> &out);
 
 /// The structural rules a `tts.tensor_layout` coordinate map obeys, checked
 /// once for the three callers that need them:

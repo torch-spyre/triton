@@ -12,8 +12,15 @@
 // an individual pass any more, so the create* factories are reached only from
 // Pipeline.cpp and from each group's own registration.
 #include "Pipeline.h"
-// The one dialect of ours a kernel is authored in, for the op builder below.
+// The one dialect of ours a kernel is authored in, for the op builder below and
+// for the coordinate-map evaluator the descriptor-layout query reads.
 #include "Dialect/TTS/IR/Dialect.h"
+// getDescriptorLogicalLayout, shared with LowerDescriptorMemory so the footprint
+// this file reports is computed from the extents that pass builds the view with.
+#include "Utils/Utility.h"
+// triton::isKernel, for finding the entry function the way ir.cc's
+// getTensorDescMetadata does.
+#include "triton/Dialect/Triton/IR/Utility.h"
 // TritonOpBuilder, defined header-only under python/src/. That directory is on
 // the include path here because the top-level CMakeLists adds it before it adds
 // third_party/<backend>, so a backend can reach it without naming a path.
@@ -24,6 +31,9 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/PassManager.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -110,7 +120,159 @@ void init_triton_spyre_ir_builders(py::module &&m) {
         });
 }
 
+/// One `tts.tensor_layout` marker, reduced to what a footprint is computed from.
+///
+/// `ptrIndex` is the ORDINAL of the entry function's pointer argument the
+/// descriptor is based on -- the i-th `!tt.ptr`, not the i-th argument. That is
+/// the key the whole launch ABI already uses: `_segment_addresses` hands segment
+/// i to pointer i, `_address_args` collects the `*`-typed signature entries in
+/// the same order, and the correction flit is walked positionally. A parameter
+/// *name* would be a better key and is not available: Triton records no argument
+/// names in the IR, and a compile stage is handed `(module, metadata)` and never
+/// the source, so the name exists only at launch, where the launcher has the
+/// signature and resolves it for the diagnostic.
+struct MarkerFootprint {
+  int64_t ptrIndex;
+  std::vector<int64_t> logicalSizes;  // kDynamic where not a constant
+  std::vector<int64_t> logicalStrides;
+  std::vector<int64_t> physSrc, physOp, physArg;
+  bool isLoad = false;
+  bool isStore = false;
+  /// False when a physical extent is not a compile-time answer, in which case
+  /// `deviceSize` is empty and the entry carries a null footprint.
+  bool staticFootprint = false;
+  std::vector<int64_t> deviceSize;
+};
+
 void init_triton_spyre_ir_utils(py::module &&m) {
+  // get_descriptor_layouts: every `tts.tensor_layout` in the module, with the
+  // device extents its coordinate map implies. Read by `_make_ktir` to record
+  // metadata["device_layouts"], which the launcher bounds-checks a tensor
+  // against and the fixture harness allocates from.
+  //
+  // One query rather than a walk in Python, for the reason the plan gives: the
+  // extents come from `tts::applyCoordMap`, the same evaluator the rewrite pass
+  // builds the physical memref with, so a Python transcription of that
+  // arithmetic cannot drift from it. The precedent is `getTensorDescMetadata` in
+  // python/src/ir.cc, which likewise walks a kernel's arguments and hands back
+  // dicts.
+  //
+  // Must be called while the entry point is still a `tt.func` taking `!tt.ptr`
+  // arguments, and while the marker ops are still present -- so before the
+  // TTIR→KTIR pipeline, alongside metadata["name"] and the base-address
+  // inference. `LowerTTSMarkers` turns each marker into an attribute and
+  // `ConvertFunctions` retypes the pointers; after either, this returns nothing
+  // and says nothing about why.
+  m.def("get_descriptor_layouts", [](mlir::ModuleOp &mod) -> py::list {
+    using namespace mlir;
+
+    py::list result;
+
+    triton::FuncOp kernel;
+    mod.walk([&](triton::FuncOp func) {
+      if (!triton::isKernel(func))
+        return WalkResult::skip();
+      kernel = func;
+      return WalkResult::interrupt();
+    });
+    if (!kernel)
+      return result;
+
+    // Argument index -> pointer ordinal, for the arguments that are pointers.
+    llvm::DenseMap<unsigned, int64_t> ptrOrdinal;
+    int64_t seen = 0;
+    for (auto [i, ty] : llvm::enumerate(kernel.getFunctionType().getInputs()))
+      if (isa<triton::PointerType>(ty))
+        ptrOrdinal[i] = seen++;
+
+    // Collected keyed by pointer ordinal so that a second marker on the same
+    // argument is visible as one. Two footprints over one buffer describe a
+    // union this metadata cannot spell -- there is one `device_size` per entry --
+    // and the honest answer is to make no claim rather than a claim that happens
+    // to be the larger of two. Recorded as a value that fails the check below.
+    llvm::MapVector<int64_t, MarkerFootprint> byPtr;
+    llvm::DenseSet<int64_t> ambiguous;
+
+    mod.walk([&](triton::tts::TensorLayoutOp marker) {
+      auto descOp = marker.getDesc().getDefiningOp<triton::MakeTensorDescOp>();
+      if (!descOp)
+        return;
+      // The base must be a pointer argument of the entry function itself. A
+      // descriptor over a computed pointer has a footprint that is a function of
+      // that arithmetic, not of this layout, so there is nothing here to claim.
+      auto base = dyn_cast<BlockArgument>(descOp.getBase());
+      if (!base || base.getOwner() != &kernel.getBody().front())
+        return;
+      auto it = ptrOrdinal.find(base.getArgNumber());
+      if (it == ptrOrdinal.end())
+        return;
+
+      MarkerFootprint fp;
+      fp.ptrIndex = it->second;
+
+      SmallVector<int64_t> sizes, strides;
+      triton::spyre::getDescriptorLogicalLayout(descOp, sizes, strides);
+      fp.logicalSizes.assign(sizes.begin(), sizes.end());
+      fp.logicalStrides.assign(strides.begin(), strides.end());
+
+      ArrayRef<int64_t> src = marker.getPhysSrc();
+      ArrayRef<int64_t> op = marker.getPhysOp();
+      ArrayRef<int64_t> arg = marker.getPhysArg();
+      fp.physSrc.assign(src.begin(), src.end());
+      fp.physOp.assign(op.begin(), op.end());
+      fp.physArg.assign(arg.begin(), arg.end());
+
+      // Guarded rather than assumed: this runs on whatever a kernel authored,
+      // and applyCoordMap indexes the logical arrays with phys_src[k]. The op's
+      // own verifier has already checked the bound against the descriptor's
+      // BLOCK rank, which equals the tensor rank -- but a module handed in as
+      // text has not necessarily been verified.
+      bool inRange = src.size() == op.size() && src.size() == arg.size();
+      for (int64_t d : src)
+        inRange &= d >= 0 && d < (int64_t)sizes.size();
+      if (inRange) {
+        SmallVector<int64_t> phys;
+        if (triton::tts::applyCoordMap(sizes, src, op, arg, phys)) {
+          fp.staticFootprint = true;
+          fp.deviceSize.assign(phys.begin(), phys.end());
+        }
+      }
+
+      for (Operation *user : descOp.getResult().getUsers()) {
+        if (isa<triton::DescriptorLoadOp, triton::DescriptorGatherOp>(user))
+          fp.isLoad = true;
+        else if (isa<triton::DescriptorStoreOp, triton::DescriptorScatterOp>(
+                     user))
+          fp.isStore = true;
+      }
+
+      if (!byPtr.insert({fp.ptrIndex, fp}).second)
+        ambiguous.insert(fp.ptrIndex);
+    });
+
+    for (const auto &entry : byPtr) {
+      if (ambiguous.contains(entry.first))
+        continue;
+      const MarkerFootprint &fp = entry.second;
+      py::dict d;
+      d["ptr_index"] = fp.ptrIndex;
+      d["logical_size"] = fp.logicalSizes;
+      d["logical_stride"] = fp.logicalStrides;
+      d["phys_src"] = fp.physSrc;
+      d["phys_op"] = fp.physOp;
+      d["phys_arg"] = fp.physArg;
+      // None, not an empty list: a dynamic extent means there is no claim, and
+      // an empty list would read as a rank-0 one.
+      d["device_size"] = fp.staticFootprint
+                             ? py::cast(fp.deviceSize)
+                             : py::cast<py::object>(py::none());
+      d["is_load"] = fp.isLoad;
+      d["is_store"] = fp.isStore;
+      result.append(d);
+    }
+    return result;
+  });
+
   // get_integer_set_attr / get_affine_map_attr: return the printed form of
   // IntegerSetAttr / AffineMapAttr attributes on an operation.
   // The typed getters on ir.operation (get_str_attr, get_int_attr, …) do not

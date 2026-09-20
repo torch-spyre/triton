@@ -179,3 +179,36 @@ tt.func @store_only_annotated_copy(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
   tt.return
 }
 }
+
+// -----
+
+// Case 5 -- an annotated view this pass never reaches.
+//
+// The post-condition, and the thing that makes SpyreBackend's device-footprint
+// claim safe. Every DECLINE above fails the compile; this is the other way an
+// annotation goes unhonoured -- not declined, just not walked. The pass redirects
+// access-tile users and nothing else, and it erases the logical view only once
+// nothing uses it, so a view held by any other user survives with its layout
+// intact.
+//
+// A bridge cast back to !tt.tensordesc is that other user here: no access
+// tile, so physicalizeDescriptor finds nothing to redirect and the view stays live.
+// On the real pipeline LowerTTSMarkers erases that cast along with the marker it
+// existed for, so reaching this state means a descriptor nothing reads or writes --
+// which is exactly the case a footprint claim must not be made for. Without the
+// check this lowers cleanly to a LOGICAL artifact while
+// metadata["device_layouts"] reports the physical footprint the kernel asked for --
+// a claim about memory the kernel never addresses, which a launcher would then
+// bounds-check against.
+
+#sd = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>
+module {
+tt.func @annotation_never_reached(%o: !tt.ptr<f16>) {
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f16> to index
+  // expected-error @below {{rewrite-descriptor-layout-generic: this memory view still carries a tts.tensor_layout after physicalization}}
+  %ov = ktdp.construct_memory_view %oi, sizes: [128], strides: [1] {coordinate_set = #sd, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>}} : memref<128xf16>
+  %od = builtin.unrealized_conversion_cast %ov : memref<128xf16> to !tt.tensordesc<128xf16>
+  tt.return
+}
+}

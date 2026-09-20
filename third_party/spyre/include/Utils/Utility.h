@@ -12,6 +12,7 @@
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include <optional>
 
@@ -21,6 +22,27 @@ namespace mlir::triton::spyre {
 /// `arith.constant`. Returns std::nullopt if the value is not a
 /// materialized constant.
 std::optional<int64_t> getConstantInt(Value v);
+
+/// The logical (host) sizes and strides a `tt.make_tensor_descriptor` describes,
+/// in elements, with `ShapedType::kDynamic` wherever the operand is not a
+/// materialized constant.
+///
+/// This is `LowerDescriptorMemory`'s rule and it is published rather than
+/// restated because a second reader has appeared: `SpyreBackend` records each
+/// annotated descriptor's device footprint in the compiled metadata, and that
+/// footprint is a function of these same logical extents. Derived twice, the
+/// footprint a launcher bounds-checks against and the memory view the IR is
+/// built with could disagree -- and the disagreement would be silent in the
+/// dangerous direction, because an under-claim is an unchecked overrun.
+///
+/// Two fallbacks come with the rule, and both are why this cannot be replaced by
+/// "read the descriptor's block type" or "assume row-major":
+///   - no `shape` operands at all: the block type's shape is the tensor's;
+///   - no `strides` operands at all: row-major over `sizes`, which stops
+///     multiplying at the first dynamic extent.
+void getDescriptorLogicalLayout(triton::MakeTensorDescOp descOp,
+                                SmallVectorImpl<int64_t> &sizes,
+                                SmallVectorImpl<int64_t> &strides);
 
 /// Build a `tensor.empty` of `type` — an uninitialized tensor used as the
 /// `outs` operand of a destination-passing-style op, where it supplies the

@@ -46,6 +46,7 @@ using mlir::triton::ktdp::getDescriptorMemView;
 using mlir::triton::ktdp::isLoweredDescriptor;
 using mlir::triton::spyre::getBasePtrAsIndex;
 using mlir::triton::spyre::getConstantInt;
+using mlir::triton::spyre::getDescriptorLogicalLayout;
 
 //===----------------------------------------------------------------------===//
 // Shared memory view construction
@@ -61,46 +62,28 @@ static Value buildBaseMemoryView(OpBuilder &builder, Location loc,
   MLIRContext *ctx = builder.getContext();
   Value baseIndex = getBasePtrAsIndex(builder, loc, descOp.getBase());
 
-  // Extract shape/strides as constants when possible, kDynamic otherwise.
-  SmallVector<int64_t> shape;
-  SmallVector<Value> dynSizes;
-  for (auto s : descOp.getShape()) {
-    if (auto c = getConstantInt(s)) {
-      shape.push_back(*c);
-    } else {
-      shape.push_back(ShapedType::kDynamic);
-      dynSizes.push_back(
-          arith::IndexCastOp::create(builder, loc, builder.getIndexType(), s));
-    }
-  }
-  // Fallback: if the descriptor has no explicit shape, use the block shape.
-  if (shape.empty()) {
-    auto blockType =
-        cast<triton::TensorDescType>(descOp.getResult().getType()).getBlockType();
-    shape.assign(blockType.getShape().begin(), blockType.getShape().end());
-  }
+  // The static form, through the shared rule: constants where they are ones,
+  // kDynamic otherwise, with the block-shape and row-major fallbacks. Shared
+  // because SpyreBackend derives each annotated descriptor's device footprint
+  // from these same extents (see getDescriptorLogicalLayout).
+  SmallVector<int64_t> shape, strides;
+  getDescriptorLogicalLayout(descOp, shape, strides);
 
-  SmallVector<int64_t> strides;
-  SmallVector<Value> dynStrides;
-  for (auto s : descOp.getStrides()) {
-    if (auto c = getConstantInt(s)) {
-      strides.push_back(*c);
-    } else {
-      strides.push_back(ShapedType::kDynamic);
-      dynStrides.push_back(
-          arith::IndexCastOp::create(builder, loc, builder.getIndexType(), s));
-    }
-  }
-  // Fallback: compute default row-major strides from the shape.
-  if (strides.empty()) {
-    int64_t stride = 1;
-    strides.resize(shape.size());
-    for (int i = shape.size() - 1; i >= 0; --i) {
-      strides[i] = stride;
-      if (shape[i] != ShapedType::kDynamic)
-        stride *= shape[i];
-    }
-  }
+  // The runtime values for the sentinels, in sentinel order, which is the
+  // convention buildMemoryView takes. Keyed off the static array rather than
+  // re-deciding what is constant, so there is one judgement and not two: an
+  // operand list that was empty contributed no sentinel and so yields no value
+  // here either.
+  SmallVector<Value> dynSizes, dynStrides;
+  auto indexCast = [&](Value v) {
+    return arith::IndexCastOp::create(builder, loc, builder.getIndexType(), v);
+  };
+  for (auto [i, s] : llvm::enumerate(descOp.getShape()))
+    if (shape[i] == ShapedType::kDynamic)
+      dynSizes.push_back(indexCast(s));
+  for (auto [i, s] : llvm::enumerate(descOp.getStrides()))
+    if (strides[i] == ShapedType::kDynamic)
+      dynStrides.push_back(indexCast(s));
 
   auto memSpaceAttr = mlir::ktdp::MemorySpaceAttr::get(
       ctx, mlir::ktdp::MemorySpaceKind::global, /*ct_id=*/-1);
