@@ -58,8 +58,7 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // directly and because it is retired on device coverage rather than on a date;
   // `data-layout` therefore still has a live consumer, which is the only one it
   // has ever had.
-  pm.addPass(ktdp::createRewriteDescriptorLayout(
-      ktdp::RewriteDescriptorLayoutOptions{options.dataLayout}));
+  pm.addPass(ktdp::createRewriteDescriptorLayout());
 
   // tt.func/tt.return -> func.func/func.return, !tt.ptr -> index. Last of the
   // conversions, because every memory pass above consumes !tt.ptr arguments

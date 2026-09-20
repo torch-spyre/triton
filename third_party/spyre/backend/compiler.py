@@ -250,10 +250,6 @@ class SpyreOptions:
     # environment variable, read once in parse_options.
     symbolic_args: bool = False
 
-    # HBM data layout: "device" (stickified row-major physical strides) or
-    # "host" (strides derived from logical strides via the coordinate map).
-    data_layout: str = "device"
-
     # ---- Required by Triton code generator -----
     sanitize_overflow: bool = False
     debug: bool = False
@@ -288,12 +284,6 @@ class SpyreOptions:
             self.grid = tuple(self.grid)
         if isinstance(self.base_addresses, list):
             self.base_addresses = tuple(self.base_addresses)
-        # RewriteDescriptorLayout treats any value other than "device" as
-        # "host", so an unrecognized string would silently pick a layout
-        # rather than fail.
-        if self.data_layout not in ("device", "host"):
-            raise ValueError(
-                f"data_layout must be 'device' or 'host', got {self.data_layout!r}")
         # Symbolic mode leaves the pointer arguments un-materialized, so there is
         # nothing for supplied addresses to be baked into. Silently honouring one
         # and dropping the other would pick a mode the caller did not ask for.
@@ -601,7 +591,6 @@ class SpyreBackend(BaseBackend):
         # std::vector<int64_t>; SpyreOptions keeps it a tuple to stay hashable.
         spyre.passes.ttir_to_ktdp.add_ttir_to_ktir_pipeline(
             pm,
-            data_layout=options.data_layout,
             grid=list(options.grid),
         )
         pm.run(mod, "make_ktir")
