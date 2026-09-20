@@ -152,9 +152,9 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // MapReductionPartials' lowerIterArgInitializer asks getNeutralAttr and fills
   // with the answer -- 0.0 for addf/subf, 1.0 for mulf, -inf for maximumf, +inf
   // for minimumf, and the integer counterparts. So the combiner a reduction uses
-  // is not by itself a reason to refuse it, and the reason the pass admits
-  // addf/subf alone is narrower and per-combiner: see isZeroNeutralCombiner in
-  // DropReductionInitFill.cpp, which states it correctly.
+  // is not by itself a reason to refuse it, which is why the pass no longer
+  // gates on the combiner or on the fill value at all: its gate is shape only.
+  // See the header of DropReductionInitFill.cpp.
   //
   // The conclusion is unchanged and the pass does not move. Recorded because the
   // wrong reason is the more memorable one, and it is the reason that would
