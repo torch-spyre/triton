@@ -1813,6 +1813,94 @@ struct RewriteDescriptorLayoutGenericPass
     return result;
   }
 
+  /// Will `v` carry a PHYSICAL type once this pass is done?
+  ///
+  /// Exactly two things here give a tensor value a physical type, and this is
+  /// both of them:
+  ///   - rewriteGeneric restates a linalg.generic, so its results follow the
+  ///     rebuilt domain. Every generic that supplies a store over an annotated
+  ///     view is restated: collectAdjacentGenerics reaches it through that store,
+  ///     and findLayoutForResult then finds the store's layout.
+  ///   - physicalizeAccessTile and its indirect twin retype a ktdp.load's result
+  ///     along with the access tile it reads, for every tile over an annotated
+  ///     view.
+  /// Anything else keeps the type it was built with.
+  static bool isOnPhysicalizedChain(Value v,
+                                    const SmallPtrSetImpl<Operation *> &marked) {
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      return false;
+    if (isa<linalg::GenericOp>(def))
+      return true;
+    auto ld = dyn_cast<mlir::ktdp::LoadOp>(def);
+    if (!ld)
+      return false;
+    Operation *tileOp = ld.getAccessTile().getDefiningOp();
+    Value base;
+    if (auto direct =
+            dyn_cast_or_null<mlir::ktdp::ConstructAccessTilesOp>(tileOp))
+      base = direct.getBase();
+    else if (auto indirect =
+                 dyn_cast_or_null<mlir::ktdp::ConstructIndirectAccessTilesOp>(
+                     tileOp))
+      base = indirect.getBase();
+    else
+      return false;
+    Operation *view = base.getDefiningOp();
+    return view && marked.contains(view);
+  }
+
+  /// Before physicalizeDescriptors mutates anything, check that every store over
+  /// an annotated view has a data value something here will physicalize.
+  ///
+  /// Phase 1 redirects a store's access tile to the physical tile
+  /// UNCONDITIONALLY, and nothing in this pass changes a data value's type except
+  /// rewriteGeneric. So a store whose destination alone is annotated, and whose
+  /// data no linalg.generic mediates — a pure load-to-store copy is the shape
+  /// that produces this — ends up with a physical access tile and logical data,
+  /// and ktdp.store's own verifier reports `data tile shape must match access
+  /// tile shape` about an op nobody named.
+  ///
+  /// The named pass absorbs this in a widening stage (ContractionSynthesis.cpp,
+  /// "widen one op-tile into physical (a store's data)"). This pass has none by
+  /// choice: every case where a compute op sits between the load and the store is
+  /// already handled by the rebuild giving both ends the same domain (see
+  /// rebuild-composite.mlir case 3), and the remaining case is a copy, for which
+  /// annotating the source as well costs one marker and needs no new machinery.
+  ///
+  /// Only this direction is checked. The mirror image — a physicalized data value
+  /// stored through an unannotated, still-logical access tile — is also
+  /// reachable, but deciding it needs this pass to predict whether a given
+  /// generic will be rewritten at all, and over-reporting there would decline
+  /// programs that lower correctly today. It still reaches the verifier.
+  LogicalResult checkStoreDataIsRestatable(
+      ArrayRef<mlir::ktdp::ConstructMemoryViewOp> annotatedViews) {
+    SmallPtrSet<Operation *, 8> marked;
+    for (auto view : annotatedViews)
+      marked.insert(view.getOperation());
+
+    LogicalResult result = success();
+    for (auto view : annotatedViews)
+      for (Operation *tile : view.getResult().getUsers()) {
+        if (!isa<mlir::ktdp::ConstructAccessTilesOp,
+                 mlir::ktdp::ConstructIndirectAccessTilesOp>(tile))
+          continue;
+        for (Operation *user : tile->getResult(0).getUsers()) {
+          auto st = dyn_cast<mlir::ktdp::StoreOp>(user);
+          if (!st || isOnPhysicalizedChain(st.getDataTile(), marked))
+            continue;
+          st.emitError(
+              "rewrite-descriptor-layout-generic: this store's access tile is "
+              "physicalized but its data is not on a physicalized chain, and "
+              "this pass restates only linalg.generic; a one-sided annotation "
+              "has no vehicle for the shape change, so annotate the source "
+              "descriptor too, at a layout compatible with this one");
+          result = failure();
+        }
+      }
+    return result;
+  }
+
   /// The generics adjacent to a physicalized view: for each view
   /// physicalizeDescriptors recorded, every generic that reads one of its loads
   /// or supplies one of its stores. Listed once each, in the order the views
@@ -1882,7 +1970,14 @@ struct RewriteDescriptorLayoutGenericPass
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout-generic] "
                             << annotatedViews.size() << " annotated view(s)\n");
 
-    if (failed(checkConsumersAreRewritable(annotatedViews)))
+    // Both checks run before Phase 1 touches anything, and for the same reason:
+    // retyping first leaves a mismatch that MLIR's own verifier reports against
+    // an indexing map or a store, naming neither this pass nor what it could not
+    // restate. Both are run before either can fail, so one invocation reports
+    // every problem it can see.
+    bool checksFailed = failed(checkConsumersAreRewritable(annotatedViews));
+    checksFailed |= failed(checkStoreDataIsRestatable(annotatedViews));
+    if (checksFailed)
       return signalPassFailure();
 
     if (failed(physicalizeDescriptors(annotatedViews)))
