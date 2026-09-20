@@ -222,6 +222,19 @@ def _normalise_rank(device_size, stride_map, phys_src, phys_op):
     if harmless:
         return list(device_size), list(stride_map)
 
+    # UNTESTED for rank >= 4, and this is the line to test first when a rank-4
+    # layout reaches the device. `at` is deliberately not `p`, but nothing in
+    # tree can tell the two apart: they COINCIDE at rank 2 -- the splat case
+    # above, which is the only one verified on hardware -- and of the 8
+    # insertions this function performs across the fixtures, the 7 where they
+    # differ are all rank >= 4 (`matmul__bmm_*`, `reduce__middle_axis_spyre_stick`),
+    # none of which declares `compiles_to_binary`, so no tier reaches them.
+    # Confirmed by mutation: `at = p` leaves both suites green.
+    #
+    # The failure mode is silent, which is why it needs a test rather than a
+    # comment: getting this position wrong leaves the new `stick_dim_index`
+    # pointing at a real axis, `dcsi_sizes` stays all ones and the DMA moves one
+    # element instead of the full extent, with no check firing.
     at = rank - 2
     return (list(device_size[:at]) + [1] + list(device_size[at:]),
             list(stride_map[:at]) + [-1] + list(stride_map[at:]))
