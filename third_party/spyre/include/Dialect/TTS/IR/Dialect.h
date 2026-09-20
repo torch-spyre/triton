@@ -68,14 +68,117 @@ std::optional<int64_t> applyStatic(int64_t logical, CoordOp op, int64_t arg);
 /// `verifyTensorLayoutArrays`; this indexes `logSizes` with `physSrc[k]` without
 /// rechecking the bound.
 ///
-/// This is the one evaluator of a coordinate map in the tree, and that is the
-/// point of it being here: the rewrite pass derives a physical memref from it,
-/// and `SpyreBackend` derives the device footprint it records in the compiled
-/// metadata from it, so the footprint a launcher bounds-checks against and the
-/// extents the IR is actually built with cannot disagree.
+/// This is the evaluator of a coordinate map for everything that survives the
+/// layout-attribute migration, and that is the point of it being here:
+/// `rewrite-descriptor-layout-generic` derives a physical memref from it, and
+/// `evaluateDeviceLayout` below derives the device footprint `SpyreBackend`
+/// records in the compiled metadata from it, so the footprint a launcher
+/// bounds-checks against and the extents the IR is actually built with cannot
+/// disagree. (The named `rewrite-descriptor-layout` pass carries its own copy,
+/// in RewriteDescriptorLayout/PermutationUtils.h, which knows no Splat; it goes
+/// when that pass does.)
 bool applyCoordMap(ArrayRef<int64_t> logSizes, ArrayRef<int64_t> physSrc,
                    ArrayRef<int64_t> physOp, ArrayRef<int64_t> physArg,
                    SmallVectorImpl<int64_t> &out);
+
+/// The device layout a coordinate map gives a logical tensor.
+///
+/// A stick-tiled buffer can hold MORE elements than its host tensor does. A `[64]`
+/// statistic written through a splat layout occupies `[64, S]` on the device, so a
+/// host shape alone cannot size the allocation -- and getting it wrong is an
+/// out-of-bounds write rather than a wrong answer: measured on that statistic, 128
+/// bytes allocated against 8192 needed, 64x short.
+///
+/// This function is what closes that gap. Given a descriptor's layout annotation
+/// (the coordinate map) and its logical shape and strides, it derives the two
+/// arrays torch-spyre needs to describe the device buffer, and which its explicit
+/// `SpyreTensorLayout` constructor takes: `device_size`, the extent of each device
+/// axis, and `stride_map`, how far the host pointer moves per step along each. The
+/// launcher checks an argument against them; a caller allocates a buffer from them.
+///
+/// Returns false, leaving both outputs unspecified, when any physical extent is
+/// not a compile-time answer -- the whole pair is then absent rather than half
+/// stated, because a stride map is meaningless without the extents it was
+/// derived over.
+///
+/// It is one function because it is one derivation. Extents, stride rule and
+/// unit-axis padding are three steps over the same coordinate-op numbering, so a
+/// caller holding only some of them has to restate that numbering to do its
+/// share. That is not hypothetical: `backend/tensor_layout.py` held the last two,
+/// and paid for it with a fourth copy of `CoordOp`. Whole, the numbering lives
+/// once, in the enum that owns it.
+///
+/// The three steps, each of which has a reason not to be obvious:
+///
+///   - **The extents.** How many positions does each device axis have? That is
+///     `applyCoordMap`'s answer, so a floordiv rounds up and a splat contributes
+///     its own width.
+///
+///   - **The stride map.** Stepping one position along a device axis moves the
+///     host pointer how far? For a partitioned dim's two halves that is one lane
+///     and one whole stick respectively. An axis the host tensor does not address
+///     at all moves it nowhere, and that case is spelled `-1`; it arises twice --
+///     a SPLAT, which replicates rather than partitions, so there is no host
+///     stride to advance by, and a logical dim of extent ONE, which has nothing to
+///     advance over. torch-spyre treats the two identically (same branch of
+///     `dim_map_to_stride_map`, `spyre_tensor_impl.cpp`).
+///
+///     A table of cases would be wrong here, which is why this is their loop
+///     re-derived instead: the outer half's stride is a PRODUCT, and stating it as
+///     `logStrides[d] x phys_arg` is the right number only while the mod half is
+///     the last axis -- true of every layout in tree and not a rule anything
+///     checks. The loop gets it right by construction, running INNERMOST TO
+///     OUTERMOST and carrying a per-logical-dim running stride: a stick split's
+///     inner (mod) half takes `logStrides[d]`, and its outer (floordiv) half then
+///     takes `logStrides[d] x (the inner half's device extent)`, whatever axis
+///     that inner half turned out to be. Neither `-1` case updates the running
+///     stride, so an outer axis over the same logical dim is unaffected by a splat
+///     inside it.
+///
+///   - **The unit-axis padding.** torch-spyre's DMA setup reads one particular
+///     device axis as the tile-count half of the stick split: the one THIRD FROM
+///     THE END, paired with the LAST axis as its lanes. Our coordinate maps can
+///     put something else there -- a real dimension, or a splat's replicated axis
+///     -- and then that read lands on a dimension it corrupts. So a dummy unit
+///     axis goes in where the DMA looks, which makes the read harmless. Where it
+///     looks depends on the rank, and inserting shifts the later positions, which
+///     is all the arithmetic below is about. Note this is therefore NOT "pad to
+///     rank 3": the padding neutralizes one read, it does not reach a rank.
+///
+///     Concretely, `get_dim_map` (`spyre_mem.cpp`) matches each device axis to a
+///     logical dim by a greedy stride scan and then FORCIBLY OVERWRITES the
+///     third-from-last entry with the dim it found for the last axis. Sound for
+///     every layout their own constructor builds, and wrong for a splat layout,
+///     whose last axis addresses no logical dim at all: feed the rank-2
+///     `device_size [64, 64]` / `stride_map [1, -1]` in unpadded and the scan
+///     finds `dim_map = [0, -1]`, the forcing turns it into `[-1, -1]`, every
+///     logical dim is then skipped downstream, and the DMA moves ONE ELEMENT
+///     instead of 64, silently, with no check firing.
+///
+///     Three shapes already neutralize it, and get no padding: the
+///     third-from-last axis has stride `-1` (the scan never matches a negative
+///     stride, so that entry is already `-1` and the forcing is guarded out); or
+///     its extent is 1 (the scan skips unit axes, same conclusion); or it really
+///     is the floordiv half of the same logical dim the last axis takes modulo,
+///     the canonical stick split, where the forcing writes back the value that
+///     was already there. Rank 1 needs nothing either, since the two positions
+///     coincide there and the forcing is a self-assignment.
+///
+///     Otherwise a unit axis goes in, and it goes in SECOND FROM THE END of the
+///     unpadded layout -- not at the position being neutralized. Inserting shifts
+///     every later position by one, so second-from-last before the insertion is
+///     third-from-last after it, which is where the DMA will look. Inserting at
+///     the old third-from-last would leave the DMA's read pointing at a real axis
+///     and change nothing.
+///
+///     Worth raising upstream: their assumption has no test on their side, and
+///     nothing in the layout they are handed lets them detect its violation.
+bool evaluateDeviceLayout(ArrayRef<int64_t> logSizes,
+                          ArrayRef<int64_t> logStrides,
+                          ArrayRef<int64_t> physSrc, ArrayRef<int64_t> physOp,
+                          ArrayRef<int64_t> physArg,
+                          SmallVectorImpl<int64_t> &deviceSize,
+                          SmallVectorImpl<int64_t> &strideMap);
 
 /// The structural rules a `tts.tensor_layout` coordinate map obeys, checked
 /// once for the three callers that need them:

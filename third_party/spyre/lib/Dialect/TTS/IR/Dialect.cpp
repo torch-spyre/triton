@@ -64,6 +64,88 @@ bool applyCoordMap(ArrayRef<int64_t> logSizes, ArrayRef<int64_t> physSrc,
   return true;
 }
 
+bool evaluateDeviceLayout(ArrayRef<int64_t> logSizes,
+                          ArrayRef<int64_t> logStrides,
+                          ArrayRef<int64_t> physSrc, ArrayRef<int64_t> physOp,
+                          ArrayRef<int64_t> physArg,
+                          SmallVectorImpl<int64_t> &deviceSize,
+                          SmallVectorImpl<int64_t> &strideMap) {
+  // The two logical arrays are indexed by the same physSrc[k] below.
+  // getDescriptorLogicalLayout always produces them parallel; a caller reading a
+  // shape and a stride list from different places may not.
+  if (logSizes.size() != logStrides.size())
+    return false;
+
+  SmallVector<int64_t> extents;
+  if (!applyCoordMap(logSizes, physSrc, physOp, physArg, extents))
+    return false;
+  unsigned rank = extents.size();
+
+  // How far does one step along each device axis move the host pointer? Innermost
+  // to outermost, so that an outer half of a partitioned dim can multiply up by
+  // whatever the inner half turned out to be: `running[d]` is the stride the next
+  // axis over logical dim d will take, seeded with the dim's own host stride.
+  SmallVector<int64_t> strides(rank, 0);
+  SmallVector<int64_t> running(logStrides.begin(), logStrides.end());
+  for (int k = (int)rank - 1; k >= 0; --k) {
+    int64_t d = physSrc[k];
+    if (static_cast<CoordOp>(physOp[k]) == CoordOp::Splat || logSizes[d] == 1) {
+      strides[k] = -1;
+      continue;
+    }
+    strides[k] = running[d];
+    // A dynamic logical stride stays dynamic rather than being multiplied: the
+    // product would overflow. Unreachable for anything in tree -- a dynamic dim
+    // only survives applyCoordMap under mod or splat -- and the alternative is
+    // signed-overflow UB rather than a number.
+    running[d] = strides[k] == ShapedType::kDynamic
+                     ? ShapedType::kDynamic
+                     : strides[k] * extents[k];
+  }
+
+  deviceSize.assign(extents.begin(), extents.end());
+  strideMap.assign(strides.begin(), strides.end());
+
+  // torch-spyre's DMA reads the axis THIRD FROM THE END as the tile-count half of
+  // the stick split, and overwrites what it matched there. If ours is something
+  // else, that read corrupts a real dimension -- so put a harmless unit axis where
+  // it looks. Three shapes are harmless already; see the header for what each
+  // rests on.
+  if (rank < 2)
+    return true;
+  unsigned p = rank > 2 ? rank - 3 : 0;
+  unsigned last = rank - 1;
+  bool harmless =
+      strides[p] == -1 || extents[p] == 1 ||
+      (physSrc[p] == physSrc[last] &&
+       static_cast<CoordOp>(physOp[p]) == CoordOp::FloorDiv &&
+       static_cast<CoordOp>(physOp[last]) == CoordOp::Mod);
+  if (harmless)
+    return true;
+
+  // Second from the end, so that after the insertion shifts everything later the
+  // unit axis is the one third from the end -- where the DMA will look. Inserting
+  // at `p` instead would leave that read pointing at a real axis.
+  //
+  // UNTESTED for rank >= 4, and this is the line to test first when a rank-4
+  // layout reaches the device, because nothing in tree can tell the two positions
+  // apart: they COINCIDE at rank 2 -- the splat case, the only one verified on
+  // hardware -- and of the 8 insertions this performs across the fixtures, the 7
+  // where they differ are all rank >= 4 (`matmul__bmm_*`,
+  // `reduce__middle_axis_spyre_stick`), none of which declares
+  // `compiles_to_binary`, so no tier reaches them. Confirmed by mutation:
+  // `at = p` leaves both suites green.
+  //
+  // The failure mode is silent, which is why it needs a test rather than a
+  // comment: a wrong position leaves the DMA's read on a real axis, `dcsi_sizes`
+  // stays all ones and one element moves instead of the full extent, with no check
+  // firing.
+  unsigned at = rank - 2;
+  deviceSize.insert(deviceSize.begin() + at, 1);
+  strideMap.insert(strideMap.begin() + at, -1);
+  return true;
+}
+
 LogicalResult verifyTensorLayoutArrays(
     ArrayRef<int64_t> src, ArrayRef<int64_t> op, ArrayRef<int64_t> arg,
     unsigned logicalRank,

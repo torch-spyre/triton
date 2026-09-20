@@ -133,29 +133,68 @@ void init_triton_spyre_ir_builders(py::module &&m) {
 /// signature and resolves it for the diagnostic.
 struct MarkerFootprint {
   int64_t ptrIndex;
-  std::vector<int64_t> logicalSizes;  // kDynamic where not a constant
-  std::vector<int64_t> logicalStrides;
-  std::vector<int64_t> physSrc, physOp, physArg;
   bool isLoad = false;
   bool isStore = false;
   /// False when a physical extent is not a compile-time answer, in which case
-  /// `deviceSize` is empty and the entry carries a null footprint.
+  /// both arrays are empty and the entry carries a null footprint.
   bool staticFootprint = false;
-  std::vector<int64_t> deviceSize;
+  /// The finished torch-spyre pair, from `tts::evaluateDeviceLayout` -- extents,
+  /// stride rule and unit-axis padding already applied. Nothing on the Python
+  /// side derives anything from these, which is why the coordinate map itself is
+  /// not reported: a caller that could not evaluate it has no use for it, and a
+  /// caller that could would be a second evaluator.
+  std::vector<int64_t> deviceSize, strideMap;
 };
 
+/// What the kernel does with the buffer, as the metadata entry's `access`.
+///
+/// An annotated descriptor nothing reads or writes is reported as `"none"`
+/// rather than dropped: the buffer still has to be big enough if the kernel is
+/// later edited to use it, and "no access" is a more useful thing for a
+/// diagnostic to say than a missing entry.
+static const char *accessName(const MarkerFootprint &fp) {
+  if (fp.isLoad && fp.isStore)
+    return "load_store";
+  if (fp.isStore)
+    return "store";
+  if (fp.isLoad)
+    return "load";
+  return "none";
+}
+
 void init_triton_spyre_ir_utils(py::module &&m) {
-  // get_descriptor_layouts: every `tts.tensor_layout` in the module, with the
-  // device extents its coordinate map implies. Read by `_make_ktir` to record
-  // metadata["device_layouts"], which the launcher bounds-checks a tensor
-  // against and the fixture harness allocates from.
+  // get_descriptor_layouts: how much device memory each annotated buffer of this
+  // kernel actually needs.
   //
-  // One query rather than a walk in Python, for the reason the plan gives: the
-  // extents come from `tts::applyCoordMap`, the same evaluator the rewrite pass
-  // builds the physical memref with, so a Python transcription of that
-  // arithmetic cannot drift from it. The precedent is `getTensorDescMetadata` in
-  // python/src/ir.cc, which likewise walks a kernel's arguments and hands back
-  // dicts.
+  // A layout annotation can ask for a device buffer LARGER than its host tensor --
+  // a splat replicates a statistic across a stick -- and nothing downstream can
+  // work that out: the allocator sees only the host shape and the launcher only
+  // device residency, so the overrun is silent until it corrupts a neighbour. This
+  // query is where the compiler writes its number down. It IS
+  // metadata["device_layouts"] -- `_make_ktir` stores the list as it comes back,
+  // the launcher bounds-checks a tensor against it, and the fixture harness
+  // allocates from it. One entry per annotated buffer, of JSON-survivable values:
+  //
+  //     {"ptr_index": 1, "device_size": [1, 64, 64], "stride_map": [-1, 1, -1],
+  //      "access": "store"}
+  //
+  // `device_size` and `stride_map` are None TOGETHER when any physical extent is
+  // not known at compile time -- a descriptor taking its shape from a runtime
+  // i32 argument, which `matmul__spyre_stick_parallel_dynamic` does. Such a
+  // kernel is unlaunchable today anyway; the point of recording the entry at all
+  // is that its absence and its emptiness mean different things. A MISSING entry
+  // for a pointer argument is not a fault: it means the kernel made no claim
+  // about that buffer, which is every unannotated descriptor.
+  //
+  // One query rather than a walk in Python, and the finished pair rather than
+  // the coordinate map, for the same reason: the derivation is
+  // `tts::evaluateDeviceLayout`, over the extents `tts::applyCoordMap` gives,
+  // which is what `rewrite-descriptor-layout-generic` builds the physical memref
+  // with -- so nothing on the Python side has to know the coordinate-op
+  // numbering, and no transcription of the arithmetic can drift from it. It had
+  // one, and the numbering with it. The precedent for the query shape is
+  // `getTensorDescMetadata` in python/src/ir.cc, which likewise walks a kernel's
+  // arguments and hands back dicts.
   //
   // Must be called while the entry point is still a `tt.func` taking `!tt.ptr`
   // arguments, and while the marker ops are still present -- so before the
@@ -212,18 +251,13 @@ void init_triton_spyre_ir_utils(py::module &&m) {
 
       SmallVector<int64_t> sizes, strides;
       triton::spyre::getDescriptorLogicalLayout(descOp, sizes, strides);
-      fp.logicalSizes.assign(sizes.begin(), sizes.end());
-      fp.logicalStrides.assign(strides.begin(), strides.end());
 
       ArrayRef<int64_t> src = marker.getPhysSrc();
       ArrayRef<int64_t> op = marker.getPhysOp();
       ArrayRef<int64_t> arg = marker.getPhysArg();
-      fp.physSrc.assign(src.begin(), src.end());
-      fp.physOp.assign(op.begin(), op.end());
-      fp.physArg.assign(arg.begin(), arg.end());
 
       // Guarded rather than assumed: this runs on whatever a kernel authored,
-      // and applyCoordMap indexes the logical arrays with phys_src[k]. The op's
+      // and the evaluator indexes the logical arrays with phys_src[k]. The op's
       // own verifier has already checked the bound against the descriptor's
       // BLOCK rank, which equals the tensor rank -- but a module handed in as
       // text has not necessarily been verified.
@@ -231,10 +265,12 @@ void init_triton_spyre_ir_utils(py::module &&m) {
       for (int64_t d : src)
         inRange &= d >= 0 && d < (int64_t)sizes.size();
       if (inRange) {
-        SmallVector<int64_t> phys;
-        if (triton::tts::applyCoordMap(sizes, src, op, arg, phys)) {
+        SmallVector<int64_t> deviceSize, strideMap;
+        if (triton::tts::evaluateDeviceLayout(sizes, strides, src, op, arg,
+                                              deviceSize, strideMap)) {
           fp.staticFootprint = true;
-          fp.deviceSize.assign(phys.begin(), phys.end());
+          fp.deviceSize.assign(deviceSize.begin(), deviceSize.end());
+          fp.strideMap.assign(strideMap.begin(), strideMap.end());
         }
       }
 
@@ -256,18 +292,16 @@ void init_triton_spyre_ir_utils(py::module &&m) {
       const MarkerFootprint &fp = entry.second;
       py::dict d;
       d["ptr_index"] = fp.ptrIndex;
-      d["logical_size"] = fp.logicalSizes;
-      d["logical_stride"] = fp.logicalStrides;
-      d["phys_src"] = fp.physSrc;
-      d["phys_op"] = fp.physOp;
-      d["phys_arg"] = fp.physArg;
       // None, not an empty list: a dynamic extent means there is no claim, and
-      // an empty list would read as a rank-0 one.
+      // an empty list would read as a rank-0 one. The two go None TOGETHER --
+      // a stride map without extents describes nothing.
       d["device_size"] = fp.staticFootprint
                              ? py::cast(fp.deviceSize)
                              : py::cast<py::object>(py::none());
-      d["is_load"] = fp.isLoad;
-      d["is_store"] = fp.isStore;
+      d["stride_map"] = fp.staticFootprint
+                            ? py::cast(fp.strideMap)
+                            : py::cast<py::object>(py::none());
+      d["access"] = accessName(fp);
       result.append(d);
     }
     return result;
