@@ -70,8 +70,11 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
         UnrealizedConversionCast bridges.
 
         Runs after LowerInterTile, so every inter-tile reduction is already in
-        ktdp form; LowerInterTile rejects a kernel that combines a layout marker
-        with an inter-tile reduction, since no propagation pattern covers it.
+        ktdp form. A kernel that combines a layout marker with an inter-tile
+        reduction is not supported and not diagnosed: no propagation pattern
+        covers the produce/reduce pair, whose halves communicate through a
+        !ktdp.tile_future rather than a RankedTensorType, so it fails here as a
+        type mismatch.
 
         Output: physical ktdp.construct_memory_view + access_tile + load/store;
         no tt.spyre_tensor_layout ops remain. Descriptors without an
