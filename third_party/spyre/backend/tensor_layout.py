@@ -263,37 +263,53 @@ def device_bytes(entry: dict, torch_dtype) -> int:
                                                                torch_dtype)))
 
 
+def fits(entry: dict, tensor) -> bool:
+    """Is *tensor*'s device storage at least what *entry* claims it must be?
+
+    Both sides go through ``get_device_size_in_bytes``: the *need* from the layout
+    the compiler recorded, the *have* from the layout the tensor actually carries.
+    Same function, so a difference is a real difference and not two sizing rules
+    disagreeing.
+
+    ``have > need`` is True. An over-allocated buffer wastes device memory and
+    corrupts nothing, and calling it a failure would reject a tensor deliberately
+    padded or sliced from a larger one.
+
+    True, vacuously, when there is nothing to compare: a ``None`` footprint, or a
+    tensor carrying no device layout at all (a host tensor, or a FakeTensor).
+    Vacuous rather than False because the caller's own device check is what should
+    report a host tensor, with a message about staging.
+
+    Separate from :func:`check_fits` because two callers want the two shapes:
+    ``SpyreLauncher`` wants the refusal, and a caller deciding *how to allocate*
+    wants the question — and it must be the same question, or a harness would
+    allocate on one rule while the launcher checked another.
+    """
+    if entry["device_size"] is None:
+        return True
+    have_layout = tensor.device_tensor_layout()
+    if have_layout is None:
+        return True
+
+    from torch_spyre._C import get_device_size_in_bytes
+    return int(get_device_size_in_bytes(have_layout)) >= device_bytes(
+        entry, tensor.dtype)
+
+
 def check_fits(entry: dict, name: str, tensor) -> None:
     """Refuse *tensor* if its device storage is smaller than *entry* claims.
-
-    Both sides go through ``get_device_size_in_bytes``: the *need* from the
-    layout the compiler recorded, the *have* from the layout the tensor actually
-    carries. Same function, so a difference is a real difference and not two
-    sizing rules disagreeing.
-
-    ``have > need`` passes. An over-allocated buffer wastes device memory and
-    corrupts nothing, and refusing it would reject a tensor deliberately padded
-    or sliced from a larger one.
 
     Checked for **every** annotated argument, not only the stored ones: a splat
     layout on an input reads out of bounds just as a splat on an output writes out
     of bounds, and the read is the quieter of the two.
     """
-    if entry["device_size"] is None:
-        # A dynamic extent: no claim was captured, so there is nothing to check.
-        # Such a kernel does not launch today for other reasons.
+    if fits(entry, tensor):
         return
     have_layout = tensor.device_tensor_layout()
-    if have_layout is None:
-        # Not a Spyre tensor, or a FakeTensor. The caller's own device check is
-        # the one that should report that, with a message about staging.
-        return
 
     from torch_spyre._C import get_device_size_in_bytes
     need = device_bytes(entry, tensor.dtype)
     have = int(get_device_size_in_bytes(have_layout))
-    if have >= need:
-        return
 
     raise RuntimeError(
         f"SpyreLauncher: argument {name!r} is allocated too small for the device "
