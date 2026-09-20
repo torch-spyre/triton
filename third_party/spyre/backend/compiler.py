@@ -10,7 +10,6 @@ import zipfile
 from triton import knobs
 from triton.backends.compiler import BaseBackend, GPUTarget
 
-from . import tensor_layout
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -585,10 +584,13 @@ class SpyreBackend(BaseBackend):
         # here for two reasons at once: LowerTTSMarkers turns every
         # tts.tensor_layout op into an attribute, and ConvertFunctions retypes the
         # !tt.ptr arguments the footprint is attributed to, so after this pipeline
-        # there is neither a marker to read nor a pointer to key it by.
+        # there is neither a marker to read nor a pointer to key it by. Stored as
+        # it comes back: the query returns finished entries, in torch-spyre's
+        # SpyreTensorLayout convention, so there is nothing to post-process here
+        # and nothing at compile time that has to import torch_spyre.
         #
         # NOT gated on options.symbolic_args, unlike the base addresses below.
-        metadata["device_layouts"] = tensor_layout.capture_device_layouts(mod)
+        metadata["device_layouts"] = spyre.ir_utils.get_descriptor_layouts(mod)
 
         # Only the address-binding mode has any use for these. Inferring them in
         # symbolic mode would also mean reporting a pointer-width or pointer-count

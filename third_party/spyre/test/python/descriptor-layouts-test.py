@@ -259,6 +259,163 @@ def test_an_absent_key_is_not_a_fault(entries):
 
 
 # ---------------------------------------------------------------------------
+# The padding convention, held to torch-spyre's own generated wrappers
+#
+# The unit-axis padding is a convention we MATCH, not one we invented, and that is
+# what this section is for. Every test above it pins the padding to our own
+# reasoning about what ``get_dim_map`` needs -- sound reasoning, but a closed loop:
+# our evaluator and our reading of their DMA are the only two parties to it, and
+# they agree by construction. There is an outside witness, though. torch-spyre's
+# own SDSC codegen states device layouts explicitly, the same way we do, and the
+# layouts it emits satisfy the same rule. So the rule is checkable against
+# something other than ourselves, which is the whole point of the comparison.
+#
+# Checked as a PROPERTY, not by parsing their wrappers. The wrapper files are
+# generated artifacts outside this repository (one of them is
+# ``gemma4-route-scalar-relayout-s2-20260902/accepted/generated.py`` under the
+# dataflow-test-framework working tree), so a test that read them would fail on
+# any machine without that tree -- which is every CI machine -- and would be
+# pinned to the spelling of a generated file nobody promises to keep. Their two
+# distinct layouts are recorded below as literals instead, and go through the
+# same predicate as ours: what is shared is the rule, and a rule both sides
+# satisfy is what the comparison was for.
+# ---------------------------------------------------------------------------
+
+#: The two distinct explicit ``SpyreTensorLayout``s torch-spyre's SDSC codegen
+#: emits across the wrapper files on hand, with the host tensor each was built
+#: for. They satisfy ``stick_axis_is_harmless`` in the two different ways it
+#: allows, which is why both are here rather than one:
+#:
+#: * the rank-4 one for host ``(1, 2816, 512)`` has the TILE HALF third from the
+#:   end (8 sticks of 64 over the innermost host dim) and its unit axis -- host
+#:   dim 0, extent 1 -- elsewhere, carrying ``-1``;
+#: * the rank-3 one for host ``(512, 2816)`` is the canonical stick split, tile
+#:   half third from the end again.
+#:
+#: Ours satisfy it the third way, with a unit axis third from the end. The
+#: predicate is what the three have in common; none of the three positions is.
+WRAPPER_LAYOUTS = [
+    ([2816, 8, 1, 64], [512, 64, -1, 1]),
+    ([44, 512, 64], [64, 2816, 1]),
+]
+
+
+def stick_axis_is_harmless(device_size, stride_map):
+    """Will torch-spyre's DMA move this layout's whole extent, or one element of it?
+
+    The DMA reads the axis **third from the end** as the tile-count half of the
+    stick split, whose lanes are the **last** axis, and overwrites what it matched
+    there with the last axis's host dim (``get_dim_map``, ``spyre_mem.cpp``). If
+    that axis is something else, a real dimension gets clobbered and the transfer
+    silently shrinks to one element. So a usable device layout has to make that one
+    assignment harmless, and this is the predicate for it — the single rule the
+    unit-axis padding exists to satisfy, and the one both our layouts and
+    torch-spyre's own can be held to.
+
+    Harmless three ways: the third-from-last axis is skipped by their scan (stride
+    ``-1``, or extent 1), or it genuinely is the tile half of the same host dim as
+    the last axis, so the value written back is the one already there.
+
+    That third clause is stated in LAYOUT terms rather than the coordinate map's,
+    deliberately: the tile half of the dim the last axis takes modulo advances by
+    one whole stick of it, ``stride_map[-1] * device_size[-1]``. That is all a
+    metadata consumer can see — nothing downstream of the compile has the
+    coordinate map — and it is what lets the same predicate judge a torch-spyre
+    wrapper's layout, which never had one.
+    """
+    rank = len(device_size)
+    if rank < 2:
+        return True  # The two positions coincide; the assignment is a self-assignment.
+    p = rank - 3 if rank > 2 else 0
+    return (stride_map[p] == -1 or device_size[p] == 1
+            or stride_map[p] == stride_map[-1] * device_size[-1])
+
+
+@pytest.mark.parametrize("device_size, stride_map", WRAPPER_LAYOUTS)
+def test_the_wrappers_own_layouts_satisfy_the_convention(device_size, stride_map):
+    """The claim this section rests on: it is their rule, not just our reading.
+
+    If this fails, the predicate below is measuring something torch-spyre does not
+    do, and the padding it justifies needs re-deriving -- not the emissions.
+    """
+    assert stick_axis_is_harmless(device_size, stride_map)
+
+
+def test_the_convention_is_discriminating():
+    """The unpadded rank-2 splat FAILS it, which is what makes the rest worth asserting.
+
+    ``[64, 64]`` / ``[1, -1]`` is the coordinate map's own answer for a splat
+    output, before the unit axis goes in. At rank 2 the axis third from the end is
+    the first one, it addresses host dim 0 with a real stride, and the last axis
+    addresses no host dim at all — so the DMA's forced assignment destroys the map.
+    A predicate every layout satisfied would say nothing about the padding.
+    """
+    assert not stick_axis_is_harmless([64, 64], [1, -1])
+
+
+#: ``[M, N]`` -> ``[ceil(M/8), 8, ceil(N/S), S]``: both logical dims split, so the
+#: axis third from the end is the mod half of the OUTER dim while the last is the
+#: lane of the inner one. Neither exemption applies and the tile-half test fails, so
+#: this is where the padding fires at a rank the splat case cannot reach.
+DOUBLE_SPLIT_2D = ((0, "floordiv", 8), (0, "mod", 8), (1, "floordiv", S),
+                   (1, "mod", S))
+
+
+@pytest.mark.parametrize("in_layout, out_layout", [
+    (STICK_ON_N, SPLIT_1D),
+    (STICK_ON_N, SPLAT_1D),
+    (DOUBLE_SPLIT_2D, SPLIT_1D),
+    (DOUBLE_SPLIT_2D, SPLAT_1D),
+])
+def test_every_emitted_pair_satisfies_the_convention(tmp_path, in_layout,
+                                                     out_layout):
+    """What the evaluator emits is held to the rule the wrappers are held to.
+
+    Four combinations rather than one because the padding decision is per layout
+    and its three exemptions are reached by different shapes: the split output
+    takes the tile-half exemption, the splat output is padded at rank 2, and
+    ``DOUBLE_SPLIT_2D`` is padded at rank 4 -- the rank where the axis inserted and
+    the axis being neutralized stop being the same one.
+    """
+    entries = capture(tmp_path, reduce_to_stick,
+                      {"in_ptr": "*fp16", "out_ptr": "*fp16"},
+                      {"M": 64, "N": 128, "IN_LAYOUT": in_layout,
+                       "OUT_LAYOUT": out_layout})
+    assert entries
+    for entry in entries:
+        assert stick_axis_is_harmless(entry["device_size"],
+                                      entry["stride_map"]), entry
+
+
+@pytest.mark.parametrize("which, in_layout", [
+    # The splat output, padded at rank 2 -- entry 1, the `out_ptr` claim.
+    (1, STICK_ON_N),
+    # The double-split input, padded at rank 4 -- entry 0, where the axis inserted
+    # and the axis being neutralized are not the same one.
+    (0, DOUBLE_SPLIT_2D),
+])
+def test_an_inserted_axis_is_spelled_the_way_theirs_is(tmp_path, which,
+                                                      in_layout):
+    """A padded layout's unit axis carries extent 1 and ``stride_map`` ``-1`` together.
+
+    The same spelling the wrappers use for an axis the host tensor does not
+    address (their ``device_size=[2816, 8, 1, 64]`` / ``stride_map=[512, 64, -1,
+    1]``). Asserted separately from the predicate above because the predicate is
+    satisfied by extent 1 ALONE: a unit axis emitted with a real stride would pass
+    it and still be a second spelling of the same thing.
+
+    Both padded ranks are covered, because the insertion goes second from the end
+    of the unpadded layout, which is the axis being neutralized only at rank 2.
+    """
+    entry = capture(tmp_path, reduce_to_stick,
+                    {"in_ptr": "*fp16", "out_ptr": "*fp16"},
+                    {"M": 64, "N": 128, "IN_LAYOUT": in_layout,
+                     "OUT_LAYOUT": SPLAT_1D})[which]
+    p = len(entry["device_size"]) - 3
+    assert (entry["device_size"][p], entry["stride_map"][p]) == (1, -1), entry
+
+
+# ---------------------------------------------------------------------------
 # The check the launcher makes
 #
 # Byte figures come from torch-spyre's own ``get_device_size_in_bytes``, so these
