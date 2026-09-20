@@ -1,7 +1,8 @@
 """SIGNATURE + VARIANTS + reference oracle + input generators for elementwise.
 
 Variants cover 1D/2D/3D shapes (Level A, OP pinned to "add") and
-op × dtype correctness on ktir_cpu (Level B, 1d_compute sweeps 3×4=12 combos).
+op × dtype correctness on ktir_cpu (Level B, 1d_compute plus the split-out
+1d_compute_intdiv covering the twelfth cell).
 
 See ``fixtures/README.md`` for the field reference and discovery rules.
 """
@@ -733,8 +734,18 @@ VARIANTS = {
         "factory":      Elementwise(rank=1),
         "constexpr":    ["n_elements", "BLOCK_SIZE", "OP"],
         "params": {
-            "DTYPE":      ["fp16", "fp32", "i32"],
-            "OP":         ["add", "sub", "mul", "div"],
+            # A JOINT GROUP RATHER THAN A PRODUCT, to leave one cell out. Eleven
+            # of the twelve rows the product would give, and the twelfth --
+            # (i32, div) -- is the sibling below, which carries a gap the other
+            # eleven do not. Written as rows because that is how the params
+            # grammar skips a combination: by not listing it. Both columns still
+            # vary, so the registry keys are the same `[DTYPE=..., OP=...]` they
+            # were.
+            ("DTYPE", "OP"): [
+                ("fp16", "add"), ("fp16", "sub"), ("fp16", "mul"), ("fp16", "div"),
+                ("fp32", "add"), ("fp32", "sub"), ("fp32", "mul"), ("fp32", "div"),
+                ("i32", "add"), ("i32", "sub"), ("i32", "mul"),
+            ],
             "n_elements": [128],
             "BLOCK_SIZE": [128],
         },
@@ -742,6 +753,43 @@ VARIANTS = {
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
+    },
+    "1d_compute_intdiv": {
+        "base": "1d_compute",
+        "summary": (
+            "The twelfth cell of the compute sweep, i32 division, split out to "
+            "carry the ktir_cpu gap below."
+        ),
+        "params": {
+            ("DTYPE", "OP"): [("i32", "div")],
+            "n_elements": [128],
+            "BLOCK_SIZE": [128],
+        },
+        # ktir_cpu, and only reachable now because of where a pass moved. An i32
+        # division is not an integer op in Triton: it goes through float, so the
+        # kernel carries `arith.sitofp` on a tensor. The `ktir` stage used to run
+        # ConvertElementwiseToLinalg, which put that cast inside a linalg.generic
+        # body where its operand is a scalar; that pass is in the `spyrecode` stage
+        # now, so the `ktir` artifact -- which is what the numerical tier reads --
+        # carries the tensor-typed cast instead.
+        #
+        # ktir_cpu's arith.sitofp handler resolves its result type through
+        # to_np_dtype, which knows scalar dtypes only, so it raises on
+        # 'tensor<128xf32>'. The IR is legal MLIR; the interpreter has no case for
+        # it. No other cell reaches this, which is why only this one is split out.
+        #
+        # This closes either when ktir_cpu handles a tensor-typed arith cast, or
+        # when the numerical tier reads an artifact that has been through
+        # ConvertElementwiseToLinalg.
+        "xfail_numerical": {
+            "reason": (
+                "ktir_cpu's arith.sitofp handler takes scalar dtypes only and "
+                "the ktir artifact now carries the cast tensor-typed, because "
+                "ConvertElementwiseToLinalg moved to the spyrecode stage"
+            ),
+            "strict": True,
+            "raises": ValueError,
+        },
     },
 
 
@@ -773,7 +821,16 @@ VARIANTS = {
             "DTYPE": ["fp16"], "OP": ["add"],
         },
         "grid":        [1],
-        "data_layout": "host",
+        # No "data_layout". It selected the NAMED RewriteDescriptorLayout's
+        # "device"/"host" stride mode, and that pass roots on a
+        # tt.spyre_tensor_layout op. tl.spyre_tensor_layout authors
+        # tts.tensor_layout now, so the named pass no-ops on every kernel in this
+        # tree and the option reached nothing. The generic pass that physicalizes
+        # these -- in the spyrecode stage -- has no equivalent option and needs
+        # none: a caller wanting the logical form reads the ktir artifact, which
+        # is logical. Removed rather than left as dead config, because conftest
+        # forwards any key naming a SpyreOptions field and the field still
+        # exists, so it would have kept being passed and kept doing nothing.
         "rtol":        1e-2,
         "atol":        5e-2,
     },

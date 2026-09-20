@@ -48,11 +48,13 @@ module {
 // NOTT-NOT: tt.get_num_programs
 // NOTT-NOT: tt.return
 
-// The `ktir` stage, whole. The entry point is a func.func over `index`,
-// DistributeWork has stamped its grid and replaced the program id, and the
-// elementwise add has become a linalg.generic whose `outs` is a fresh
-// tensor.empty rather than one of its own `ins` -- that last one is the property
-// dbo-opt needs, and the stage's pass list is what arranges it.
+// The `ktir` stage, whole. The entry point is a func.func over `index`, and
+// DistributeWork has stamped its grid and replaced the program id.
+//
+// THE ELEMENTWISE ADD IS STILL `arith.addf` ON TENSORS, and that is the stage
+// boundary this file exists to pin. 
+// So the `ktir` artifact is the kernel as written -- logical descriptors, tensor
+// arithmetic -- and nothing about the device's shape is baked into it.
 //
 // KTIR-LABEL:   func.func @add_kernel(
 // KTIR-SAME:      %[[X:.*]]: index, %[[Y:.*]]: index, %[[OUT:.*]]: index
@@ -61,21 +63,36 @@ module {
 // KTIR:           ktdp.construct_memory_view %[[X]],
 // KTIR:           %[[XT:.*]] = ktdp.load
 // KTIR:           %[[YT:.*]] = ktdp.load
-// KTIR:           %[[EMPTY:.*]] = tensor.empty() : tensor<1024xf32>
-// KTIR:           %[[SUM:.*]] = linalg.generic
-// KTIR-SAME:        ins(%[[XT]], %[[YT]] : tensor<1024xf32>, tensor<1024xf32>)
-// KTIR-SAME:        outs(%[[EMPTY]] : tensor<1024xf32>)
-// KTIR:             arith.addf
+// KTIR:           %[[SUM:.*]] = arith.addf %[[XT]], %[[YT]] : tensor<1024xf32>
 // KTIR:           ktdp.store %[[SUM]],
 // KTIR:           return
+//
+// And no linalg at all, which is the other half of the same claim: a `linalg.fill`
+// would mean a reduction and there is none here, so `linalg` appearing in this
+// stage's output would mean the shaping passes had drifted back across the
+// boundary.
+//
+// KTIR-NOT:       linalg.
 
 // The `spyrecode` stage in the default argument-passing mode. It is a KTIR → KTIR
 // round trip: the pointer arguments survive, because the addresses are not known
 // at compile time and the runtime patches them in.
 //
+// This is where the add becomes a linalg.generic, and where its `outs` is a fresh
+// tensor.empty rather than one of its own `ins` -- that last one is the property
+// dbo-opt needs, and UnaliasLinalgOuts running after ConvertElementwiseToLinalg is
+// what arranges it.
+//
 // SYMBOLIC-LABEL:   func.func @add_kernel(
 // SYMBOLIC-SAME:      %{{.*}}: index, %{{.*}}: index, %{{.*}}: index
-// SYMBOLIC:           ktdp.store
+// SYMBOLIC:           %[[SXT:.*]] = ktdp.load
+// SYMBOLIC:           %[[SYT:.*]] = ktdp.load
+// SYMBOLIC:           %[[EMPTY:.*]] = tensor.empty() : tensor<1024xf32>
+// SYMBOLIC:           %[[GEN:.*]] = linalg.generic
+// SYMBOLIC-SAME:        ins(%[[SXT]], %[[SYT]] : tensor<1024xf32>, tensor<1024xf32>)
+// SYMBOLIC-SAME:        outs(%[[EMPTY]] : tensor<1024xf32>)
+// SYMBOLIC:             arith.addf
+// SYMBOLIC:           ktdp.store %[[GEN]],
 
 // And in the binding mode, which is the one genuine choice in that stage: the
 // arguments become constants and leave the signature, because the dataflow

@@ -2115,11 +2115,16 @@ class TritonSemantic(Generic[TensorTy]):
           src_dim                        -> identity on logical dim
           (src_dim, "floordiv", divisor) -> logical_dim // divisor
           (src_dim, "mod", modulus)      -> logical_dim %  modulus
+          (src_dim, "splat", lanes)      -> logical_dim replicated over `lanes`
           (src_dim, "identity")          -> same as bare int
         """
 
-        # Coordinate-op encoding: maps keyword -> i64 stored on the MLIR op.
-        _COORD_OPS = {"identity": 0, "floordiv": 1, "mod": 2}
+        # Coordinate-op encoding: maps keyword -> i64 stored on the MLIR op. The
+        # set is the one tts::verifyTensorLayoutArrays admits, which is where the
+        # structural rules on a coordinate map live -- including which pairings of
+        # a repeated logical dim are legal, a rule this function cannot see
+        # because it reads one entry at a time.
+        _COORD_OPS = {"identity": 0, "floordiv": 1, "mod": 2, "splat": 3}
 
         if not isinstance(entry, (tuple, list)):
             return int(tl._unwrap_if_constexpr(entry)), 0, 0
@@ -2140,16 +2145,18 @@ class TritonSemantic(Generic[TensorTy]):
             op_code = _COORD_OPS[op_key]
         else:
             op_code = int(op_key)
-            if op_code not in (0, 1, 2):
+            if op_code not in _COORD_OPS.values():
                 raise ValueError(
                     f"spyre_tensor_layout: entry {i} op must be "
-                    f"{sorted(_COORD_OPS)} or 0/1/2, got {op_key!r}")
+                    f"{sorted(_COORD_OPS)} or "
+                    f"{'/'.join(str(c) for c in sorted(_COORD_OPS.values()))}, "
+                    f"got {op_key!r}")
 
         arg_val = int(entry[2]) if len(entry) == 3 else 0
         return src_dim, op_code, arg_val
 
     def spyre_tensor_layout(self, desc, layout):
-        """Emit tt.spyre_tensor_layout — annotates a descriptor with its
+        """Emit tts.tensor_layout — annotates a descriptor with its
         physical device layout as parallel arrays (phys_src, phys_op, phys_arg),
         one entry per physical dimension."""
         target = driver.active.get_current_target()
@@ -2165,6 +2172,13 @@ class TritonSemantic(Generic[TensorTy]):
             op.append(o)
             arg.append(a)
 
-        self.builder.create_spyre_tensor_layout(desc.handle, src, op, arg)
+        # The builder lives in the Spyre pybind module, not in ir.cc's, because
+        # the op is in our dialect and the dependency only points one way. The
+        # import is inside the function for the same reason the guard above is:
+        # the submodule exists only in a Spyre build, and this file is every
+        # backend's.
+        from triton._C.libtriton import spyre
+        spyre.ir_builders.create_tensor_layout(self.builder, desc.handle, src,
+                                               op, arg)
         return tl.tensor(None, tl.void)
     # --- END --- added for spyre

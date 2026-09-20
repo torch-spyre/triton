@@ -68,7 +68,16 @@ No layout annotation anywhere here; that is Level C.
   dbo-opt refuses the loop that outlines from that. The one reduce that does
   reach a binary is the loop-free `one_tile` at `AXIS=0` (Level D).
 
-### Level C — layout (stick physicalization, on ktir_cpu)
+### Level C — layout (annotated kernels, on ktir_cpu)
+
+**What ktir_cpu sees here is no longer physicalized.** Physicalization moved to the
+`spyrecode` stage and the numerical tier reads the `ktir` stage's artifact, which
+is logical — see the note in `fixtures/README.md`. So these two arms check that an
+annotated kernel still computes the right answer, and the physical IR their
+descriptions below talk about is pinned by the lit fixtures under
+`test/Dialect/KTDP/Transforms/RewriteDescriptorLayoutGeneric/` and by the device
+tier instead. The descriptions are kept because they say what each variant is
+*for*, and the lit side is where they are now checked.
 
 The two arms are chosen for where the stick lands relative to the reduced axis.
 

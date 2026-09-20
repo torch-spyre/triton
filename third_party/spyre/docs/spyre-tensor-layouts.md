@@ -1,5 +1,21 @@
 # RewriteDescriptorLayout: Reconciling Kernels with Device Tensor Layouts
 
+> **No compiled kernel reaches this pass any more.** `tl.spyre_tensor_layout`
+> authors a `tts.tensor_layout` op, which becomes a `tts.tensor_layout` attribute
+> on the memory view, and `RewriteDescriptorLayoutGeneric` reads that attribute in
+> the `spyrecode` stage. The pass this document describes roots on
+> `tt.spyre_tensor_layout` and so now fires only for its own lit fixtures, which
+> supply that op directly. It is still installed in the `ktir` stage and is retired
+> on device coverage rather than on a date, so the description below is still true
+> of the pass — it is just no longer the path a kernel takes.
+>
+> Everything here about sticks, physicalization and the coordinate map applies to
+> both passes; the differences are that the generic pass reads the attribute rather
+> than the op, has no `data-layout` option (physical strides are row-major over the
+> physical sizes), restates `linalg.generic` rather than propagating through
+> individual ops, and admits a fourth coordinate op, `splat`. `Passes.td` under
+> `include/Dialect/KTDP/Transforms/` is the authoritative contract for it.
+
 `RewriteDescriptorLayout` reconciles a logical Triton kernel against a device
 tensor layout that is already stickified. The layout comes from a user
 annotation, `tl.spyre_tensor_layout`, on each tensor descriptor; the pass does

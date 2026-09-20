@@ -3857,6 +3857,10 @@ def spyre_tensor_layout(desc, layout, _semantic=None):
     - ``src`` (a bare int) — identity: ``phys_idx = logical_idx[src]``.
     - ``(src, "floordiv", div)`` — ``phys_idx = logical_idx[src] // div``.
     - ``(src, "mod", mod)`` — ``phys_idx = logical_idx[src] % mod``.
+    - ``(src, "splat", lanes)`` — a fresh axis of ``lanes`` over which
+      ``logical_idx[src]`` is replicated rather than partitioned. Pairs with an
+      identity entry on the same ``src``: that is the reduce-on-stick output
+      layout, where a rank-1 logical result is stored one stick wide.
 
     Example — ``[M, N]`` tensor stick-tiled on ``N``, physical layout
     ``[ceil(N/64), M, 64]``, indices ``[N//64, M, N%64]``::

@@ -36,9 +36,18 @@ class OpPassManager;
 namespace mlir::triton::spyre {
 
 struct TTIRToKTIRPipelineOptions {
-  /// RewriteDescriptorLayout's HBM layout: "device" (stickified row-major
-  /// physical strides) or "host" (strides derived from the logical ones).
-  /// Anything else is read as "host" by the pass itself.
+  /// The named RewriteDescriptorLayout's HBM layout: "device" (stickified
+  /// row-major physical strides) or "host" (strides derived from the logical
+  /// ones). Anything else is read as "host" by the pass itself.
+  ///
+  /// It reaches the named pass and nothing else, and that pass is inert for every
+  /// kernel the Triton frontend produces: the frontend authors `tts.tensor_layout`
+  /// and the named pass roots on `tt.spyre_tensor_layout`. So this selects nothing
+  /// for a real compile today. Kept rather than dropped because the pass is kept,
+  /// on device coverage rather than on a date -- and because dropping it would
+  /// change every kernel's options hash, and so its cache key, for no change in
+  /// the artifact. The generic layout pass that replaced it, in the `spyrecode`
+  /// stage, has no equivalent option and needs none.
   std::string dataLayout = "device";
 
   /// DistributeWork's per-axis partition of the hardware grid. Empty leaves
@@ -63,6 +72,12 @@ struct SpyrecodePipelineOptions {
 
 /// Builds the `ktir` stage: Triton IR in, KTIR out.
 ///
+/// Its artifact is LOGICAL: a descriptor becomes a memory view at the shape and
+/// strides the kernel declared, with the physical device layout riding along as a
+/// `tts.tensor_layout` attribute on the view. Physicalizing it is the `spyrecode`
+/// stage's, so a reader of this artifact -- the numerical tier among them -- sees
+/// the kernel as written rather than as stick-tiled.
+///
 /// Ends with DistributeWork and a canonicalize, which is the whole stage and
 /// not just the dialect conversion -- the split that let the old fused helper
 /// drift was exactly that those two were added by the caller.
@@ -83,6 +98,11 @@ void buildTTIRToKTIRPipeline(OpPassManager &pm,
 /// IR (the `ktir` stage runs for every compile, most of which stop there, and a
 /// kernel that never becomes a binary can be one the pass rejects), or its
 /// output is no longer standalone KTIR.
+///
+/// Physicalization is here on the first of those: a stick-tiled layout is what the
+/// device needs, not what the IR needs. So is the linalg shaping that establishes
+/// its input contract -- see the notes in Pipeline.cpp, which are about the order
+/// those four have to run in.
 void buildSpyrecodePipeline(OpPassManager &pm,
                             const SpyrecodePipelineOptions &options);
 

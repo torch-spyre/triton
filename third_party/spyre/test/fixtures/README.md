@@ -78,6 +78,34 @@ reference oracle and input generator. Different functions
 `test_numerical` compiles the kernel through the TTIR→KTIR pipeline, executes
 it on `ktir_cpu` and compares against the NumPy oracle.
 
+### The artifact it reads is the `ktir` stage's, and that artifact is logical
+
+`make_ktir_mod` runs the `ktir` stage and stops. It does **not** run the
+`spyrecode` stage, and physicalization lives there — so what `ktir_cpu` executes
+has the shapes and strides the kernel declared, with the device layout carried
+alongside as a `tts.tensor_layout` attribute that nothing in this tier reads.
+The same is true of `arith` on tensors: `convert-elementwise-to-linalg` is in the
+`spyrecode` stage too, so pointwise work reaches `ktir_cpu` as tensor arithmetic
+rather than as a `linalg.generic`.
+
+This bounds what a **Level C** variant can claim, and the bound is sharper than
+"less physical than it was". Say it plainly: **numerically, Level C is now
+Level B.** The annotation is present in the artifact and no pass or interpreter in
+this tier acts on it, so a Level C variant and a Level B variant of the same
+kernel execute the same IR and check the same thing. The band's remaining value is
+that the annotation *compiles* and does not change the answer — not that it
+physicalizes, which is what the name says.
+
+The physical form is pinned by the lit fixtures under
+`test/Dialect/KTDP/Transforms/RewriteDescriptorLayoutGeneric/` and by the device
+tier. Nothing numerical covers it. Closing that needs a fixture able to ask for
+the `spyrecode` stage's artifact, which no field does today; until then, do not
+read a green Level C variant as evidence about a layout.
+
+It also means an `xfail_numerical` reason can legitimately be about the
+interpreter meeting *logical* IR it has no case for, with nothing wrong in the
+compiler — `elementwise__1d_compute_intdiv` is exactly that.
+
 Structural claims about the lowered IR are **not** made here. They live in the
 lit/FileCheck suite, whose layout mirrors `lib/` -- `test/Conversion/`,
 `test/Dialect/` and `test/Transforms/` -- which pins the exact IR a

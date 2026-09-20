@@ -1969,6 +1969,11 @@ void init_triton_ir(py::module &&m) {
         return results;
       });
 
+  // NO LONGER CALLED. tl.spyre_tensor_layout authors tts.tensor_layout, through
+  // a builder in third_party/spyre/triton_spyre.cc -- which is where a builder for
+  // an op of ours belongs, since this file is upstream's and may not name our
+  // dialect. Kept while tt.spyre_tensor_layout is kept, so the op stays reachable
+  // from Python for as long as it exists; it is retired with the op.
   TritonOpBuilderBinding.def("create_spyre_tensor_layout",
       [](TritonOpBuilder &self, Value &desc, std::vector<int64_t> &physSrc,
          std::vector<int64_t> &physOp, std::vector<int64_t> &physArg) -> void {

@@ -24,11 +24,22 @@ if(TRITON_BUILD_PYTHON_MODULE)
   # The three pass libraries stay named: unlike spyre-triton-opt, this file
   # reaches individual create*Pass factories, not just the registration entry
   # point.
+  #
+  # TTSIR is for the one op builder this file exposes to the frontend. Reached
+  # transitively through SpyreRegisterEverything, but named because
+  # triton_spyre.cc includes the dialect's header directly -- and DEPENDS on
+  # TTSIncGen for the same reason, so a clean parallel build does not rely on the
+  # link edge to order that tablegen ahead of this file.
   add_triton_plugin(TritonSpyre
     ${CMAKE_CURRENT_SOURCE_DIR}/triton_spyre.cc
+
+    DEPENDS
+    TTSIncGen
+
     LINK_LIBS SpyreRegisterEverything
               SpyrePipeline
               TritonToKTIR KTDPTransforms SpyreTransforms
+              TTSIR
               MLIRLinalgTransforms)
   target_link_libraries(TritonSpyre PRIVATE Python3::Module pybind11::headers)
 endif()
