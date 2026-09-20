@@ -160,6 +160,25 @@ def _stick_1d(dtype: str) -> tuple:
     return ("stick", ((0, "floordiv", stick), (0, "mod", stick)))
 
 
+def _stick_1d_splat(dtype: str) -> tuple:
+    """``[M]`` -> ``[M, S]``: the statistic *replicated* across a stick.
+
+    The counterpart of :func:`_stick_1d`, and the difference is the whole point.
+    ``_stick_1d`` *partitions* M's elements over two physical dims, so the element
+    count is unchanged and one statistic lands in one lane. This one *splats*:
+    physical dim 1 is a replication of width S, so each statistic occupies a whole
+    stick. That is the form a stick-axis reduce has to store, because the lanes it
+    reduced are read as one dim and written as another -- a floordiv/mod split,
+    which keeps the element count, has nowhere to put the surviving extent.
+
+    Note the layout is what targets ``[M, S]``; the host buffer stays logical
+    ``[M]``, and the allocation is derived from the compiled kernel's own recorded
+    footprint rather than restated here. See ``device_alloc_from`` in
+    ``test_device_launch.py``.
+    """
+    return ("splat", (0, (0, "splat", _stick_of(dtype))))
+
+
 def _stick_2d_on_n(dtype: str) -> tuple:
     """``[M, N]`` -> ``[ceil(N/S), M, S]``: stick on the reduced axis.
 
@@ -204,6 +223,19 @@ def _stick_on_n_row(dtype: str, n_sticks: int) -> tuple:
     """
     return (dtype, n_sticks * _stick_of(dtype),
             _stick_2d_on_n(dtype), _stick_1d(dtype))
+
+
+def _stick_on_n_row_splat(dtype: str, n_sticks: int) -> tuple:
+    """:func:`_stick_on_n_row` with the *splat* output layout.
+
+    Same input side, so the reduce folds the same axis; only where the statistic
+    lands differs. At ``M=64, N=128`` fp16 this is::
+
+        IN_LAYOUT  = ((1, "floordiv", 64), 0, (1, "mod", 64))   # [64,128] -> [2,64,64]
+        OUT_LAYOUT = (0, (0, "splat", 64))                      # [64]     -> [64,64]
+    """
+    return (dtype, n_sticks * _stick_of(dtype),
+            _stick_2d_on_n(dtype), _stick_1d_splat(dtype))
 
 
 def _stick_on_d2_row(dtype: str, n_sticks: int) -> tuple:
@@ -631,5 +663,63 @@ VARIANTS = {
         # (3.2 ulp) is already generous. Inheriting the sibling's 0.25 would
         # check it 20x looser than it needs for no reason.
         "atol":        5e-2,
+    },
+
+    # The same stick-axis fold as the sibling above, storing its statistic
+    # REPLICATED across a stick instead of split across one -- and that is what
+    # reaches a binary where the split form does not.
+    #
+    # The split cannot work and it is structural, not a tuning question. Under
+    # stick-on-N the lanes being folded are read as one physical dim and the
+    # statistic is written as another, so _stick_1d's floordiv/mod -- which
+    # PARTITIONS, keeping the element count -- has nowhere to put the surviving
+    # extent. A splat coord op REPLICATES: logical [M] becomes physical [M, S],
+    # one whole stick per statistic. The emitted reduce is then byte-identical to
+    # the form torch-spyre's own KTIR backend emits for torch.sum(x, dim=-1):
+    #
+    #   indexing_maps  = [(d0,d1,d2,d3) -> (d0,d1,d2),
+    #                     (d0,d1,d2,d3) -> (d1,d3)]
+    #   iterator_types = ["reduction", "parallel", "reduction", "parallel"]
+    #
+    # d3 appears in no input map, which is what replicates: for a row, every
+    # output lane receives the same reduced value. rebuild-reduction.mlir pins
+    # that form.
+    #
+    # No pass change was needed for it. The "a stick dim cannot be sub-stick"
+    # check keys on the mod coord op, and a splat dim is not one, so it never
+    # fires here. It is still the wall on the READ side of a statistic (a block
+    # shape of [M, 1] under a stick layout), which softmax needs and this does
+    # not.
+    #
+    # The replication is 8 elements wide on the DEVICE, not S. That is a device
+    # fact with no representation in the layout: the buffer still has to span
+    # M x S because S is the stride, and the host tensor addresses lane 0 only,
+    # which is what makes the oracle comparison correct. Reading the lane matching
+    # one's own output would read memory nothing wrote.
+    "one_tile_on_stick_splat": {
+        "base": "one_tile",
+        "summary": (
+            "The stick-axis sum again, storing its statistic SPLAT across a "
+            "stick instead of split across one. The split form cannot be "
+            "scheduled -- the lanes are reduced as one physical dim and would be "
+            "written as another -- and the splat form is what the reference "
+            "chains store. This is the arm that reaches a binary."
+        ),
+        "params": {
+            ("DTYPE", "N", "IN_LAYOUT", "OUT_LAYOUT"): [
+                _stick_on_n_row_splat("fp16", n_sticks=2),
+            ],
+            "M": [64], "OP": ["sum"], "AXIS": [1],
+        },
+        "compiles_to_binary": True,
+        # No "device_alloc" and nothing restating OUT_LAYOUT. The output buffer
+        # cannot be staged with `.to("spyre")` -- that path allocates the host
+        # element count, 128 bytes here, against the 8192 the splat layout
+        # addresses -- and the harness gets the right number by asking the
+        # COMPILED KERNEL for it, from metadata["device_layouts"]. Which buffers
+        # need that treatment follows from the recorded layouts too, so this
+        # variant declares nothing about it. See device_alloc_from in
+        # test_device_launch.py.
+        "atol":        2.5e-1,
     },
 }
