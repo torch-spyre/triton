@@ -41,14 +41,6 @@ namespace mlir::triton::tts {
 
 /// The coordinate op a `tts.tensor_layout`'s `phys_op[k]` names, by the
 /// attribute's own numbering.
-///
-/// Here rather than in a consumer because the numbering is the dialect's
-/// contract: `verifyTensorLayoutArrays` is what admits 0 through 3, the
-/// frontend's `_COORD_OPS` table is what authors them, and a consumer that
-/// spells the enum itself is a second definition of a rule it does not own. The
-/// rewrite pass did exactly that, with a comment warning the reader to use
-/// `Splat` and not the retired `Broadcast` spelling -- a warning that only
-/// existed because the enum had no single home.
 enum class CoordOp : int64_t { Identity = 0, FloorDiv = 1, Mod = 2, Splat = 3 };
 
 /// The physical extent one coordinate op gives one logical extent, or
