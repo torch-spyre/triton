@@ -16,7 +16,10 @@
 // transpose-specific or store-specific: both operands splitting the same loop dim
 // (so no composite is needed and the maps come out identical), the operands
 // splitting different loop dims (so each carries the other's composite), and the
-// same at a ktdp.store, which is why this pass has no widening stage.
+// same at a ktdp.store, which is why this pass needs no widening stage WHEREVER A
+// GENERIC MEDIATES THE STORE. Where none does -- a pure load-to-store copy with
+// only the destination annotated -- there is no vehicle for the shape change and
+// the pass declines; invalid-layout.mlir case 4 is that one.
 //
 // Captures are hand-named and this file is hand-maintained: do not regenerate it
 // with generate-test-checks.py, which numbers captures globally across a file and
@@ -175,8 +178,12 @@ tt.func @transpose_different_split_dims(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
 // logical dim 1 and the store destination splits logical dim 0, so -- as in case
 // 2 -- both dims are split in the loop domain and each operand carries the
 // composite for the dim the other splits. The store's data tile then has exactly
-// the shape its access tile names, by construction: there is nothing left for a
-// widening stage to do, which is why this pass has none.
+// the shape its access tile names, by construction: with a generic on the chain
+// there is nothing left for a widening stage to do.
+//
+// The condition is the generic, not the store: it is the generic's outs operand
+// that the rebuild gives the store's physical shape. Take it away and the two ends
+// have nothing to agree through -- invalid-layout.mlir case 4.
 
 // CHECK: #[[$ID3_STORE:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 // CHECK: #[[$STORE_IN_MAP:.+]] = affine_map<(d0, d1, d2, d3) -> (d2, d0 * 64 + d1, d3)>
