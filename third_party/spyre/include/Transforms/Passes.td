@@ -251,17 +251,22 @@ def FoldDataMovementGenerics
         through, and has zero occurrences across the fixture artifacts. Being
         "not a restatement" means it is neither absorbed nor rejected.
 
-        THE GATE on rejection, which is not optional. Measured across 163 fixture
-        artifacts, `tensor.reshape` appears in `gather__1d` and
-        `inter_tile_reduce__softmax`, both of which carry ZERO `tts.tensor_layout`
-        and compile today; rejecting unconditionally breaks them. So an
-        unabsorbable restatement is refused only on a path
-        RewriteDescriptorLayoutGeneric will physicalize, asked with THAT PASS'S
-        OWN seed traversals (shared from Dialect/KTDP/Utils, not copied): seed
-        from every `tts.tensor_layout`-annotated `ktdp.construct_memory_view`,
-        reach its loads and stores through its access tiles, take the generics one
-        hop off those. One hop, not a transitive closure — that is the scope the
-        layout pass rewrites.
+        THE GATE on rejection: an unabsorbable restatement is refused only on a
+        path RewriteDescriptorLayoutGeneric will physicalize, asked with THAT
+        PASS'S OWN seed traversals (shared from Dialect/KTDP/Utils, not copied):
+        seed from every `tts.tensor_layout`-annotated
+        `ktdp.construct_memory_view`, reach its loads and stores through its
+        access tiles, take the generics one hop off those. One hop, not a
+        transitive closure — that is the scope the layout pass rewrites.
+
+        Why gated, and the reason is forward-looking rather than protective. As
+        annotation coverage grows toward everything on a device path being
+        physicalized, the gate fires more often and converges to the ungated
+        behaviour by itself, so it never needs removing; shipping ungated would
+        instead mean adding a gate later, the moment an unannotated path has to
+        be legal. Kept pending the LX roundtrip, at which point the better move
+        may be to invert it into an assertion that anything on a device path IS
+        annotated.
 
         Three seeds, because the hazard has two sides. BACKWARD from each `ins`
         operand of such a generic, through every generic not itself in the rewrite
@@ -272,17 +277,15 @@ def FoldDataMovementGenerics
         view, the exact mirror: findLayoutForResult walks a generic's result users
         for a `ktdp.store` DIRECTLY, so a shape op between the two makes it return
         null and the linearization lands on the `outs` map instead — `gather__1d`
-        carries an `8x1 → 8` `tt.reshape` into a store, unannotated. FORWARD one
-        hop off each physicalized load, for a result neither backward walk
-        reaches; where it reaches a generic this is redundant with
+        carries an `8x1 → 8` `tt.reshape` into a store, so the shape is real.
+        FORWARD one hop off each physicalized load, for a result neither backward
+        walk reaches; where it reaches a generic this is redundant with
         checkConsumersAreRewritable and is kept only because it fires a stage
         earlier and says which property of the op is the problem.
 
-        The store side is REJECTION ONLY, never absorption. That rewrite would
-        have to change the generic's result type, replace the `tensor.empty`
-        behind `outs`, restate the outs map and repoint the store's data operand,
-        and it needs the map in the opposite direction — an inversePermutation
-        that is null for exactly the linearizing cases this is about.
+        The store side is REJECTION ONLY, never absorption; the header of
+        FoldDataMovementGenerics.cpp says why, and what the eventual fix would
+        have to choose between.
 
         Rejection is DERIVED, not a declared op list: the condition is exactly
         "absorption failed" and "on a physicalized path", and the first is asked

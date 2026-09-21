@@ -50,6 +50,23 @@
 //   reassociation instead would decline it for a linearization that is not there
 //   in the map anyone would schedule.
 //
+// THE STORE SIDE IS REJECTION ONLY, NEVER ABSORPTION.
+//   Everything above is the `ins` side. A shape op between a generic and the
+//   `ktdp.store` that consumes its result is the same hazard mirrored, and this
+//   pass refuses it -- but never absorbs it, and that is a decision rather than
+//   an unfinished case. Absorbing there is not a variation on
+//   AbsorbCoordinateOp: it would have to change the generic's RESULT type,
+//   replace the `tensor.empty` behind `outs`, restate the outs map and repoint
+//   the store's data operand -- and it needs the map in the OPPOSITE direction,
+//   which is an inversePermutation that is null for exactly the linearizing
+//   cases this is about. AbsorbCoordinateOp's `outs` is untouched, as it says.
+//
+//   The eventual fix is an open choice between doing that and teaching
+//   RewriteDescriptorLayoutGeneric's findLayoutForResult to look through a
+//   unit-dim reshape. The latter is arguably the better home: `ktdp.store`
+//   carries no indexing map, so on the store side there is nothing to absorb
+//   INTO, and what goes wrong is a walk that stops one op too early.
+//
 // The mechanism is upstream's, the POLICY is ours:
 //   Elementwise fusion is upstream's `populateElementwiseOpsFusionPatterns`,
 //   which takes a `ControlFusionFn` deciding each fusion. Upstream's own pass
@@ -151,14 +168,16 @@
 //
 //   Left in front of a generic the layout pass will physicalize, each of those is
 //   a program that fails later, in dbo-opt, with a diagnostic that names neither
-//   the op nor this pass. So they are rejected here -- but ONLY on such a path,
-//   and the gate is not optional. Measured across 163 fixture artifacts,
-//   `tensor.reshape` appears in `gather__1d` (x1) and `inter_tile_reduce__softmax`
-//   (x2), and both of those kernels carry ZERO `tts.tensor_layout` and compile
-//   today. Rejecting unconditionally breaks two working kernels. This is the same
-//   discipline DropReductionInitFill states for the fill it leaves alone: failing
-//   on an op you merely cannot reason about would break any pipeline that merely
-//   contains one.
+//   the op nor this pass. So they are rejected here -- and ONLY on such a path.
+//
+//   WHY THE REJECTION IS GATED, and the reason is forward-looking rather than
+//   protective. As annotation coverage grows toward everything on a device path
+//   being physicalized, the gate fires more often and converges to the ungated
+//   behaviour by itself, so it never needs removing. Shipping ungated would
+//   instead mean ADDING a gate later, the moment an unannotated path has to be
+//   legal. It is kept pending the LX roundtrip, at which point the better move
+//   may be to INVERT it -- into an assertion that anything on a device path IS
+//   annotated.
 //
 //   THE GATE is the layout rewrite's own scope, asked with the layout rewrite's
 //   own traversals (Dialect/KTDP/Utils, shared rather than copied): seed from
@@ -186,15 +205,9 @@
 //     shape op between the generic and the store makes it return null, the outs
 //     gets CoordOp::Identity, and the LINEARIZATION lands on the outs map
 //     instead of an ins map. `gather__1d` carries an 8x1 -> 8 `tt.reshape` into a
-//     store, which is that shape in the tree today; it is unannotated, which is
-//     the gate earning its keep rather than an argument against the seed.
-//
-//     Rejection ONLY on the store side, never absorption, and deliberately. That
-//     rewrite would have to change the generic's RESULT type, replace the
-//     tensor.empty behind `outs`, restate the outs map and repoint the store's
-//     data operand -- non-local, and it needs the map in the opposite direction,
-//     which is an inversePermutation that is null for exactly the linearizing
-//     cases this is about. AbsorbCoordinateOp's `outs` is untouched, as it says.
+//     store, so the shape is real and in the tree today -- on a kernel this pass
+//     never sees, since it stops at the `ktir` stage. Rejection only on this
+//     side, never absorption: see THE STORE SIDE, above.
 //
 //     FORWARD, one hop off each physicalized load, for a `load -> reshape`
 //     whose result goes somewhere neither of the backward walks reaches. Where it
@@ -238,10 +251,8 @@
 // generic -> generic only, so a named producer or consumer blocks it whatever the
 // control function says. Before rewrite_descriptor_layout_generic, which must see
 // the folded maps so that no data-movement generic is left for it to linearize,
-// and which is also the pass whose scope the gate above predicts. Nothing to say
-// about lower_inter_tile: that pass runs in the `ktir` stage, a whole stage
-// earlier, so this pass necessarily runs after it -- harmlessly, since by then
-// every !ktdp.tile_future has been retired.
+// and which is also the pass whose scope the gate above predicts. Nothing is owed
+// to lower_inter_tile, which runs in the `ktir` stage a whole stage earlier.
 //
 //===----------------------------------------------------------------------===//
 

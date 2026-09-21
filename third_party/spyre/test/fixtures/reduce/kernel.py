@@ -225,34 +225,25 @@ def reduce_one_tile(
 # The statistic chain: a reduce whose own output is read back by a later
 # elementwise op. Two kernels, one per axis, and ``sum`` in both.
 #
-# ``sum`` is not a preference. ``DropReductionInitFill`` admits ``arith.addf``
-# and ``arith.subf`` and nothing else, so a ``max`` reduce is refused with
-#
-#   reduction 'outs' operand #1 is combined with 'arith.maxnumf', which the
-#   dataflow scheduler does not lower correctly against a dropped neutral
-#   element; only arith.addf and arith.subf do
-#
-# before it reaches a binary, and at fp16 ``tl.max`` also widens to fp32 first
-# (``arith.extf``, which no pass here lowers). Both refusals are about the
-# combiner and neither is about reading a statistic back, so a ``max`` chain
-# would be blocked by a wall that has nothing to do with what these test. That
-# is also why the ``reduce`` family's own ``max``/``min`` variants, and all eight
-# ``softmax`` variants, reach no binary today.
-#
-# A SUBTRACT rather than a divide, for the oracle rather than for the lowering:
-# ``x / sum(x)`` has a denominator that is a sum of standard normals, which can
-# land near zero and make the comparison a statement about catastrophic
-# cancellation. ``x - sum(x)`` passes the statistic's own error through
-# unamplified, so an absolute tolerance sized in ulp of the statistic is the
-# whole story. (``/`` would also promote fp16 to fp32 in the frontend and need
-# ``tl.fdiv`` instead -- a second thing to get right for no gain.)
-#
 # TWO KERNELS rather than one with an ``AXIS`` constexpr, unlike
-# ``reduce_one_tile`` above. The axis is not the only thing that differs: the
-# off-stick arm reads its statistic back through the descriptor it wrote, and the
-# on-stick arm needs a SECOND descriptor over the same pointer at a shape only
-# the physical layout has -- so the two have different argument lists, and one of
-# them takes the stick width.
+# ``reduce_one_tile`` above, because the axis is not the only thing that differs.
+# The off-stick arm reads its statistic back through the descriptor it wrote; the
+# on-stick arm needs a SECOND descriptor over the same pointer, at a shape only
+# the physical layout has. Different argument lists, and one of them has to be
+# told the stick width.
+#
+# A SUBTRACT rather than a divide, for the ORACLE rather than for the lowering.
+# ``x / sum(x)`` has a denominator that is a sum of standard normals and can land
+# near zero, which would make the comparison a statement about catastrophic
+# cancellation instead of about the chain. ``x - sum(x)`` passes the statistic's
+# own error through unamplified, so an absolute tolerance sized in ulp of the
+# statistic is the whole story.
+#
+# ``sum`` and not ``max``, and the reason is the DTYPE and not the combiner: at
+# fp16 ``tl.max`` promotes to fp32 and emits an ``arith.extf`` that no pass here
+# lowers. DropReductionInitFill gates on shape alone, so the combiner itself
+# refuses nothing -- which makes the wall the promotion, and the promotion has
+# nothing to do with reading a statistic back.
 # ---------------------------------------------------------------------------
 
 

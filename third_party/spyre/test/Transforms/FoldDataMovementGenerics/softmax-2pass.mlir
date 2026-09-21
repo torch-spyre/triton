@@ -1,26 +1,21 @@
 // RUN: spyre-triton-opt %s --convert-elementwise-to-linalg --linalg-generalize-named-ops --unalias-linalg-outs --fold-data-movement-generics 2>&1 | FileCheck %s
 
-// THE OVER-INCLUSION CANARY, on real IR rather than a hand-written shape: the
-// `ktir`-stage output of the `softmax_2pass` fixture, verbatim except that
-// locations are stripped.
+// REAL IR, not a hand-written shape: the `ktir`-stage output of the
+// `softmax_2pass` fixture verbatim, locations stripped. Its own file because it is
+// the only case here that is a whole kernel, and the only one needing the three
+// passes ahead of this one in the pipeline.
 //
-// It earns its place twice over.
+// Two things at once. As a POSITIVE it is the absorber on a kernel nobody wrote
+// for it: 2 `tensor.expand_shape` and 3 `tensor.collapse_shape`, all absorbed,
+// none surviving -- and the hardcoded absorber this replaced could not have taken
+// the two expands. As an OVER-INCLUSION check it carries zero
+// `tts.tensor_layout`, so the gate must stay shut over all five; a gate keyed on
+// the shape ops rather than on the path would refuse the whole kernel.
 //
-// As a POSITIVE, it is the generalized absorber on a kernel nobody wrote for it:
-// 2 `tensor.expand_shape` and 3 `tensor.collapse_shape`, arriving in front of
-// generics only after the three passes ahead of it in the RUN line have made
-// every compute one. All five are absorbed and none survives -- which is what the
-// CHECK-NOTs below say, and which the previous hardcoded absorber could not have
-// done for the two expands.
-//
-// As the CANARY, it carries ZERO `tts.tensor_layout`, so the gate must stay shut
-// over all five. A gate keyed on the shape ops rather than on the path would
-// refuse this kernel, and it compiles today.
-//
-// The RUN line runs the three passes ahead of this one rather than this one alone
-// because that is the only way the shape ops reach the absorber at all: at the
-// `ktir` stage the computes are still `arith.*` on tensors and the broadcasts and
-// reduces are still named linalg ops, and fusion matches generic -> generic only.
+// The RUN line needs the other three passes because they are what puts the shape
+// ops in front of generics: at the `ktir` stage the computes are still `arith.*`
+// on tensors and the broadcasts and reduces are still named linalg ops, and
+// fusion matches generic -> generic only.
 
 // CHECK-NOT: error
 // CHECK-NOT: tensor.expand_shape

@@ -1,23 +1,22 @@
 // RUN: spyre-triton-opt %s --fold-data-movement-generics -split-input-file -verify-diagnostics
 
-// The GATE. absorb-coordinate-ops.mlir has the same three unabsorbable shape ops
-// with no annotated memory view anywhere, and every one of them is left in place
-// with no diagnostic. Here each one sits on a path
-// RewriteDescriptorLayoutGeneric will physicalize, and each is REFUSED.
+// THE GATE: the condition is "absorption failed" AND "on a path
+// RewriteDescriptorLayoutGeneric will physicalize". absorb.mlir has the same
+// unabsorbable shape ops with no annotated memory view anywhere and leaves every
+// one of them silently; here each sits on such a path and is REFUSED. Its own
+// file because the subject is the path rather than the op -- and because proving
+// a diagnostic needs -verify-diagnostics rather than FileCheck.
 //
-// Why the gate is not optional: measured across 163 fixture artifacts,
-// `tensor.reshape` appears in `gather__1d` and `inter_tile_reduce__softmax`, and
-// BOTH of those carry zero `tts.tensor_layout` and compile today. Refusing it
-// unconditionally breaks two working kernels. So the condition is "absorption
-// failed" AND "on a physicalized path", and the two halves need separate
-// coverage -- which is what this file paired with its sibling is.
+// Why gated at all is forward-looking rather than protective: as annotation
+// coverage grows, the gate fires more often and converges to ungated behaviour by
+// itself, so it never needs removing. See FoldDataMovementGenerics.cpp.
 //
-// THE SHAPE OF EVERY CASE BELOW is `stat_chain_on_stick`'s, because that is the
-// shape nothing else catches: the data view is annotated, but the STATISTIC view
-// that feeds the re-indexing op is deliberately NOT, its logical shape already
-// being its physical one. RewriteDescriptorLayoutGeneric calls retypeToPhysical
-// only for an operand that HAS a layout, so an operand that has none is bridged
-// by rebuildMap with no check at all. A forward-only walk from the annotated
+// THE SHAPE OF CASES 1-6 is `stat_chain_on_stick`'s, because that is the shape
+// nothing else catches: the data view is annotated, but the STATISTIC view that
+// feeds the re-indexing op is deliberately NOT, its logical shape already being
+// its physical one. RewriteDescriptorLayoutGeneric calls retypeToPhysical only for
+// an operand that HAS a layout, so an operand that has none is bridged by
+// rebuildMap with no check at all, and a forward-only walk from the annotated
 // view's loads would miss all of it.
 
 // -----
@@ -142,7 +141,7 @@ func.func @linearizing_collapse_on_physicalized_path(%base: index, %stat: index)
 // cannot state an extent change: linalg infers its loop bounds from the operand
 // shapes through the maps, so no map on the unsliced source reproduces the
 // cropped one. "Not a restatement" means neither absorbed nor refused, here and
-// in the sibling file's silent case, which is the status quo and deliberate.
+// in absorb.mlir's test 9, which is the status quo and deliberate.
 module {
 func.func @extract_slice_on_physicalized_path(%base: index, %stat: index) {
   %c0 = arith.constant 0 : index
@@ -170,12 +169,9 @@ func.func @extract_slice_on_physicalized_path(%base: index, %stat: index) {
 // `tts.tensor_layout` and case 6's does not. Case 5 must error and case 6 must
 // come out clean.
 //
-// That pairing is the property worth testing, because the two failure modes are
-// invisible on their own. A gate stuck always-false makes case 5 pass silently
-// (no error emitted, none expected -- except `expected-error` then fails, which
-// is the point). A gate stuck always-true makes case 6 fail, which is what would
-// have happened to `gather__1d` and `inter_tile_reduce__softmax`. Neither can be
-// caught by looking at one case.
+// That pairing is the property worth testing, because neither failure mode is
+// visible on its own: a gate stuck always-false leaves case 5 with no diagnostic,
+// and a gate stuck always-true makes case 6 fail. One case alone catches neither.
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #map1 = affine_map<(d0) -> (d0)>
@@ -217,9 +213,7 @@ func.func @pair_annotated(%base: index, %stat: index) {
 #set1 = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
 
 // Case 6: UNANNOTATED, and otherwise identical to case 5. No `expected-error`, so
-// -verify-diagnostics fails this chunk if the pass says anything at all. This is
-// `gather__1d`'s and `inter_tile_reduce__softmax`'s situation, both of which
-// compile today.
+// -verify-diagnostics fails this chunk if the pass says anything at all.
 module {
 func.func @pair_unannotated(%base: index, %stat: index) {
   %c0 = arith.constant 0 : index
@@ -256,14 +250,10 @@ func.func @pair_unannotated(%base: index, %stat: index) {
 // the LINEARIZATION into the outs map rather than an ins map. Same hazard, other
 // end of the op.
 //
-// This is rejection only. Absorbing here would mean changing the generic's RESULT
-// type, replacing the tensor.empty behind `outs`, restating the outs map and
-// repointing the store -- and it needs the result-to-source map INVERTED, which
-// is null for exactly the linearizing cases. Out of scope by choice.
-//
-// `gather__1d` is the real instance of this shape in the tree: an `8x1 -> 8`
-// `tt.reshape` feeding `ktdp.store`. It is unannotated, so case 8 below is the
-// case that keeps it compiling.
+// Rejection only, never absorption: see THE STORE SIDE in the header of
+// FoldDataMovementGenerics.cpp for why, and for what the eventual fix chooses
+// between. `gather__1d` shows the shape is real -- an `8x1 -> 8` `tt.reshape`
+// feeding `ktdp.store` -- on a kernel this pass never sees.
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #map1 = affine_map<(d0) -> (d0)>
@@ -302,8 +292,7 @@ func.func @reshape_between_generic_and_store(%src: index, %out: index) {
 #set1 = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
 
 // Case 8: UNANNOTATED, and otherwise identical to case 7. No `expected-error`, so
-// -verify-diagnostics fails this chunk if the pass says anything at all. This is
-// `gather__1d`'s situation, which compiles today.
+// -verify-diagnostics fails this chunk if the pass says anything at all.
 module {
 func.func @reshape_between_generic_and_store_unannotated(%src: index, %out: index) {
   %c0 = arith.constant 0 : index
