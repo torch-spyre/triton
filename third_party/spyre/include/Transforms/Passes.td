@@ -5,11 +5,13 @@ include "mlir/Pass/PassBase.td"
 
 // ============================================================================
 // Transforms whose subject is upstream structure or the whole program rather
-// than any one dialect's abstractions.  UnaliasLinalgOuts and
-// DropReductionInitFill act on linalg form; MaterializeBaseAddresses acts on
-// the entry function's signature.  None of them translates a dialect, and none
-// is about ktdp's own memory-view model, so they sit at the top level -- which
-// does not stop them including dialect headers freely.
+// than any one dialect's abstractions.  UnaliasLinalgOuts,
+// DropReductionInitFill and FoldDataMovementGenerics act on linalg form --
+// generic bodies, indexing maps, reshape reassociations;
+// MaterializeBaseAddresses acts on the entry function's signature.  None of
+// them translates a dialect, and none is about ktdp's own memory-view model, so
+// they sit at the top level -- which does not stop them including dialect
+// headers freely.
 //
 // Each pass declares its contract below:
 //   Input    - dialects/ops it expects to see
@@ -132,6 +134,119 @@ def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
 
         Output: reductions whose outs is a bare tensor.empty, as hand-written
         reference KTIR states directly.
+    }];
+
+    let dependentDialects = [
+        "mlir::linalg::LinalgDialect",
+        "mlir::tensor::TensorDialect"
+    ];
+}
+
+
+def FoldDataMovementGenerics
+    : Pass<"fold-data-movement-generics", "mlir::ModuleOp"> {
+    let summary = "Fold a pure data-movement linalg.generic into the indexing "
+                  "map of the op that consumes it.";
+    let description = [{
+        Input: IR in which every compute op is already a `linalg.generic` — so
+        after ConvertElementwiseToLinalg, UnaliasLinalgOuts and
+        LinalgGeneralizeNamedOps. A coordinate change (broadcast, transpose,
+        inserted unit dim) arrives as its own generic whose body computes
+        nothing; only its indexing maps differ.
+
+        Lowering:
+        - linalg.generic PRODUCER whose body is exactly one operation, a
+          `linalg.yield` of an `ins` block argument, feeding a linalg.generic
+          consumer → fused, its operand map composed into the consumer's.
+          Upstream's `populateElementwiseOpsFusionPatterns` does the
+          composition; this pass supplies the control function that decides
+          which fusions may happen.
+        - A `tensor.collapse_shape` on a generic's `ins` operand whose
+          reassociation merges only UNIT dims into at most one non-unit dim →
+          absorbed into that operand's indexing map, with a constant 0 in each
+          unit position. This is the reshape `tt.broadcast`'s lowering puts in
+          front of the broadcast generic (linalg.broadcast takes its input
+          rank-reduced), and the unit-dim case is the one a reshape can be
+          written as an operand map at all.
+        - Anything else is left alone, silently. Two computes never merge, a
+          compute already carrying a shape change never merges with a downstream
+          compute, and a reshape that merges two non-unit dims — a genuine
+          linearization — is not folded.
+
+        The predicate is STRUCTURAL, not an attribute: it is what gates every
+        fusion decision, so a stale or missing label would not merely mislead a
+        reader, it would silently change the emitted program. There is also
+        nothing to read — the ops it keys on reach this pass from
+        LinalgGeneralizeNamedOps rewriting a linalg.broadcast or
+        linalg.transpose, neither of which records its provenance, and
+        RewriteDescriptorLayoutGeneric rebuilds every generic on a physicalized
+        chain, so a label would have to be maintained by a pass with no other
+        reason to know it exists.
+
+        The control function does not check `hasOneUse`, unlike the one
+        upstream's own --linalg-fuse-elementwise-ops supplies. A data-movement
+        generic feeding two consumers is folded into each and then dies, which is
+        the intent: the goal is that none survives, and duplicating a coordinate
+        change costs nothing because there is no body to duplicate — the second
+        consumer gains an operand map, not an op.
+
+        Two properties fall out rather than needing cases of their own. A
+        generic that is both a compute and a shape change is declined as a
+        producer and remains eligible as a consumer. And because the predicate
+        keys on the producer, a REDUCTION consumer is fine: the shape change
+        folds into its operand map while its `iterator_types` and single-compute
+        body are untouched — which is also what keeps DropReductionInitFill's
+        precondition (a reduce body of exactly two ops) true, since a pure
+        data-movement producer contributes no body op.
+
+        Motivation: a data-movement generic has no descriptor and so no layout
+        marker, so RewriteDescriptorLayoutGeneric leaves its result logical while
+        its consumer is physical. The consumer's operand map then has to bridge
+        the two and a LINEARIZATION is folded into it
+        (`(d0, d1, d2) -> (d1, d0 * 64 + d2)`), which the dataflow-scheduler
+        cannot schedule: "could not locate matching linalg operand to project
+        loop IVs and tile sizes through; the data_transfer rank would not match
+        the underlying memref". Folded into the consumer, the same coordinate
+        change is an operand map the layout pass restates at physical rank like
+        any other — a statistic read at a constant lane comes out as
+        `(d0, d1, d2) -> (d1, 0)`, which is what hand-written reference KTIR
+        states.
+
+        Not used here: upstream's `populateFoldReshapeOpsBy{Expansion,
+        Collapsing}Patterns`, which take the same control-function type. They
+        answer a general reshape by changing the consumer's iteration space and
+        pushing a reshape onto its other operands, which on a physicalized chain
+        emits a `tensor.expand_shape` that RewriteDescriptorLayoutGeneric
+        rejects ("this op reads a value the rewrite retyped, but the rewrite
+        restates only linalg.generic"). The unit-dim absorption above covers the
+        only reshape our own emission produces in front of a data-movement
+        generic — and only when it survives at all: where the unit dim came from
+        a tt.expand_dims rather than from the loaded shape, the collapse cancels
+        against that expand in the canonicalize closing the `ktir` stage and a
+        bare linalg.broadcast arrives here with no tensor op in front of it.
+
+        Not absorbed, and left with no diagnostic from anywhere: of the tensor
+        shape ops LowerComputeOps can emit, `tensor.reshape` (tt.reshape) is not
+        affine, `tensor.concat` (tt.join) is not expressible as one operand map,
+        and the unit-dim `tensor.expand_shape` (tt.expand_dims) is absorbable in
+        principle but not yet implemented. The `tensor.extract_slice` pair from
+        tt.split needs no absorber, the scheduler looking through one.
+        RewriteDescriptorLayoutGeneric does not catch the survivors either: its
+        precondition sweep walks only the users of a generic's results, so a
+        reshape reading a ktdp.load directly is invisible to it and the failure
+        lands in dbo-opt without naming the reshape. See the file header for the
+        full inventory.
+
+        Ordering: after the passes that make every compute op a linalg.generic
+        (fusion matches generic → generic only, so a named producer or consumer
+        blocks it whatever the control function says), and before
+        RewriteDescriptorLayoutGeneric, which must see the folded maps so that no
+        data-movement generic survives for it to linearize.
+
+        Output: no linalg.generic whose body is a lone yield of an input remains
+        where a linalg.generic consumes its result, and no unit-dim
+        `tensor.collapse_shape` feeds a generic. Every op is left with the same
+        single compute in its body it had before.
     }];
 
     let dependentDialects = [
