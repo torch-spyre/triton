@@ -58,6 +58,40 @@ Value buildMemoryView(OpBuilder &builder, Location loc, Value baseIndex,
 Value buildAccessTile(OpBuilder &builder, Location loc, Value memView,
                       ArrayRef<int64_t> blockShape, ValueRange indices);
 
+//===----------------------------------------------------------------------===//
+// The layout rewrite's seed traversals
+//
+// Two walks out of a `ktdp.construct_memory_view`, published because the layout
+// rewrite is no longer their only caller: a pass that has to know WHICH ops that
+// rewrite will reach -- to decline something it would bridge badly -- has to ask
+// the same question, and a second copy of the walk would diverge from this one
+// on the next change, in both directions.  They are stated in terms of ktdp ops
+// on one side and a `linalg.generic` on the other, which is what makes them
+// KTDP's rather than any one pass's.
+//
+// `Operation *` rather than the op classes, so this header stays the light
+// include it is; callers cast, which they must do anyway to key their own sets.
+//===----------------------------------------------------------------------===//
+
+/// The loads and stores that reach `memView` through its access tiles, direct or
+/// indirect.  ONE HOP each way: view -> `ktdp.construct_access_tile` /
+/// `ktdp.construct_indirect_access_tile` -> `ktdp.load` / `ktdp.store`.  A user
+/// of the view that is not an access tile is skipped, and so is a user of a tile
+/// that is neither a load nor a store.  Appends; does not clear.
+void collectViewAccesses(Operation *memView,
+                         SmallVectorImpl<Operation *> &loads,
+                         SmallVectorImpl<Operation *> &stores);
+
+/// The `linalg.generic` ops ADJACENT to `memViews`: for each view, the direct
+/// consumers of its loads plus the direct data producer of its stores.  Each
+/// listed once, in the order the views are given.
+///
+/// This is the SCOPE of the layout rewrite -- one hop off a view's accesses, not
+/// a transitive closure -- so it is also the scope any pass predicting that
+/// rewrite has to use.
+void collectAdjacentGenerics(ArrayRef<Operation *> memViews,
+                             SmallVectorImpl<Operation *> &out);
+
 } // namespace mlir::triton::ktdp
 
 #endif // TRITON_SPYRE_DIALECT_KTDP_UTILS_UTILITY_H

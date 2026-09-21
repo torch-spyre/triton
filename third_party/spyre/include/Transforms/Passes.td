@@ -161,17 +161,25 @@ def FoldDataMovementGenerics
           Upstream's `populateElementwiseOpsFusionPatterns` does the
           composition; this pass supplies the control function that decides
           which fusions may happen.
-        - A `tensor.collapse_shape` on a generic's `ins` operand whose
-          reassociation merges only UNIT dims into at most one non-unit dim →
-          absorbed into that operand's indexing map, with a constant 0 in each
-          unit position. This is the reshape `tt.broadcast`'s lowering puts in
-          front of the broadcast generic (linalg.broadcast takes its input
-          rank-reduced), and the unit-dim case is the one a reshape can be
-          written as an operand map at all.
-        - Anything else is left alone, silently. Two computes never merge, a
-          compute already carrying a shape change never merges with a downstream
-          compute, and a reshape that merges two non-unit dims — a genuine
-          linearization — is not folded.
+        - A COORDINATE RESTATEMENT on a generic's `ins` operand — currently
+          `tensor.collapse_shape` or `tensor.expand_shape` — whose
+          result-to-source map, COMPOSED with the consumer's operand map, has
+          every result a bare loop dim or a constant → absorbed: the operand is
+          repointed at the restatement's source and given the composed map. A
+          unit-dim collapse `[64,1] → [64]` gives `(d0) → (d0, 0)`, the reshape
+          `tt.broadcast`'s lowering puts in front of the broadcast generic;
+          a unit-dim expand `[4] → [4,1]` gives `(d0, d1) → (d0)`, the one
+          `tt.expand_dims` leaves behind where no collapse cancelled it.
+        - Anything else is left alone. Two computes never merge, and a compute
+          already carrying a shape change never merges with a downstream compute.
+        - A coordinate restatement whose composed map LINEARIZES — a collapse
+          fusing two non-unit dims, an expand splitting into two — is not
+          absorbed. `tensor.reshape` and `tensor.concat` have no result-to-source
+          map at all: a reshape takes its shape as a tensor operand, so there is
+          no static structure to read one off, and a concat selects between
+          operands per coordinate. All three are left alone SILENTLY where
+          nothing physicalizes them, and REJECTED where something does — see the
+          gate below.
 
         The predicate is STRUCTURAL, not an attribute: it is what gates every
         fusion decision, so a stale or missing label would not merely mislead a
@@ -212,43 +220,98 @@ def FoldDataMovementGenerics
         `(d0, d1, d2) -> (d1, 0)`, which is what hand-written reference KTIR
         states.
 
+        Why the projection check is on the COMPOSED map and not on the
+        reassociation: a linearizing collapse is not INEXPRESSIBLE as an affine
+        map — AffineExpr has FloorDiv and Mod, and this pass emits
+        `(d0) → (d0 floordiv 2, d0 mod 2)` for `[64,2] → [128]`. The reason to
+        decline it is that the scheduler cannot project loop IVs and tile sizes
+        through floordiv or mod, which is a property of the map the CONSUMER ends
+        up holding. The two can differ, because composition folds: the same
+        collapse read at a constant coordinate composes to `(d0, d1) → (0, 0)`,
+        which projects fine and is absorbed.
+
         Not used here: upstream's `populateFoldReshapeOpsBy{Expansion,
         Collapsing}Patterns`, which take the same control-function type. They
         answer a general reshape by changing the consumer's iteration space and
         pushing a reshape onto its other operands, which on a physicalized chain
         emits a `tensor.expand_shape` that RewriteDescriptorLayoutGeneric
         rejects ("this op reads a value the rewrite retyped, but the rewrite
-        restates only linalg.generic"). The unit-dim absorption above covers the
-        only reshape our own emission produces in front of a data-movement
-        generic — and only when it survives at all: where the unit dim came from
-        a tt.expand_dims rather than from the loaded shape, the collapse cancels
-        against that expand in the canonicalize closing the `ktir` stage and a
-        bare linalg.broadcast arrives here with no tensor op in front of it.
+        restates only linalg.generic"). The absorption above keeps the iteration
+        space and moves the coordinate change into one operand's map, which is
+        the whole of the difference.
 
-        Not absorbed, and left with no diagnostic from anywhere: of the tensor
-        shape ops LowerComputeOps can emit, `tensor.reshape` (tt.reshape) is not
-        affine, `tensor.concat` (tt.join) is not expressible as one operand map,
-        and the unit-dim `tensor.expand_shape` (tt.expand_dims) is absorbable in
-        principle but not yet implemented. The `tensor.extract_slice` pair from
-        tt.split needs no absorber, the scheduler looking through one.
-        RewriteDescriptorLayoutGeneric does not catch the survivors either: its
-        precondition sweep walks only the users of a generic's results, so a
-        reshape reading a ktdp.load directly is invisible to it and the failure
-        lands in dbo-opt without naming the reshape. See the file header for the
-        full inventory.
+        `tensor.extract_slice` is deliberately NOT a coordinate restatement, and
+        not for the reason one would guess. Its coordinate map is derivable —
+        static offsets and unit strides give `(d0, d1) → (d0 + o0, d1 + o1)`. What
+        is not is its EXTENT change: linalg infers its loop bounds from the
+        operand shapes through the indexing maps, so repointing an operand at the
+        larger unsliced source under any map makes the inferred extents
+        inconsistent and fails linalg's own verifier. A slice crops; an operand
+        map re-indexes. It is also the one shape op the scheduler already looks
+        through, and has zero occurrences across the fixture artifacts. Being
+        "not a restatement" means it is neither absorbed nor rejected.
+
+        THE GATE on rejection, which is not optional. Measured across 163 fixture
+        artifacts, `tensor.reshape` appears in `gather__1d` and
+        `inter_tile_reduce__softmax`, both of which carry ZERO `tts.tensor_layout`
+        and compile today; rejecting unconditionally breaks them. So an
+        unabsorbable restatement is refused only on a path
+        RewriteDescriptorLayoutGeneric will physicalize, asked with THAT PASS'S
+        OWN seed traversals (shared from Dialect/KTDP/Utils, not copied): seed
+        from every `tts.tensor_layout`-annotated `ktdp.construct_memory_view`,
+        reach its loads and stores through its access tiles, take the generics one
+        hop off those. One hop, not a transitive closure — that is the scope the
+        layout pass rewrites.
+
+        Three seeds, because the hazard has two sides. BACKWARD from each `ins`
+        operand of such a generic, through every generic not itself in the rewrite
+        set, stopping at anything that is not a coordinate restatement; this
+        catches a re-indexing op whose own load is on an UNANNOTATED view, which
+        nothing else looks at (retypeToPhysical is only called for an operand that
+        HAS a layout). BACKWARD from the DATA of each store over an annotated
+        view, the exact mirror: findLayoutForResult walks a generic's result users
+        for a `ktdp.store` DIRECTLY, so a shape op between the two makes it return
+        null and the linearization lands on the `outs` map instead — `gather__1d`
+        carries an `8x1 → 8` `tt.reshape` into a store, unannotated. FORWARD one
+        hop off each physicalized load, for a result neither backward walk
+        reaches; where it reaches a generic this is redundant with
+        checkConsumersAreRewritable and is kept only because it fires a stage
+        earlier and says which property of the op is the problem.
+
+        The store side is REJECTION ONLY, never absorption. That rewrite would
+        have to change the generic's result type, replace the `tensor.empty`
+        behind `outs`, restate the outs map and repoint the store's data operand,
+        and it needs the map in the opposite direction — an inversePermutation
+        that is null for exactly the linearizing cases this is about.
+
+        Rejection is DERIVED, not a declared op list: the condition is exactly
+        "absorption failed" and "on a physicalized path", and the first is asked
+        of the same function the absorber asks. Teaching that function a static
+        `tensor.reshape` stops the rejection for it with nothing else to update.
+
+        `--debug-only=fold-data-movement-generics` traces the decisions: each
+        restatement asked for and the answer, each operand the absorber considered
+        with the composition spelled out, the gate's seeds and scope, and each
+        rejection with the path that reached it.
 
         Ordering: after the passes that make every compute op a linalg.generic
         (fusion matches generic → generic only, so a named producer or consumer
         blocks it whatever the control function says), and before
         RewriteDescriptorLayoutGeneric, which must see the folded maps so that no
-        data-movement generic survives for it to linearize.
+        data-movement generic survives for it to linearize — and whose scope the
+        gate above predicts.
 
         Output: no linalg.generic whose body is a lone yield of an input remains
-        where a linalg.generic consumes its result, and no unit-dim
-        `tensor.collapse_shape` feeds a generic. Every op is left with the same
-        single compute in its body it had before.
+        where a linalg.generic consumes its result, and no coordinate restatement
+        with a projectable composed map feeds a generic. Every op is left with the
+        same single compute in its body it had before. On a module with at least
+        one annotated memory view, no unabsorbable coordinate restatement is left
+        on a path that view physicalizes; the pass fails instead.
     }];
 
+    // No ktdp and no tts, though the gate reads both: dependentDialects is about
+    // ops a pass CREATES, and this one only inspects them.  The link edges those
+    // reads need are in the CMakeLists, derived from the #includes.
     let dependentDialects = [
         "mlir::linalg::LinalgDialect",
         "mlir::tensor::TensorDialect"
