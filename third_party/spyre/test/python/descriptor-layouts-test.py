@@ -485,9 +485,12 @@ def test_check_fits_refuses_a_host_shaped_allocation(tmp_path):
     with pytest.raises(RuntimeError) as excinfo:
         check_fits(out, "out_ptr", host_shaped)
     message = str(excinfo.value)
+    # The suggested call is copy-pasteable: the declared numbers are interpolated
+    # into it, so a reader fixes the allocation without looking anything up.
     for fragment in ("out_ptr", "[1, 64, 64]", "[-1, 1, -1]", "8192 bytes",
                      "128 bytes", "write past the end",
-                     "empty_with_device_layout"):
+                     'device_layout=SpyreTensorLayout(',
+                     "device_size=[1, 64, 64]", "_lazy_init"):
         assert fragment in message, f"missing {fragment!r} from:\n{message}"
 
 

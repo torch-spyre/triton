@@ -126,13 +126,15 @@ def check_fits(entry: dict, name: str, tensor) -> None:
         f"  tensor's device_size {list(have_layout.device_size)} "
         f"stride_map {list(have_layout.stride_map)} -> {have} bytes\n"
         f'  .to("spyre") sizes from the host shape alone, which is short whenever '
-        "the layout replicates. Allocate it from the compiled kernel's own claim "
-        "instead:\n"
-        "    from triton.backends.spyre.tensor_layout import "
-        "empty_with_device_layout\n"
-        f"    {name} = empty_with_device_layout(entry, host_{name})\n"
-        "  where `entry` is the matching element of "
-        'kernel.metadata.device_layouts.')
+        "the layout replicates. Stage it with the layout instead — the numbers "
+        "are the declared ones above:\n"
+        "    import torch\n"
+        "    from torch_spyre._C import SpyreTensorLayout, get_device_dtype\n"
+        "    torch.spyre._impl._lazy_init()  # this path does not self-initialize\n"
+        f"    {name} = host_{name}.to(\"spyre\", device_layout=SpyreTensorLayout(\n"
+        f"        device_size={list(entry['device_size'])}, "
+        f"stride_map={list(entry['stride_map'])},\n"
+        f"        device_dtype=get_device_dtype(host_{name}.dtype)))")
 
 
 def _reads_or_writes(access: str) -> str:
