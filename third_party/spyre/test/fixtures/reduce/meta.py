@@ -987,20 +987,14 @@ VARIANTS = {
         # Sized in ulp of the STATISTIC, which is where the error comes from: the
         # subtract passes it through unamplified. The column sums reach 24.03,
         # where fp16 ulp is 0.015625, and a 64-term reordering predicts the drift
-        # growing as sqrt(64) = 8 ulp = 0.125. Measured against the fp16 oracle for
-        # this exact input (seed 0, M = 64, N = 128):
+        # growing as sqrt(64) = 8 ulp = 0.125.
         #
-        #     device     0.1406   =  9.0 ulp   <- what sets this
-        #     ktir_cpu   0.0547   =  3.5 ulp
-        #
-        # Set by the DEVICE arm, and 0.125 -- the predicted bound, and what this
-        # carried while ktir_cpu was the only tier reading it -- is the one number
-        # the device lands just outside. Same rule and same answer as ``one_tile``:
-        # 0.25 is 16 ulp, the sqrt(64) prediction with a factor of two, not the
-        # worst case (64 ulp = 1.0) and not a number fitted to the element that
-        # failed. It is one COLUMN that drifts, 64 of 8192 elements, which is the
-        # statistic passing through unamplified rather than the subtract adding
-        # anything.
+        # 0.25 is that prediction with a factor of two -- 16 ulp, not the worst
+        # case of 64 ulp = 1.0. Same rule and same answer as ``one_tile``. A
+        # summation order that differs from the oracle's puts the drift just
+        # outside the predicted bound, so the bound rather than the prediction is
+        # what this carries; it is one COLUMN that moves, which is the statistic
+        # passing through unamplified rather than the subtract adding anything.
         "atol":        2.5e-1,
     },
 
@@ -1039,10 +1033,9 @@ VARIANTS = {
         # banner for the map.
         "compiles_to_binary": True,
         "output_key":  "out_ptr",
-        # Sized by the sibling's rule, and the device arm passes inside it: the row
-        # sums reach 27.09, fp16 ulp there is 0.015625, and a 128-term reordering
-        # predicts sqrt(128) = 11.3 ulp = 0.18. 0.25 is 16 ulp, which is also what
-        # the Level D splat sibling measured on the device.
+        # Sized by the sibling's rule: the row sums reach 27.09, fp16 ulp there is
+        # 0.015625, and a 128-term reordering predicts sqrt(128) = 11.3 ulp = 0.18.
+        # 0.25 is 16 ulp, the same bound the splat sibling carries.
         "rtol":        0.0,
         "atol":        2.5e-1,
         # WHY THE NUMERICAL ARM CANNOT PASS, and it is a tier boundary rather than
