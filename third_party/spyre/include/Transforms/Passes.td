@@ -18,11 +18,12 @@ include "mlir/Pass/PassBase.td"
 //   Lowering - ops it converts and what they become
 //   Output   - what the IR looks like after this pass
 //
-// All three are members of a fixed stage pipeline in lib/Pipeline.cpp, not
-// opt-in: UnaliasLinalgOuts in the `ktir` stage, DropReductionInitFill and
-// MaterializeBaseAddresses in `spyrecode`.  A pass's position there is chosen in
-// C++ from a typed factory, so there is no caller hook for inserting one at a
-// named point.
+// All four are members of a fixed stage pipeline in lib/Pipeline.cpp, not
+// opt-in, and all four run in `spyrecode`: DropReductionInitFill,
+// UnaliasLinalgOuts and FoldDataMovementGenerics in that stage's shaping prefix,
+// MaterializeBaseAddresses at its tail and only when `bindBaseAddresses` is set.
+// A pass's position there is chosen in C++ from a typed factory, so there is no
+// caller hook for inserting one at a named point.
 // ============================================================================
 
 def UnaliasLinalgOuts : Pass<"unalias-linalg-outs", "mlir::ModuleOp"> {
