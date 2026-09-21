@@ -135,7 +135,7 @@ Current upstream touch points:
   **The two IR pipelines are registered MLIR pass pipelines**, built once in C++
   (`lib/Pipeline.cpp`) and reachable as `spyre-triton-opt --spyre-ttir-to-ktir`
   and `--spyre-prepare-spyrecode`. So a lit test can drive a whole stage rather
-  than one pass (`test/Pipeline/stage-pipelines.mlir`), and the module `dbo-opt`
+  than one pass (`test/spyre-triton-opt/stage-pipelines.mlir`), and the module `dbo-opt`
   receives can be reproduced by hand — see below.
 - The C++ passes live in three libraries, split by what each pass's subject is.
   See the spyre / spyre-ktir agents for the pass pipeline.
@@ -215,8 +215,11 @@ symbolic mode, which is what a launch uses.
 
 ```bash
 uv run pytest third_party/spyre/test                    # full suite
-uv run pytest third_party/spyre/test -k "not numerical" # structural only
 uv run lit build/cmake.*/third_party/spyre/test -v      # lit/FileCheck tests
+
+# everything except the device launches -- use --ignore, NOT -k "not numerical",
+# which deselects the 162 numerical cases and SELECTS test_device_launch.py
+uv run pytest third_party/spyre/test --ignore=third_party/spyre/test/test_device_launch.py
 
 # fast loop on one python-driven lit test -- no cmake, no re-configure
 T=third_party/spyre/test/python/segment-addresses.py
@@ -225,6 +228,38 @@ PYTHONPATH=python:third_party/spyre uv run python $T | ./python/triton/FileCheck
 
 Numerical coverage is a work in progress; known gaps are strict-xfail'd and
 missing oracles skip, so the suite stays green while catching regressions.
+
+### Probes and timeouts — how long things take
+
+Build-and-test latency dominates any investigation here, so guessing at it is the
+main way to waste an hour. Approximate wall times, so nothing has to be discovered:
+
+| | |
+|---|---|
+| structural pytest (`--ignore` device) | ~165 s |
+| `test_device_launch.py` | ~16 s |
+| full lit suite | 1–2 min |
+| incremental rebuild, warm ccache | a few min; longer after a `.td` change, which regenerates tablegen widely |
+
+Four rules, each of which has cost real time:
+
+- **A long timeout is for a command already seen to succeed.** The first run of a new
+  tool, flag, path or test selector gets a *short* one — at that moment the likely
+  failure is that the command is wrong, not that it is slow, and finding that out
+  should cost seconds. A wrong command under a five-minute timeout costs five minutes.
+- **When a command times out, first assume the command is wrong.** A bad path, a flag
+  the tool lacks, a selector matching nothing, a missing `source spyre-env.sh`. Re-read
+  it before raising the limit; raising it on a wrong command buys nothing.
+- **Validate cheaply first.** `pytest --collect-only` confirms a selector in seconds,
+  `--help` confirms a flag exists, a trivial input confirms a tool runs at all.
+- **Size the probe to the question.** Run the single test that discriminates, not the
+  suite. Mutating one line and then running everything to watch nothing fail costs
+  minutes for what one `-k` or one `.mlir` answers. Full suites once, at the end,
+  before committing.
+
+Never `sleep`. The shell blocks until a command exits, so raise its timeout instead;
+the device releases on process exit, so sequential runs need no gap; and genuinely long
+work goes to the background, where completion is reported rather than polled.
 
 `test_device_launch.py` launches on hardware, in the pytest process itself, and a
 Spyre device admits one opener for that process's whole lifetime. It is in the
