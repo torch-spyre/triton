@@ -164,6 +164,18 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
   pm.addPass(createUnaliasLinalgOutsPass());
 
+  // Every coordinate change becomes an `indexing_maps` entry on the generic that
+  // consumes it, so nothing whose only effect is to re-index survives.
+  //
+  // Both neighbours fix the position. It must follow the three passes above,
+  // which are what make every compute a linalg.generic: the fusion it drives
+  // matches generic -> generic, so a named producer or consumer blocks it whatever
+  // the control function says. And it must precede the layout pass below, whose
+  // behaviour it changes -- left in place, a data-movement generic has no layout
+  // marker, so that pass leaves its result logical and bridges the gap with a
+  // linearizing operand map the scheduler cannot project loop IVs through.
+  pm.addPass(createFoldDataMovementGenericsPass());
+
   // Logical descriptors -> physical (stick-tiled) layout, rooted on the
   // `tts.tensor_layout` attribute LowerTTSMarkers wrote onto each annotated
   // memory view in the `ktir` stage. Unannotated descriptors are left alone.

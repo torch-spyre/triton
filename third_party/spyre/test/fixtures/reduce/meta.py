@@ -12,14 +12,13 @@ One combination reaches a Spyre binary and launches -- ``one_tile`` at
 ``AXIS=0``, the loop-free shape folding the non-stick axis. The Level D banner
 records why that one and not the others.
 
-Level E adds a third shape, and it is a reduce's CONSUMER rather than a fourth
-reduction: ``out = x - sum(x, axis)``, a statistic written to HBM and read back
-by a later elementwise op, at both axes. Softmax's first two groups. Neither arm
-reaches a binary and one of the two cannot be checked numerically either; the
-Level E banner says exactly where each stops and why the axis turns out not to be
-what separates them.
+Level D has a SECOND GROUP, and it is a reduce's CONSUMER rather than a fourth
+reduction: ``out = x - sum(x, axis)``, a statistic written to HBM and read back by
+a later elementwise op, at both axes. Softmax's first two groups. Both arms reach
+a binary and launch; the on-stick one is checkable only on the device, and that
+group's banner says why.
 
-The variants are grouped under Level A-E banners, each of which says what its
+The variants are grouped under Level A-D banners, each of which says what its
 level is for and what it deliberately does not vary. See ``fixtures/README.md``
 for the field reference and the discovery rules.
 """
@@ -836,9 +835,9 @@ VARIANTS = {
     # check keys on the mod coord op, and a splat dim is not one, so it never
     # fires here. It was expected to be the wall on the READ side of a statistic
     # (a block shape of [M, 1] under a stick layout), which softmax needs and this
-    # does not -- and Level E, which does need it, found that it is not: a read
-    # view carrying NO layout has no stick dim to be sub-stick, and the [M, 1]
-    # tile it takes is accepted. Level E stops somewhere else entirely.
+    # does not -- and the chain group below, which does need it, found that it is
+    # not: a read view carrying NO layout has no stick dim to be sub-stick, and
+    # the [M, 1] tile it takes is accepted.
     #
     # The replication is 8 elements wide on the DEVICE, not S. That is a device
     # fact with no representation in the layout: the buffer still has to span
@@ -887,37 +886,33 @@ VARIANTS = {
     # off-stick arm, ``one_tile_on_stick_splat`` for the on-stick one), so
     # everything below is about G2.
     #
-    # NEITHER REACHES A BINARY, and both stop on the same thing, which is neither
-    # arm's layout and neither arm's axis. Reading a statistic back and applying
-    # it to a full tile is a Triton BROADCAST, and a broadcast reaches the layout
-    # pass as a linalg.generic of its own that computes nothing -- it yields its
-    # input and only its maps differ. That op has no descriptor, so no layout
-    # marker, so RewriteDescriptorLayoutGeneric leaves its result LOGICAL while its
-    # producer and consumer are both physical, and the consumer's operand map is
-    # left to bridge the two. It bridges it with a LINEARIZATION, identically in
-    # both arms:
+    # BOTH REACH A BINARY AND LAUNCH, and what made that true is one pass rather
+    # than anything about either arm. Reading a statistic back and applying it to a
+    # full tile is a Triton BROADCAST, and a broadcast used to reach the layout pass
+    # as a linalg.generic of its own that computes nothing -- it yields its input
+    # and only its maps differ. That op has no descriptor, so no layout marker, so
+    # RewriteDescriptorLayoutGeneric left its result LOGICAL while its producer and
+    # consumer were both physical, and the consumer's operand map was left to bridge
+    # the two. It bridged it with a LINEARIZATION, identically in both arms
+    # (`(d0, d1, d2) -> (d1, d0 * 64 + d2)`), and dbo-opt aborted on the off-stick
+    # arm inside upstream's own fusion pass and refused the on-stick arm's [M, 1]
+    # statistic load.
     #
-    #   #map5 = affine_map<(d0, d1, d2) -> (d1, d0 * 64 + d2)>
+    # FoldDataMovementGenerics closes it, in the spyrecode stage ahead of the layout
+    # pass: the coordinate change becomes an operand map the layout pass restates at
+    # physical rank like any other. What each arm now emits, and the checkpoint
+    # worth keeping because it is the whole reason the arms compile:
     #
-    # ins(%x2 : tensor<2x64x64xf16>, %broadcast : tensor<64x128xf16>) -- a physical
-    # operand beside a logical one. dbo-opt cannot schedule it, and the two arms
-    # fail differently only in how far into dbo-opt they get:
+    #   off-stick   the broadcast FOLDS, consumer operand map
+    #               `(d0, d1, d2) -> (d0, d2)`, and no linearizing map anywhere
+    #   on-stick    the unit-dim collapse in front of the broadcast is ABSORBED,
+    #               giving `(d0, d1, d2) -> (d1, 0)` -- a statistic read at a
+    #               constant lane, which is what case 4 of
+    #               ``rebuild-reduction.mlir`` states -- and no
+    #               tensor.collapse_shape survives
     #
-    #   off-stick   an abort inside upstream's own fusion pass --
-    #               `areElementwiseOpsFusable(fusedOperand) && "expected
-    #               elementwise operation pre-conditions to pass"'
-    #   on-stick    a diagnostic first: "could not locate matching linalg operand
-    #               to project loop IVs and tile sizes through; the data_transfer
-    #               rank would not match the underlying memref", on the [M, 1]
-    #               statistic load
-    #
-    # What closes both is folding that data-movement generic into its consumer, so
-    # the coordinate change becomes an operand map the layout pass restates at
-    # physical rank like any other -- `(d0, d1, d2) -> (d1, 0)` for a statistic
-    # read at a constant lane, which is exactly what case 4 of
-    # ``rebuild-reduction.mlir`` states. That fixture's input is hand-written
-    # POST-fold IR, so it pins a form this pipeline cannot yet produce end to end;
-    # that is the gap, and it is a pass, not a fixture.
+    # That fixture's input is hand-written POST-fold IR, and this group is what now
+    # produces the same form end to end.
     #
     # The walls the reduce family's own banners predicted did NOT fire, and both
     # non-firings are worth having recorded:
@@ -943,17 +938,17 @@ VARIANTS = {
     # lane 0 through an unannotated rank-2 view instead, and pays for it in this
     # tier rather than on the device.
     #
-    # fp16 and sum in both, pinned rather than swept. ``sum`` because
-    # DropReductionInitFill admits addf/subf only -- kernel.py's own banner has the
-    # diagnostic -- and fp16 because the statistic read-back is an fp16-only path
-    # downstream. Neither is a free choice, so neither is a param.
+    # fp16 and sum in both, pinned rather than swept -- ``sum`` because at fp16
+    # ``tl.max`` promotes to fp32 and emits an ``arith.extf`` nothing here lowers,
+    # and fp16 because the statistic read-back is an fp16-only path downstream. See
+    # kernel.py's banner. Neither is a free choice, so neither is a param.
     # -----------------------------------------------------------------------
 
     # Folds M, the NON-stick axis, so the statistic survives on the stick dim and
     # its layout PARTITIONS. A partition keeps the element count, so the logical
     # [N] buffer is a faithful description of the bytes -- which is why this arm
     # needs only ONE statistic descriptor, needs no stick width, and is checked
-    # numerically on ktir_cpu like any other variant here.
+    # numerically on ktir_cpu as well as on the device.
     "stat_chain_off_stick": {
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
@@ -977,7 +972,11 @@ VARIANTS = {
             "M": [64],
         },
         "grid":        [1],
-        # No ``compiles_to_binary``: the Level E banner has the diagnostic.
+        # No tl.program_id, so DistributeWork has nothing to place and there is no
+        # scf.for for dbo-opt to refuse. The chain reaches a binary because
+        # FoldDataMovementGenerics folds the statistic broadcast into its consumer's
+        # operand map; see the group banner above for the map it lands on.
+        "compiles_to_binary": True,
         "output_key":  "out_ptr",
         # An ABSOLUTE bound alone, and rtol is 0 deliberately rather than omitted.
         # `x - sum(x)` has elements near zero, where a relative bound says nothing,
@@ -988,17 +987,29 @@ VARIANTS = {
         # Sized in ulp of the STATISTIC, which is where the error comes from: the
         # subtract passes it through unamplified. The column sums reach 24.03,
         # where fp16 ulp is 0.015625, and a 64-term reordering predicts the drift
-        # growing as sqrt(64) = 8 ulp = 0.125. Measured on ktir_cpu against the
-        # fp16 oracle for this exact input (seed 0, M=64, N=128): max |err| =
-        # 0.0547, i.e. 3.5 ulp -- inside the prediction, so 0.125 is the predicted
-        # bound rather than a number fitted to the element that failed.
-        "atol":        1.25e-1,
+        # growing as sqrt(64) = 8 ulp = 0.125. Measured against the fp16 oracle for
+        # this exact input (seed 0, M = 64, N = 128):
+        #
+        #     device     0.1406   =  9.0 ulp   <- what sets this
+        #     ktir_cpu   0.0547   =  3.5 ulp
+        #
+        # Set by the DEVICE arm, and 0.125 -- the predicted bound, and what this
+        # carried while ktir_cpu was the only tier reading it -- is the one number
+        # the device lands just outside. Same rule and same answer as ``one_tile``:
+        # 0.25 is 16 ulp, the sqrt(64) prediction with a factor of two, not the
+        # worst case (64 ulp = 1.0) and not a number fitted to the element that
+        # failed. It is one COLUMN that drifts, 64 of 8192 elements, which is the
+        # statistic passing through unamplified rather than the subtract adding
+        # anything.
+        "atol":        2.5e-1,
     },
 
     # Folds N, the STICK axis, so the statistic must be SPLAT and the logical form
     # stops describing the bytes. Everything this arm costs over its sibling
     # follows from that one fact: a second descriptor, a stick width the kernel has
-    # to be told, and no numerical arm.
+    # to be told, and no ktir_cpu arm. The DEVICE arm is where it is checked, and
+    # that is not a compromise -- the device is the tier whose buffer the [M, S]
+    # read view actually describes.
     "stat_chain_on_stick": {
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
@@ -1022,13 +1033,16 @@ VARIANTS = {
             "M": [64],
         },
         "grid":        [1],
-        # No ``compiles_to_binary``: the Level E banner has the diagnostic.
+        # Same as the sibling: no tl.program_id, so no loop to refuse, and what
+        # gets it past the layout pass is FoldDataMovementGenerics ABSORBING the
+        # unit-dim collapse in front of the statistic broadcast. See the group
+        # banner for the map.
+        "compiles_to_binary": True,
         "output_key":  "out_ptr",
-        # NOT MEASURED, because no tier runs this arm to a right answer. Sized by
-        # the sibling's rule so that the day one does, it starts from something
-        # defensible: the row sums reach 27.09, fp16 ulp there is 0.015625, and a
-        # 128-term reordering predicts sqrt(128) = 11.3 ulp = 0.18. 0.25 is 16 ulp,
-        # which is also what the Level D splat sibling measured on the device.
+        # Sized by the sibling's rule, and the device arm passes inside it: the row
+        # sums reach 27.09, fp16 ulp there is 0.015625, and a 128-term reordering
+        # predicts sqrt(128) = 11.3 ulp = 0.18. 0.25 is 16 ulp, which is also what
+        # the Level D splat sibling measured on the device.
         "rtol":        0.0,
         "atol":        2.5e-1,
         # WHY THE NUMERICAL ARM CANNOT PASS, and it is a tier boundary rather than
@@ -1041,10 +1055,11 @@ VARIANTS = {
         # the writer wrote. The interpreter does not refuse it; it returns other
         # numbers (max |err| 27.1, which is the size of the statistic itself).
         #
-        # So this arm is not numerically checkable anywhere today: not on ktir_cpu,
-        # for the reason above, and not on the device, for the Level E banner's.
-        # Landed with the wall named rather than left out, because the chain does
-        # LOWER -- which is what ``raises`` pins.
+        # The DEVICE arm has no such problem and passes: physicalization happens in
+        # the spyrecode stage, so the buffer a launch reads really is the [M, S] the
+        # splat made and lane 0 really is where the statistic was written. So the
+        # xfail below is a statement about ONE tier, not about the arm -- which is
+        # the reverse of what it said while neither tier could check it.
         #
         # raises=AssertionError, not left open: the failure that is expected is the
         # comparison's. A compile that stops working would raise RuntimeError out
@@ -1054,8 +1069,8 @@ VARIANTS = {
         "xfail_numerical": {
             "reason": "the [M, S] statistic read view is a physical-layout shape, "
                       "and ktir_cpu executes the logical ktir artifact, where the "
-                      "statistic buffer is a dense [M]; no tier can check this arm "
-                      "numerically today",
+                      "statistic buffer is a dense [M]; the device arm checks this "
+                      "arm instead",
             "strict": True,
             "raises": AssertionError,
         },
