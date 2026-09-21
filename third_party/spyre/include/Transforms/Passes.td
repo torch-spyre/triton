@@ -16,9 +16,11 @@ include "mlir/Pass/PassBase.td"
 //   Lowering - ops it converts and what they become
 //   Output   - what the IR looks like after this pass
 //
-// These are all opt-in fix passes rather than members of the core pipeline;
-// they are spliced in from Python via SpyreOptions.required_fixes.  See
-// third_party/spyre/backend/compiler.py.
+// All three are members of a fixed stage pipeline in lib/Pipeline.cpp, not
+// opt-in: UnaliasLinalgOuts in the `ktir` stage, DropReductionInitFill and
+// MaterializeBaseAddresses in `spyrecode`.  A pass's position there is chosen in
+// C++ from a typed factory, so there is no caller hook for inserting one at a
+// named point.
 // ============================================================================
 
 def UnaliasLinalgOuts : Pass<"unalias-linalg-outs", "mlir::ModuleOp"> {
@@ -168,9 +170,9 @@ def MaterializeBaseAddresses
         materializes a prefix and leaves the rest as arguments.
 
         Applies to public functions only; a private helper is not a kernel
-        boundary. With an empty list the pass is a no-op — it is opt-in, run
-        only via required_fixes, and is in neither _CORE_PIPELINE_PASSES nor
-        the fused add_convert_ttir_to_ktdp binding.
+        boundary. With an empty list the pass is a no-op. It runs in the
+        `spyrecode` stage only when `bindBaseAddresses` is set; the symbolic
+        mode leaves the pointer arguments in place.
 
         Output: func.func whose base-address arguments are gone; every other
         argument survives, keeping relative order. Arity zero is not
