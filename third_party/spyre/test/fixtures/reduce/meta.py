@@ -128,9 +128,15 @@ def _make_inputs_stat_chain(M, N, DTYPE="fp16", *, axis) -> dict:
     compiled kernel's recorded footprint, not from here -- see ``device_alloc_from``
     in ``test_device_launch.py``.
 
-    fp16 by default and floats only, unlike :func:`_make_inputs`: every variant of
-    this shape is fp16 (the statistic read-back is an fp16-only path further down),
-    and an integer branch would be dead code.
+    Floats only, unlike :func:`_make_inputs`: both arms of this shape sum, and a
+    sum through HBM is not a path any integer variant takes, so an integer branch
+    would be dead code. The dtype still comes from ``params`` as it does there.
+
+    fp16 is the default because it is the only dtype BOTH arms reach a binary at.
+    The off-stick arm has a working fp32 device variant; the on-stick one cannot
+    have one, and the reason is the tool rather than this fixture -- the lane-0
+    read that spreads a statistic across its stick becomes a
+    ``vectorchain.shuffle``, which ``dbo-opt`` takes at 2 bytes and refuses at 4.
     """
     np_dtype = DTYPE_MAP[DTYPE]
     rng = np.random.default_rng(seed=0)
@@ -152,9 +158,9 @@ def _stat_chain_oracle(axis):
     """``x - sum(x, axis)`` in the input's own dtype, broadcast back over *axis*.
 
     In the kernel's dtype for the reason :func:`_oracle` gives, and with the same
-    caveat: this is not the kernel's arithmetic. The statistic is a float16 sum
-    over a different summation order, and the subtract passes that difference
-    straight through -- so the variant's ``atol`` is sized in ulp of the
+    caveat: this is not the kernel's arithmetic. The statistic is summed in the
+    input's dtype but in a different summation order, and the subtract passes that
+    difference straight through -- so the variant's ``atol`` is sized in ulp of the
     STATISTIC, not of the output.
     """
     def run(inputs):
