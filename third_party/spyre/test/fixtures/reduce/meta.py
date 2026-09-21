@@ -998,6 +998,43 @@ VARIANTS = {
         "atol":        2.5e-1,
     },
 
+    # The same chain at fp32, which is a DIAGNOSTIC before it is coverage: it says
+    # whether the sibling's drift is the accumulation order or something
+    # structural. The reduce folds M either way, so both arms sum the same 64
+    # terms and only the precision differs -- so if the drift is a reordering it
+    # falls by the ratio of the ulps and a bound near 1e-5 holds, and if it stays
+    # at the fp16 absolute size then the cause is not arithmetic at all.
+    #
+    # Second job, not incidental: a stick is 32 lanes at fp32 against 64 at fp16,
+    # so the absorber and the layout pass are exercised at a different stick width
+    # on the same kernel. N follows from the dtype -- `_stick_on_n_row` takes its
+    # width from there, so two sticks is 64 elements here where it was 128.
+    "stat_chain_off_stick_fp32": {
+        "base": "stat_chain_off_stick",
+        "summary": (
+            "out[m, n] = x[m, n] - sum(x[:, n]) at fp32: the same non-stick-axis "
+            "reduce through HBM, at half the stick width and a quarter the ulp."
+        ),
+        "params": {
+            ("DTYPE", "N", "TILE_LAYOUT", "STAT_LAYOUT"): [
+                _stick_on_n_row("fp32", n_sticks=2),
+            ],
+            # M = 64, N = 64: two whole sticks at fp32, nothing ragged.
+            "M": [64],
+        },
+        # The sibling's rule at this dtype: ulp of the statistic, times the
+        # sqrt(64) reordering factor, times two. The column sums reach the same
+        # 24.03, where fp32 ulp is 1.907e-6, so 16 ulp is 3e-5.
+        #
+        # This arm ANSWERED the question it was added for. Against the fp16
+        # sibling, the drift falls by the ratio of the two ulps rather than staying
+        # at the fp16 absolute size -- so it is the summation order and not a
+        # mis-addressed element, which would have moved the same distance at either
+        # precision. It is also spread across the output rather than concentrated,
+        # which is the other thing a mis-addressed statistic would not do.
+        "atol":        3e-5,
+    },
+
     # Folds N, the STICK axis, so the statistic must be SPLAT and the logical form
     # stops describing the bytes. Everything this arm costs over its sibling
     # follows from that one fact: a second descriptor, a stick width the kernel has
