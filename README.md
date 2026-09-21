@@ -260,6 +260,73 @@ TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/dump TRITON_ALWAYS_COMPILE=1 python ke
 `spyrecode` artifact on every compile. To obtain that module without running the
 tool at all, use the two-pipeline recipe above.
 
+## Launching a Kernel
+
+A launch looks like any other Triton launch: host tensors go to the device, then the
+kernel is indexed by its grid and called.
+
+```python
+x   = torch.randn(64, 128, dtype=torch.float16).to("spyre")
+out = torch.empty(64, 128, dtype=torch.float16).to("spyre")
+my_kernel[(1,)](x, out, M=64, N=128, X_LAYOUT=..., OUT_LAYOUT=...)
+```
+
+`.to("spyre")` is correct for almost every buffer, including stick-tiled ones. A
+stick layout *partitions* a dimension — it decides where elements sit, not how many
+there are — so the device needs exactly the element count the host tensor already
+has.
+
+### When a layout replicates, you must allocate for it
+
+One kind of layout is different. A **splat** coordinate op does not partition a
+dimension, it *replicates* one: a rank-1 statistic annotated splat-on-lanes occupies
+`[M, S]` on the device, `S` copies of each value. That buffer needs `M × S` elements
+where the host tensor holds `M`.
+
+`.to("spyre")` cannot know this — it sizes from the host shape alone — so it
+allocates `M`, and the kernel writes past the end of it. You are expected to know
+your own layout and allocate accordingly, by handing `to` the device layout
+explicitly:
+
+```python
+import torch
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+# Required for this path, and only for this path: a plain .to("spyre")
+# initializes the runtime on its own, while the device_layout= branch
+# allocates directly and fails with "RuntimeContext not created" without it.
+torch.spyre._impl._lazy_init()
+
+host_stat = torch.zeros(64, dtype=torch.float16)
+stat = host_stat.to("spyre", device_layout=SpyreTensorLayout(
+    device_size=[1, 64, 64], stride_map=[-1, 1, -1],
+    device_dtype=get_device_dtype(host_stat.dtype)))
+
+my_kernel[(1,)](x, stat, M=64, N=128, X_LAYOUT=..., STAT_LAYOUT=...)
+```
+
+The host tensor's contents are copied over, so zeroing it on the host is how you
+tell a buffer the kernel never wrote from one that wrote the right answer.
+
+The rule for which buffers need this is the layout you annotated, not the buffer's
+role: a splat anywhere — on an input as much as an output — needs an explicit
+allocation, and a layout built only from identity, floordiv and mod does not.
+
+### You will be told if you get it wrong
+
+The launcher does not rely on you remembering. Every annotated argument is checked
+against the layout its kernel was compiled with, and a buffer too small is refused
+before the kernel runs rather than corrupting whatever follows it in device memory.
+The refusal names the argument, both device layouts with their byte counts, and the
+allocation call that would fix it — so the fastest way to discover the layout for a
+new kernel is to launch it with a plain `.to("spyre")` and read the error.
+
+Two limits worth knowing. An argument whose physical extents depend on a *runtime*
+value cannot be checked, because the size is not known at compile time; such a
+buffer passes unexamined, and a replicating layout on one would overrun it silently.
+And the check measures device storage, so it catches a buffer that is too small but
+not one whose contents are wrong.
+
 ## Device Launch Dependency
 
 `kernel[grid](x, y, out, ...)` runs on hardware in the calling process:
