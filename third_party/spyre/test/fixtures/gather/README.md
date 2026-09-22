@@ -37,14 +37,17 @@ Level A  shape/distribution   fp32 data, i32 indices (gather has one
          3d_partial, scatter_3d, scatter_3d_partial,
          2d_index_gather, 2d_index_roundtrip,
          2d_index_3d_block, 2d_index_3d_block_large           27 keys
+
+Level B  compute correctness   DTYPE sweep on gather_kernel_1core, the
+                                simplest legal shape (still no OP axis)
+         1core_compute[DTYPE=fp16|fp32|i32]                    3 keys
 ```
 
-Levels B and D have no gather variants: no compute-correctness sweep
-(one operation, nothing to sweep an `OP` over) and no variant that
-reaches a Spyre binary. The layout-carrying trio (`spyre_stick`,
-`spyre_stick_output_only`, `4d_spyre_stick_output`) sits outside Level A,
-deliberately unclassified — see the `Unclassified` section under
-`## Variants` below.
+Level D has no gather variant: no variant reaches a Spyre binary. The
+layout-carrying trio (`spyre_stick`, `spyre_stick_output_only`,
+`4d_spyre_stick_output`) sits outside Level A, deliberately
+unclassified — see the `Unclassified` section under `## Variants`
+below.
 
 ### Pythonic semantics
 
@@ -309,6 +312,32 @@ numerics on `ktir_cpu`.
 |----------------------------|----------|------|-----|----|-----|---------|---------|---------|----------|---------------------------------------------------------------|
 | `2d_index_3d_block`        | 16       | 6    | 8   | 4  | 8   | 2       | 4       | 2       | 2        | both relaxations at once: 2D index grid *and* rank-3 source block, non-zero `h_offset` on the inner axis |
 | `2d_index_3d_block_large`  | 32768    | 32   | 128 | 12 | 256 | 2       | 64      | 4       | 8        | same path at paged-KV-cache scale                            |
+
+### Level B — compute correctness
+
+| Variant                     | M  | N  | K_INDICES | BLOCK_COLS | y_offset | DTYPE            | Pinned bug class                                    |
+|------------------------------|----|----|-----------|------------|----------|------------------|------------------------------------------------------|
+| `1core_compute[DTYPE=fp16]` | 16 | 16 | 8         | 16         | 0        | fp16             | descriptor_gather correctness at fp16                |
+| `1core_compute[DTYPE=fp32]` | 16 | 16 | 8         | 16         | 0        | fp32             | descriptor_gather correctness at fp32                |
+| `1core_compute[DTYPE=i32]`  | 16 | 16 | 8         | 16         | 0        | i32              | descriptor_gather correctness on an integer payload   |
+
+Reuses `gather_kernel_1core` unchanged — no dtype-specific code in the
+kernel, so this variant exists purely to sweep `in_ptr`/`out_ptr`'s
+element type through `SIGNATURE`. `idx_ptr` is pinned `i32` in every
+key: index dtype is a fixed contract, not a compute axis, the same way
+`reduce`'s axis being reduced is fixed while `OP`/`DTYPE` sweep. There
+is no `OP` axis here either — gather has exactly one operation, so the
+sweep is DTYPE alone.
+
+The shape is the smallest `gather_kernel_1core`'s preconditions allow
+across all three dtypes: `BLOCK_COLS ≥ 32 / bitwidth * 8` needs 16 for
+fp16 and only 8 for fp32/i32, so `BLOCK_COLS = 16` is the smallest value
+that satisfies every arm with one shared shape row (see
+`## Preconditions` below). `y_offset = 0` with `N = BLOCK_COLS` reads
+the full row, the simplest case. Because gather has no arithmetic —
+it is pure indexed data movement — all three dtypes are bit-exact
+against the NumPy oracle; unlike `reduce`/`elementwise`'s compute
+sweeps, no `rtol`/`atol` override is needed.
 
 ### Unclassified — layout-carrying (level deliberately unstated)
 
