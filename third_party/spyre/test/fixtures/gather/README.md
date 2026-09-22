@@ -35,16 +35,16 @@ Level A  shape/distribution   fp32 data, i32 indices (gather has one
          2d, 2d_serial, 2d_large_table, 2d_large_table_serial, 1d,
          3d, 3d_large_k, 3d_group, 3d_group_end, 4d, 4d_boundary,
          3d_partial, scatter_3d, scatter_3d_partial,
-         2d_index_gather, 2d_index_roundtrip                25 keys
+         2d_index_gather, 2d_index_roundtrip,
+         2d_index_3d_block, 2d_index_3d_block_large           27 keys
 ```
 
 Levels B and D have no gather variants: no compute-correctness sweep
 (one operation, nothing to sweep an `OP` over) and no variant that
 reaches a Spyre binary. The layout-carrying trio (`spyre_stick`,
-`spyre_stick_output_only`, `4d_spyre_stick_output`) and the fp16
-indexed-copy pair (`2d_index_3d_block`, `2d_index_3d_block_large`) sit
-outside Level A, deliberately unclassified — see the `Unclassified`
-sections under `## Variants` below.
+`spyre_stick_output_only`, `4d_spyre_stick_output`) sits outside Level A,
+deliberately unclassified — see the `Unclassified` section under
+`## Variants` below.
 
 ### Pythonic semantics
 
@@ -303,20 +303,12 @@ Numerical oracles for the rank-K `x_offsets` relaxation: they confirm
 the K-D indirect read (and scatter write) executes with correct
 numerics on `ktir_cpu`.
 
-### Unclassified — fp16 indexed copy
+#### Rank-2 index grid × rank-3 block (`gather_2d_index_3d_block_kernel`)
 
-| Variant                     | CACHE_SZ | HEAD | D   | B  | L   | BLOCK_B | BLOCK_L | BLOCK_H | h_offset |
-|------------------------------|----------|------|-----|----|-----|---------|---------|---------|----------|
-| `2d_index_3d_block`          | 16       | 6    | 8   | 4  | 8   | 2       | 4       | 2       | 2        |
-| `2d_index_3d_block_large`    | 32768    | 32   | 128 | 12 | 256 | 2       | 64      | 4       | 8        |
-
-Both generalisations at once: a 2D index grid *and* a rank-3 source
-block, with a non-zero `h_offset` on the inner axis. `fp16` because
-the gather is a pure indexed copy, so the oracle compares bit-exactly
-at paged-KV-cache shapes — not a dtype probe: deciding whether this
-belongs under Level A or Level B needs a call that hasn't been made,
-so it's left out of the Level A heading above rather than folded
-under it.
+| Variant                    | CACHE_SZ | HEAD | D   | B  | L   | BLOCK_B | BLOCK_L | BLOCK_H | h_offset | Pinned bug class                                             |
+|----------------------------|----------|------|-----|----|-----|---------|---------|---------|----------|---------------------------------------------------------------|
+| `2d_index_3d_block`        | 16       | 6    | 8   | 4  | 8   | 2       | 4       | 2       | 2        | both relaxations at once: 2D index grid *and* rank-3 source block, non-zero `h_offset` on the inner axis |
+| `2d_index_3d_block_large`  | 32768    | 32   | 128 | 12 | 256 | 2       | 64      | 4       | 8        | same path at paged-KV-cache scale                            |
 
 ### Unclassified — layout-carrying (level deliberately unstated)
 

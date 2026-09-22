@@ -51,13 +51,14 @@ layout annotation):
     ``gather_scatter_2d_index_kernel``) — ``2d_index_gather``,
     ``2d_index_roundtrip``; a 2D ``[S0, S1]`` index grid instead of a
     1D index list.
+  - **rank-2 index grid x rank-3 block** (``gather_2d_index_3d_block_kernel``)
+    — ``2d_index_3d_block``, ``2d_index_3d_block_large``; both
+    generalisations at once (2-D x_offsets AND a rank-3 source block),
+    at paged-KV-cache shapes.
 
-Two regions sit outside the Level A banner, deliberately unclassified —
-see the banner comment above each in ``VARIANTS`` for why:
+One region sits outside the Level A banner, deliberately unclassified —
+see the banner comment above it in ``VARIANTS`` for why:
 
-  - ``2d_index_3d_block`` / ``2d_index_3d_block_large``
-    (``gather_2d_index_3d_block_kernel``) — fp16, a pure indexed copy at
-    paged-KV-cache shapes.
   - ``spyre_stick``, ``spyre_stick_output_only`` (``gather_kernel_spyre``)
     and ``4d_spyre_stick_output`` (``gather_4d_kernel``) — carry a real
     stick layout annotation that the numerical tier no longer
@@ -611,20 +612,19 @@ def run_2d_index_roundtrip(inputs: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# rank-2 index grid x rank-3 source block -> rank-4 output (f16).
+# rank-2 index grid x rank-3 source block -> rank-4 output.
 #
 # Drives ``gather_2d_index_3d_block_kernel``: a 2-D (S0 x S1) index grid
 # gathers from a rank-3 source [M, D1, D2] with block [1, C1, D2] (leading 1 =
 # the fanned-out page), producing a rank-4 [S0, S1, C1, D2] result stored into
 # the [0,0,0,0] corner of a [IS0, IS1, D1, D2] output table. ``y_offset`` is
-# non-zero, exercising the direct subscript on the inner (D1) axis. f16 source
-# (a pure indexed copy, so the oracle compares bit-exactly).
+# non-zero, exercising the direct subscript on the inner (D1) axis.
 # ---------------------------------------------------------------------------
 
 def _make_inputs_2d_index_4d_out(
     M, D1, D2, IS0, IS1, S0, S1, C1, h_offset, *, seed,
 ) -> dict:
-    """Rank-3 f16 source + a full [IS0, IS1] index buffer of page indices.
+    """Rank-3 source + a full [IS0, IS1] index buffer of page indices.
 
     The index buffer matches the *descriptor* full shape [IS0, IS1]; the
     kernel loads only the [0:S0, 0:S1] block from it (so the buffer must
@@ -636,9 +636,9 @@ def _make_inputs_2d_index_4d_out(
     table; the kernel writes only the [S0, S1, C1, D2] corner.
     """
     rng = np.random.default_rng(seed)
-    in_data = rng.standard_normal((M, D1, D2)).astype(np.float16)
+    in_data = rng.standard_normal((M, D1, D2)).astype(np.float32)
     idx_data = rng.integers(0, M, size=(IS0, IS1)).astype(np.int32)
-    out_data = np.zeros((IS0, IS1, D1, D2), dtype=np.float16)
+    out_data = np.zeros((IS0, IS1, D1, D2), dtype=np.float32)
     return {
         "in_ptr":   in_data,
         "out_ptr":  out_data,
@@ -872,11 +872,11 @@ _SIG_2D_INDEX = {
     "BLOCK_COLS": "i32",
 }
 
-# rank-2 index grid x rank-3 source block -> rank-4 output (f16 source).
+# rank-2 index grid x rank-3 source block -> rank-4 output.
 # Runtime args (in/out/idx pointers + h_offset) first; the rest are constexpr.
 _SIG_2D_INDEX_4D = {
-    "in_ptr":   "*fp16",
-    "out_ptr":  "*fp16",
+    "in_ptr":   "*fp32",
+    "out_ptr":  "*fp32",
     "idx_ptr":  "*i32",
     "h_offset": "i32",
     "CACHE_SZ": "i32",
@@ -1473,17 +1473,11 @@ VARIANTS = {
         "inputs":       make_inputs_2d_index_roundtrip,
         "output_key":   "out_ptr",
     },
-    # -----------------------------------------------------------------------
-    # Unclassified -- fp16 indexed copy
-    #
-    # rank-2 index grid x rank-3 source block -> rank-4 output. Both
+    # ------------------------------------------------------------------
+    # rank-2 index grid x rank-3 source block -> rank-4 output.  Both
     # generalisations at once (2-D x_offsets AND a rank-3 block), with a
-    # non-zero h_offset on the inner axis. fp16 because the gather is a
-    # pure indexed copy, so the oracle compares bit-exactly at paged-KV-
-    # cache shapes -- not a dtype probe: deciding whether this belongs
-    # under Level A or Level B needs a call that hasn't been made, so it
-    # is left out of the Level A banner above rather than folded under it.
-    # -----------------------------------------------------------------------
+    # non-zero h_offset on the inner axis, at paged-KV-cache shapes.
+    # ------------------------------------------------------------------
     "2d_index_3d_block": {
         # 2x4 index grid into a [16, 6, 8] source, block [1, 2, 8]:
         # reads in[idx[i,j], 2:4, :] -> [2, 4, 2, 8] tile, stored into the
