@@ -21,7 +21,9 @@ Vocabulary (matches ``kernel.py``):
 Several kernel functions share this fixture, most of them under the
 Level A banner below (shape, rank and distribution; no ``OP`` axis since
 gather has exactly one operation, fp32 data with i32 indices, no real
-layout annotation):
+layout annotation). One variant sits under a Level B banner (compute
+correctness: a DTYPE sweep on ``gather_kernel_1core`` at the simplest
+shape, since there's still no ``OP`` axis to cross it against):
 
   - **distributed** (``gather_kernel``) — the ``default``, plus six
     edge-case variants rebased onto it, each pinning a specific bug
@@ -65,18 +67,19 @@ see the banner comment above it in ``VARIANTS`` for why:
     physicalizes (that moved from ``ktir`` to ``spyrecode``), so it would
     be misleading to call them Level C.
 
-Levels B and D are real gaps here, not omissions — gather has no
-compute-correctness sweep (one operation, nothing to sweep an ``OP``
-over) and no variant that reaches a Spyre binary. See
-``fixtures/README.md`` for the field reference and discovery rules.
+Level D is a real gap here, not an omission — gather has no variant that
+reaches a Spyre binary. See ``fixtures/README.md`` for the field
+reference and discovery rules.
 """
 
 import functools
+from dataclasses import dataclass
 
 import numpy as np
 
+import conftest
 from . import kernel
-from utils import sticksize
+from utils import sticksize, DTYPE_MAP
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +88,7 @@ from utils import sticksize
 
 def _make_inputs(
     M: int, N: int, K_INDICES: int, BLOCK_COLS: int, y_offset: int,
-    *, seed: int, allow_duplicates: bool,
+    *, seed: int, allow_duplicates: bool, dtype: str = "fp32",
 ) -> dict:
     """Shared input builder for both variants.
 
@@ -100,15 +103,25 @@ def _make_inputs(
     separate kwarg path through ``test_numerical``. The same value is
     also threaded through ``run_cpu`` as a kernel runtime arg via the
     ``params``/``runtime_scalars`` flow.
+
+    ``dtype`` is a :data:`DTYPE_MAP` key for the source/output payload
+    (defaults to ``"fp32"`` so every pre-existing call site is
+    unaffected); ``idx_ptr`` is always ``i32`` regardless. Integers take
+    their own branch for the same reason ``reduce``'s ``_make_inputs``
+    does: ``standard_normal`` cast to ``int32`` truncates to -1/0/1.
     """
+    np_dtype = DTYPE_MAP[dtype]
     rng = np.random.default_rng(seed)
-    in_data = rng.standard_normal((M, N)).astype(np.float32)
+    if np.issubdtype(np_dtype, np.integer):
+        in_data = rng.integers(-100, 100, size=(M, N)).astype(np_dtype)
+    else:
+        in_data = rng.standard_normal((M, N)).astype(np_dtype)
     if allow_duplicates:
         idx_data = rng.integers(0, M, size=(K_INDICES,)).astype(np.int32)
     else:
         # Sample without replacement to force unique indices (sanity case).
         idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
-    out_data = np.zeros((K_INDICES, BLOCK_COLS), dtype=np.float32)
+    out_data = np.zeros((K_INDICES, BLOCK_COLS), dtype=np_dtype)
     return {
         "in_ptr":   in_data,
         "out_ptr":  out_data,
@@ -167,6 +180,13 @@ def make_inputs_large_k(M, N, K_INDICES, BLOCK_COLS, y_offset,
                         **_unused) -> dict:
     return _make_inputs(M, N, K_INDICES, BLOCK_COLS, y_offset,
                         seed=1006, allow_duplicates=True)
+
+
+def make_inputs_1core_compute(M, N, K_INDICES, BLOCK_COLS, y_offset,
+                              DTYPE="fp32", **_unused) -> dict:
+    """Level B inputs: DTYPE-swept payload; idx_ptr stays i32 always."""
+    return _make_inputs(M, N, K_INDICES, BLOCK_COLS, y_offset,
+                        seed=2001, allow_duplicates=False, dtype=DTYPE)
 
 
 def make_inputs_spyre(M, N, K_INDICES, BLOCK_COLS, y_offset,
@@ -902,6 +922,23 @@ _SIG_1D = {
 }
 
 
+@dataclass(frozen=True)
+class Gather1Core(conftest.VariantFactory):
+    """Level B factory: swept payload dtype for ``gather_kernel_1core``.
+
+    ``idx_ptr`` always stays ``i32`` -- index dtype is a fixed contract,
+    not a compute axis -- so only ``in_ptr``/``out_ptr`` in SIGNATURE vary
+    with DTYPE. The oracle (``run``) has no dtype-specific code and
+    ``make_inputs_1core_compute`` already reads DTYPE from ``params``
+    directly, so neither needs a hook here -- only ``signature`` does,
+    since SIGNATURE is a literal dict rather than something invoked with
+    the combination at run time.
+    """
+
+    def signature(self, DTYPE, **_):
+        return {**_SIG_1CORE, "in_ptr": f"*{DTYPE}", "out_ptr": f"*{DTYPE}"}
+
+
 # ---------------------------------------------------------------------------
 # VARIANTS
 # ---------------------------------------------------------------------------
@@ -963,6 +1000,40 @@ VARIANTS = {
         "grid":       [32],
         "reference":  run,
         "inputs":     make_inputs,
+        "output_key": "out_ptr",
+    },
+    # -----------------------------------------------------------------------
+    # Level B -- compute correctness
+    #
+    # gather has exactly one operation, so there's no OP axis to sweep the
+    # way reduce sweeps OP="sum"/"max"/"min" -- this is a pure DTYPE sweep on
+    # gather_kernel_1core at the simplest legal shape. idx_ptr is pinned i32
+    # throughout: index dtype is a fixed contract, not a compute axis.
+    # -----------------------------------------------------------------------
+    "1core_compute": {
+        "base":       None,
+        "kernel_fn":  kernel.gather_kernel_1core,
+        "factory":    Gather1Core(),
+        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS"],
+        "params": {
+            "DTYPE":      ["fp16", "fp32", "i32"],
+            "M":          [16],
+            "N":          [16],
+            "K_INDICES":  [8],
+            "BLOCK_COLS": [16],
+            "y_offset":   [0],
+        },
+        "tags":       ["descriptor-gather", "1core", "gather-compute"],
+        "summary": (
+            "Compute-correctness sweep: gather_kernel_1core at the "
+            "simplest legal shape across fp16/fp32/i32 payload dtypes, "
+            "confirming descriptor_gather is dtype-agnostic. idx_ptr "
+            "stays i32 throughout -- index dtype is a fixed contract, "
+            "not a swept axis."
+        ),
+        "grid":       [1],
+        "reference":  run,
+        "inputs":     make_inputs_1core_compute,
         "output_key": "out_ptr",
     },
     # ------------------------------------------------------------------
