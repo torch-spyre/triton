@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Unit tests for the reusable Spyre frontend backend guard.
+"""Unit tests for the reusable Spyre frontend backend guard, and the one
+upstream dtype refusal forked behind it.
 
 ``triton.language.target_info`` gains two helpers (next to ``is_cuda`` /
 ``is_hip``) that let frontend code diverge by backend at *runtime* — needed
@@ -15,11 +16,17 @@ because frontend op construction runs before any pass, so the C++
 Both resolve the backend through ``current_target()``, so these tests drive
 them by monkeypatching ``current_target`` to return a chosen ``GPUTarget`` —
 no active driver required.
+
+The second half covers a different mechanism, which is why it does not use those
+helpers: ``language/math.py``'s ``_check_dtype`` admits the extra dtypes a target
+declares through the ``extra_math_dtypes`` codegen hook, alongside
+``min_dot_size``. The table of which ops qualify lives in the backend, so these
+tests drive the hook rather than a backend predicate.
 """
 
 import pytest
 from triton.backends.compiler import GPUTarget
-from triton.language import target_info
+from triton.language import core, math, target_info
 
 
 def _target(backend):
@@ -101,3 +108,174 @@ class TestRequiresBackend:
         msg = str(exc.value)
         assert "_spyre_only" in msg
         assert "'cuda'" in msg
+
+
+# ---------------------------------------------------------------------------
+# math.py's _check_dtype — the extra_math_dtypes hook
+# ---------------------------------------------------------------------------
+
+class _FakeTensor(core.tensor):
+    """A ``core.tensor`` carrying a dtype and nothing else.
+
+    ``_check_dtype`` reads exactly two things off each argument: that it *is* a
+    ``core.tensor`` (a real ``isinstance``, so a mock will not do) and
+    ``arg.type.scalar.name``. Building a real tensor would need an MLIR builder
+    and a value handle; subclassing and setting ``type`` needs neither.
+    """
+
+    def __init__(self, dtype):
+        self.type = core.block_type(dtype, [4])
+
+
+class _FakeSemantic:
+    """The one thing ``_check_dtype`` reads off ``_semantic``: ``builder.codegen_fns``."""
+
+    def __init__(self, codegen_fns):
+        self.builder = type("_B", (), {"codegen_fns": codegen_fns})()
+
+
+def _spyre_codegen_fns():
+    """The real hook, from the backend, so these tests cannot drift from it."""
+    from backend.compiler import SpyreBackend
+
+    backend = SpyreBackend(_target("spyre"))
+    return backend.get_codegen_implementation(backend.parse_options({}))
+
+
+def _standin(name, dtypes=("fp32", "fp64")):
+    """A ``_check_dtype``-decorated callable standing in for the math op ``name``.
+
+    Decorated here rather than calling ``tl.exp`` so the test measures the
+    decorator and not a builtin's body. The name is set explicitly because the
+    hook is keyed on it, so it is part of what is under test.
+    """
+
+    def op(*args, **kwargs):
+        return "ran"
+
+    op.__name__ = name
+    return math._check_dtype(dtypes=list(dtypes))(op)
+
+
+def _call(op, dtype, codegen_fns):
+    return op(_FakeTensor(dtype), _semantic=_FakeSemantic(codegen_fns))
+
+
+#: The ops the hook admits fp16 into, and ops that declare fp32 but are not in it.
+_LOWERABLE = ("exp", "sqrt", "rsqrt")
+_NOT_LOWERABLE = ("log", "sin", "erf", "exp2", "floor")
+
+
+@pytest.fixture(scope="module")
+def spyre_fns():
+    return _spyre_codegen_fns()
+
+
+class TestExtraMathDtypes:
+
+    def test_the_backend_supplies_the_hook(self, spyre_fns):
+        assert callable(spyre_fns.get("extra_math_dtypes"))
+
+    def test_the_admitted_set_is_the_ops_lowerspyreops_converts(self, spyre_fns):
+        # LowerSpyreOps converts math.exp, sqrt and rsqrt at f16 and no other math
+        # op, so a change to either side has to be a change to both.
+        hook = spyre_fns["extra_math_dtypes"]
+        assert {n for n in _LOWERABLE + _NOT_LOWERABLE if hook(n)} == set(_LOWERABLE)
+
+    @pytest.mark.parametrize("name", _LOWERABLE)
+    def test_fp16_admitted(self, spyre_fns, name):
+        assert _call(_standin(name), core.float16, spyre_fns) == "ran"
+
+    def test_no_hook_leaves_the_upstream_table(self):
+        # Every other backend, and the interpreter, whose codegen_fns omit the key.
+        with pytest.raises(ValueError, match="Expected dtype"):
+            _call(_standin("exp"), core.float16, {"min_dot_size": None})
+
+    @pytest.mark.parametrize("name", _NOT_LOWERABLE)
+    def test_fp16_refused_for_an_op_with_no_f16_intrinsic(self, spyre_fns, name):
+        # These declare fp32 exactly as the three above do, so only the name
+        # separates them.
+        with pytest.raises(ValueError, match="Expected dtype"):
+            _call(_standin(name), core.float16, spyre_fns)
+
+    def test_declared_dtypes_still_admitted(self, spyre_fns):
+        # The hook only ever adds; fp32/fp64 must not be lost on the way.
+        assert _call(_standin("exp"), core.float32, spyre_fns) == "ran"
+        assert _call(_standin("exp"), core.float64, spyre_fns) == "ran"
+
+    def test_bf16_not_admitted(self, spyre_fns):
+        with pytest.raises(ValueError, match="Expected dtype"):
+            _call(_standin("exp"), core.bfloat16, spyre_fns)
+
+    def test_integer_op_untouched(self, spyre_fns):
+        # A float addition must not leak into an op that never accepted floats.
+        umulhi = _standin("umulhi", dtypes=("int32", "int64", "uint32", "uint64"))
+        with pytest.raises(ValueError, match="Expected dtype"):
+            _call(umulhi, core.float16, spyre_fns)
+        assert _call(umulhi, core.int32, spyre_fns) == "ran"
+
+    def test_error_reports_the_set_actually_accepted(self, spyre_fns):
+        # The message has to name fp16 too, or it tells the reader to cast to a
+        # type that was already allowed.
+        with pytest.raises(ValueError) as exc:
+            _call(_standin("exp"), core.bfloat16, spyre_fns)
+        msg = str(exc.value)
+        assert "fp16" in msg and "bf16" in msg
+
+    def test_read_per_call_not_per_decoration(self, spyre_fns):
+        # codegen_fns belongs to the compilation, so one callable has to answer
+        # differently for two of them.
+        exp = _standin("exp")
+        with pytest.raises(ValueError):
+            _call(exp, core.float16, {})
+        assert _call(exp, core.float16, spyre_fns) == "ran"
+
+
+# ---------------------------------------------------------------------------
+# The hook, in the IR it actually produces
+#
+# The tests above pin the decorator against a stub; this traces for real. No
+# active driver is needed: compile_to_ttir takes codegen_fns from the backend it
+# constructs, which is the same route a compile uses.
+# ---------------------------------------------------------------------------
+
+class TestExtraMathDtypesInTracedIR:
+
+    @staticmethod
+    def _ttir():
+        import triton
+        import triton.language as tl
+        from utils import compile_to_ttir
+
+        @triton.jit
+        def fp16_exp(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+            """An fp16 ``tl.exp``. Descriptors rather than pointer arithmetic,
+            matching the fixtures -- nothing here goes past TTIR, so no layout is
+            needed."""
+            x_desc = tl.make_tensor_descriptor(
+                x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            out_desc = tl.make_tensor_descriptor(
+                out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            x = x_desc.load([0, 0])
+            out_desc.store([0, 0], tl.exp(x))
+
+        signature = {"x_ptr": "*fp16", "out_ptr": "*fp16",
+                     "M": "constexpr", "N": "constexpr"}
+        return compile_to_ttir(fp16_exp, signature, {"M": 64, "N": 64})
+
+    @pytest.fixture(scope="class")
+    def ttir(self):
+        return self._ttir()
+
+    def test_no_conversion_emitted(self, ttir):
+        # The op stays at the width it was handed, rather than being widened
+        # around a fp32-only intrinsic.
+        assert "arith.extf" not in ttir
+        assert "arith.truncf" not in ttir
+
+    def test_exp_traces_at_fp16(self, ttir):
+        # Upstream this call raises ValueError during tracing, so reaching TTIR
+        # at all is the assertion; the type is checked so a silent cast would
+        # not pass either.
+        assert "math.exp %" in ttir
+        assert "tensor<64x64xf16>" in ttir.split("math.exp %")[1].split("\n")[0]
