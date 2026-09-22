@@ -239,11 +239,9 @@ def reduce_one_tile(
 # own error through unamplified, so an absolute tolerance sized in ulp of the
 # statistic is the whole story.
 #
-# ``sum`` and not ``max``, and the reason is the DTYPE and not the combiner: at
-# fp16 ``tl.max`` promotes to fp32 and emits an ``arith.extf`` that no pass here
-# lowers. DropReductionInitFill gates on shape alone, so the combiner itself
-# refuses nothing -- which makes the wall the promotion, and the promotion has
-# nothing to do with reading a statistic back.
+# ``sum`` and not ``max``: at fp16 ``tl.max`` promoted to fp32 and emitted an
+# ``arith.extf`` that no pass here lowers. The softmax chains below use a ``max``,
+# the promotion now being forked behind ``is_spyre()``.
 # ---------------------------------------------------------------------------
 
 
@@ -383,3 +381,220 @@ def stat_chain_on_stick(
     x2 = x_desc.load([0, 0])
     s = stat_r.load([0, 0])
     out_desc.store([0, 0], x2 - s)
+
+
+# ---------------------------------------------------------------------------
+# Softmax: the statistic chain carried to its end, in two lengths.
+#
+# ``stat_chain_on_stick`` above is where this starts -- a stick-axis reduce, a
+# statistic through HBM, a consumer reading it back at lane 0. These two continue
+# it, and they are separate kernels because a variant is the unit that can carry
+# its own tolerance and buffer count:
+#
+#   max_shift_exp_on_stick   3 groups, 4 buffers   exp(x - max(x))
+#   softmax_on_stick         6 groups, 7 buffers   the whole normalisation
+#
+# fp16 in both: a statistic that round-trips through HBM is an fp16-only path,
+# per ``stat_chain_on_stick``'s banner. Their maximum is spelled with
+# :func:`_maximum` below, and the fp16 ``tl.exp`` they need is admitted behind
+# ``is_spyre()`` -- see ``test_frontend_guards.py``.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _maximum(a, b):
+    """The combiner of a maximum reduce, for :func:`tl.reduce`."""
+    return tl.maximum(a, b)
+
+
+@triton.jit
+def max_shift_exp_on_stick(
+    x_ptr,
+    max_ptr,
+    diff_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    S: tl.constexpr,
+    TILE_LAYOUT: tl.constexpr,
+    STAT_LAYOUT: tl.constexpr,
+):
+    """``out[m, n] = exp(x[m, n] - max(x[m, :]))`` -- softmax's numerator.
+
+    :func:`stat_chain_on_stick` with two changes: the reduce is a ``max`` instead
+    of a ``sum``, and the shifted tile goes to a scratch buffer that a third group
+    exponentiates rather than straight out. Three compute groups, four buffers.
+
+    ``diff`` and ``out`` cannot be the same buffer: a group's store and a later
+    group's load of the same buffer is the fence the scheduler splits on, so each
+    intermediate needs its own.
+
+    One ``TILE_LAYOUT`` for three descriptors: ``x``, ``diff`` and ``out`` are all
+    full-width ``[M, N]`` tiles stuck on N the same way, so the only layout that
+    differs is the statistic's.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    diff_desc = tl.make_tensor_descriptor(
+        diff_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    # The statistic, in its two roles: written rank-1 through a splat layout so
+    # each value lands across a whole stick, read back as the [M, S] the splat
+    # made, one lane wide. See stat_chain_on_stick for the lane-0 read and for why
+    # ``S`` has to be an argument.
+    max_w = tl.make_tensor_descriptor(
+        max_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    max_r = tl.make_tensor_descriptor(
+        max_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1],
+    )
+    tl.spyre_tensor_layout(x_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(diff_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(out_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(max_w, STAT_LAYOUT)
+
+    # G1: the row maximum, stored stick-wide. A reduce with an explicit combiner,
+    # which does not promote a narrow float the way ``tl.max`` does.
+    x1 = x_desc.load([0, 0])
+    max_w.store([0], tl.reduce(x1, 1, _maximum))
+
+    # G2: every value shifted by its row's maximum, so the exponential below
+    # never sees a positive argument.
+    x2 = x_desc.load([0, 0])
+    m = max_r.load([0, 0])
+    diff_desc.store([0, 0], x2 - m)
+
+    # G3: the exponential.
+    d = diff_desc.load([0, 0])
+    out_desc.store([0, 0], tl.exp(d))
+
+
+@triton.jit
+def softmax_on_stick(
+    x_ptr,
+    max_ptr,
+    diff_ptr,
+    exp_ptr,
+    sum_ptr,
+    recip_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    S: tl.constexpr,
+    TILE_LAYOUT: tl.constexpr,
+    STAT_LAYOUT: tl.constexpr,
+):
+    """A whole softmax over the stick axis: six compute groups, seven buffers.
+
+    :func:`max_shift_exp_on_stick` continued to the end -- the exponentials are
+    summed, the total is inverted, and every exponential is scaled by its row's
+    reciprocal:
+
+        max     reduce the stick axis      the largest value per row
+        sub     x - max                    read at the head of the stick
+        exp     the intrinsic
+        sum     reduce the stick axis      the total of the exponentials
+        recip   one over that total        written back across a stick
+        mul     exp * recip                read at the head of the stick
+
+    Seven buffers is every base address there is, the eighth segment holding the
+    program, so nothing here can be given a scratch buffer it does not have.
+
+    Two things about the shape are constraints rather than choices:
+
+    * The exponentials go to memory because TWO groups read them -- the sum
+      reduces them and the multiply scales them -- and a load result may not be
+      shared across groups.
+    * The reciprocal is its own group producing a STICK-WIDE result, rather than
+      a divide folded into the multiply. The multiply reads its statistic one
+      lane wide like every other consumer here, so something has to have written
+      that lane.
+
+    ``tl.fdiv`` and not ``one / s``: ``/`` promotes fp16 to fp32
+    (``computation_type_impl`` in semantic.py) and the promotion emits an
+    ``arith.extf`` that no pass here lowers. ``tl.fdiv`` divides at the operand
+    width. The numerator is a same-dtype ``tl.full`` for the same reason -- a bare
+    Python ``1.0`` is an fp32 scalar.
+
+    THE NUMERATOR BEING EXACTLY ONE IS LOAD-BEARING and must stay that way:
+    ``LowerSpyreOps`` matches a numerator of one and emits the UNARY
+    ``spyreop.reciprocal``, so no float immediate reaches the device. Rewriting
+    this group in any way that keeps the constant alive changes the answer -- see
+    the variant's banner in ``meta.py``.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    diff_desc = tl.make_tensor_descriptor(
+        diff_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    exp_desc = tl.make_tensor_descriptor(
+        exp_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    # The two statistics, each in its two roles: written rank-1 through a splat
+    # layout so a value lands across a whole stick, read back as the [M, S] the
+    # splat made, one lane wide. See stat_chain_on_stick for the lane-0 read.
+    max_w = tl.make_tensor_descriptor(
+        max_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    max_r = tl.make_tensor_descriptor(
+        max_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1],
+    )
+    sum_w = tl.make_tensor_descriptor(
+        sum_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    sum_r = tl.make_tensor_descriptor(
+        sum_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1],
+    )
+    # The reciprocal is the one statistic written WITHOUT a splat layout: it is
+    # produced [M, S] already, by a compute whose output tile is stick-wide, so
+    # its logical shape is its physical one and there is nothing to replicate.
+    # Both descriptors are rank-2 over the same bytes; only the block differs.
+    recip_w = tl.make_tensor_descriptor(
+        recip_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, S],
+    )
+    recip_r = tl.make_tensor_descriptor(
+        recip_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1],
+    )
+    tl.spyre_tensor_layout(x_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(diff_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(exp_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(out_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(max_w, STAT_LAYOUT)
+    tl.spyre_tensor_layout(sum_w, STAT_LAYOUT)
+
+    # G1: the row maximum, stored stick-wide. A reduce with an explicit combiner,
+    # which does not promote a narrow float the way ``tl.max`` does.
+    x1 = x_desc.load([0, 0])
+    max_w.store([0], tl.reduce(x1, 1, _maximum))
+
+    # G2: every value shifted by its row's maximum.
+    x2 = x_desc.load([0, 0])
+    m = max_r.load([0, 0])
+    diff_desc.store([0, 0], x2 - m)
+
+    # G3: the exponential, to memory because two groups below read it.
+    d = diff_desc.load([0, 0])
+    exp_desc.store([0, 0], tl.exp(d))
+
+    # G4: the total of the exponentials, stored stick-wide.
+    e1 = exp_desc.load([0, 0])
+    sum_w.store([0], tl.sum(e1, axis=1))
+
+    # G5: one over that total, spread across the stick so G6 can read a lane.
+    s = sum_r.load([0, 0])
+    s_bcast = tl.broadcast_to(s, [M, S])
+    one = tl.full([M, S], 1.0, dtype=s_bcast.dtype)
+    recip_w.store([0, 0], tl.fdiv(one, s_bcast))
+
+    # G6: every exponential scaled by its row's reciprocal.
+    e2 = exp_desc.load([0, 0])
+    r = recip_r.load([0, 0])
+    out_desc.store([0, 0], e2 * r)

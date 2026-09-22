@@ -18,6 +18,11 @@ a later elementwise op, at both axes. Softmax's first two groups. Both arms reac
 a binary and launch; the on-stick one is checkable only on the device, and that
 group's banner says why.
 
+And a THIRD group, which is that chain carried to its end: ``max_shift_exp_on_stick``
+(softmax's numerator, three groups over four buffers) and ``softmax_on_stick`` (the
+whole normalisation, six groups over SEVEN -- every base address there is). Both
+launch and both are checked on the device only, for the second group's reason.
+
 The variants are grouped under Level A-D banners, each of which says what its
 level is for and what it deliberately does not vary. See ``fixtures/README.md``
 for the field reference and the discovery rules.
@@ -88,11 +93,10 @@ def _oracle(OP, axis=1):
     """NumPy oracle for *OP* over *axis*, in the input's own dtype.
 
     The cast keeps the oracle in the kernel's dtype, so a tolerance is not a
-    measure of NumPy's promotion rules. What it does NOT do is make the oracle
-    the same arithmetic as the kernel: ``np.sum`` over a float16 array reduces in
-    float16 here (measured), but in its own summation order, and two fp16 orders
-    over 64 terms differ by several ulp of the result. That difference, not the
-    dtype, is what ``one_tile``'s ``atol`` is sized for -- see the note there.
+    measure of NumPy's promotion rules. It does NOT make the oracle the same
+    arithmetic as the kernel: the summation order differs, and two fp16 orders over
+    64 terms differ by several ulp of the result. That difference is what
+    ``one_tile``'s ``atol`` is sized for.
     """
     def run(inputs):
         x = inputs["in_ptr"]
@@ -132,11 +136,11 @@ def _make_inputs_stat_chain(M, N, DTYPE="fp16", *, axis) -> dict:
     sum through HBM is not a path any integer variant takes, so an integer branch
     would be dead code. The dtype still comes from ``params`` as it does there.
 
-    fp16 is the default because it is the only dtype BOTH arms reach a binary at.
-    The off-stick arm has a working fp32 device variant; the on-stick one cannot
-    have one, and the reason is the tool rather than this fixture -- the lane-0
-    read that spreads a statistic across its stick becomes a
-    ``vectorchain.shuffle``, which ``dbo-opt`` takes at 2 bytes and refuses at 4.
+    fp16 is the default because it is the only dtype BOTH arms reach a binary at:
+    the lane-0 read that spreads a statistic across its stick becomes a
+    ``vectorchain.shuffle``, which ``dbo-opt`` takes at 2 bytes and not at 4. The
+    off-stick arm partitions its statistic instead of splatting it, so nothing
+    there spreads a lane and it has a working fp32 device variant.
     """
     np_dtype = DTYPE_MAP[DTYPE]
     rng = np.random.default_rng(seed=0)
@@ -158,9 +162,8 @@ def _stat_chain_oracle(axis):
     """``x - sum(x, axis)`` in the input's own dtype, broadcast back over *axis*.
 
     In the kernel's dtype for the reason :func:`_oracle` gives, and with the same
-    caveat: this is not the kernel's arithmetic. The statistic is summed in the
-    input's dtype but in a different summation order, and the subtract passes that
-    difference straight through -- so the variant's ``atol`` is sized in ulp of the
+    caveat: the summation order differs, and the subtract passes that difference
+    straight through -- so the variant's ``atol`` is sized in ulp of the
     STATISTIC, not of the output.
     """
     def run(inputs):
@@ -169,6 +172,85 @@ def _stat_chain_oracle(axis):
         spread = stat[None, :] if axis == 0 else stat[:, None]
         return (x - spread).astype(x.dtype)
     return run
+
+
+# ---------------------------------------------------------------------------
+# Softmax — inputs and oracles
+#
+# The statistic chain carried to its end, in two lengths: ``exp(x - max(x))`` and
+# the whole normalisation. Both fold the stick axis, so both are the on-stick
+# chain's shape with more groups; what is new is the number of BUFFERS.
+#
+# Each has its own input maker rather than one parametrised on a buffer count,
+# because the buffers are named arguments with individual shapes and the kernel's
+# declaration order is what pairs them with the signature.
+#
+# Every scratch buffer is zeroed, so a compute group that never ran is a wrong
+# answer rather than an unpredictable one. Their host shapes are the LOGICAL ones
+# even where the splat layout replicates: what the device needs is derived from the
+# compiled kernel's recorded footprint, per ``device_alloc_from`` in
+# ``test_device_launch.py``.
+# ---------------------------------------------------------------------------
+
+def make_inputs_max_shift_exp(M, N, DTYPE="fp16", **_unused) -> dict:
+    """``[M, N]`` in, an ``[M]`` scratch maximum, an ``[M, N]`` scratch shift, out."""
+    np_dtype = DTYPE_MAP[DTYPE]
+    rng = np.random.default_rng(seed=0)
+    x = rng.standard_normal((M, N)).astype(np_dtype)
+    return {"x_ptr":    x,
+            "max_ptr":  np.zeros(M, dtype=np_dtype),
+            "diff_ptr": np.zeros((M, N), dtype=np_dtype),
+            "out_ptr":  np.zeros((M, N), dtype=np_dtype)}
+
+
+def make_inputs_softmax(M, N, S, DTYPE="fp16", **_unused) -> dict:
+    """``[M, N]`` in, five scratch buffers and an ``[M, N]`` out -- seven in all.
+
+    Two rank-1 statistics (``max``, ``sum``) which the splat layout stretches to
+    ``[M, S]`` on the device; one ``[M, S]`` reciprocal, whose host shape is
+    already its device shape because the compute that writes it is stick-wide and
+    no layout replicates it; and two ``[M, N]`` intermediates.
+
+    ``S`` is an argument here and nowhere else in this file's makers: the
+    reciprocal is produced at physical width, so its shape cannot be derived from
+    the logical problem. Same leak ``stat_chain_on_stick`` pays on its read
+    descriptor.
+    """
+    np_dtype = DTYPE_MAP[DTYPE]
+    rng = np.random.default_rng(seed=0)
+    x = rng.standard_normal((M, N)).astype(np_dtype)
+    return {"x_ptr":     x,
+            "max_ptr":   np.zeros(M, dtype=np_dtype),
+            "diff_ptr":  np.zeros((M, N), dtype=np_dtype),
+            "exp_ptr":   np.zeros((M, N), dtype=np_dtype),
+            "sum_ptr":   np.zeros(M, dtype=np_dtype),
+            "recip_ptr": np.zeros((M, S), dtype=np_dtype),
+            "out_ptr":   np.zeros((M, N), dtype=np_dtype)}
+
+
+def max_shift_exp_reference(inputs) -> np.ndarray:
+    """``exp(x - max(x, axis=1))``, in the input's own dtype -- softmax's
+    numerator, shifted by the row maximum so every argument to the exponential is
+    at or below zero.
+    """
+    x = inputs["x_ptr"]
+    shifted = x - x.max(axis=1, keepdims=True)
+    return np.exp(shifted).astype(x.dtype)
+
+
+def softmax_reference(inputs) -> np.ndarray:
+    """A row softmax, in the input's own dtype and by the kernel's own steps.
+
+    Written out rather than as ``e / e.sum()`` because the kernel does not divide:
+    it inverts the total in a group of its own and multiplies, and in fp16 a
+    rounded reciprocal times a value is not a divide.
+    """
+    x = inputs["x_ptr"]
+    dt = x.dtype
+    shifted = (x - x.max(axis=1, keepdims=True)).astype(dt)
+    e = np.exp(shifted).astype(dt)
+    recip = (np.float32(1.0) / e.sum(axis=1, keepdims=True).astype(dt)).astype(dt)
+    return (e * recip).astype(dt)
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +306,29 @@ def _signature_stat_chain(dtype: str, axis: int) -> dict:
     if axis == 1:
         sig["S"] = "i32"
     return {**sig, "TILE_LAYOUT": "constexpr", "STAT_LAYOUT": "constexpr"}
+
+
+def _signature_softmax_chain(dtype: str, *scratch: str) -> dict:
+    """A stick-axis softmax chain's arg list: ``x``, *scratch*, ``out``.
+
+    The two chains differ only in how many intermediates sit between the input and
+    the output, so they share one builder and name their own. ``max_shift_exp`` is
+    ``("max_ptr", "diff_ptr")`` and ``softmax`` is those plus ``exp_ptr``,
+    ``sum_ptr`` and ``recip_ptr``.
+
+    TWO LAYOUTS FOR ANY NUMBER OF POINTERS: every full-width ``[M, N]`` tile in
+    either chain carries the same stick-on-N split, so ``TILE_LAYOUT`` states it
+    once; only the rank-1 statistics differ, and ``STAT_LAYOUT`` is theirs.
+    ``recip_ptr`` is annotated by neither -- a stick-wide compute writes it, so its
+    logical shape is already its physical one.
+
+    Order is the kernels' declaration order, as :func:`_signature_stat_chain` says:
+    ``device_layouts`` is keyed by pointer ordinal, so a signature listing them
+    differently would pair a recorded layout with the wrong buffer.
+    """
+    ptrs = {name: f"*{dtype}" for name in ("x_ptr", *scratch, "out_ptr")}
+    return {**ptrs, "M": "i32", "N": "i32", "S": "i32",
+            "TILE_LAYOUT": "constexpr", "STAT_LAYOUT": "constexpr"}
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +458,9 @@ def _stat_chain_row_on_stick(dtype: str, n_sticks: int) -> tuple:
     :func:`_stick_on_n_row`'s pair, and only the argument names they land on
     differ (``TILE_LAYOUT``/``STAT_LAYOUT`` rather than ``IN_LAYOUT``/
     ``OUT_LAYOUT``), which is a property of the group KEY and not of the row.
+
+    The two SOFTMAX chains sweep this same row unchanged: however many full-width
+    intermediates they add, each is another tile stuck on N exactly like ``x``.
     """
     dt, n, tile, stat = _stick_on_n_row_splat(dtype, n_sticks)
     return (dt, n, _stick_of(dtype), tile, stat)
@@ -698,18 +806,12 @@ VARIANTS = {
     # that keeps Level C at two variants. Collapse them back into a single
     # ``AXIS: [0, 1]`` sweep the day the on-stick arm reaches the device too.
     #
-    # The first wall is shared by both, and neither variant asserts it:
-    #
-    #   V1 only supports add/mul/sub/reduce compute ops; found unsupported
-    #   compute op
-    #
-    # naming the ``linalg.fill`` that LowerComputeOps puts on the reduction's
-    # ``outs``. ``linalg.reduce`` itself is in that allowlist; the neutral-element
-    # fill beside it is not. ``DropReductionInitFill`` removes exactly that fill,
-    # and the spyrecode stage installs it unconditionally, out of
-    # ``buildSpyrecodePipeline``'s own list -- so what reaches the
-    # device is the emission with the fill already gone, which is what makes it
-    # match torch-spyre's, whose emitter never writes one.
+    # The scheduler's compute allowlist takes ``linalg.reduce`` but not the
+    # neutral-element ``linalg.fill`` LowerComputeOps puts on the reduction's
+    # ``outs``. ``DropReductionInitFill`` removes exactly that fill, and the
+    # spyrecode stage installs it unconditionally, so what reaches the device is
+    # the emission with the fill already gone -- which is what makes it match
+    # torch-spyre's, whose emitter never writes one.
     #
     # DTYPE and OP are pinned in both: the fill and then the shape are what
     # decide the outcome, and every dtype and every combiner produce those alike.
@@ -752,25 +854,17 @@ VARIANTS = {
         "rtol":        1e-2,
         # Set by the DEVICE arm, and looser than the elementwise-shaped 5e-2 the
         # other stick variants use because a reduce accumulates where an
-        # elementwise op does not: 5e-2 is only 3.2 ulp at this output's
-        # magnitude, and the device lands past it.
+        # elementwise op does not.
         #
-        # Sized in ulp rather than picked. The sums reach 24, where fp16 ulp is
-        # 0.015625, so 0.25 is 16 of them. Measured against the fp16 oracle on
-        # this exact input (seed 0, M=64, N=128):
+        # Sized in ulp rather than picked: the sums reach 24, where fp16 ulp is
+        # 0.015625, so 0.25 is 16 of them -- a 64-term reordering predicts
+        # sqrt(64) = 8 ulp, and this is that with a factor of two. Not the worst
+        # case, which is 64 ulp = 1.0.
         #
-        #     device     0.1367   =  8.75 ulp   <- what sets this
-        #     ktir_cpu   0.0205   =  1.31 ulp
-        #
-        # 8.75 ulp is what a 64-term reordering predicts -- the drift grows as
-        # sqrt(64) = 8 ulp -- so the device is behaving, and 16 ulp is that with
-        # a factor of two. Not the worst case, which is 64 ulp = 1.0, and not a
-        # number fitted to the element that failed at 5e-2.
-        #
-        # It is this device's accumulation order that differs, not fp16 order in
-        # general: NumPy's fp16 sum and a plain sequential fp16 sum agree here
-        # bit for bit, so there is no oracle-side order to match. Widening the
-        # oracle to an fp32 accumulator does not close the gap either.
+        # It is the device's accumulation order that differs, not fp16 order in
+        # general: NumPy's fp16 sum and a plain sequential fp16 sum agree here bit
+        # for bit, so there is no oracle-side order to match, and widening the
+        # oracle to an fp32 accumulator does not close the gap.
         #
         # The on-stick sibling below keeps 5e-2: it never runs on the device, so
         # nothing there asks for this. That is what the split buys.
@@ -786,8 +880,8 @@ VARIANTS = {
     # having a rank-2 dest against a 1-result dest_map. No batch dimension
     # survives to carry the split, so the sibling above's path does not apply --
     # and torch-spyre does not emit linalg.reduce for this case at all, using a
-    # linalg.generic with the maps written out, which currently fails there too.
-    # So there is no working emission to match yet.
+    # linalg.generic with the maps written out, so there is no working emission to
+    # match.
     #
     # That refusal is why this variant carries no ``compiles_to_binary``. It is
     # not asserted anywhere: what is under test is that the reduce lowers and
@@ -810,10 +904,9 @@ VARIANTS = {
         # compiles_to_binary is not inherited -- but say so rather than relying
         # on a reader knowing that: this arm does not reach a binary.
         "compiles_to_binary": False,
-        # Back to the elementwise-shaped tolerance. Nothing here runs on the
-        # device, and on ktir_cpu this arm drifts 0.0122 = 0.78 ulp, so 5e-2
-        # (3.2 ulp) is already generous. Inheriting the sibling's 0.25 would
-        # check it 20x looser than it needs for no reason.
+        # Back to the elementwise-shaped tolerance: nothing here runs on the
+        # device, so 5e-2 (3.2 ulp of this output) is already generous and
+        # inheriting the sibling's 0.25 would check it 20x looser than it needs.
         "atol":        5e-2,
     },
 
@@ -839,11 +932,7 @@ VARIANTS = {
     #
     # No pass change was needed for it. The "a stick dim cannot be sub-stick"
     # check keys on the mod coord op, and a splat dim is not one, so it never
-    # fires here. It was expected to be the wall on the READ side of a statistic
-    # (a block shape of [M, 1] under a stick layout), which softmax needs and this
-    # does not -- and the chain group below, which does need it, found that it is
-    # not: a read view carrying NO layout has no stick dim to be sub-stick, and
-    # the [M, 1] tile it takes is accepted.
+    # fires here.
     #
     # The replication is 8 elements wide on the DEVICE, not S. That is a device
     # fact with no representation in the layout: the buffer still has to span
@@ -892,22 +981,19 @@ VARIANTS = {
     # off-stick arm, ``one_tile_on_stick_splat`` for the on-stick one), so
     # everything below is about G2.
     #
-    # BOTH REACH A BINARY AND LAUNCH, and what made that true is one pass rather
-    # than anything about either arm. Reading a statistic back and applying it to a
-    # full tile is a Triton BROADCAST, and a broadcast used to reach the layout pass
-    # as a linalg.generic of its own that computes nothing -- it yields its input
-    # and only its maps differ. That op has no descriptor, so no layout marker, so
-    # RewriteDescriptorLayoutGeneric left its result LOGICAL while its producer and
-    # consumer were both physical, and the consumer's operand map was left to bridge
-    # the two. It bridged it with a LINEARIZATION, identically in both arms
-    # (`(d0, d1, d2) -> (d1, d0 * 64 + d2)`), and dbo-opt aborted on the off-stick
-    # arm inside upstream's own fusion pass and refused the on-stick arm's [M, 1]
-    # statistic load.
+    # BOTH REACH A BINARY AND LAUNCH, and what makes that true is one pass. Reading
+    # a statistic back and applying it to a full tile is a Triton BROADCAST, which
+    # reaches the layout pass as a linalg.generic of its own that computes nothing.
+    # That op has no descriptor and so no layout marker, so
+    # RewriteDescriptorLayoutGeneric would leave its result LOGICAL while its
+    # producer and consumer were both physical, and the consumer's operand map
+    # would bridge the two with a LINEARIZATION the scheduler cannot project loop
+    # IVs through.
     #
     # FoldDataMovementGenerics closes it, in the spyrecode stage ahead of the layout
     # pass: the coordinate change becomes an operand map the layout pass restates at
-    # physical rank like any other. What each arm now emits, and the checkpoint
-    # worth keeping because it is the whole reason the arms compile:
+    # physical rank like any other. What each arm emits, and the checkpoint worth
+    # keeping because it is the reason the arms compile:
     #
     #   off-stick   the broadcast FOLDS, consumer operand map
     #               `(d0, d1, d2) -> (d0, d2)`, and no linearizing map anywhere
@@ -917,35 +1003,27 @@ VARIANTS = {
     #               ``rebuild-reduction.mlir`` states -- and no
     #               tensor.collapse_shape survives
     #
-    # That fixture's input is hand-written POST-fold IR, and this group is what now
+    # That fixture's input is hand-written POST-fold IR, and this group is what
     # produces the same form end to end.
     #
-    # The walls the reduce family's own banners predicted did NOT fire, and both
-    # non-firings are worth having recorded:
+    # The statistic READ is not sub-stick-refused, which the reduce family's banners
+    # predicted it would be: the read view carries no layout at all, so there is no
+    # stick dim to be sub-stick, and it physicalizes to itself -- memref<64x64> with
+    # a !ktdp.access_tile<64x1>. And each arm's G1 emits exactly the reduce its
+    # Level D sibling does, the on-stick one matching case 2 of
+    # ``rebuild-reduction.mlir``.
     #
-    #   - The sub-stick refusal on the statistic READ. Level D's banner names a
-    #     block shape of [M, 1] under a stick layout as the wall softmax will hit.
-    #     The read view carries no layout at all, so there is no stick dim to be
-    #     sub-stick, and it physicalizes to itself: memref<64x64> with a
-    #     !ktdp.access_tile<64x1>. The pattern works.
-    #   - G1 itself. Both arms emit exactly the reduce their Level D sibling does,
-    #     the on-stick one byte-identical to case 2 of ``rebuild-reduction.mlir``
-    #     (["reduction", "parallel", "reduction", "parallel"], output map
-    #     (d0,d1,d2,d3) -> (d1,d3)).
+    # ONE ALTERNATIVE SPELLING FOR THE ON-STICK ARM IS REJECTED, and it looks better
+    # than it is: reading the statistic back through the annotated rank-1 [M]
+    # descriptor that wrote it and letting Triton broadcast. It is logically
+    # faithful, so it passes on ktir_cpu -- but it physicalizes to a load of the
+    # WHOLE stick, and the device replicates a statistic only 8 elements wide, so
+    # lanes 8 and up are memory nothing wrote. The arm below reads lane 0 through an
+    # unannotated rank-2 view instead, and pays for it in this tier rather than on
+    # the device.
     #
-    # One alternative spelling was tried for the on-stick arm and REJECTED, which
-    # is worth a line because it looks better than it is: reading the statistic
-    # back through the rank-1 [M] descriptor that wrote it, annotated, and letting
-    # Triton broadcast. It is logically faithful, so it passes on ktir_cpu (0.031
-    # measured) -- but it physicalizes to a load of the WHOLE stick,
-    # tensor<64x64xf16>, and the device replicates a statistic only 8 elements
-    # wide, so lanes 8 and up are memory nothing wrote. Green in this tier and
-    # wrong on hardware is the one outcome worse than red, so the arm below reads
-    # lane 0 through an unannotated rank-2 view instead, and pays for it in this
-    # tier rather than on the device.
-    #
-    # fp16 and sum in both, pinned rather than swept -- ``sum`` because at fp16
-    # ``tl.max`` promotes to fp32 and emits an ``arith.extf`` nothing here lowers,
+    # fp16 and sum in both, pinned rather than swept: ``sum`` because at fp16
+    # ``tl.max`` promoted to fp32 and emitted an ``arith.extf`` nothing here lowers,
     # and fp16 because the statistic read-back is an fp16-only path downstream. See
     # kernel.py's banner. Neither is a free choice, so neither is a param.
     # -----------------------------------------------------------------------
@@ -996,20 +1074,14 @@ VARIANTS = {
         # growing as sqrt(64) = 8 ulp = 0.125.
         #
         # 0.25 is that prediction with a factor of two -- 16 ulp, not the worst
-        # case of 64 ulp = 1.0. Same rule and same answer as ``one_tile``. A
-        # summation order that differs from the oracle's puts the drift just
-        # outside the predicted bound, so the bound rather than the prediction is
-        # what this carries; it is one COLUMN that moves, which is the statistic
-        # passing through unamplified rather than the subtract adding anything.
+        # case of 64 ulp = 1.0. Same rule and same answer as ``one_tile``.
         "atol":        2.5e-1,
     },
 
-    # The same chain at fp32, which is a DIAGNOSTIC before it is coverage: it says
-    # whether the sibling's drift is the accumulation order or something
-    # structural. The reduce folds M either way, so both arms sum the same 64
-    # terms and only the precision differs -- so if the drift is a reordering it
-    # falls by the ratio of the ulps and a bound near 1e-5 holds, and if it stays
-    # at the fp16 absolute size then the cause is not arithmetic at all.
+    # The same chain at fp32, which is a DIAGNOSTIC before it is coverage: the
+    # reduce folds M either way, so both arms sum the same 64 terms and only the
+    # precision differs, and the drift falling by the ratio of the ulps is what says
+    # it is the summation order rather than a mis-addressed element.
     #
     # Second job, not incidental: a stick is 32 lanes at fp32 against 64 at fp16,
     # so the absorber and the layout pass are exercised at a different stick width
@@ -1031,13 +1103,6 @@ VARIANTS = {
         # The sibling's rule at this dtype: ulp of the statistic, times the
         # sqrt(64) reordering factor, times two. The column sums reach the same
         # 24.03, where fp32 ulp is 1.907e-6, so 16 ulp is 3e-5.
-        #
-        # This arm ANSWERED the question it was added for. Against the fp16
-        # sibling, the drift falls by the ratio of the two ulps rather than staying
-        # at the fp16 absolute size -- so it is the summation order and not a
-        # mis-addressed element, which would have moved the same distance at either
-        # precision. It is also spread across the output rather than concentrated,
-        # which is the other thing a mis-addressed statistic would not do.
         "atol":        3e-5,
     },
 
@@ -1088,14 +1153,13 @@ VARIANTS = {
         # PHYSICAL buffer: it exists because the splat layout made one stick per
         # statistic. Logically the buffer is a dense [M], so a read at stride S
         # addresses element m*S of an M-element buffer and only m = 0 is the value
-        # the writer wrote. The interpreter does not refuse it; it returns other
-        # numbers (max |err| 27.1, which is the size of the statistic itself).
+        # the writer wrote; the interpreter does not refuse it, it returns other
+        # numbers.
         #
-        # The DEVICE arm has no such problem and passes: physicalization happens in
-        # the spyrecode stage, so the buffer a launch reads really is the [M, S] the
-        # splat made and lane 0 really is where the statistic was written. So the
-        # xfail below is a statement about ONE tier, not about the arm -- which is
-        # the reverse of what it said while neither tier could check it.
+        # The DEVICE arm has no such problem and passes: the buffer a launch reads
+        # really is the [M, S] the splat made and lane 0 really is where the
+        # statistic was written. So the xfail below is a statement about ONE tier,
+        # not about the arm.
         #
         # raises=AssertionError, not left open: the failure that is expected is the
         # comparison's. A compile that stops working would raise RuntimeError out
@@ -1106,6 +1170,163 @@ VARIANTS = {
             "reason": "the [M, S] statistic read view is a physical-layout shape, "
                       "and ktir_cpu executes the logical ktir artifact, where the "
                       "statistic buffer is a dense [M]; the device arm checks this "
+                      "arm instead",
+            "strict": True,
+            "raises": AssertionError,
+        },
+    },
+
+
+    # ---- Level D, third group: the chain carried to its end -----------------
+    #
+    # Softmax, in two lengths. The chain group above writes a statistic and reads
+    # it back; these two continue that arm -- same stick-axis reduce, same splat
+    # statistic, same lane-0 read -- and what is new is LENGTH, measured in
+    # buffers:
+    #
+    #   max_shift_exp_on_stick   3 groups, 4 buffers   exp(x - max(x))
+    #   softmax_on_stick         6 groups, 7 buffers   the whole normalisation
+    #
+    # SEVEN IS THE CEILING: there are eight segments and the eighth holds the
+    # program, so softmax uses every base address there is. Every buffer in it is a
+    # store destination one group writes and a later group reads, and a group's
+    # store followed by a later group's load is the fence the scheduler splits on,
+    # so no two can be merged and none can be dropped.
+    #
+    # A ``max`` HERE AND A ``sum`` ABOVE, and the difference is the frontend rather
+    # than the chain: three upstream spellings would widen fp16 to fp32. Two are
+    # avoided in the kernel -- ``tl.reduce`` with an explicit ``tl.maximum``
+    # combiner in place of ``tl.max``, and ``tl.fdiv`` in place of ``/`` -- and the
+    # third, ``tl.exp`` refusing fp16 outright, is admitted behind ``is_spyre()``
+    # (see ``test_frontend_guards.py``).
+    #
+    # fp16 IN BOTH, for the reason ``_make_inputs_stat_chain`` records: the
+    # statistic read-back is a ``vectorchain.shuffle`` spreading lane 0 across a
+    # stick, which ``dbo-opt`` takes at 2 bytes and refuses at 4. N is two sticks
+    # and not one because a single-stick reduced extent fails at either dtype, which
+    # is a separate limitation.
+    #
+    # NEITHER HAS A ktir_cpu ARM, for the reason ``stat_chain_on_stick``'s note
+    # gives: the ``[M, S]`` read view is a statement about the PHYSICAL buffer, and
+    # ktir_cpu executes the logical ``ktir`` artifact where the statistic is a dense
+    # ``[M]``. The device tier is the one whose buffer that view describes.
+
+    # Softmax's numerator, and the first three-deep chain here: the reduce is a
+    # max, and the tile it shifts goes to a scratch buffer that a THIRD group
+    # exponentiates. So ``diff`` is both a store destination and a load source
+    # through one descriptor, which the chain group above never had.
+    #
+    # Four buffers, so four base addresses of the seven.
+    "max_shift_exp_on_stick": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "simplified:no-loop", "spyre-tensor-layout", "hbm-round-trip"],
+        "summary": (
+            "out[m, n] = exp(x[m, n] - max(x[m, :])) through HBM: a stick-axis "
+            "max storing its statistic stick-wide, a second group shifting the "
+            "tile by it, and a third exponentiating the result."
+        ),
+        "kernel_fn":  kernel.max_shift_exp_on_stick,
+        "SIGNATURE":  _signature_softmax_chain("fp16", "max_ptr", "diff_ptr"),
+        "constexpr":  ["M", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT"],
+        "params": {
+            # The on-stick chain's row unchanged; see _stat_chain_row_on_stick for
+            # why S rides along with the layouts it was built from.
+            ("DTYPE", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT"): [
+                _stat_chain_row_on_stick("fp16", n_sticks=2),
+            ],
+            # M = 64 rows, two whole 64-lane sticks of N. Nothing is padded.
+            "M": [64],
+        },
+        "grid":        [1],
+        # No tl.program_id, so no scf.for for dbo-opt to refuse, and what gets the
+        # statistic read past the layout pass is FoldDataMovementGenerics absorbing
+        # the unit-dim collapse in front of its broadcast -- the chain group's
+        # banner has the map.
+        "compiles_to_binary": True,
+        "reference":   max_shift_exp_reference,
+        "inputs":      make_inputs_max_shift_exp,
+        "output_key":  "out_ptr",
+        # A RELATIVE bound alone, which is the reverse of the stat_chain pair's
+        # choice: their output passes through zero, where a relative bound says
+        # nothing, and this one cannot -- every element is an exponential of a
+        # non-positive argument. So atol is 0.0 deliberately.
+        #
+        # Sized against the measured device drift with a factor of three. Two
+        # effects are characterised rather than slack: the device's fp16 is
+        # Spyre's 1-6-9 float where the oracle's is IEEE 1-5-10, so the shift
+        # cannot be bit-exact; and ``spyreop.exp`` has its own error. The max
+        # reduce contributes nothing, being a selection.
+        "rtol":        3e-2,
+        "atol":        0.0,
+        "xfail_numerical": {
+            "reason": "the [M, S] statistic read view is a physical-layout shape, "
+                      "and ktir_cpu executes the logical ktir artifact, where the "
+                      "statistic buffer is a dense [M]; the device arm checks this "
+                      "arm instead",
+            "strict": True,
+            "raises": AssertionError,
+        },
+    },
+
+    # The whole thing: a row softmax in six compute groups over all seven base
+    # addresses, and group for group it is the hand-written reference chain.
+    #
+    # One divergence from that reference, benign but worth knowing: the reference
+    # states G5 as ONE generic, reading the total through a splat map and writing a
+    # stick. This emission produces two -- the reciprocal at [M, 1] and then a
+    # pure-copy generic widening it to [M, S] -- because the broadcast is written
+    # before the divide in the kernel and the pipeline reassociates the divide back
+    # through it. Two computes in one group is what dbo-opt normally refuses; it
+    # does not here, the second having no arithmetic in its body. Nothing depends
+    # on that holding, and if it stops holding the fix is to give the divide
+    # something lane-varying to consume rather than to reorder the groups.
+    #
+    # THE RECIPROCAL GROUP CARRIES NO FLOAT IMMEDIATE, and that is load-bearing:
+    # ``tl.fdiv(one, s)`` lowers to the UNARY ``spyreop.reciprocal``, not to
+    # ``spyreop.realdiv`` with a ``1.0`` operand, because LowerSpyreOps matches a
+    # numerator of one and drops it. A float immediate reaching the device is not
+    # read back as it was written, so this kernel must not be rewritten in a way
+    # that keeps the constant alive.
+    "softmax_on_stick": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "simplified:no-loop", "spyre-tensor-layout", "hbm-round-trip"],
+        "summary": (
+            "A whole row softmax over the stick axis: max, shift, exp, sum, "
+            "reciprocal and multiply as six compute groups chained through HBM, "
+            "over all seven base addresses."
+        ),
+        "kernel_fn":  kernel.softmax_on_stick,
+        "SIGNATURE":  _signature_softmax_chain(
+            "fp16", "max_ptr", "diff_ptr", "exp_ptr", "sum_ptr", "recip_ptr"),
+        "constexpr":  ["M", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT"],
+        "params": {
+            ("DTYPE", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT"): [
+                _stat_chain_row_on_stick("fp16", n_sticks=2),
+            ],
+            # M = 64 rows, two whole 64-lane sticks of N. Nothing is padded.
+            "M": [64],
+        },
+        "grid":        [1],
+        "compiles_to_binary": True,
+        "reference":   softmax_reference,
+        "inputs":      make_inputs_softmax,
+        "output_key":  "out_ptr",
+        # A relative bound alone, like the numerator's and for the same reason: a
+        # softmax row sums to one over 128 terms, so no output is near zero. Sized
+        # against the measured device drift with a factor of three.
+        #
+        # Two of the effects in it are characterised rather than slack: the
+        # device's fp16 is Spyre's 1-6-9 float where the oracle's is IEEE 1-5-10,
+        # so the shift cannot be bit-exact; and ``spyreop.exp`` has its own error.
+        # Neither is a reason to widen this further.
+        "rtol":        4e-2,
+        "atol":        0.0,
+        "xfail_numerical": {
+            "reason": "the [M, S] statistic read views are physical-layout shapes, "
+                      "and ktir_cpu executes the logical ktir artifact, where both "
+                      "statistic buffers are dense [M]; the device arm checks this "
                       "arm instead",
             "strict": True,
             "raises": AssertionError,

@@ -7,21 +7,23 @@ include "mlir/Pass/PassBase.td"
 // Transforms whose subject is upstream structure or the whole program rather
 // than any one dialect's abstractions.  UnaliasLinalgOuts,
 // DropReductionInitFill and FoldDataMovementGenerics act on linalg form --
-// generic bodies, indexing maps, reshape reassociations;
-// MaterializeBaseAddresses acts on the entry function's signature.  None of
-// them translates a dialect, and none is about ktdp's own memory-view model, so
-// they sit at the top level -- which does not stop them including dialect
-// headers freely.
+// generic bodies, indexing maps, reshape reassociations; NormalizeForDevice on
+// upstream ops the toolchain downstream of this tree will not take, wherever
+// they appear; MaterializeBaseAddresses acts on the entry function's signature.
+// None of them translates a dialect, and none is about ktdp's own memory-view
+// model, so they sit at the top level -- which does not stop them including
+// dialect headers freely.
 //
 // Each pass declares its contract below:
 //   Input    - dialects/ops it expects to see
 //   Lowering - ops it converts and what they become
 //   Output   - what the IR looks like after this pass
 //
-// All four are members of a fixed stage pipeline in lib/Pipeline.cpp, not
-// opt-in, and all four run in `spyrecode`: DropReductionInitFill,
-// UnaliasLinalgOuts and FoldDataMovementGenerics in that stage's shaping prefix,
-// MaterializeBaseAddresses at its tail and only when `bindBaseAddresses` is set.
+// All five are members of a fixed stage pipeline in lib/Pipeline.cpp, not
+// opt-in, and all five run in `spyrecode`: NormalizeForDevice at that stage's
+// head, DropReductionInitFill, UnaliasLinalgOuts and FoldDataMovementGenerics in
+// its shaping prefix, MaterializeBaseAddresses at its tail and only when
+// `bindBaseAddresses` is set.
 // A pass's position there is chosen in C++ from a typed factory, so there is no
 // caller hook for inserting one at a named point.
 // ============================================================================
@@ -74,6 +76,62 @@ def UnaliasLinalgOuts : Pass<"unalias-linalg-outs", "mlir::ModuleOp"> {
     let dependentDialects = [
         "mlir::linalg::LinalgDialect",
         "mlir::tensor::TensorDialect"
+    ];
+}
+
+def NormalizeForDevice : Pass<"normalize-for-device", "mlir::ModuleOp"> {
+    let summary = "Rewrite valid upstream IR the Spyre toolchain refuses or "
+                  "mis-lowers into a spelling it takes. A PATTERN HOST: see the "
+                  "admission rule. MAY CHANGE BEHAVIOUR, per pattern.";
+    let description = [{
+        Input: any IR. Each rewrite is an independent pattern, matched wherever
+        its op appears — inside a linalg.generic body, inside a linalg.reduce
+        combiner, or as plain scalar arithmetic — because nothing this pass
+        rewrites depends on where the op sits. A greedy driver runs them to
+        fixpoint.
+
+        Lowering, one line per pattern:
+        - arith.maxnumf → arith.maximumf
+        - arith.minnumf → arith.minimumf
+        Operands and the fastmath attribute are carried across unchanged.
+        Nothing else is touched.
+
+        WHAT MAY BE ADDED HERE. A pass that exists to host patterns becomes a
+        junk drawer without a rule, so: a pattern belongs here only if all
+        three hold.
+
+        1. It rewrites WITHIN upstream dialects — source and target both
+           upstream ops. Crossing a dialect boundary is a conversion and
+           belongs in Conversion/, not here — which is why the reciprocal
+           peephole, arith.divf → spyreop.reciprocal, sits in LowerSpyreOps.
+           Rule 1 draws the line by what a rewrite touches, not by what
+           motivates it.
+        2. The input is VALID IR that some downstream consumer refuses or
+           mis-lowers, not a defect being fixed. A defect is a bug in whatever
+           produced it, and patching it here hides that.
+        3. The rewrite names the downstream behaviour it is for — the tool, the
+           component, what it does — so a reader can check whether it still
+           holds.
+
+        The min/max families differ on NaN, so this is a behaviour change and
+        not only a spelling fix.
+
+        Ordering: after LowerComputeOps, which is what turns a `tt.reduce` into
+        a `linalg.reduce` carrying the combiner in its body — before that the
+        combiner is not an arith op in a linalg body and there is nothing here
+        to match. Otherwise free, so it runs at the head of the `spyrecode`
+        stage as an invariant rather than to satisfy a later pass.
+
+        In the `spyrecode` stage and not the `ttir`→`ktir` pipeline: what a
+        pattern here claims is a claim about the SCHEDULER, and the `ktir`
+        artifact keeps the spelling Triton's own semantics name.
+
+        Output: no arith.maxnumf or arith.minnumf remains anywhere in the
+        module.
+    }];
+
+    let dependentDialects = [
+        "mlir::arith::ArithDialect"
     ];
 }
 
