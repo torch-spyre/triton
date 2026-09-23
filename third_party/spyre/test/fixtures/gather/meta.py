@@ -1700,7 +1700,6 @@ VARIANTS = {
             "OUT_LAYOUT": [[(3, "floordiv", _S4("out_ptr")), 0, 1, 2,
                             (3, "mod", _S4("out_ptr"))]],
         },
-        "data_layout": "host",
         "inputs":    functools.partial(make_inputs_4d, dtype=np.float16),
         "rtol":      1e-2,
         "atol":      5e-2,
