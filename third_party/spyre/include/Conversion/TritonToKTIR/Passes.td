@@ -235,20 +235,20 @@ def ConvertFunctions : Pass<"convert-ttir-functions", "mlir::ModuleOp"> {
 }
 
 def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
-    let summary = "Lower tt.inter_tile_reduce to ktdp inter-tile produce/reduce pairs.";
+    let summary = "Lower tts.inter_tile_reduce to ktdp inter-tile produce/reduce pairs.";
     let description = [{
-        Input: TTIR after LowerComputeOps — tt.inter_tile_reduce ops whose
+        Input: TTIR after LowerComputeOps — tts.inter_tile_reduce ops whose
         partial operands are already linalg/tensor values; enclosing func.func
         carries numWkSlicesPerDim and coreIdToWkSlice function attributes.
 
         Lowering:
-        - tt.inter_tile_reduce (mode=all_reduce) →
+        - tts.inter_tile_reduce (mode=all_reduce) →
             ktdp.inter_tile_produce (producer region + ktdp.yield_partial) +
             ktdp.inter_tile_reduce (full consumer set + ktdp.yield_reduced)
-        - tt.inter_tile_reduce (mode=reduce_to_one) →
+        - tts.inter_tile_reduce (mode=reduce_to_one) →
             ktdp.inter_tile_produce +
             ktdp.inter_tile_reduce (consumer = pick₀(g))
-        - tt.inter_tile_reduce (mode=broadcast, reduce_scatter) →
+        - tts.inter_tile_reduce (mode=broadcast, reduce_scatter) →
             rejected with "not yet supported" diagnostic.
         - Axis with numWkSlicesPerDim[axis] == 1 → fold-away (erase op,
             forward partial unchanged).
@@ -260,17 +260,18 @@ def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
         rewrite).
 
         A kernel that carries both a layout annotation and a
-        tt.inter_tile_reduce is not supported: the layout pass cannot carry a
+        tts.inter_tile_reduce is not supported: the layout pass cannot carry a
         physical type through the produce/reduce pair, whose two halves
         communicate through a !ktdp.tile_future rather than a RankedTensorType.
         That combination is not diagnosed — it fails downstream as a type
         mismatch.
 
-        Output: no tt.inter_tile_reduce ops remain; ktdp.inter_tile_produce /
+        Output: no tts.inter_tile_reduce ops remain; ktdp.inter_tile_produce /
         inter_tile_reduce pairs are introduced; the tile_future is single-use.
     }];
 
     let dependentDialects = [
+        "mlir::triton::tts::TTSDialect",
         "mlir::ktdp::KtdpDialect",
         "mlir::arith::ArithDialect",
         "mlir::linalg::LinalgDialect",

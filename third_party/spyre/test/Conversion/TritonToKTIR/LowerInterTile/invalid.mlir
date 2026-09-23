@@ -3,8 +3,8 @@
 // Negative tests for --lower-inter-tile: precondition and validation diagnostics.
 
 tt.func @missing_work_slice_attrs(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
-  // expected-error @+1 {{'tt.inter_tile_reduce' op requires attribute 'coreIdToWkSlice'}}
-  %0 = tt.inter_tile_reduce
+  // expected-error @+1 {{'tts.inter_tile_reduce' op requires attribute 'coreIdToWkSlice'}}
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -16,7 +16,7 @@ tt.func @missing_work_slice_attrs(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tens
 
 tt.func @unknown_axis(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{axis 'x' not in numWkSlicesPerDim}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -30,7 +30,7 @@ tt.func @unknown_axis(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
 
 tt.func @unknown_mode(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{unknown mode 'bad_mode'}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "bad_mode" combiner = "add"
@@ -44,7 +44,7 @@ tt.func @unknown_mode(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
 
 tt.func @broadcast_rejected(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{mode 'broadcast' is not yet supported}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "broadcast" combiner = ""
@@ -58,7 +58,7 @@ tt.func @broadcast_rejected(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf
 
 tt.func @reduce_scatter_rejected(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{mode 'reduce_scatter' is not yet supported}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "reduce_scatter" combiner = "add"
@@ -73,7 +73,7 @@ tt.func @reduce_scatter_rejected(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tenso
 
 tt.func @scatter_dim_without_reduce_scatter(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{scatter_dimension only valid for reduce_scatter}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -88,7 +88,7 @@ tt.func @scatter_dim_without_reduce_scatter(%p: tensor<8xf32>, %id: tensor<8xf32
 
 tt.func @custom_combiner_rejected(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{custom combiner regions are not yet supported}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = ""
@@ -102,7 +102,7 @@ tt.func @custom_combiner_rejected(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tens
 
 tt.func @dep_invalid_consumer(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor<16xf32> {
   // expected-error @+1 {{depWkSlices key 1 is not a valid consumer for mode 'reduce_to_one' (only indices [0, 1) are consumers)}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<16xf32>)
          identities(%id : tensor<16xf32>)
          axis = "x" mode = "reduce_to_one" combiner = "add"
@@ -119,7 +119,7 @@ tt.func @dep_invalid_consumer(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor
 
 tt.func @tile_count_indivisible(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{tile count 3 does not divide evenly by gsize=2 for axis 'x'}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -135,7 +135,7 @@ tt.func @tile_count_indivisible(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor
 
 tt.func @core_map_empty(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{coreIdToWkSlice is empty}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -151,7 +151,7 @@ tt.func @core_map_empty(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> 
 
 tt.func @core_map_entry_missing_axis(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{coreIdToWkSlice entry 1 has no key 'x'}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -168,7 +168,7 @@ tt.func @core_map_entry_missing_axis(%p: tensor<8xf32>, %id: tensor<8xf32>) -> t
 
 tt.func @group_count_mismatch(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{expected 2 groups (numTiles/W[axis]=4/2) but found 4 distinct non-axis tuples}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -186,7 +186,7 @@ tt.func @group_count_mismatch(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8
 
 tt.func @group_not_contiguous(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{group 0 is not contiguous: expected tile 1 at position 1, got 2 (non-contiguous groups not yet supported)}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -203,7 +203,7 @@ tt.func @group_not_contiguous(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8
 
 tt.func @group_without_axis_zero(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{group 0 has no tile with x=0}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -219,7 +219,7 @@ tt.func @group_without_axis_zero(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tenso
 
 tt.func @group_with_two_axis_zero(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{group 0 has more than one tile with x=0}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -237,7 +237,7 @@ tt.func @group_with_two_axis_zero(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tens
 
 tt.func @pick0_not_arithmetic(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{reduce_to_one: pick0 tile-ids are not an arithmetic sequence (non-uniform pick0 layouts are not yet supported)}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "reduce_to_one" combiner = "add"
@@ -255,7 +255,7 @@ tt.func @pick0_not_arithmetic(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8
 
 tt.func @unknown_combiner(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
   // expected-error @+1 {{unknown shorthand combiner 'min'}}
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "min"
@@ -270,8 +270,8 @@ tt.func @unknown_combiner(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32
 // Missing numWkSlicesPerDim alone (the op verifier catches it before the pass).
 
 tt.func @missing_num_wk_slices(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
-  // expected-error @+1 {{'tt.inter_tile_reduce' op requires attribute 'numWkSlicesPerDim'}}
-  %0 = tt.inter_tile_reduce
+  // expected-error @+1 {{'tts.inter_tile_reduce' op requires attribute 'numWkSlicesPerDim'}}
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"

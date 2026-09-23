@@ -24,7 +24,7 @@ splitk (reduce_to_one, f32):
   handles arbitrary M for the fixed grid.
 
 No stick-layout variant: LowerInterTile refuses a kernel carrying both a layout
-marker and a ``tt.inter_tile_reduce``. The layout pass cannot carry a physical
+marker and a ``tts.inter_tile_reduce``. The layout pass cannot carry a physical
 type through the produce/reduce pair either, which communicates through a
 ``!ktdp.tile_future`` whose tensor types are nested inside the type.
 

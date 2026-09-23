@@ -13,7 +13,7 @@ view** (§3). The view itself is the target, not the subject — where the desig
 change it, §8 says so.
 
 It is **one lowering target, not the whole subject**. `LowerInterTile` gains a second mode
-and the existing `tt.inter_tile_reduce` path stays exactly as it is; §11 says what that
+and the existing `tts.inter_tile_reduce` path stays exactly as it is; §11 says what that
 path is and why it is not the design.
 
 The communication in question is a **scratchpad relayout**: a tensor moving between
@@ -261,7 +261,7 @@ slice width           512 / 8 = 64 on out; x is whole
 
 ### Where the phases live
 
-`LowerInterTile` gains a second mode. The existing path — `tt.inter_tile_reduce` to
+`LowerInterTile` gains a second mode. The existing path — `tts.inter_tile_reduce` to
 `ktdp.inter_tile_produce` plus a delivery op — is not removed. §11.
 
 ## 4. The pull model
