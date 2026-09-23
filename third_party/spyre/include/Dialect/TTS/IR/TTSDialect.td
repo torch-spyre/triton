@@ -31,13 +31,15 @@ def TTS_Dialect : Dialect {
     `dbo-opt` loads ours. So the value of `tts.tensor_layout` is built out of
     builtin attributes only, and must stay that way.
 
-    The one op the dialect does define, `tts.tensor_layout`, is the *authoring*
-    form of that same layout and is bound by the same rule from the other side:
-    it is fully consumed before any artifact is written, by
-    `LowerDescriptorMemory`, which turns it into the attribute. An op does have
-    to be constructed, so one surviving into an artifact would fail at parse in
-    a consumer that does not load us — which is why the op and the attribute are
-    a before/after pair and never a choice of encoding for the same IR.
+    The ops the dialect defines are bound by the same rule from the other side:
+    each is fully consumed before any artifact is written. `tts.tensor_layout`
+    is the *authoring* form of that same layout, and `LowerDescriptorMemory`
+    turns it into the attribute; `tts.inter_tile_reduce` names a cross-tile
+    combination, and `LowerInterTile` expands it into `ktdp` ops. An op does
+    have to be constructed, so one surviving into an artifact would fail at
+    parse in a consumer that does not load us — which is why the layout op and
+    the layout attribute are a before/after pair and never a choice of encoding
+    for the same IR.
   }];
 
   let extraClassDeclaration = [{

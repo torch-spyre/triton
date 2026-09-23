@@ -50,4 +50,64 @@ def TTS_TensorLayoutOp : TTS_Op<"tensor_layout", []> {
   let hasVerifier = 1;
 }
 
+def TTS_InterTileReduceOp : TTS_Op<"inter_tile_reduce", [
+    AttrSizedOperandSegments
+]> {
+  let summary = "Cross-tile partial-combination metadata op";
+
+  let description = [{
+    `tts.inter_tile_reduce` names the intent of combining per-tile partial
+    values across the cooperating tiles identified by `axis`. The
+    `LowerInterTile` pass expands it into a `ktdp.inter_tile_produce` +
+    delivery op pair. No result; uses are replaced by the delivery op results.
+
+    Attributes:
+    - `axis`              : work-slice dim name (key into `numWkSlicesPerDim`).
+    - `mode`              : one of `all_reduce`, `reduce_to_one`,
+                            `reduce_scatter`, `broadcast`.
+    - `combiner`          : shorthand `"add"` / `"max"` / `"mul"`, or `""` for
+                            a custom reducer region. `broadcast` uses `""`.
+    - `scatter_dimension` : i64, required iff `mode = reduce_scatter`.
+
+    Operands:
+    - `partials`  : A per-tile partial tensors (already lowered to linalg/tensor
+                    values by LowerComputeOps; A >= 1).
+    - `identities`: A explicit identity tensors, required iff combiner is `""`
+                    (region form). Empty for shorthand combiners.
+
+    The op may carry a combiner region (2A block args → A yielded values via
+    `tt.reduce.return`) when `combiner` is `""`.
+
+    Like `tts.tensor_layout`, the op is fully consumed before any artifact is
+    written, so it never has to be parsed by a consumer that does not load this
+    dialect.
+  }];
+
+  let arguments = (ins
+    Variadic<AnyTensor>:$partials,
+    Variadic<AnyTensor>:$identities,
+    StrAttr:$axis,
+    StrAttr:$mode,
+    StrAttr:$combiner,
+    OptionalAttr<I64Attr>:$scatter_dimension,
+    // Work-slice op attributes (from tl.inter_tile work_slices/dep_work_slices
+    // constexprs). The frontend derives W from C and stores both on the op so
+    // LowerInterTile can read them without consulting the enclosing tt.func.
+    DictionaryAttr:$numWkSlicesPerDim,        // W: axis → count
+    ArrayAttr:$coreIdToWkSlice,               // C: per-tile {axis → slice-idx}
+    OptionalAttr<DictionaryAttr>:$depWkSlices // D: consumer-local → [prod-local]
+  );
+  let results = (outs Variadic<AnyTensor>:$results);
+  let regions = (region AnyRegion:$combiner_region);
+
+  let assemblyFormat = [{
+    `partials` `(` $partials `:` type($partials) `)`
+    `identities` `(` $identities `:` type($identities) `)`
+    `axis` `=` $axis `mode` `=` $mode `combiner` `=` $combiner
+    (`scatter_dimension` `=` $scatter_dimension^)?
+    attr-dict `->` `(` type($results) `)`
+    ($combiner_region^)?
+  }];
+}
+
 #endif // TTS_OPS
