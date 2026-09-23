@@ -15,6 +15,7 @@ import inspect
 
 from .._C.libtriton import ir
 from .._utils import TRITON_MAX_TENSOR_NUMEL, validate_block_shape, get_primitive_bitwidth, _tuple_create
+from .target_info import requires_backend  # --- added for spyre
 
 T = TypeVar('T')
 
@@ -3848,6 +3849,7 @@ def wk_slice_coord(work_slices, axis, _semantic=None):
 
 
 @builtin
+@requires_backend("spyre")
 def spyre_tensor_layout(desc, layout, _semantic=None):
     """(Spyre only) Annotate a tensor descriptor with its physical device layout.
 

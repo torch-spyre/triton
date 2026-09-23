@@ -18,6 +18,7 @@ no active driver required.
 """
 
 import pytest
+import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.language import target_info
 
@@ -101,3 +102,18 @@ class TestRequiresBackend:
         msg = str(exc.value)
         assert "_spyre_only" in msg
         assert "'cuda'" in msg
+
+
+# ---------------------------------------------------------------------------
+# tl.spyre_tensor_layout — the decorator's one call site
+# ---------------------------------------------------------------------------
+
+class TestSpyreTensorLayoutGuard:
+    """``tl.spyre_tensor_layout`` carries the decorator, so the guard fires
+    before the builtin touches ``_semantic`` or the descriptor."""
+
+    @pytest.mark.parametrize("backend", ["cuda", "hip", None])
+    def test_raises_off_backend(self, as_backend, backend):
+        as_backend(backend)
+        with pytest.raises(ValueError, match="only supported on the 'spyre' backend"):
+            tl.spyre_tensor_layout(None, [0], _semantic=object())
