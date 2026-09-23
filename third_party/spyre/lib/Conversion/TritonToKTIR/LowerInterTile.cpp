@@ -1,11 +1,11 @@
-//===- LowerInterTile.cpp - Lower tt.inter_tile_reduce to KTDP ops --------===//
+//===- LowerInterTile.cpp - Lower tts.inter_tile_reduce to KTDP ops -------===//
 //
-// Expands each tt.inter_tile_reduce into:
+// Expands each tts.inter_tile_reduce into:
 //   ktdp.inter_tile_produce  (per-tile partial, producer region)
 //     + one delivery op (ktdp.inter_tile_reduce for all_reduce / reduce_to_one)
 //
 // Algorithm:
-//   1. Collect all tt.inter_tile_reduce ops (collect-then-rewrite to avoid
+//   1. Collect all tts.inter_tile_reduce ops (collect-then-rewrite to avoid
 //      invalidating the walk cursor when expansions insert/erase ops).
 //   2. For each op:
 //      a. Fold-away guard  — W[axis]==1 → forward partial(s), erase.
@@ -16,11 +16,12 @@
 //      f. Build combiner   — shorthand → linalg.fill+op; region → transcribe.
 //      g. Emit delivery    — ktdp.inter_tile_reduce + yield_reduced region.
 //      h. Emit dep set     — producer_dependency_per_consumer from depWkSlices.
-//      i. RAUW + erase     — replace tt op uses with delivery results.
+//      i. RAUW + erase     — replace tts op uses with delivery results.
 //
 //===----------------------------------------------------------------------===//
 
 #include "Conversion/TritonToKTIR/Passes.h"
+#include "Dialect/TTS/IR/Dialect.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "ktir/Dialect/KTDP/KTDPTypes.h"
@@ -68,7 +69,7 @@ struct WorkSliceAttrs {
 };
 
 static FailureOr<WorkSliceAttrs>
-readWorkSliceAttrs(triton::InterTileReduceOp op) {
+readWorkSliceAttrs(triton::tts::InterTileReduceOp op) {
   auto W = op->getAttrOfType<DictionaryAttr>(kNumWkSlicesPerDim);
   if (!W)
     return op.emitError("missing '") << kNumWkSlicesPerDim << "' op attribute";
@@ -304,8 +305,8 @@ struct LowerInterTilePass
     IRRewriter rewriter(&getContext());
 
     // Collect all inter_tile_reduce ops first (collect-then-rewrite).
-    SmallVector<triton::InterTileReduceOp> ops;
-    mod.walk([&](triton::InterTileReduceOp op) { ops.push_back(op); });
+    SmallVector<triton::tts::InterTileReduceOp> ops;
+    mod.walk([&](triton::tts::InterTileReduceOp op) { ops.push_back(op); });
 
     for (auto op : ops) {
       if (failed(lowerOne(op, rewriter)))
@@ -313,7 +314,8 @@ struct LowerInterTilePass
     }
   }
 
-  LogicalResult lowerOne(triton::InterTileReduceOp op, IRRewriter &rewriter) {
+  LogicalResult lowerOne(triton::tts::InterTileReduceOp op,
+                         IRRewriter &rewriter) {
     Location loc = op.getLoc();
     MLIRContext *ctx = &getContext();
 
@@ -367,9 +369,9 @@ struct LowerInterTilePass
 
     // --- fold-away: gsize == 1 → each tile is its own group ---
     if (gs.gsize == 1) {
-      // No cooperation needed — forward partials as results. The tt op's
+      // No cooperation needed — forward partials as results. The tts op's
       // result type equals its partial type (no rank reduction), so
-      // rewriting each downstream use of a tt result to the matching
+      // rewriting each downstream use of a tts result to the matching
       // partial value is type-safe by construction.
       rewriter.setInsertionPoint(op);
       op.replaceAllUsesWith(partials);
@@ -414,7 +416,7 @@ struct LowerInterTilePass
     // not by a tensor axis, so no dim is collapsed here.
     SmallVector<Type> resultTypes(partialTypes.begin(), partialTypes.end());
 
-    // Identities are always provided on the tt op (semantic.py materializes
+    // Identities are always provided on the tts op (semantic.py materializes
     // them for shorthand combiners at TTIR construction time).
     SmallVector<Value> identityValues(identities.begin(), identities.end());
 

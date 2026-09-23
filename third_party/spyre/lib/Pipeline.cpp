@@ -40,7 +40,7 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // tt.reduce/broadcast/expand_dims/dot -> linalg + tensor, and a dead-op sweep.
   pm.addPass(createLowerComputeOpsPass());
 
-  // tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery. After
+  // tts.inter_tile_reduce -> ktdp.inter_tile_produce + delivery. After
   // LowerComputeOps, because the partials it consumes have to be linalg/tensor
   // by then.
   pm.addPass(createLowerInterTilePass());

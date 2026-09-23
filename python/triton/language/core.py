@@ -3787,7 +3787,7 @@ def inter_tile(x, axis, combiner, mode, *, work_slices, dep_work_slices=None,
                scatter_dimension=None, _semantic=None):
     """(Spyre only) Cross-tile reduction over the given work-slice axis.
 
-    Lowers to a ``tt.inter_tile_reduce`` op carrying the work-slice metadata
+    Lowers to a ``tts.inter_tile_reduce`` op carrying the work-slice metadata
     as op attributes.  The ``LowerInterTile`` pass expands it into a
     ``ktdp.inter_tile_produce`` + delivery op pair.
 
