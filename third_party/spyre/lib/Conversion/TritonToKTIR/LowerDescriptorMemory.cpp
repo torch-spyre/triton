@@ -630,18 +630,11 @@ struct LowerDescriptorMemoryPass
     // Marking it legal here prevents `applyPartialConversion` from
     // treating either cast as an unconverted op and failing the pass.
     //
-    // The two layout markers are legal for different reasons, and the
-    // difference is their lifetime rather than anything this pass does:
-    //
-    //   * `tt.spyre_tensor_layout` survives all the way to the named
-    //     `rewrite-descriptor-layout`, which is what consumes it.
-    //   * `tts.tensor_layout` survives only as far as `lower-tts-markers`,
-    //     the next-but-one pass, which moves it onto the memory view built
-    //     here. Either way this pass leaves both untouched; without the
-    //     entry the conversion driver would call the op unconverted and
-    //     fail the pass.
+    // `tts.tensor_layout` survives as far as `lower-tts-markers`, the
+    // next-but-one pass, which moves it onto the memory view built here. This
+    // pass leaves it untouched; without the entry the conversion driver would
+    // call the op unconverted and fail the pass.
     target.addLegalOp<ModuleOp, UnrealizedConversionCastOp,
-                      triton::SpyreTensorLayoutOp,
                       mlir::triton::tts::TensorLayoutOp>();
 
     RewritePatternSet patterns(ctx);

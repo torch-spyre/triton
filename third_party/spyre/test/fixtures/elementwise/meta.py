@@ -781,12 +781,10 @@ VARIANTS = {
         },
         "grid":        [1],
         # No "data_layout". It selected a stride mode on a layout pass that no
-        # longer exists. The pass that physicalizes these -- in the spyrecode
-        # stage -- has no equivalent option and needs none: a caller wanting the
-        # logical form reads the ktir artifact, which is logical. Removed rather
-        # than left as dead config, because conftest
-        # forwards any key naming a SpyreOptions field and the field still
-        # exists, so it would have kept being passed and kept doing nothing.
+        # longer exists, and neither the option nor the SpyreOptions field is in
+        # tree. The pass that physicalizes these -- in the spyrecode stage -- has
+        # no equivalent and needs none: a caller wanting the logical form reads
+        # the ktir artifact, which is logical.
         "rtol":        1e-2,
         "atol":        5e-2,
     },

@@ -9,11 +9,10 @@ than as a statement about this surface.
 
 Three claims, and they are separable on purpose.
 
-**It authors ``tts.tensor_layout``.** Not ``tt.spyre_tensor_layout``, which is what
-it built before the layout annotation moved into our own dialect, and which is
-still in tree for the named pass. Since the two ops carry identical attributes, a
-kernel authored against the wrong one lowers quietly down the old path instead of
-failing -- so the op name is asserted, not assumed.
+**It authors ``tts.tensor_layout``.** Not the Triton-dialect op it built before
+the layout annotation moved into our own dialect, which is gone. The op name is
+asserted rather than assumed, so a builder rewired to some other op fails here
+rather than somewhere downstream.
 
 **The four coordinate ops round-trip, by keyword and by code.** ``splat`` is the
 one worth naming: both verifiers accepted code 3 before the frontend could reach
@@ -101,10 +100,6 @@ def test_authors_the_coordinate_map(label, spelled, numbered, expected):
     """The op is ours, and it carries the map the author wrote."""
     line = emit(spelled)
     assert line.startswith("tts.tensor_layout"), line
-    # And never the Triton-dialect op the named pass still reads. The two carry
-    # identical attributes, so a kernel authored against the wrong one would
-    # lower quietly down the old path rather than fail.
-    assert "tt.spyre_tensor_layout" not in line, line
     assert expected in line, f"{label}: expected {expected!r} in\n  {line}"
 
 

@@ -382,10 +382,7 @@ const char *coordOpName(CoordOp op) {
 ///   verifyOperationAttribute enforces them on every annotated op at every
 ///   verification point. This calls the same function that hook does, so a
 ///   caller that reached the layout some other way than by parsing verified IR
-///   is held to the identical rules rather than to a second copy of them. That
-///   single owner is the decision recorded in the deletion note at the top of
-///   RewriteDescriptorLayout.cpp; SpyreTensorLayoutOp::verify() still holds its
-///   own copy for the op form, and that duplication ends with the op.
+///   is held to the identical rules rather than to a second copy of them.
 ///
 ///   The CONSUMER rules below are this pass's, and are stricter. A layout that
 ///   drops a logical dim, or carries one half of a split, or splats a dim it

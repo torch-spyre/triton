@@ -33,12 +33,6 @@ def TTS_TensorLayoutOp : TTS_Op<"tensor_layout", []> {
       op        — what a kernel author writes, on a `!tt.tensordesc`
       attribute — what the lowered IR carries, on the memory view
 
-    The discriminator is structural: a descriptor annotated with this op is
-    lowered to the attribute, while one annotated with `tt.spyre_tensor_layout`
-    keeps the older shape (op and bridge cast both survive) and is consumed by
-    the named `rewrite-descriptor-layout` pass instead. No flag selects between
-    them.
-
     The structural rules on the three arrays are the attribute's rules, checked
     by the same `tts::verifyTensorLayoutArrays`. The only difference is where the
     logical rank comes from: here it is the descriptor's block type, there it is
@@ -52,8 +46,6 @@ def TTS_TensorLayoutOp : TTS_Op<"tensor_layout", []> {
     DenseI64ArrayAttr:$phys_arg
   );
 
-  // Deliberately the same shape as tt.spyre_tensor_layout's, so the two are
-  // legible side by side while both exist.
   let assemblyFormat = "$desc attr-dict `:` type($desc)";
   let hasVerifier = 1;
 }
