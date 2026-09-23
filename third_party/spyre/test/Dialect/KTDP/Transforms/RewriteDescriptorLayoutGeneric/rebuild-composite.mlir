@@ -29,6 +29,10 @@
 // holding dims whole: every dim the annotated operand splits is a composite in the
 // unannotated one's map.
 //
+// Case 6 raises the permutation from a rank-2 swap to a rank-3 3-CYCLE, which is
+// not its own inverse: a map restated wrongly there is a shape error rather than a
+// silent value one.
+//
 // Captures are hand-named and this file is hand-maintained: do not regenerate it
 // with generate-test-checks.py, which numbers captures globally across a file and
 // would renumber every section on any edit.
@@ -346,6 +350,90 @@ tt.func @elementwise_unannotated_store(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
     linalg.yield %n : f32
   } -> tensor<64x128xf32>
   ktdp.store %r, %ot : tensor<64x128xf32>, <64x128xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 6 -- a rank-3 3-cycle permutation into a split store.
+//
+// A batch contraction on no layout feeds a permuting generic whose store target
+// IS annotated, so the permutation and the split land in the SAME map. The
+// permutation is [2, 0, 1], a 3-cycle: it is not its own inverse, so restating it
+// as its inverse -- or dropping it -- changes the shape rather than just the
+// values, and the emitted map has to compose it with the split's linearization in
+// one expression.
+//
+// The contraction is left alone: none of its operands is annotated, so it is not
+// adjacent to any physicalized view. The permuting generic's `outs` is a
+// tensor.empty that follows the store to [96/32, 4, 64, 96%32] = [3, 4, 64, 32],
+// and its input map becomes (d1, d2, d0 * 32 + d3) -- the 3-cycle's positions
+// carrying dim 0's composite. One generic, one map: no second permutation and no
+// scatter, which is what the named pass emitted for this kernel.
+//
+// bmm A[4, 64, 128] @ B[4, 128, 96] -> [4, 64, 96], permuted to [96, 4, 64], then
+// stored to a D that is stick-on-dim-0 at width 32.
+
+// CHECK: #[[$S6_BA:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
+// CHECK: #[[$S6_BB:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d3, d2)>
+// CHECK: #[[$S6_BC:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
+// CHECK: #[[$S6_PERM:.+]] = affine_map<(d0, d1, d2, d3) -> (d1, d2, d0 * 32 + d3)>
+// CHECK: #[[$S6_ID4:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#bA = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
+#bB = affine_map<(d0, d1, d2, d3) -> (d0, d3, d2)>
+#bC = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
+#perm = affine_map<(d0, d1, d2) -> (d1, d2, d0)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 127 >= 0)>
+#set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 95 >= 0)>
+#set2 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 3 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+module {
+// CHECK-LABEL:   tt.func @sink_trans_3cycle_bmm(
+// The contraction is untouched: rank 3 in, rank 3 out, original maps.
+// CHECK:           %[[BMM:.*]] = linalg.generic {indexing_maps = [#[[$S6_BA]], #[[$S6_BB]], #[[$S6_BC]]], iterator_types = ["parallel", "parallel", "parallel", "reduction"]} ins(%{{.*}}, %{{.*}} : tensor<4x64x128xf32>, tensor<4x128x96xf32>) outs(%{{.*}} : tensor<4x64x96xf32>) {
+// CHECK:           } -> tensor<4x64x96xf32>
+// The permuting generic's outs follows the store's physical shape.
+// CHECK:           %[[E:.*]] = tensor.empty() : tensor<3x4x64x32xf32>
+// CHECK:           %[[P:.*]] = linalg.generic {indexing_maps = [#[[$S6_PERM]], #[[$S6_ID4]]], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%[[BMM]] : tensor<4x64x96xf32>) outs(%[[E]] : tensor<3x4x64x32xf32>) {
+// CHECK:           } -> tensor<3x4x64x32xf32>
+// The 3-cycle is expressed once, inside that one map. Between that generic and
+// the store the named pass emitted a second linalg.transpose for the layout and a
+// scatter loop over the three sticks; nothing stands here.
+// CHECK-NOT:       linalg.transpose
+// CHECK-NOT:       linalg.generic
+// CHECK-NOT:       scf.for
+// CHECK-NOT:       tensor.insert_slice
+// CHECK:           ktdp.store %[[P]], %{{.*}} : tensor<3x4x64x32xf32>, <3x4x64x32xindex>
+// CHECK:           tt.return
+tt.func @sink_trans_3cycle_bmm(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %cst = arith.constant dense<0.000000e+00> : tensor<4x64x96xf32>
+  %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
+  %1 = ktdp.construct_memory_view %0, sizes: [4, 64, 128], strides: [8192, 128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<4x64x128xf32>
+  %2 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<4x64x128xf32> -> !ktdp.access_tile<4x64x128xindex>
+  %3 = ktdp.load %2 : <4x64x128xindex> -> tensor<4x64x128xf32>
+  %4 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
+  %5 = ktdp.construct_memory_view %4, sizes: [4, 128, 96], strides: [12288, 96, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<4x128x96xf32>
+  %6 = ktdp.construct_access_tile %5[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<4x128x96xf32> -> !ktdp.access_tile<4x128x96xindex>
+  %7 = ktdp.load %6 : <4x128x96xindex> -> tensor<4x128x96xf32>
+  %8 = linalg.generic {indexing_maps = [#bA, #bB, #bC], iterator_types = ["parallel", "parallel", "parallel", "reduction"]} ins(%3, %7 : tensor<4x64x128xf32>, tensor<4x128x96xf32>) outs(%cst : tensor<4x64x96xf32>) {
+  ^bb0(%x: f32, %y: f32, %z: f32):
+    %p = arith.mulf %x, %y : f32
+    %s = arith.addf %z, %p : f32
+    linalg.yield %s : f32
+  } -> tensor<4x64x96xf32>
+  %9 = tensor.empty() : tensor<96x4x64xf32>
+  %10 = linalg.generic {indexing_maps = [#perm, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%8 : tensor<4x64x96xf32>) outs(%9 : tensor<96x4x64xf32>) {
+  ^bb0(%x: f32, %o: f32):
+    linalg.yield %x : f32
+  } -> tensor<96x4x64xf32>
+  %11 = builtin.unrealized_conversion_cast %arg2 : !tt.ptr<f32> to index
+  %12 = ktdp.construct_memory_view %11, sizes: [96, 4, 64], strides: [256, 64, 1] {coordinate_set = #set2, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 1, 2, 0>, phys_op = array<i64: 1, 0, 0, 2>, phys_arg = array<i64: 32, 0, 0, 32>}} : memref<96x4x64xf32>
+  %13 = ktdp.construct_access_tile %12[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set2} : memref<96x4x64xf32> -> !ktdp.access_tile<96x4x64xindex>
+  ktdp.store %10, %13 : tensor<96x4x64xf32>, <96x4x64xindex>
   tt.return
 }
 }
