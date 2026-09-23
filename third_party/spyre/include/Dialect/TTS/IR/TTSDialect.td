@@ -31,7 +31,7 @@ def TTS_Dialect : Dialect {
     `dbo-opt` loads ours. So the value of `tts.tensor_layout` is built out of
     builtin attributes only, and must stay that way.
 
-    The two ops the dialect does define, `tts.tensor_layout` and `tts.pin`, are
+    Two of the ops the dialect defines, `tts.tensor_layout` and `tts.pin`, are
     the *authoring* forms of two such annotations, and are bound by the same rule
     from the other side: both are fully consumed before any artifact is written,
     by `LowerTTSMarkers`, which turns each into its attribute. An op does have to
@@ -44,6 +44,10 @@ def TTS_Dialect : Dialect {
     descriptor became, a pin names a value and lands on the op producing it.
     What does not differ is that the value of either is built out of builtin
     attributes only.
+
+    The third, `tts.inter_tile_reduce`, names a cross-tile combination and is
+    held to the same rule: `LowerInterTile` expands it into `ktdp` ops, so it
+    too is fully consumed before any artifact is written.
   }];
 
   let extraClassDeclaration = [{
