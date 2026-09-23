@@ -83,9 +83,7 @@ std::optional<int64_t> applyStatic(int64_t logical, CoordOp op, int64_t arg);
 /// `evaluateDeviceLayout` below derives the device footprint `SpyreBackend`
 /// records in the compiled metadata from it, so the footprint a launcher
 /// bounds-checks against and the extents the IR is actually built with cannot
-/// disagree. (The named `rewrite-descriptor-layout` pass carries its own copy,
-/// in RewriteDescriptorLayout/PermutationUtils.h, which knows no Splat; it goes
-/// when that pass does.)
+/// disagree.
 bool applyCoordMap(ArrayRef<int64_t> logSizes, ArrayRef<int64_t> physSrc,
                    ArrayRef<int64_t> physOp, ArrayRef<int64_t> physArg,
                    SmallVectorImpl<int64_t> &out);

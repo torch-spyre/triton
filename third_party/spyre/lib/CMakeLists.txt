@@ -14,9 +14,8 @@ add_subdirectory(Utils)
 add_triton_library(SpyrePipeline
   Pipeline.cpp
 
-  # This file includes all four generated Passes.h.inc, one of them for the
-  # RewriteDescriptorLayout options struct, so a clean parallel build must not
-  # rely on the link edge to order tablegen ahead of it.
+  # This file includes all four generated Passes.h.inc, so a clean parallel
+  # build must not rely on the link edge to order tablegen ahead of it.
   DEPENDS
   TritonToKTIRIncGen
   KTDPTransformsIncGen

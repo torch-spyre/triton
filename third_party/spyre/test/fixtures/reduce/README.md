@@ -88,7 +88,7 @@ The two arms are chosen for where the stick lands relative to the reduced axis.
 - **spyre_stick** (`reduce__spyre_stick[IN_LAYOUT=stick, OUT_LAYOUT=stick]`) —
   fp16. `in_ptr` is stick-on-N, so the **reduced** axis is the one split across
   the leading and trailing physical dims (`[M, N]` → `[ceil(N/S), M, S]`); this is
-  the source-reduce path through `RewriteDescriptorLayout`. `out_ptr` is a 1D
+  the source-reduce path through `RewriteDescriptorLayoutGeneric`. `out_ptr` is a 1D
   stick.
 - **middle_axis_spyre_stick** (`reduce__middle_axis_spyre_stick[IN_LAYOUT=stick]`)
   — fp32. `in_ptr` is stick-on-D2, an **unreduced** axis, which leaves the reduced
@@ -144,7 +144,7 @@ Past that the two diverge, on what happens to the stick split:
 - **one_tile** (`reduce__one_tile[IN_LAYOUT=stick, OUT_LAYOUT=stick]`) — folds M,
   the non-stick axis, deleting a whole physical dimension. The split of N
   survives, and because `OUT_LAYOUT` declares exactly the layout that leaves,
-  `RewriteDescriptorLayout` physicalizes the reduce's output and the surviving
+  `RewriteDescriptorLayoutGeneric` physicalizes the reduce's output and the surviving
   stick index becomes a **batch dimension** of the one `linalg.reduce`:
   `ins tensor<2x64x64> outs tensor<2x64> dimensions = [1]`, with `ktdp.store`
   consuming the result directly. That is the shape torch-spyre's working `sum`
@@ -152,8 +152,8 @@ Past that the two diverge, on what happens to the stick split:
 
   It used to walk the stick axis with an `scf.for` and a slice per stick, plus a
   second loop to re-tile for the store, and dbo-opt rejected the loop.
-  `Dialect/KTDP/Transforms/rewrite-descriptor-layout-reduce-batch-dim.mlir` pins the form that
-  replaced it; `docs/spyre-tensor-layouts.md` is the design.
+  `Dialect/KTDP/Transforms/RewriteDescriptorLayoutGeneric/rebuild-reduction.mlir`
+  pins the form that replaced it.
 
   Its `atol` is 0.25 rather than the elementwise-shaped 5e-2, set by the device
   arm and sized in ulp: the sums reach 24 where fp16 ulp is 0.015625, the device

@@ -258,11 +258,9 @@ def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
         - depWkSlices present → producer_dependency_per_consumer affine set;
             absent → full-barrier (attribute omitted).
 
-        Must run after LowerComputeOps (partials must be linalg/tensor),
-        before RewriteDescriptorLayout (that pass has no physical-type
-        propagation pattern for tt.inter_tile_reduce, so no inter-tile op may
-        still be live when it runs), and before ConvertFunctions (reads function
-        attributes ConvertFunctions would rewrite).
+        Must run after LowerComputeOps (partials must be linalg/tensor) and
+        before ConvertFunctions (reads function attributes ConvertFunctions would
+        rewrite).
 
         A kernel that carries both a layout annotation and a
         tt.inter_tile_reduce is not supported: the layout pass cannot carry a

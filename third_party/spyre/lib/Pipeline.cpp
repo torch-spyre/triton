@@ -42,23 +42,8 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
 
   // tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery. After
   // LowerComputeOps, because the partials it consumes have to be linalg/tensor
-  // by then; before the layout pass, which has no propagation pattern for a
-  // !ktdp.tile_future and so must not be reached with one live.
+  // by then.
   pm.addPass(createLowerInterTilePass());
-
-  // Logical tensor descriptors -> physical (stick-tiled) layout, from the
-  // tt.spyre_tensor_layout annotations. After LowerComputeOps so a tt.dot is
-  // already a linalg.matmul before its operands are physicalized.
-  //
-  // INERT FOR EVERY COMPILED KERNEL, and deliberately still installed. The
-  // frontend authors `tts.tensor_layout`, so `tt.spyre_tensor_layout` -- the only
-  // thing this pass roots on -- reaches it from nothing the Triton frontend can
-  // produce, and it no-ops. Its replacement is RewriteDescriptorLayoutGeneric, in
-  // the `spyrecode` stage below. Kept here because its own lit fixtures drive it
-  // directly and because it is retired on device coverage rather than on a date;
-  // `data-layout` therefore still has a live consumer, which is the only one it
-  // has ever had.
-  pm.addPass(ktdp::createRewriteDescriptorLayout());
 
   // tt.func/tt.return -> func.func/func.return, !tt.ptr -> index. Last of the
   // conversions, because every memory pass above consumes !tt.ptr arguments
@@ -187,11 +172,11 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // `tts.tensor_layout` attribute LowerTTSMarkers wrote onto each annotated
   // memory view in the `ktir` stage. Unannotated descriptors are left alone.
   //
-  // No data-layout option, and there is nothing to pass one: a physicalized view
-  // lays its strides out row-major over its PHYSICAL sizes, because that is what
-  // stick-tiled device data is, and the logical strides are not read. The named
-  // pass's "host" mode has no counterpart here and needs none -- a caller wanting
-  // the logical form now reads the `ktir` artifact, which is logical.
+  // No option selects a stride mode, and there is nothing to select: a
+  // physicalized view lays its strides out row-major over its PHYSICAL sizes,
+  // because that is what stick-tiled device data is, and the logical strides are
+  // not read. A caller wanting the logical form reads the `ktir` artifact, which
+  // is logical.
   pm.addPass(ktdp::createRewriteDescriptorLayoutGeneric());
 
   // The cleanup belonging to the pass above, moved across the boundary with it.
