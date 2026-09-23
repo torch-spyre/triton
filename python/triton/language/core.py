@@ -3782,6 +3782,7 @@ def builtin_min(*args, propagate_nan=_NOTHING, _semantic=None):
 
 # --- START --- added for spyre
 @builtin
+@requires_backend("spyre")
 def inter_tile(x, axis, combiner, mode, *, work_slices, dep_work_slices=None,
                scatter_dimension=None, _semantic=None):
     """(Spyre only) Cross-tile reduction over the given work-slice axis.
@@ -3818,6 +3819,7 @@ def inter_tile(x, axis, combiner, mode, *, work_slices, dep_work_slices=None,
 
 
 @builtin
+@requires_backend("spyre")
 def wk_slice_coord(work_slices, axis, _semantic=None):
     """(Spyre only) Runtime slice coordinate of the current tile on ``axis``.
 

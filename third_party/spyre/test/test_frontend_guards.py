@@ -111,6 +111,7 @@ class TestRequiresBackend:
         assert "'cuda'" in msg
 
 
+
 # ---------------------------------------------------------------------------
 # tl.spyre_tensor_layout — the decorator's one call site
 # ---------------------------------------------------------------------------
@@ -295,3 +296,25 @@ class TestExtraMathDtypesInTracedIR:
         # not pass either.
         assert "math.exp %" in ttir
         assert "tensor<64x64xf16>" in ttir.split("math.exp %")[1].split("\n")[0]
+
+
+# ---------------------------------------------------------------------------
+# The decorator's call sites
+# ---------------------------------------------------------------------------
+
+class TestInterTileGuards:
+    """``tl.inter_tile`` and ``tl.wk_slice_coord`` carry the decorator, so the
+    guard fires before the builtin touches ``_semantic`` or its arguments."""
+
+    @pytest.mark.parametrize("backend", ["cuda", "hip", None])
+    def test_inter_tile_raises_off_backend(self, as_backend, backend):
+        as_backend(backend)
+        with pytest.raises(ValueError, match="only supported on the 'spyre' backend"):
+            tl.inter_tile(None, "x", "add", "all_reduce", work_slices=[{"x": 0}],
+                          _semantic=object())
+
+    @pytest.mark.parametrize("backend", ["cuda", "hip", None])
+    def test_wk_slice_coord_raises_off_backend(self, as_backend, backend):
+        as_backend(backend)
+        with pytest.raises(ValueError, match="only supported on the 'spyre' backend"):
+            tl.wk_slice_coord([{"x": 0}], "x", _semantic=object())

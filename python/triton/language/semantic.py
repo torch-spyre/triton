@@ -1924,12 +1924,6 @@ class TritonSemantic(Generic[TensorTy]):
     def inter_tile(self, x, axis, combiner, mode, *, work_slices,
                    dep_work_slices=None, scatter_dimension=None):
         """Emit tt.inter_tile_reduce with work-slice op attributes."""
-        target = driver.active.get_current_target()
-        if target.backend != "spyre":
-            raise ValueError(
-                "tl.inter_tile is only supported on the 'spyre' "
-                f"backend, not '{target.backend}'")
-
         axis = tl._unwrap_if_constexpr(axis)
         combiner = tl._unwrap_if_constexpr(combiner)
         mode = tl._unwrap_if_constexpr(mode)
@@ -2071,12 +2065,6 @@ class TritonSemantic(Generic[TensorTy]):
         All operands are i32 scalars, so the result is a runtime i32 scalar — no
         tensors, no reduction (spec E4).
         """
-        target = driver.active.get_current_target()
-        if target.backend != "spyre":
-            raise ValueError(
-                "tl.wk_slice_coord is only supported on the 'spyre' "
-                f"backend, not '{target.backend}'")
-
         axis = tl._unwrap_if_constexpr(axis)
         work_slices = tl._unwrap_if_constexpr(work_slices)
 
