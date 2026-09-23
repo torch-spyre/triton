@@ -3,10 +3,7 @@
 // Parse-print-parse round trip for the tts.tensor_layout OP -- the authoring
 // form, on a !tt.tensordesc.
 //
-// The assembly format is deliberately the same shape as tt.spyre_tensor_layout's
-// (see spyre-triton-opt/spyre-tensor-layout-roundtrip.mlir) so the two are
-// legible side by side while both exist. Two things about the printed form are
-// worth pinning rather than assuming:
+// Two things about the printed form are worth pinning rather than assuming:
 //
 //   * the three coordinate arrays are inherent attributes printed through
 //     `attr-dict`, so they come back in the printer's sorted order (phys_arg,

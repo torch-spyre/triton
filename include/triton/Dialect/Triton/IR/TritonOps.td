@@ -1073,28 +1073,6 @@ def TT_InterTileReduceOp : TT_Op<"inter_tile_reduce", [
   }];
 }
 
-def TT_SpyreTensorLayoutOp : TT_Op<"spyre_tensor_layout", []> {
-  let summary = "Spyre: annotate a tensor descriptor with its physical device layout";
-
-  let description = [{
-    `tt.spyre_tensor_layout` carries the physical (stick-tiled) device layout for
-    a `tt.make_tensor_descriptor` as three parallel i64 array attributes
-    (`phys_src` / `phys_op` / `phys_arg`), one entry per physical dim — the
-    OpSpec `device_coordinates` form. The Spyre lowering reads them together with
-    the descriptor's logical shape operands to build the physical device layout.
-    No result; the op is a marker consumed and erased by the lowering.
-  }];
-
-  let arguments = (ins
-    TT_TensorDescType:$desc,
-    DenseI64ArrayAttr:$phys_src,
-    DenseI64ArrayAttr:$phys_op,
-    DenseI64ArrayAttr:$phys_arg
-  );
-
-  let assemblyFormat = "$desc attr-dict `:` type($desc)";
-  let hasVerifier = 1;
-}
 // --- END --- added for spyre
 
 // The following ops, including `call`, `func`, and `return` are copied and modified from

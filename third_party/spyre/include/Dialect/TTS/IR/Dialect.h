@@ -196,12 +196,10 @@ bool evaluateDeviceLayout(ArrayRef<int64_t> logSizes,
 ///     hand-written IR and so cannot assume the verifier ran with the rank it
 ///     measures against.
 ///
-/// One checker rather than three is the decision recorded here: the rules were
-/// stated twice while the layout lived in the Triton dialect — in
-/// `SpyreTensorLayoutOp::verify` and again in that pass — and the pass's half
-/// would have quietly become the only half when the op went away. The op form
-/// moving into this dialect is what lets it share the checker instead of adding
-/// a third copy.
+/// One checker rather than two is the decision recorded here: the rules were
+/// stated twice while the layout lived in the Triton dialect, because an
+/// upstream file cannot depend on third_party/spyre and so could not call this
+/// one. The op form moving into this dialect is what lets both callers share it.
 ///
 /// `logicalRank` is the rank of the thing the layout describes, and it is read
 /// from a different place per caller: the descriptor's block type for the op,

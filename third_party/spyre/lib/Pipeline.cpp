@@ -79,11 +79,11 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // the way to dbo-opt, which is what requires a physical layout -- a kernel that
   // stops at `ktir` is better served by the logical form it was written as.
   //
-  // The annotation being an attribute is what allows this placement: a
-  // `tt.spyre_tensor_layout` op could not cross the boundary, since no consumer of
-  // the `ktir` artifact registers the Triton dialect and an op from an
-  // unregistered dialect fails at parse. A discardable attribute with builtin
-  // values needs no dialect to round-trip.
+  // The annotation being an attribute is what allows this placement: an op in a
+  // Triton-side dialect could not cross the boundary, since no consumer of the
+  // `ktir` artifact registers that dialect and an op from an unregistered
+  // dialect fails at parse. A discardable attribute with builtin values needs no
+  // dialect to round-trip.
   //
   // The three shaping passes cross the boundary with the layout pass because they
   // establish its input contract: it restates `linalg.generic` and diagnoses
