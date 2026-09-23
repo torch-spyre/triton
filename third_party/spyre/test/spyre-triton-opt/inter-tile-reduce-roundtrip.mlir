@@ -7,11 +7,11 @@
 
 // RUN: spyre-triton-opt %s | spyre-triton-opt | FileCheck %s
 
-// Tests parse-print-parse roundtrip for tt.inter_tile_reduce.
+// Tests parse-print-parse roundtrip for tts.inter_tile_reduce.
 //
 // Declarative assembly format (identities always non-empty — semantic.py
 // materializes identity tensors for shorthand combiners at TTIR build time):
-//   tt.inter_tile_reduce
+//   tts.inter_tile_reduce
 //     partials(%v : <type>, ...)
 //     identities(%id : <type>, ...)
 //     axis = "<name>" mode = "<mode>" combiner = "<comb>"
@@ -22,19 +22,19 @@
 // Result type == partial type (no rank reduction; caller collapses dims).
 // Note: the region combiner case is not tested here because tt.reduce.return
 // verifies it has a tt.reduce parent — region combiners are tested end-to-end
-// via the lowering lit tests (Conversion/TritonToKTIR/lower-inter-tile.mlir).
+// via the lowering lit tests (Conversion/TritonToKTIR/LowerInterTile/basic.mlir).
 
 // ---------------------------------------------------------------------------
 // (a) all_reduce, shorthand combiner "add"
 // ---------------------------------------------------------------------------
 // CHECK-LABEL:   tt.func @all_reduce_shorthand(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<1x64xf32>, %[[VAL_1:.*]]: tensor<1x64xf32>) -> tensor<1x64xf32> {
-// CHECK:           %[[VAL_2:.*]] = tt.inter_tile_reduce partials(%[[VAL_0]] : tensor<1x64xf32>) identities(%[[VAL_1]] : tensor<1x64xf32>) axis = "x" mode = "all_reduce" combiner = "add" {coreIdToWkSlice = [{x = 0 : i64}, {x = 1 : i64}, {x = 2 : i64}, {x = 3 : i64}], numWkSlicesPerDim = {x = 4 : i64}} -> (tensor<1x64xf32>)
+// CHECK:           %[[VAL_2:.*]] = tts.inter_tile_reduce partials(%[[VAL_0]] : tensor<1x64xf32>) identities(%[[VAL_1]] : tensor<1x64xf32>) axis = "x" mode = "all_reduce" combiner = "add" {coreIdToWkSlice = [{x = 0 : i64}, {x = 1 : i64}, {x = 2 : i64}, {x = 3 : i64}], numWkSlicesPerDim = {x = 4 : i64}} -> (tensor<1x64xf32>)
 // CHECK:           tt.return %[[VAL_2]] : tensor<1x64xf32>
 // CHECK:         }
 tt.func @all_reduce_shorthand(%p: tensor<1x64xf32>,
                                %id: tensor<1x64xf32>) -> tensor<1x64xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<1x64xf32>)
          identities(%id : tensor<1x64xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -50,12 +50,12 @@ tt.func @all_reduce_shorthand(%p: tensor<1x64xf32>,
 // ---------------------------------------------------------------------------
 // CHECK-LABEL:   tt.func @reduce_to_one_shorthand(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<1x64xf32>, %[[VAL_1:.*]]: tensor<1x64xf32>) -> tensor<1x64xf32> {
-// CHECK:           %[[VAL_2:.*]] = tt.inter_tile_reduce partials(%[[VAL_0]] : tensor<1x64xf32>) identities(%[[VAL_1]] : tensor<1x64xf32>) axis = "x" mode = "reduce_to_one" combiner = "max" {coreIdToWkSlice = [{x = 0 : i64}, {x = 1 : i64}], numWkSlicesPerDim = {x = 2 : i64}} -> (tensor<1x64xf32>)
+// CHECK:           %[[VAL_2:.*]] = tts.inter_tile_reduce partials(%[[VAL_0]] : tensor<1x64xf32>) identities(%[[VAL_1]] : tensor<1x64xf32>) axis = "x" mode = "reduce_to_one" combiner = "max" {coreIdToWkSlice = [{x = 0 : i64}, {x = 1 : i64}], numWkSlicesPerDim = {x = 2 : i64}} -> (tensor<1x64xf32>)
 // CHECK:           tt.return %[[VAL_2]] : tensor<1x64xf32>
 // CHECK:         }
 tt.func @reduce_to_one_shorthand(%p: tensor<1x64xf32>,
                                   %id: tensor<1x64xf32>) -> tensor<1x64xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<1x64xf32>)
          identities(%id : tensor<1x64xf32>)
          axis = "x" mode = "reduce_to_one" combiner = "max"
@@ -70,12 +70,12 @@ tt.func @reduce_to_one_shorthand(%p: tensor<1x64xf32>,
 // ---------------------------------------------------------------------------
 // CHECK-LABEL:   tt.func @reduce_scatter_with_dim(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<1x64xf32>, %[[VAL_1:.*]]: tensor<1x64xf32>) -> tensor<1x64xf32> {
-// CHECK:           %[[VAL_2:.*]] = tt.inter_tile_reduce partials(%[[VAL_0]] : tensor<1x64xf32>) identities(%[[VAL_1]] : tensor<1x64xf32>) axis = "x" mode = "reduce_scatter" combiner = "add" scatter_dimension = 0 {coreIdToWkSlice = [{x = 0 : i64}, {x = 1 : i64}], numWkSlicesPerDim = {x = 2 : i64}} -> (tensor<1x64xf32>)
+// CHECK:           %[[VAL_2:.*]] = tts.inter_tile_reduce partials(%[[VAL_0]] : tensor<1x64xf32>) identities(%[[VAL_1]] : tensor<1x64xf32>) axis = "x" mode = "reduce_scatter" combiner = "add" scatter_dimension = 0 {coreIdToWkSlice = [{x = 0 : i64}, {x = 1 : i64}], numWkSlicesPerDim = {x = 2 : i64}} -> (tensor<1x64xf32>)
 // CHECK:           tt.return %[[VAL_2]] : tensor<1x64xf32>
 // CHECK:         }
 tt.func @reduce_scatter_with_dim(%p: tensor<1x64xf32>,
                                   %id: tensor<1x64xf32>) -> tensor<1x64xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<1x64xf32>)
          identities(%id : tensor<1x64xf32>)
          axis = "x" mode = "reduce_scatter" combiner = "add"
