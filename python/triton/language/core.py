@@ -15,6 +15,7 @@ import inspect
 
 from .._C.libtriton import ir
 from .._utils import TRITON_MAX_TENSOR_NUMEL, validate_block_shape, get_primitive_bitwidth, _tuple_create
+from .target_info import requires_backend  # --- added for spyre
 
 T = TypeVar('T')
 
@@ -3781,6 +3782,7 @@ def builtin_min(*args, propagate_nan=_NOTHING, _semantic=None):
 
 # --- START --- added for spyre
 @builtin
+@requires_backend("spyre")
 def inter_tile(x, axis, combiner, mode, *, work_slices, dep_work_slices=None,
                scatter_dimension=None, _semantic=None):
     """(Spyre only) Cross-tile reduction over the given work-slice axis.
@@ -3817,6 +3819,7 @@ def inter_tile(x, axis, combiner, mode, *, work_slices, dep_work_slices=None,
 
 
 @builtin
+@requires_backend("spyre")
 def wk_slice_coord(work_slices, axis, _semantic=None):
     """(Spyre only) Runtime slice coordinate of the current tile on ``axis``.
 
