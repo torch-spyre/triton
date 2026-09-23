@@ -458,10 +458,10 @@ VARIANTS = {
         "constexpr": ["BLOCK_M", "BLOCK_K", "BLOCK_N"],
     },
     # --- Spyre physical-layout variants ---
-    # All annotate A, B, C with a stick-tiling layout so the kernel lowers
-    # through RewriteDescriptorLayout's loop synthesis (source matmul stage +
-    # store sink stage) instead of staying logical. Stick size is derived from
-    # the element dtype via sticksize (fp16 → 64 = 128 bytes / 2).
+    # All annotate A, B, C with a stick-tiling layout so the kernel is
+    # physicalized by RewriteDescriptorLayoutGeneric instead of staying logical.
+    # Stick size is derived from the element dtype via sticksize
+    # (fp16 → 64 = 128 bytes / 2).
     #   stick-on-X layout: phys [X//stick, other, X%stick]
     #     = [(X_logical, "floordiv", stick), other_logical, (X_logical, "mod", stick)]
     "spyre_stick_k_reduction": {
@@ -570,12 +570,9 @@ VARIANTS = {
     },
     "spyre_stick_k_dynamic": {
         # Dynamic-shape variant of spyre_stick_k: A stick-on-K with BLOCK_K=128
-        # and stick size 64, so A's K-stick dim spans 2 sticks and
-        # RewriteDescriptorLayout emits a 2-iteration K-stick reduction loop.
-        # B's K-flat dim (extent 128 > stickSize 64) is therefore SlicedStick:
-        # advanced one 64-wide stick per reduction iteration at offset k*64.
-        # The B slice offset is a runtime SSA value, exercising the dynamic-
-        # offset path in tensor.extract_slice.
+        # and stick size 64, so A's K-stick dim spans 2 sticks and the rebuilt
+        # contraction carries two K reduction loop dims. B holds K whole at 128,
+        # so its operand map carries the composite over the same pair.
         "base": "spyre_stick_k",
         "tags": ["descriptor-load-dynamic", "descriptor-store-dynamic", "dot",
                  "program-id-1d", "spyre-tensor-layout"],
@@ -651,10 +648,10 @@ VARIANTS = {
     # BMM with two independent stick splits on A: M (parallel) and K
     # (reduction), giving a rank-5 physical view. Numerical counterpart of the
     # @parallel_floor_rank5 lit case in
-    # test/Dialect/KTDP/Transforms/rewrite-descriptor-layout-parallel-multistick.mlir.
-    # A's M floor dim is indexed by the outer scatter IV and its K floor dim by
-    # the inner reduction IV, so the two IVs must be threaded independently.
-    # C is left logical (rank-3) so the store sink drives the scatter.
+    # test/Dialect/KTDP/Transforms/RewriteDescriptorLayoutGeneric/rebuild-contraction.mlir.
+    # The two splits become two loop-dim pairs of the one rebuilt contraction,
+    # one parallel and one reduction. C is left logical (rank-3), so its operand
+    # map carries M's composite.
     "bmm_spyre_stick_rank5": {
         "base": "bmm_spyre_stick",
         "summary": (
@@ -681,8 +678,7 @@ VARIANTS = {
     # D[M,N] stick-on-N. The inner B@C loop produces a logical scratchpad
     # tile bc[BLOCK_K1, BLOCK_N] that feeds the outer A@bc dot. This
     # exercises the scratchpad operand path in dispatchSource (Step 8b).
-    # Every stick dim is exactly one stick (64 = 128B / 2B fp16): a sub-stick
-    # stick dim is rejected by RewriteDescriptorLayout (it would pad the lane).
+    # Every stick dim is exactly one stick (64 = 128B / 2B fp16).
     "spyre_chained_scratchpad": {
         "tags": ["descriptor-load-static", "descriptor-store-static", "dot",
                  "program-id-1d", "spyre-tensor-layout"],

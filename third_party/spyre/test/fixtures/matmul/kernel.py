@@ -53,7 +53,7 @@ def matmul_kernel(
     ``A_LAYOUT`` / ``B_LAYOUT`` / ``C_LAYOUT`` are optional Spyre physical
     stick-tiling layouts (OpSpec ``device_coordinates`` form). When supplied
     (as constexprs) they annotate the matching descriptor via
-    ``tl.spyre_tensor_layout`` so RewriteDescriptorLayout physicalizes it;
+    ``tl.spyre_tensor_layout`` so the layout pass physicalizes it;
     left ``0`` the kernel lowers logically (non-Spyre variants pass ``0``).
     Passed as constexprs so the inline-literal requirement of
     ``tl.spyre_tensor_layout`` is met without binding to a local.

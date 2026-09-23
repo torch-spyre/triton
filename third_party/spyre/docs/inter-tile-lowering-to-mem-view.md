@@ -106,8 +106,7 @@ A redistribution needs only the **source** list. The destination arrangement is 
 each instance passes when it reads — see §2.
 
 The **stick** is the hardware's contiguous innermost unit, 128 bytes, so `S = 128 /
-itemsize` — 64 for fp16. Written `S` throughout, as in
-[spyre-tensor-layouts.md](spyre-tensor-layouts.md).
+itemsize` — 64 for fp16. Written `S` throughout.
 
 ### Assumptions this design relies on
 

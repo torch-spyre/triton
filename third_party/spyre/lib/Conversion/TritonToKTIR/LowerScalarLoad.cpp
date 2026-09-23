@@ -144,7 +144,7 @@ static Value resolveScalarAddress(OpBuilder &builder, Location loc,
 /// Emit the full single-element 1-D read: memory view -> access tile ->
 /// ktdp.load -> tensor.extract, returning the scalar `elemType` value.
 /// Built from the shared `buildMemoryView`/`buildAccessTile` helpers (also
-/// used by `LowerDescriptorMemory.cpp` and `RewriteDescriptorLayout.cpp`),
+/// used by `LowerDescriptorMemory.cpp`),
 /// with a single dim of extent 1 rather than rank 0 — rank-0 shaped types
 /// are not a supported interchange form downstream, while a single-element
 /// 1-D vector is. The one `arith.constant 0 : index` serves double duty, as

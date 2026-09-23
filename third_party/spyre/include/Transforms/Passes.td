@@ -188,8 +188,8 @@ def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
 
         Ordering: must run after LowerComputeOps, the pass that creates the fill;
         anchored earlier it is a silent no-op. Independent of
-        RewriteDescriptorLayout — running before it simply means the layout pass
-        physicalizes a tensor.empty rather than a fill.
+        RewriteDescriptorLayoutGeneric — running before it simply means the layout
+        pass physicalizes a tensor.empty rather than a fill.
 
         Output: reductions whose outs is a bare tensor.empty, as hand-written
         reference KTIR states directly.

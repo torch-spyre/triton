@@ -45,11 +45,6 @@ namespace {
 // values.
 struct TTIRToKTIRCLIOptions
     : public mlir::PassPipelineOptions<TTIRToKTIRCLIOptions> {
-  // No data-layout. It selected the named RewriteDescriptorLayout's stride mode,
-  // which no longer reaches a compiled artifact -- that pass roots on
-  // tt.spyre_tensor_layout and the frontend authors tts.tensor_layout. Reach the
-  // pass's own option directly (--rewrite-descriptor-layout=data-layout=...) to
-  // exercise both modes.
   ListOption<int64_t> grid{
       *this, "grid",
       llvm::cl::desc("Per-axis partition of the Spyre hardware grid, one entry "

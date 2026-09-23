@@ -262,8 +262,8 @@ def gather_kernel_spyre(
     tl.spyre_tensor_layout; idx_desc is not (index arrays have no stick layout).
 
     The inner col_stick loop is what exercises the multi-stick rewrite when
-    BLOCK_COLS spans more than one stick: RewriteDescriptorLayout rescales the
-    loop to stick granularity and the out_desc / in_desc tiles share that loop.
+    BLOCK_COLS spans more than one stick: the layout pass restates the access
+    over stick granularity and the out_desc / in_desc tiles share that loop.
 
     IN_LAYOUT  — stick-tiling for in_ptr's full [M, N] extent.
     OUT_LAYOUT — stick-tiling for out_ptr's full [K_INDICES, N] extent.
