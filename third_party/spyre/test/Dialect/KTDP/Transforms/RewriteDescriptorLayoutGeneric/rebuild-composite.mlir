@@ -12,14 +12,22 @@
 // the one place the rebuild puts arithmetic into a map at all -- see
 // rebuild-passthrough.mlir for the cases where it has nothing to add.
 //
-// The three cases are the three ways that can land, and nothing in any of them is
+// Cases 1 to 3 are the three ways that can land, and nothing in any of them is
 // transpose-specific or store-specific: both operands splitting the same loop dim
 // (so no composite is needed and the maps come out identical), the operands
 // splitting different loop dims (so each carries the other's composite), and the
 // same at a ktdp.store, which is why this pass needs no widening stage WHEREVER A
-// GENERIC MEDIATES THE STORE. Where none does -- a pure load-to-store copy with
-// only the destination annotated -- there is no vehicle for the shape change and
-// the pass declines; invalid-layout.mlir case 4 is that one.
+// GENERIC MEDIATES THE STORE.
+//
+// Cases 4 and 5 are the two ends of that "wherever". Case 4 is a pure
+// load-to-store copy with NO generic at all and both ends annotated, which needs
+// none: phase 1 physicalizes the two views and the two tiles, and the load's
+// retyped result already matches the store's retyped tile. With only the
+// destination annotated the same copy has no vehicle for the shape change and the
+// pass declines -- invalid-layout.mlir case 4 is that one, and case 4 here is its
+// positive twin. Case 5 is an operand on no layout at all, which is the extreme of
+// holding dims whole: every dim the annotated operand splits is a composite in the
+// unannotated one's map.
 //
 // Captures are hand-named and this file is hand-maintained: do not regenerate it
 // with generate-test-checks.py, which numbers captures globally across a file and
@@ -235,6 +243,104 @@ tt.func @store_agrees_without_widening(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
   %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   %e = tensor.empty() : tensor<64x128xf32>
   %r = linalg.generic {indexing_maps = [#id, #id], iterator_types = ["parallel", "parallel"]} ins(%al : tensor<64x128xf32>) outs(%e : tensor<64x128xf32>) {
+  ^bb0(%x: f32, %y: f32):
+    %n = arith.negf %x : f32
+    linalg.yield %n : f32
+  } -> tensor<64x128xf32>
+  ktdp.store %r, %ot : tensor<64x128xf32>, <64x128xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 4 -- a pure load-to-store copy with BOTH ends annotated.
+//
+// No linalg.generic anywhere, so no rebuild runs. Phase 1 alone is the whole
+// answer: each view is restated at [2, 128, 64], each tile's one subscript per
+// logical dim becomes a divsi/remsi pair, and the load's result is retyped along
+// with the tile it reads -- which is exactly the type the store's retyped tile
+// wants.
+
+// CHECK: #[[$CPY_ID3:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+// CHECK: #[[$CPY_SET3:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#idc = affine_map<(d0, d1) -> (d0, d1)>
+#sc = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+// CHECK-LABEL:   tt.func @copy_both_annotated(
+// CHECK-NOT:       linalg.generic
+// CHECK:           %[[AV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [2, 128, 64], strides: [8192, 64, 1] {coordinate_set = #[[$CPY_SET3]], memory_space = #ktdp.memory_space<global>} : memref<2x128x64xf32>
+// CHECK:           %[[AT:.*]] = ktdp.construct_access_tile %[[AV]]{{.*}} {access_tile_order = #[[$CPY_ID3]], access_tile_set = #[[$CPY_SET3]]} : memref<2x128x64xf32> -> !ktdp.access_tile<2x128x64xindex>
+// CHECK:           %[[AL:.*]] = ktdp.load %[[AT]] : <2x128x64xindex> -> tensor<2x128x64xf32>
+// CHECK:           %[[OV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [2, 128, 64], strides: [8192, 64, 1] {coordinate_set = #[[$CPY_SET3]], memory_space = #ktdp.memory_space<global>} : memref<2x128x64xf32>
+// CHECK:           %[[OT:.*]] = ktdp.construct_access_tile %[[OV]]{{.*}} : memref<2x128x64xf32> -> !ktdp.access_tile<2x128x64xindex>
+// The loaded value goes straight to the store, both at physical rank 3.
+// CHECK:           ktdp.store %[[AL]], %[[OT]] : tensor<2x128x64xf32>, <2x128x64xindex>
+// CHECK-NOT:       linalg.generic
+// CHECK:           tt.return
+tt.func @copy_both_annotated(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [128, 128], strides: [128, 1] {coordinate_set = #sc, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<128x128xf32>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #idc, access_tile_set = #sc} : memref<128x128xf32> -> !ktdp.access_tile<128x128xindex>
+  %al = ktdp.load %at : <128x128xindex> -> tensor<128x128xf32>
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [128, 128], strides: [128, 1] {coordinate_set = #sc, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<128x128xf32>
+  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #idc, access_tile_set = #sc} : memref<128x128xf32> -> !ktdp.access_tile<128x128xindex>
+  ktdp.store %al, %ot : tensor<128x128xf32>, <128x128xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 5 -- an annotated load through an elementwise generic to an UNANNOTATED
+// store.
+//
+// The store's destination carries no layout, so the generic's outs stays logical at
+// [64, 128] and holds the split dim whole: its map carries the composite
+// d1 * 64 + d2. The input names the pair directly. So the shape change stops at the
+// generic's result rather than reaching the store, and no bridging loop, slice or
+// insert is emitted to get it there -- the maps do all of it.
+
+// CHECK: #[[$UAS_ID3:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+// CHECK: #[[$UAS_ID2:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK: #[[$UAS_IN:.+]] = affine_map<(d0, d1, d2) -> (d1, d0, d2)>
+// CHECK: #[[$UAS_OUT:.+]] = affine_map<(d0, d1, d2) -> (d0, d1 * 64 + d2)>
+// CHECK: #[[$UAS_SET3:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+// CHECK: #[[$UAS_SET2:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#ide = affine_map<(d0, d1) -> (d0, d1)>
+#se = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+// CHECK-LABEL:   tt.func @elementwise_unannotated_store(
+// CHECK:           %[[AV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [2, 64, 64], strides: [4096, 64, 1] {coordinate_set = #[[$UAS_SET3]], memory_space = #ktdp.memory_space<global>} : memref<2x64x64xf32>
+// CHECK:           %[[AL:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf32>
+// The destination stays logical, and its tile takes no divsi/remsi.
+// CHECK:           %[[OV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [64, 128], strides: [128, 1] {coordinate_set = #[[$UAS_SET2]], memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
+// CHECK-NOT:       arith.divsi
+// CHECK:           %[[OT:.*]] = ktdp.construct_access_tile %[[OV]]{{.*}} {access_tile_order = #[[$UAS_ID2]], access_tile_set = #[[$UAS_SET2]]} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+// CHECK:           %[[E:.*]] = tensor.empty() : tensor<64x128xf32>
+// Three parallel loops, the outs at logical shape and carrying the composite.
+// CHECK:           %[[R:.*]] = linalg.generic {indexing_maps = [#[[$UAS_IN]], #[[$UAS_OUT]]], iterator_types = ["parallel", "parallel", "parallel"]} ins(%[[AL]] : tensor<2x64x64xf32>) outs(%[[E]] : tensor<64x128xf32>) {
+// CHECK:           } -> tensor<64x128xf32>
+// No bridging loop and no slicing between the generic and the store.
+// CHECK-NOT:       scf.for
+// CHECK-NOT:       tensor.extract_slice
+// CHECK:           ktdp.store %[[R]], %[[OT]] : tensor<64x128xf32>, <64x128xindex>
+tt.func @elementwise_unannotated_store(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #se, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #ide, access_tile_set = #se} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+  %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf32>
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #se, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
+  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #ide, access_tile_set = #se} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+  %e = tensor.empty() : tensor<64x128xf32>
+  %r = linalg.generic {indexing_maps = [#ide, #ide], iterator_types = ["parallel", "parallel"]} ins(%al : tensor<64x128xf32>) outs(%e : tensor<64x128xf32>) {
   ^bb0(%x: f32, %y: f32):
     %n = arith.negf %x : f32
     linalg.yield %n : f32

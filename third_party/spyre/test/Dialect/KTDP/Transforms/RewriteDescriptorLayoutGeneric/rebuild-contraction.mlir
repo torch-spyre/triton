@@ -14,8 +14,9 @@
 // half of each case; the named-op pass emits a stick loop, a rescaling multiply
 // and a pair of slices for these same kernels.
 //
-// Three cases, all positive: the contracted dim at one stick, at one stick inside
-// a batched kernel that has a program-id loop of its own, and at two sticks. What
+// Four cases, all positive: the contracted dim at one stick, at one stick inside
+// a batched kernel that has a program-id loop of its own, at two sticks, and an
+// accumulator carried across an enclosing scf.for as its iter_arg. What
 // this pass DECLINES is not shaped like a contraction -- a named linalg.matmul is
 // in invalid-layout.mlir and the malformed-input declines are in invalid-ktir.mlir
 // -- so no case here is expected to fail.
@@ -357,4 +358,87 @@ module {
     ktdp.store %14, %15 : tensor<64x64xf32>, <64x64xindex>
     tt.return
   }
+}
+
+// -----
+
+// Case 4 -- the accumulator is an enclosing scf.for's iter_arg.
+//
+// The attention P @ V inner loop: B is stick-on-N and the accumulator is not
+// annotated, so it holds N whole and its map carries the composite d2 * 64 + d3.
+// The accumulator's type therefore does not change, and the loop's iter_arg, its
+// result type and the scf.yield operand are all left as they are -- the rank change
+// lives entirely inside the generic's maps. The loop itself is untouched, as in
+// subscripts-direct.mlir case 2.
+//
+// An accumulator that DID have to be retyped is another matter: it is a block
+// argument, with no producer to restate, and block-arg-outs.mlir has that.
+
+// CHECK: #[[$S4_ID2:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK: #[[$S4_ID3:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+// CHECK: #[[$S4_A:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1)>
+// CHECK: #[[$S4_B:.+]] = affine_map<(d0, d1, d2, d3) -> (d2, d1, d3)>
+// CHECK: #[[$S4_C:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d2 * 64 + d3)>
+// CHECK: #[[$S4_SET_A:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+// CHECK: #[[$S4_SET_B:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+// CHECK: #[[$S4_SET_C:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+
+#a_m = affine_map<(d0, d1, d2) -> (d0, d2)>
+#b_m = affine_map<(d0, d1, d2) -> (d2, d1)>
+#c_m = affine_map<(d0, d1, d2) -> (d0, d1)>
+#id2 = affine_map<(d0, d1) -> (d0, d1)>
+#sa = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+#sb = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+// The loop this pass did not touch: one scf.for, its iter_arg and result still at
+// the logical type, and no slicing anywhere.
+// NOLOOP-LABEL:   tt.func @matmul_loop_carried_acc(
+// NOLOOP:           scf.for %{{.*}} iter_args(%{{.*}} = %{{.*}}) -> (tensor<64x128xf32>)
+// NOLOOP-NOT:       scf.for
+// NOLOOP-NOT:       tensor.extract_slice
+// NOLOOP:           tt.return
+// CHECK-LABEL:   tt.func @matmul_loop_carried_acc(
+// CHECK:           %[[CST:.*]] = arith.constant dense<0.000000e+00> : tensor<64x128xf32>
+// A is unannotated and stays [64, 64]; B is stick-on-N and becomes [2, 64, 64].
+// CHECK:           %[[AV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [64, 64], strides: [64, 1] {coordinate_set = #[[$S4_SET_A]], memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
+// CHECK:           %[[BV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [2, 64, 64], strides: [4096, 64, 1] {coordinate_set = #[[$S4_SET_B]], memory_space = #ktdp.memory_space<global>} : memref<2x64x64xf32>
+// CHECK:           %[[OV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [64, 128], strides: [128, 1] {coordinate_set = #[[$S4_SET_C]], memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
+// CHECK:           %[[RES:.*]] = scf.for %{{.*}} iter_args(%[[ACC:.*]] = %[[CST]]) -> (tensor<64x128xf32>) {
+// CHECK:             %[[AL:.*]] = ktdp.load %{{.*}} : <64x64xindex> -> tensor<64x64xf32>
+// CHECK:             %[[BL:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf32>
+// CHECK:             %[[R:.*]] = linalg.generic {indexing_maps = [#[[$S4_A]], #[[$S4_B]], #[[$S4_C]]], iterator_types = ["parallel", "reduction", "parallel", "parallel"]} ins(%[[AL]], %[[BL]] : tensor<64x64xf32>, tensor<2x64x64xf32>) outs(%[[ACC]] : tensor<64x128xf32>) {
+// CHECK:             } -> tensor<64x128xf32>
+// CHECK:             scf.yield %[[R]] : tensor<64x128xf32>
+// CHECK:           }
+// CHECK:           ktdp.store %[[RES]], %{{.*}} : tensor<64x128xf32>, <64x128xindex>
+// CHECK:           tt.return
+tt.func @matmul_loop_carried_acc(%a: !tt.ptr<f32>, %b: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %cst = arith.constant dense<0.000000e+00> : tensor<64x128xf32>
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 64], strides: [64, 1] {coordinate_set = #sa, memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
+  %bi = builtin.unrealized_conversion_cast %b : !tt.ptr<f32> to index
+  %bv = ktdp.construct_memory_view %bi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #sb, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #sb, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
+  %res = scf.for %i = %c0 to %c2 step %c1 iter_args(%acc = %cst) -> (tensor<64x128xf32>) {
+    %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sa} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
+    %al = ktdp.load %at : <64x64xindex> -> tensor<64x64xf32>
+    %bt = ktdp.construct_access_tile %bv[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sb} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+    %bl = ktdp.load %bt : <64x128xindex> -> tensor<64x128xf32>
+    %r = linalg.generic {indexing_maps = [#a_m, #b_m, #c_m], iterator_types = ["parallel", "parallel", "reduction"]} ins(%al, %bl : tensor<64x64xf32>, tensor<64x128xf32>) outs(%acc : tensor<64x128xf32>) {
+    ^bb0(%x: f32, %y: f32, %z: f32):
+      %p = arith.mulf %x, %y : f32
+      %s = arith.addf %z, %p : f32
+      linalg.yield %s : f32
+    } -> tensor<64x128xf32>
+    scf.yield %r : tensor<64x128xf32>
+  }
+  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sb} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+  ktdp.store %res, %ot : tensor<64x128xf32>, <64x128xindex>
+  tt.return
+}
 }

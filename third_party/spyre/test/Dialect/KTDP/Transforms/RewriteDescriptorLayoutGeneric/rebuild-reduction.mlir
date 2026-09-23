@@ -17,13 +17,18 @@
 // on the chain, so it follows the reduce to physical shape along with the
 // tensor.empty underneath it.
 //
-// Four cases: the reduction off the stick axis, the reduction on it (where the
-// output has to be re-stuck by a broadcast because reducing the split dim
+// Cases 1 to 4 are the reduction off the stick axis, the reduction on it (where
+// the output has to be re-stuck by a broadcast because reducing the split dim
 // destroys the stick structure), that same re-stuck output with the broadcast
 // axis FIRST in its physical order rather than last, and a three-generic chain
 // that composes the first two -- a reduce whose broadcast statistic is read back
 // by a rank-3 elementwise which feeds another. rebuild-contraction.mlir is this
 // same rule with a second input.
+//
+// Cases 5 to 10 vary what the output end and the reduced axis are: an output on no
+// layout at all, an output stick-SPLIT rather than re-stuck, a trip-1 floor dim, a
+// rank-3 output carrying two batch dims, and the reduced axis at a non-trailing
+// and then a leading logical position with three distinct extents.
 //
 // Captures are hand-named and this file is hand-maintained: do not regenerate it
 // with generate-test-checks.py, which emits only positive CHECKs and would drop
@@ -419,4 +424,367 @@ module {
     ktdp.store %exps, %t6 : tensor<64x64xf32>, <64x64xindex>
     tt.return
   }
+}
+
+// -----
+
+// Case 5 -- the output carries no layout at all.
+//
+// The reduce is on the stick axis, as in case 2, but the rank-1 result stays
+// logical. The domain still splits the reduced dim into two reduction loops; the
+// output map names only the surviving loop, and nothing re-sticks the result.
+
+// CHECK: #[[$UN_ID3:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+// CHECK: #[[$UN_ID1:.+]] = affine_map<(d0) -> (d0)>
+// CHECK: #[[$UN_OUT:.+]] = affine_map<(d0, d1, d2) -> (d1)>
+// CHECK: #[[$UN_SET3:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+// CHECK: #[[$UN_SET1:.+]] = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+
+#in  = affine_map<(d0, d1) -> (d0, d1)>
+#out = affine_map<(d0, d1) -> (d0)>
+#sin  = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#sout = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+#id2 = affine_map<(d0, d1) -> (d0, d1)>
+#id1 = affine_map<(d0) -> (d0)>
+module {
+// CHECK-LABEL:   tt.func @red_unannotated_out(
+// CHECK:           %[[AV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [2, 64, 64], strides: [4096, 64, 1] {coordinate_set = #[[$UN_SET3]], memory_space = #ktdp.memory_space<global>} : memref<2x64x64xf32>
+// CHECK:           %[[AL:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf32>
+// The output view is the rank-1 one it arrived as, and its tile takes one
+// subscript with no divsi/remsi ahead of it.
+// CHECK:           %[[OV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [64], strides: [1] {coordinate_set = #[[$UN_SET1]], memory_space = #ktdp.memory_space<global>} : memref<64xf32>
+// CHECK-NOT:       arith.divsi
+// CHECK:           %[[OT:.*]] = ktdp.construct_access_tile %[[OV]]{{\[}}%{{.*}}] {access_tile_order = #[[$UN_ID1]], access_tile_set = #[[$UN_SET1]]} : memref<64xf32> -> !ktdp.access_tile<64xindex>
+// CHECK:           %[[FILL:.*]] = linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<64xf32>) -> tensor<64xf32>
+// Two reduction loops for the split reduced dim, one parallel loop named by the
+// output.
+// CHECK:           %[[R:.*]] = linalg.generic {indexing_maps = [#[[$UN_ID3]], #[[$UN_OUT]]], iterator_types = ["reduction", "parallel", "reduction"]} ins(%[[AL]] : tensor<2x64x64xf32>) outs(%[[FILL]] : tensor<64xf32>) {
+// CHECK:           } -> tensor<64xf32>
+// CHECK:           ktdp.store %[[R]], %[[OT]] : tensor<64xf32>, <64xindex>
+tt.func @red_unannotated_out(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #sin, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sin} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+  %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf32>
+
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [64], strides: [1] {coordinate_set = #sout, memory_space = #ktdp.memory_space<global>} : memref<64xf32>
+  %ot = ktdp.construct_access_tile %ov[%c0] {access_tile_order = #id1, access_tile_set = #sout} : memref<64xf32> -> !ktdp.access_tile<64xindex>
+
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<64xf32>
+  %e = linalg.fill ins(%zero : f32) outs(%e0 : tensor<64xf32>) -> tensor<64xf32>
+  %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["parallel", "reduction"]} ins(%al : tensor<64x128xf32>) outs(%e : tensor<64xf32>) {
+  ^bb0(%x: f32, %acc: f32):
+    %s = arith.addf %x, %acc : f32
+    linalg.yield %s : f32
+  } -> tensor<64xf32>
+  ktdp.store %r, %ot : tensor<64xf32>, <64xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 6 -- the rank-1 output is stick-SPLIT, not re-stuck by a broadcast.
+//
+// Case 2's output layout replicates the surviving dim across lanes; this one
+// delinearizes it instead -- phys_op [floordiv, mod] over phys_src [0, 0] gives
+// physical [64/64, 64%64] = [1, 64]. Both ends therefore split a dim, so the
+// domain has four loops and no broadcast axis: the surviving dim's own two loops
+// are the output's two physical dims, and the input, which holds that dim whole,
+// carries the composite d1 * 64 + d3.
+
+// CHECK: #[[$SPL_ID3:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+// CHECK: #[[$SPL_ID2:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK: #[[$SPL_IN:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1 * 64 + d3, d2)>
+// CHECK: #[[$SPL_OUT:.+]] = affine_map<(d0, d1, d2, d3) -> (d1, d3)>
+// CHECK: #[[$SPL_SET3:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+// CHECK: #[[$SPL_SET2:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+
+#in  = affine_map<(d0, d1) -> (d0, d1)>
+#out = affine_map<(d0, d1) -> (d0)>
+#sin  = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#sout = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+#id2 = affine_map<(d0, d1) -> (d0, d1)>
+#id1 = affine_map<(d0) -> (d0)>
+module {
+// CHECK-LABEL:   tt.func @red_out_split(
+// CHECK:           %[[AL:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf32>
+// The rank-1 output becomes rank 2, and its one subscript becomes a divsi/remsi
+// pair like any other split.
+// CHECK:           %[[OV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [1, 64], strides: [64, 1] {coordinate_set = #[[$SPL_SET2]], memory_space = #ktdp.memory_space<global>} : memref<1x64xf32>
+// CHECK:           %[[W:.*]] = arith.constant 64 : index
+// CHECK:           %[[STICK:.*]] = arith.divsi %{{.*}}, %[[W]] : index
+// CHECK:           %[[W2:.*]] = arith.constant 64 : index
+// CHECK:           %[[LANE:.*]] = arith.remsi %{{.*}}, %[[W2]] : index
+// CHECK:           %[[OT:.*]] = ktdp.construct_access_tile %[[OV]]{{\[}}%[[STICK]], %[[LANE]]] {access_tile_order = #[[$SPL_ID2]], access_tile_set = #[[$SPL_SET2]]} : memref<1x64xf32> -> !ktdp.access_tile<1x64xindex>
+// CHECK:           %[[FILL:.*]] = linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<1x64xf32>) -> tensor<1x64xf32>
+// Four loops, the outs at tensor<1x64xf32>, and no broadcast axis anywhere.
+// CHECK:           %[[R:.*]] = linalg.generic {indexing_maps = [#[[$SPL_IN]], #[[$SPL_OUT]]], iterator_types = ["reduction", "parallel", "reduction", "parallel"]} ins(%[[AL]] : tensor<2x64x64xf32>) outs(%[[FILL]] : tensor<1x64xf32>) {
+// CHECK:           } -> tensor<1x64xf32>
+// CHECK:           ktdp.store %[[R]], %[[OT]] : tensor<1x64xf32>, <1x64xindex>
+tt.func @red_out_split(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #sin, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sin} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
+  %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf32>
+
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [64], strides: [1] {coordinate_set = #sout, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>}} : memref<64xf32>
+  %ot = ktdp.construct_access_tile %ov[%c0] {access_tile_order = #id1, access_tile_set = #sout} : memref<64xf32> -> !ktdp.access_tile<64xindex>
+
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<64xf32>
+  %e = linalg.fill ins(%zero : f32) outs(%e0 : tensor<64xf32>) -> tensor<64xf32>
+  %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["parallel", "reduction"]} ins(%al : tensor<64x128xf32>) outs(%e : tensor<64xf32>) {
+  ^bb0(%x: f32, %acc: f32):
+    %s = arith.addf %x, %acc : f32
+    linalg.yield %s : f32
+  } -> tensor<64xf32>
+  ktdp.store %r, %ot : tensor<64xf32>, <64xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 7 -- a trip-1 floor dim.
+//
+// A rank-3 input stick-split on its trailing dim at the dim's own width, so the
+// stick count is 1 and the physical shape carries a leading extent-1 dim. That dim
+// is an ordinary reduction loop: the rebuild does not inspect extents, so nothing
+// folds it away and the generic is 4 loops over a tensor<1x2x64x64xf32>.
+
+// CHECK: #[[$T1_ID4:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+// CHECK: #[[$T1_ID2:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK: #[[$T1_OUT:.+]] = affine_map<(d0, d1, d2, d3) -> (d1, d2)>
+// CHECK: #[[$T1_SET4:.+]] = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0, d3 >= 0, -d3 + 63 >= 0)>
+// CHECK: #[[$T1_SET2:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+
+#in  = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#out = affine_map<(d0, d1, d2) -> (d0, d1)>
+#sin  = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#sout = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+#id3 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#id2 = affine_map<(d0, d1) -> (d0, d1)>
+module {
+// CHECK-LABEL:   tt.func @red_trip1_floor(
+// CHECK:           %[[AV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [1, 2, 64, 64], strides: [8192, 4096, 64, 1] {coordinate_set = #[[$T1_SET4]], memory_space = #ktdp.memory_space<global>} : memref<1x2x64x64xf32>
+// CHECK:           %[[AL:.*]] = ktdp.load %{{.*}} : <1x2x64x64xindex> -> tensor<1x2x64x64xf32>
+// CHECK:           %[[OV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [2, 64], strides: [64, 1] {coordinate_set = #[[$T1_SET2]], memory_space = #ktdp.memory_space<global>} : memref<2x64xf32>
+// CHECK:           %[[OT:.*]] = ktdp.construct_access_tile %[[OV]]{{.*}} : memref<2x64xf32> -> !ktdp.access_tile<2x64xindex>
+// CHECK:           %[[FILL:.*]] = linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<2x64xf32>) -> tensor<2x64xf32>
+// The trip-1 stick loop is a reduction loop like the lane loop beside it.
+// CHECK:           %[[R:.*]] = linalg.generic {indexing_maps = [#[[$T1_ID4]], #[[$T1_OUT]]], iterator_types = ["reduction", "parallel", "parallel", "reduction"]} ins(%[[AL]] : tensor<1x2x64x64xf32>) outs(%[[FILL]] : tensor<2x64xf32>) {
+// CHECK:           } -> tensor<2x64xf32>
+// CHECK:           ktdp.store %[[R]], %[[OT]] : tensor<2x64xf32>, <2x64xindex>
+tt.func @red_trip1_floor(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [2, 64, 64], strides: [4096, 64, 1] {coordinate_set = #sin, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 2, 0, 1, 2>, phys_op = array<i64: 1, 0, 0, 2>, phys_arg = array<i64: 64, 0, 0, 64>}} : memref<2x64x64xf32>
+  %at = ktdp.construct_access_tile %av[%c0, %c0, %c0] {access_tile_order = #id3, access_tile_set = #sin} : memref<2x64x64xf32> -> !ktdp.access_tile<2x64x64xindex>
+  %al = ktdp.load %at : <2x64x64xindex> -> tensor<2x64x64xf32>
+
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [2, 64], strides: [64, 1] {coordinate_set = #sout, memory_space = #ktdp.memory_space<global>} : memref<2x64xf32>
+  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sout} : memref<2x64xf32> -> !ktdp.access_tile<2x64xindex>
+
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<2x64xf32>
+  %e = linalg.fill ins(%zero : f32) outs(%e0 : tensor<2x64xf32>) -> tensor<2x64xf32>
+  %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["parallel", "parallel", "reduction"]} ins(%al : tensor<2x64x64xf32>) outs(%e : tensor<2x64xf32>) {
+  ^bb0(%x: f32, %acc: f32):
+    %s = arith.addf %x, %acc : f32
+    linalg.yield %s : f32
+  } -> tensor<2x64xf32>
+  ktdp.store %r, %ot : tensor<2x64xf32>, <2x64xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 8 -- a rank-3 output carrying TWO batch dims.
+//
+// Both ends are stick-split on the trailing dim and the reduced dim is the middle
+// one, so the output keeps three physical dims: the stick index, the untouched
+// leading dim, and the lane. Physical dims 0 and 2 of the output both come from
+// logical dim 1, which is what a role numbered per logical dim cannot express.
+// The maps are plain projected permutations on both ends -- both split the same
+// loop dims at the same width, so no composite appears.
+
+// CHECK: #[[$TB_ID4:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+// CHECK: #[[$TB_ID3:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+// CHECK: #[[$TB_OUT:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
+// CHECK: #[[$TB_SET4:.+]] = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0, d3 >= 0, -d3 + 63 >= 0)>
+// CHECK: #[[$TB_SET3:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+
+#in  = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#out = affine_map<(d0, d1, d2) -> (d0, d2)>
+#sin  = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 127 >= 0)>
+#sout = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#id3 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#id2 = affine_map<(d0, d1) -> (d0, d1)>
+module {
+// CHECK-LABEL:   tt.func @red_two_batch_dims(
+// CHECK:           %[[AV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [2, 2, 64, 64], strides: [8192, 4096, 64, 1] {coordinate_set = #[[$TB_SET4]], memory_space = #ktdp.memory_space<global>} : memref<2x2x64x64xf16>
+// CHECK:           %[[AL:.*]] = ktdp.load %{{.*}} : <2x2x64x64xindex> -> tensor<2x2x64x64xf16>
+// CHECK:           %[[OV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [2, 2, 64], strides: [128, 64, 1] {coordinate_set = #[[$TB_SET3]], memory_space = #ktdp.memory_space<global>} : memref<2x2x64xf16>
+// CHECK:           %[[OT:.*]] = ktdp.construct_access_tile %[[OV]]{{.*}} : memref<2x2x64xf16> -> !ktdp.access_tile<2x2x64xindex>
+// CHECK:           %[[FILL:.*]] = linalg.fill ins(%{{.*}} : f16) outs(%{{.*}} : tensor<2x2x64xf16>) -> tensor<2x2x64xf16>
+// CHECK:           %[[R:.*]] = linalg.generic {indexing_maps = [#[[$TB_ID4]], #[[$TB_OUT]]], iterator_types = ["parallel", "parallel", "reduction", "parallel"]} ins(%[[AL]] : tensor<2x2x64x64xf16>) outs(%[[FILL]] : tensor<2x2x64xf16>) {
+// CHECK:           } -> tensor<2x2x64xf16>
+// CHECK:           ktdp.store %[[R]], %[[OT]] : tensor<2x2x64xf16>, <2x2x64xindex>
+tt.func @red_two_batch_dims(%a: !tt.ptr<f16>, %o: !tt.ptr<f16>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f16> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [2, 64, 128], strides: [8192, 128, 1] {coordinate_set = #sin, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 2, 0, 1, 2>, phys_op = array<i64: 1, 0, 0, 2>, phys_arg = array<i64: 64, 0, 0, 64>}} : memref<2x64x128xf16>
+  %at = ktdp.construct_access_tile %av[%c0, %c0, %c0] {access_tile_order = #id3, access_tile_set = #sin} : memref<2x64x128xf16> -> !ktdp.access_tile<2x64x128xindex>
+  %al = ktdp.load %at : <2x64x128xindex> -> tensor<2x64x128xf16>
+
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f16> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [2, 128], strides: [128, 1] {coordinate_set = #sout, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<2x128xf16>
+  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sout} : memref<2x128xf16> -> !ktdp.access_tile<2x128xindex>
+
+  %zero = arith.constant 0.000000e+00 : f16
+  %e0 = tensor.empty() : tensor<2x128xf16>
+  %e = linalg.fill ins(%zero : f16) outs(%e0 : tensor<2x128xf16>) -> tensor<2x128xf16>
+  %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["parallel", "reduction", "parallel"]} ins(%al : tensor<2x64x128xf16>) outs(%e : tensor<2x128xf16>) {
+  ^bb0(%x: f16, %acc: f16):
+    %s = arith.addf %x, %acc : f16
+    linalg.yield %s : f16
+  } -> tensor<2x128xf16>
+  ktdp.store %r, %ot : tensor<2x128xf16>, <2x128xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 9 -- the reduced axis is NON-TRAILING, at three distinct extents.
+//
+// A[32, 128, 96] stick-on-dim-2(96), reducing logical dim 1. The three logical
+// extents are all different, so a map that named a loop by its slot in the
+// physical order rather than by the logical dim it carries would address the wrong
+// axis and the linalg verifier would say so.
+//
+// The domain is ordered off the result operand, which is unannotated here: loop d0
+// is logical dim 0, d1/d3 the split dim 2's halves, d2 the reduced dim 1. The
+// input's map (d1, d0, d2, d3) is the layout's physical order read through that
+// numbering, and the output, holding dim 2 whole, carries d1 * 96 + d3.
+
+// CHECK: #[[$MID_ID4:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+// CHECK: #[[$MID_ID2:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK: #[[$MID_IN:.+]] = affine_map<(d0, d1, d2, d3) -> (d1, d0, d2, d3)>
+// CHECK: #[[$MID_OUT:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1 * 96 + d3)>
+// CHECK: #[[$MID_SET4:.+]] = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 127 >= 0, d3 >= 0, -d3 + 95 >= 0)>
+// CHECK: #[[$MID_SET2:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 95 >= 0)>
+
+#in  = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#out = affine_map<(d0, d1, d2) -> (d0, d2)>
+#sin  = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 95 >= 0)>
+#sout = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 95 >= 0)>
+#id3 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#id2 = affine_map<(d0, d1) -> (d0, d1)>
+module {
+// CHECK-LABEL:   tt.func @red_middle_axis(
+// CHECK:           %[[AV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [1, 32, 128, 96], strides: [393216, 12288, 96, 1] {coordinate_set = #[[$MID_SET4]], memory_space = #ktdp.memory_space<global>} : memref<1x32x128x96xf32>
+// CHECK:           %[[AL:.*]] = ktdp.load %{{.*}} : <1x32x128x96xindex> -> tensor<1x32x128x96xf32>
+// CHECK:           %[[OV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [32, 96], strides: [96, 1] {coordinate_set = #[[$MID_SET2]], memory_space = #ktdp.memory_space<global>} : memref<32x96xf32>
+// CHECK:           %[[OT:.*]] = ktdp.construct_access_tile %[[OV]]{{.*}} : memref<32x96xf32> -> !ktdp.access_tile<32x96xindex>
+// CHECK:           %[[FILL:.*]] = linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<32x96xf32>) -> tensor<32x96xf32>
+// The reduction loop is d2, the one the reduced dim 1 named -- not the last loop.
+// CHECK:           %[[R:.*]] = linalg.generic {indexing_maps = [#[[$MID_IN]], #[[$MID_OUT]]], iterator_types = ["parallel", "parallel", "reduction", "parallel"]} ins(%[[AL]] : tensor<1x32x128x96xf32>) outs(%[[FILL]] : tensor<32x96xf32>) {
+// CHECK:           } -> tensor<32x96xf32>
+// CHECK:           ktdp.store %[[R]], %[[OT]] : tensor<32x96xf32>, <32x96xindex>
+tt.func @red_middle_axis(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [32, 128, 96], strides: [12288, 96, 1] {coordinate_set = #sin, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 2, 0, 1, 2>, phys_op = array<i64: 1, 0, 0, 2>, phys_arg = array<i64: 96, 0, 0, 96>}} : memref<32x128x96xf32>
+  %at = ktdp.construct_access_tile %av[%c0, %c0, %c0] {access_tile_order = #id3, access_tile_set = #sin} : memref<32x128x96xf32> -> !ktdp.access_tile<32x128x96xindex>
+  %al = ktdp.load %at : <32x128x96xindex> -> tensor<32x128x96xf32>
+
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [32, 96], strides: [96, 1] {coordinate_set = #sout, memory_space = #ktdp.memory_space<global>} : memref<32x96xf32>
+  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sout} : memref<32x96xf32> -> !ktdp.access_tile<32x96xindex>
+
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<32x96xf32>
+  %e = linalg.fill ins(%zero : f32) outs(%e0 : tensor<32x96xf32>) -> tensor<32x96xf32>
+  %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["parallel", "reduction", "parallel"]} ins(%al : tensor<32x128x96xf32>) outs(%e : tensor<32x96xf32>) {
+  ^bb0(%x: f32, %acc: f32):
+    %s = arith.addf %x, %acc : f32
+    linalg.yield %s : f32
+  } -> tensor<32x96xf32>
+  ktdp.store %r, %ot : tensor<32x96xf32>, <32x96xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 10 -- the reduced axis is LEADING, same input as case 9.
+//
+// The one difference from case 9 is which logical axis the generic reduces: dim 0
+// (32) instead of dim 1 (128), giving a [128, 96] output. The output map prints
+// identically to case 9's, `(d0, d1 * 96 + d3)`, and means something else -- d0 is
+// logical dim 1 here and logical dim 0 there. The input map is what separates them:
+// (d1, d2, d0, d3) rather than (d1, d0, d2, d3).
+
+// CHECK: #[[$LEAD_ID4:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+// CHECK: #[[$LEAD_ID2:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK: #[[$LEAD_IN:.+]] = affine_map<(d0, d1, d2, d3) -> (d1, d2, d0, d3)>
+// CHECK: #[[$LEAD_OUT:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1 * 96 + d3)>
+// CHECK: #[[$LEAD_SET4:.+]] = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 127 >= 0, d3 >= 0, -d3 + 95 >= 0)>
+// CHECK: #[[$LEAD_SET2:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 95 >= 0)>
+
+#in  = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#out = affine_map<(d0, d1, d2) -> (d1, d2)>
+#sin  = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 95 >= 0)>
+#sout = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 95 >= 0)>
+#id3 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#id2 = affine_map<(d0, d1) -> (d0, d1)>
+module {
+// CHECK-LABEL:   tt.func @red_leading_axis(
+// CHECK:           %[[AV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [1, 32, 128, 96], strides: [393216, 12288, 96, 1] {coordinate_set = #[[$LEAD_SET4]], memory_space = #ktdp.memory_space<global>} : memref<1x32x128x96xf32>
+// CHECK:           %[[AL:.*]] = ktdp.load %{{.*}} : <1x32x128x96xindex> -> tensor<1x32x128x96xf32>
+// CHECK:           %[[OV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [128, 96], strides: [96, 1] {coordinate_set = #[[$LEAD_SET2]], memory_space = #ktdp.memory_space<global>} : memref<128x96xf32>
+// CHECK:           %[[OT:.*]] = ktdp.construct_access_tile %[[OV]]{{.*}} : memref<128x96xf32> -> !ktdp.access_tile<128x96xindex>
+// CHECK:           %[[FILL:.*]] = linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<128x96xf32>) -> tensor<128x96xf32>
+// CHECK:           %[[R:.*]] = linalg.generic {indexing_maps = [#[[$LEAD_IN]], #[[$LEAD_OUT]]], iterator_types = ["parallel", "parallel", "reduction", "parallel"]} ins(%[[AL]] : tensor<1x32x128x96xf32>) outs(%[[FILL]] : tensor<128x96xf32>) {
+// CHECK:           } -> tensor<128x96xf32>
+// CHECK:           ktdp.store %[[R]], %[[OT]] : tensor<128x96xf32>, <128x96xindex>
+tt.func @red_leading_axis(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [32, 128, 96], strides: [12288, 96, 1] {coordinate_set = #sin, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 2, 0, 1, 2>, phys_op = array<i64: 1, 0, 0, 2>, phys_arg = array<i64: 96, 0, 0, 96>}} : memref<32x128x96xf32>
+  %at = ktdp.construct_access_tile %av[%c0, %c0, %c0] {access_tile_order = #id3, access_tile_set = #sin} : memref<32x128x96xf32> -> !ktdp.access_tile<32x128x96xindex>
+  %al = ktdp.load %at : <32x128x96xindex> -> tensor<32x128x96xf32>
+
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [128, 96], strides: [96, 1] {coordinate_set = #sout, memory_space = #ktdp.memory_space<global>} : memref<128x96xf32>
+  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sout} : memref<128x96xf32> -> !ktdp.access_tile<128x96xindex>
+
+  %zero = arith.constant 0.000000e+00 : f32
+  %e0 = tensor.empty() : tensor<128x96xf32>
+  %e = linalg.fill ins(%zero : f32) outs(%e0 : tensor<128x96xf32>) -> tensor<128x96xf32>
+  %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["reduction", "parallel", "parallel"]} ins(%al : tensor<32x128x96xf32>) outs(%e : tensor<128x96xf32>) {
+  ^bb0(%x: f32, %acc: f32):
+    %s = arith.addf %x, %acc : f32
+    linalg.yield %s : f32
+  } -> tensor<128x96xf32>
+  ktdp.store %r, %ot : tensor<128x96xf32>, <128x96xindex>
+  tt.return
+}
 }

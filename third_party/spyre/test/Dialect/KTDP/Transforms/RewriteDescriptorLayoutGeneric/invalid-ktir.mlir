@@ -299,3 +299,111 @@ tt.func @sliced_consumer(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
   tt.return
 }
 }
+
+// -----
+
+// Case 12 -- an INDIRECT access tile whose block shape has no static physical
+// form.
+//
+// Cases 5 to 8 said this for a direct tile; the indirect twin is a separate path
+// through the pass, with its own four checks, and these are those four. The block
+// extent on the gathered dim is a runtime symbol, so the rebuilt tile's type has
+// no extent to state there.
+#o12 = affine_map<(d0, d1) -> (d0, d1)>
+#sidx12 = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
+#sdata12 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#sdyn12 = affine_set<(d0, d1)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+tt.func @indirect_dynamic_block_shape(%data: !tt.ptr<f32>, %idx: !tt.ptr<i32>, %n: index) {
+  %c0 = arith.constant 0 : index
+  %ii = builtin.unrealized_conversion_cast %idx : !tt.ptr<i32> to index
+  %iv = ktdp.construct_memory_view %ii, sizes: [32], strides: [1] {coordinate_set = #sidx12, memory_space = #ktdp.memory_space<global>} : memref<32xi32>
+  %di = builtin.unrealized_conversion_cast %data : !tt.ptr<f32> to index
+  %dv = ktdp.construct_memory_view %di, sizes: [512, 128], strides: [128, 1] {coordinate_set = #sdata12, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<512x128xf32>
+  // expected-error @below {{tts.tensor_layout: cannot derive a static physical block shape for this indirect access tile}}
+  %dt = ktdp.construct_indirect_access_tile intermediate_variables(%v0, %v1) %dv[ind(%iv[%c0 + %v0]), (%c0 + %v1)] symbols(%n) {variables_space_order = #o12, variables_space_set = #sdyn12} : memref<512x128xf32>, memref<32xi32> -> !ktdp.access_tile<?x128xindex>
+  %dl = ktdp.load %dt : <?x128xindex> -> tensor<?x128xf32>
+  tt.return
+}
+}
+
+// -----
+
+// Case 13 -- an indirect access tile user that is neither a load nor a store.
+//
+// physicalizeIndirectAccessTile re-points loads and stores at the physical tile
+// and erases the logical one, so any other user would be left reading an erased
+// value. The direct twin is case 8.
+#o13 = affine_map<(d0, d1) -> (d0, d1)>
+#sidx13 = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
+#sdata13 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#stile13 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+tt.func private @sink_indirect_tile(%t: !ktdp.access_tile<32x128xindex>)
+tt.func @unexpected_indirect_tile_user(%data: !tt.ptr<f32>, %idx: !tt.ptr<i32>) {
+  %c0 = arith.constant 0 : index
+  %ii = builtin.unrealized_conversion_cast %idx : !tt.ptr<i32> to index
+  %iv = ktdp.construct_memory_view %ii, sizes: [32], strides: [1] {coordinate_set = #sidx13, memory_space = #ktdp.memory_space<global>} : memref<32xi32>
+  %di = builtin.unrealized_conversion_cast %data : !tt.ptr<f32> to index
+  %dv = ktdp.construct_memory_view %di, sizes: [512, 128], strides: [128, 1] {coordinate_set = #sdata13, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<512x128xf32>
+  %dt = ktdp.construct_indirect_access_tile intermediate_variables(%v0, %v1) %dv[ind(%iv[%c0 + %v0]), (%c0 + %v1)] {variables_space_order = #o13, variables_space_set = #stile13} : memref<512x128xf32>, memref<32xi32> -> !ktdp.access_tile<32x128xindex>
+  // expected-error @below {{tts.tensor_layout: unexpected user of an indirect access tile}}
+  tt.call @sink_indirect_tile(%dt) : (!ktdp.access_tile<32x128xindex>) -> ()
+  tt.return
+}
+}
+
+// -----
+
+// Case 14 -- a permuted variables_space_order on an indirect tile.
+//
+// The order determines the tile's shape from the variable space, and the rebuilt
+// tile states the identity over its physical dims -- so a permutation on the input
+// would be dropped. Here it is the transpose, which is why the tile arrives 128x32
+// over a variable space of 32x128. The direct twin is case 6.
+#perm14 = affine_map<(d0, d1) -> (d1, d0)>
+#sidx14 = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
+#sdata14 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#stile14 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+tt.func @permuted_variables_space_order(%data: !tt.ptr<f32>, %idx: !tt.ptr<i32>) {
+  %c0 = arith.constant 0 : index
+  %ii = builtin.unrealized_conversion_cast %idx : !tt.ptr<i32> to index
+  %iv = ktdp.construct_memory_view %ii, sizes: [32], strides: [1] {coordinate_set = #sidx14, memory_space = #ktdp.memory_space<global>} : memref<32xi32>
+  %di = builtin.unrealized_conversion_cast %data : !tt.ptr<f32> to index
+  %dv = ktdp.construct_memory_view %di, sizes: [512, 128], strides: [128, 1] {coordinate_set = #sdata14, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<512x128xf32>
+  // expected-error @below {{tts.tensor_layout: variables_space_order must be the identity to physicalize this tile; a permuted order would be overwritten}}
+  %dt = ktdp.construct_indirect_access_tile intermediate_variables(%v0, %v1) %dv[ind(%iv[%c0 + %v0]), (%c0 + %v1)] {variables_space_order = #perm14, variables_space_set = #stile14} : memref<512x128xf32>, memref<32xi32> -> !ktdp.access_tile<128x32xindex>
+  %dl = ktdp.load %dt : <128x32xindex> -> tensor<128x32xf32>
+  tt.return
+}
+}
+
+// -----
+
+// Case 15 -- a non-dense variables_space_set on an indirect tile.
+//
+// Same reason as case 14 for the set rather than the order: the rebuilt tile states
+// the dense range of its physical block, so a strided variable space would be lost.
+// This one is a stride-2 subset of the same range. The direct twin is case 7.
+#o15 = affine_map<(d0, d1) -> (d0, d1)>
+#sidx15 = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
+#sdata15 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#strided15 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 127 >= 0, d1 mod 2 == 0)>
+module {
+tt.func @non_dense_variables_space_set(%data: !tt.ptr<f32>, %idx: !tt.ptr<i32>) {
+  %c0 = arith.constant 0 : index
+  %ii = builtin.unrealized_conversion_cast %idx : !tt.ptr<i32> to index
+  %iv = ktdp.construct_memory_view %ii, sizes: [32], strides: [1] {coordinate_set = #sidx15, memory_space = #ktdp.memory_space<global>} : memref<32xi32>
+  %di = builtin.unrealized_conversion_cast %data : !tt.ptr<f32> to index
+  %dv = ktdp.construct_memory_view %di, sizes: [512, 128], strides: [128, 1] {coordinate_set = #sdata15, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<512x128xf32>
+  // expected-error @below {{tts.tensor_layout: variables_space_set must be the dense range of the tile shape to physicalize this tile; a non-dense set would be overwritten}}
+  %dt = ktdp.construct_indirect_access_tile intermediate_variables(%v0, %v1) %dv[ind(%iv[%c0 + %v0]), (%c0 + %v1)] {variables_space_order = #o15, variables_space_set = #strided15} : memref<512x128xf32>, memref<32xi32> -> !ktdp.access_tile<32x128xindex>
+  %dl = ktdp.load %dt : <32x128xindex> -> tensor<32x128xf32>
+  tt.return
+}
+}
