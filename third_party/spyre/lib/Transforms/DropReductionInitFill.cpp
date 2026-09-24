@@ -1,7 +1,9 @@
-//===- DropReductionInitFill.cpp - Drop a zero reduction init fill --------===//
+//===- DropReductionInitFill.cpp - Drop a reduction's init fill -----------===//
 //
-// Removes a `linalg.fill` of zero that supplies the `outs` of a reduction,
-// repointing that `outs` at the `tensor.empty` the fill wrote into.
+// Removes the `linalg.fill` that supplies the `outs` of a reduction, repointing
+// that `outs` at the `tensor.empty` the fill wrote into. The fill VALUE is not
+// read: what replaces it downstream is derived from the combiner, not from what
+// the fill states — see below.
 //
 // Why this is needed:
 //   tt.reduce lowers (LowerComputeOps) to a linalg.reduce whose `outs` is
@@ -15,17 +17,27 @@
 //   `ins` — never absorbs it). Hand-written reference KTIR states a bare
 //   tensor.empty for exactly this reason.
 //
-// Why the rewrite is sound, and why the gate is narrow:
+// Why the rewrite is sound, and what the two gates are:
 //   A reduction's payload READS its init operand — `linalg.reduce` names the
 //   operand `$inits` and its own ODS example writes `arith.addf %out, %in` — and
 //   `tensor.empty` has explicitly "unspecified" contents. So the rewritten IR is
-//   only well-defined because something downstream overwrites the accumulator
-//   before it is read: MapReductionPartials' "Step 2: zero-fill the accumulator".
-//   That reset is a hardcoded 0.0. The rewrite is therefore sound in exactly one
-//   situation — when that pass will run on this op, and the value it writes is
-//   the value the fill states.
+//   only well-defined because something downstream re-establishes the
+//   accumulator before it is read: MapReductionPartials' initializer, which asks
+//   `getNeutralAttr` for the neutral element OF THIS COMBINER and fills with the
+//   answer — 0.0 for addf/subf, 1.0 for mulf, -inf for maximumf, +inf for
+//   minimumf, 0.0 for the absmax form, and the integer counterparts.
 //
-//   Both halves of that are checked, because neither implies the other:
+//   That is a claim about the BACKEND, not about this IR, and it is the whole
+//   soundness argument: nothing here can verify it, and it can change without
+//   this file noticing. What follows from it is narrow but real — the combiner
+//   is not by itself a reason to refuse a reduction, because the reset is
+//   derived from the combiner. So there is no combiner allowlist here. A
+//   combiner the backend does not yet handle is the backend's diagnostic to
+//   emit; mirroring its table here only rots toward refusing reductions that
+//   have since started working.
+//
+//   What IS checked is shape, because the reset only happens to ops that pass
+//   actually rewrites:
 //
 //     isMapReductionPartialsShape  one `ins`, one `init` — mirroring that pass's
 //                                  own asserts. Excludes MATMUL above all: a
@@ -33,23 +45,32 @@
 //                                  whose neutral genuinely IS zero, so a
 //                                  fill-value-only gate would drop its init even
 //                                  though MapReductionPartials never rewrites a
-//                                  matmul and nothing would reset it.
+//                                  matmul and nothing would reset it. That
+//                                  hazard is a shape question and survives any
+//                                  widening of the combiner gate.
 //     simpleReductionPayload       body is exactly payload + yield, init read by
 //                                  the payload — the shape that pass clones and
 //                                  LinalgLowering maps to one vectorchain op.
-//     isZeroNeutralCombiner        addf/subf only. An allowlist, not a
-//                                  neutral-is-zero test: integer combiners have a
-//                                  zero neutral but abort the scheduler, whose
-//                                  reset is built as a float attribute, and
-//                                  maxnumf mis-lowers to abs_max.
-//     isConstantZero               the stated init matches what the reset writes.
 //
-//   Failing the first two means the fill is load-bearing, so it is LEFT ALONE and
-//   no diagnostic is emitted — this pass is not responsible for ops it cannot
+//   Failing either means the fill is load-bearing, so it is LEFT ALONE and no
+//   diagnostic is emitted — this pass is not responsible for ops it cannot
 //   reason about, and failing on them would break any pipeline that merely
-//   contains a matmul. Failing the last two means this IS our op but its init
-//   cannot be honoured (mulf wants 1.0, max wants -inf); both alternatives are
-//   wrong, so it is reported.
+//   contains a matmul. The pass therefore never fails.
+//
+//   The one thing no neutral table can recover is a SEEDED reduction: a fill of
+//   2.5 under an addf combiner states `2.5 + sum`, and this pass rewrites it to
+//   `sum`, silently. A bias is not a property of the combiner, so the backend
+//   cannot restore it. Unreachable from anything above this pass — `tl.reduce` /
+//   `tl.sum` / `tl.max` take no init parameter and `tt.reduce`'s ODS has no init
+//   operand — so it is a hand-written-KTIR hazard only, pinned by a test rather
+//   than gated here.
+//
+// This pass is a TEMPORARY fixup, and the intended end state is DELETION rather
+// than more gates: it exists only because the scheduler rejects the
+// `linalg.fill` that upstream linalg semantics require on a reduction's `outs`.
+// Once downstream consumes that fill directly — honouring the init it states
+// instead of re-deriving one — there is nothing left for this pass to do, and
+// the seeded-reduction unsoundness above goes away with it.
 //
 // Algorithm:
 //   1. Collect linalg ops that have at least one reduction iterator
@@ -60,19 +81,16 @@
 //   3. For each remaining `outs` operand defined by a linalg.fill whose own
 //      output is a tensor.empty:
 //      a. Skip    — the body is not a simple reduction.
-//      b. Reject  — the combiner's neutral is not zero, or the fill is non-zero.
-//      c. Rewrite — point the operand at the tensor.empty, and erase the fill
+//      b. Rewrite — point the operand at the tensor.empty, and erase the fill
 //                   if nothing else uses it.
 //
 //===----------------------------------------------------------------------===//
 
 #include "Transforms/Passes.h"
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
@@ -86,23 +104,17 @@ namespace mlir::triton::spyre {
 
 namespace {
 
-/// True iff `v` is defined by a constant whose value is zero, of either a float
-/// or an integer type. m_AnyZeroFloat accepts -0.0 as well as +0.0; both are
-/// additive identities, and both are what the scheduler's reset writes.
-bool isConstantZero(Value v) {
-  return matchPattern(v, m_AnyZeroFloat()) || matchPattern(v, m_Zero());
-}
-
 /// True iff `op` has the shape MapReductionPartials actually handles, and will
-/// therefore get its accumulator overwritten by that pass's zero reset.
+/// therefore get its accumulator re-established by that pass's initializer.
 ///
-/// This is the whole soundness argument, so the check mirrors that pass's own
-/// preconditions rather than approximating them: it asserts a single `ins` and a
-/// single `init`.
+/// With no combiner gate left this carries the whole soundness argument, so the
+/// check mirrors that pass's own preconditions rather than approximating them: it
+/// asserts a single `ins` and a single `init`.
 ///
 /// The single-input condition is what excludes a **matmul**: a contraction is an
-/// `addf`-accumulate reduction whose neutral genuinely is zero, so a gate that
-/// only looked at the fill value would drop its init — but MapReductionPartials
+/// `addf`-accumulate reduction whose neutral genuinely is zero, so neither a
+/// fill-value gate nor a combiner gate would stop this pass dropping its init —
+/// it passes both, which is how it slipped through once. But MapReductionPartials
 /// never rewrites a matmul, so nothing would reset that accumulator and the fill
 /// is load-bearing. Same for any other multi-operand reduction (argmax and
 /// friends, which carry an index lane).
@@ -136,19 +148,6 @@ Operation *simpleReductionPayload(linalg::LinalgOp op, OpOperand &init) {
   return payload;
 }
 
-/// True iff `payload` is a combiner whose neutral is zero AND which the
-/// scheduler lowers correctly with a zero reset.
-///
-/// Deliberately an allowlist of two, not "does its neutral happen to be zero".
-/// These are the only combiners that reach a correct answer today: `mul` needs
-/// 1.0, `max`/`min` need -/+inf, and `maxnumf` additionally mis-lowers to
-/// `abs_max`. Integer combiners (`addi`, `ori`) have a zero neutral but abort the
-/// scheduler outright, because its reset is built as a float attribute — so
-/// restricting to the float ops turns that abort into a diagnostic here.
-bool isZeroNeutralCombiner(Operation *payload) {
-  return isa<arith::AddFOp, arith::SubFOp>(payload);
-}
-
 struct DropReductionInitFillPass
     : public mlir::triton::spyre::impl::DropReductionInitFillBase<
           DropReductionInitFillPass> {
@@ -164,44 +163,30 @@ struct DropReductionInitFillPass
         reductions.push_back(op);
     });
 
-    // Keep going after a rejection so one run reports every fill it cannot
-    // handle, rather than costing the user one recompile per reduction.
-    bool anyFailed = false;
-    for (auto op : reductions) {
-      if (failed(dropOne(op, rewriter)))
-        anyFailed = true;
-    }
-    if (anyFailed)
-      signalPassFailure();
+    for (auto op : reductions)
+      dropOne(op, rewriter);
   }
 
-  /// Drops every zero `linalg.fill` feeding an `outs` operand of `op`.
+  /// Drops every `linalg.fill` feeding an `outs` operand of `op`.
   ///
-  /// Two distinct kinds of non-rewrite, deliberately not conflated:
+  /// There is only one kind of non-rewrite left, and it is silent: `op` is not a
+  /// reduction MapReductionPartials will ever touch (matmul or another
+  /// multi-operand contraction, a multi-result reduction, a non-trivial body).
+  /// The fill is load-bearing there because nothing downstream re-establishes
+  /// the accumulator, so leaving it is the correct and conservative answer.
+  /// Diagnosing it is not this pass's job either: whatever cannot lower it will
+  /// say so, and failing here would make any pipeline that merely *contains* a
+  /// matmul unable to run this fix.
   ///
-  ///  * **Skip, silently** — `op` is not a reduction MapReductionPartials will
-  ///    ever touch (matmul or another multi-operand contraction, a
-  ///    multi-result reduction, a non-trivial body). The fill is load-bearing
-  ///    there because nothing downstream resets the accumulator, so leaving it
-  ///    is the correct and conservative answer. Diagnosing it is not this pass's
-  ///    job either: whatever cannot lower it will say so, and failing here would
-  ///    make any pipeline that merely *contains* a matmul unable to run this fix.
-  ///
-  ///  * **Reject, with a diagnostic** — `op` IS a simple single-input reduction,
-  ///    so this pass is responsible for it, but its init cannot be discarded
-  ///    soundly (non-zero fill, or a combiner whose neutral is not zero). Both
-  ///    alternatives are wrong — dropping loses a stated init, keeping it is
-  ///    refused downstream — so the error is the only honest outcome.
-  ///
-  /// Operands that can be rewritten are rewritten even when a sibling is
-  /// rejected, so the IR is left partially modified on failure.
-  LogicalResult dropOne(linalg::LinalgOp op, IRRewriter &rewriter) {
-    LogicalResult result = success();
-
-    // Not a shape MapReductionPartials rewrites -> no zero reset downstream ->
-    // the fill must stay. This is the matmul case.
+  /// Nothing is rejected on the strength of the combiner or the fill VALUE. The
+  /// reset downstream is derived per combiner (`getNeutralAttr`), so a combiner
+  /// this pass has never heard of is for the backend to accept or refuse — see
+  /// the header.
+  void dropOne(linalg::LinalgOp op, IRRewriter &rewriter) {
+    // Not a shape MapReductionPartials rewrites -> no reset downstream -> the
+    // fill must stay. This is the matmul case.
     if (!isMapReductionPartialsShape(op))
-      return success();
+      return;
 
     for (OpOperand &out : op.getDpsInitsMutable()) {
       auto fill = out.get().getDefiningOp<linalg::FillOp>();
@@ -216,32 +201,8 @@ struct DropReductionInitFillPass
 
       // A body this pass does not recognise as a simple reduction is left alone
       // for the same reason as the matmul case above.
-      Operation *payload = simpleReductionPayload(op, out);
-      if (!payload)
+      if (!simpleReductionPayload(op, out))
         continue;
-
-      if (!isZeroNeutralCombiner(payload)) {
-        op->emitError("reduction 'outs' operand #")
-            << out.getOperandNumber() << " is combined with '"
-            << payload->getName().getStringRef()
-            << "', whose neutral element is not zero; the dataflow-scheduler "
-               "resets a reduction accumulator to zero regardless of the "
-               "combiner, so this reduction cannot be lowered correctly at all";
-        result = failure();
-        continue;
-      }
-
-      if (!isConstantZero(fill.getInputs()[0])) {
-        op->emitError("reduction 'outs' operand #")
-            << out.getOperandNumber()
-            << " is initialised by a linalg.fill of a non-zero value; the "
-               "dataflow-scheduler rejects linalg.fill and resets a reduction "
-               "accumulator to zero regardless of the combiner, so this "
-               "reduction cannot be lowered without discarding its stated "
-               "initial value";
-        result = failure();
-        continue;
-      }
 
       out.set(fill.getOutputs()[0]);
       // Only this reduction used it in the pipeline's own output, but a fill is
@@ -249,7 +210,6 @@ struct DropReductionInitFillPass
       if (fill->use_empty())
         rewriter.eraseOp(fill);
     }
-    return result;
   }
 };
 

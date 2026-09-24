@@ -1927,27 +1927,12 @@ struct RewriteDescriptorLayoutGenericPass
   /// replaces the op it is given, which would invalidate a user iterator held
   /// across the call.
   void collectAdjacentGenerics(SmallVectorImpl<linalg::GenericOp> &out) {
-    SmallPtrSet<Operation *, 8> seen;
-    auto note = [&](Operation *op) {
-      if (auto g = dyn_cast_or_null<linalg::GenericOp>(op))
-        if (seen.insert(g).second)
-          out.push_back(g);
-    };
-    for (const auto &entry : physViewOf) {
-      for (Operation *tile : entry.first->getResult(0).getUsers()) {
-        if (!isa<mlir::ktdp::ConstructAccessTilesOp,
-                 mlir::ktdp::ConstructIndirectAccessTilesOp>(tile))
-          continue;
-        for (Operation *user : tile->getResult(0).getUsers()) {
-          if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
-            for (Operation *consumer : ld.getResult().getUsers())
-              note(consumer);
-          } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
-            note(st.getDataTile().getDefiningOp());
-          }
-        }
-      }
-    }
+    SmallVector<Operation *> views, generics;
+    for (const auto &entry : physViewOf)
+      views.push_back(entry.first);
+    triton::ktdp::collectAdjacentGenerics(views, generics);
+    for (Operation *op : generics)
+      out.push_back(cast<linalg::GenericOp>(op));
   }
 
   /// No ModuleOp parameter: the recorded views are the entry points now, so

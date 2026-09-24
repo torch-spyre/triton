@@ -219,3 +219,167 @@ def reduce_one_tile(
     else:
         reduced = tl.min(a_tile, AXIS)
     out_desc.store([0], reduced)
+
+
+# ---------------------------------------------------------------------------
+# The statistic chain: a reduce whose own output is read back by a later
+# elementwise op. Two kernels, one per axis, and ``sum`` in both.
+#
+# TWO KERNELS rather than one with an ``AXIS`` constexpr, unlike
+# ``reduce_one_tile`` above, because the axis is not the only thing that differs.
+# The off-stick arm reads its statistic back through the descriptor it wrote; the
+# on-stick arm needs a SECOND descriptor over the same pointer, at a shape only
+# the physical layout has. Different argument lists, and one of them has to be
+# told the stick width.
+#
+# A SUBTRACT rather than a divide, for the ORACLE rather than for the lowering.
+# ``x / sum(x)`` has a denominator that is a sum of standard normals and can land
+# near zero, which would make the comparison a statement about catastrophic
+# cancellation instead of about the chain. ``x - sum(x)`` passes the statistic's
+# own error through unamplified, so an absolute tolerance sized in ulp of the
+# statistic is the whole story.
+#
+# ``sum`` and not ``max``, and the reason is the DTYPE and not the combiner: at
+# fp16 ``tl.max`` promotes to fp32 and emits an ``arith.extf`` that no pass here
+# lowers. DropReductionInitFill gates on shape alone, so the combiner itself
+# refuses nothing -- which makes the wall the promotion, and the promotion has
+# nothing to do with reading a statistic back.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def stat_chain_off_stick(
+    x_ptr,
+    stat_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    TILE_LAYOUT: tl.constexpr,
+    STAT_LAYOUT: tl.constexpr,
+):
+    """``out[m, n] = x[m, n] - sum(x[:, n])``, the statistic through HBM.
+
+    Two compute groups, and the second one is the point. ``reduce_one_tile`` at
+    ``AXIS=0`` already proves the first: folding the non-stick axis leaves the
+    stick split of N untouched, so the reduce is emitted at physical shape with
+    the surviving stick index as a batch dimension, and it reaches a binary and
+    launches. What is new here is a LATER compute reading that statistic back and
+    applying it to a full tile -- softmax's G1 and G2, with the max replaced by a
+    sum for the reason the banner above gives.
+
+    ONE DESCRIPTOR for the statistic, written and then read, and that is the
+    off-stick arm's whole advantage over its sibling. The statistic's surviving
+    logical dim IS the stick dim, so its layout PARTITIONS -- ``[N]`` becomes
+    ``[N/S, S]``, the element count unchanged -- and a partition is faithful to
+    the dense ``[N]`` buffer the host staged. So the logical form is a correct
+    description of the bytes, the same descriptor serves both roles, and the
+    kernel never has to name the stick width. Compare ``stat_chain_on_stick``,
+    which has to.
+
+    ``x`` is loaded twice, once per group: a load result may not be shared across
+    two compute groups.
+
+    The layouts are not optional here the way they are on the kernels above. The
+    arm exists to say what happens to a statistic chain under stick tiling, and
+    with no annotation there is nothing for it to say.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    # The reduce folds M, so the statistic is over N -- a whole number of sticks.
+    stat_desc = tl.make_tensor_descriptor(
+        stat_ptr, shape=[N], strides=[1], block_shape=[N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    tl.spyre_tensor_layout(x_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(out_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(stat_desc, STAT_LAYOUT)
+
+    # G1: fold the non-stick axis, store the statistic across the sticks of N.
+    x1 = x_desc.load([0, 0])
+    stat_desc.store([0], tl.sum(x1, axis=0))
+
+    # G2: read the same descriptor back and apply it down every row.
+    x2 = x_desc.load([0, 0])
+    s = stat_desc.load([0])
+    out_desc.store([0, 0], x2 - s[None, :])
+
+
+@triton.jit
+def stat_chain_on_stick(
+    x_ptr,
+    stat_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    S: tl.constexpr,
+    TILE_LAYOUT: tl.constexpr,
+    STAT_LAYOUT: tl.constexpr,
+):
+    """``out[m, n] = x[m, n] - sum(x[m, :])``, the statistic through HBM.
+
+    The sibling above with the axis moved onto the stick, and that one change
+    costs the statistic its faithful logical form. ``reduce_one_tile_on_stick``'s
+    splat variant already proves the write half: under stick-on-N the lanes being
+    folded are read as one physical dim and the statistic is written as another,
+    so a partitioning floordiv/mod split has nowhere to put the surviving extent
+    and the layout has to SPLAT instead -- logical ``[M]`` becomes physical
+    ``[M, S]``, one whole stick per statistic.
+
+    TWO DESCRIPTORS OVER ONE POINTER, and the asymmetry between them is the
+    non-obvious part:
+
+    - ``stat_w`` is rank-1 ``[M]`` and carries the splat layout, so the reduce's
+      rank-1 result is stored across a stick apiece.
+    - ``stat_r`` is rank-2 ``[M, S]`` blocked ``[M, 1]`` and carries **no**
+      layout, because its logical shape already is its physical one. That is what
+      lets the consumer address a fixed lane, and it is why the read side is not
+      annotated at all -- an annotated statistic view asked for a ``[M, 1]`` block
+      is the refusal this sidesteps.
+
+    Lane 0 rather than the consumer's own lane, which is a device fact rather
+    than a style: the device replicates a statistic only 8 elements wide, not
+    ``S``, so a read at the lane matching one's own output would read memory
+    nothing ever wrote. Lane 0 is written for every row.
+
+    ``S`` is therefore a constexpr the kernel has to be told, and it is a LEAK:
+    the stick width is a property of the dtype and the hardware, and nothing else
+    in this file needs it -- the layouts carry theirs inside themselves. Here the
+    kernel has to restate it, in a descriptor over its own statistic buffer,
+    because there is no way to say "the physical shape of that buffer" in the
+    frontend. The off-stick sibling needs no such argument, which is what makes
+    this an on-stick cost rather than a chain cost.
+
+    ``x`` is loaded twice, once per group: a load result may not be shared across
+    two compute groups.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    # Store side: rank-1, splat. The layout pass derives the physical [M, S]
+    # strides, so the stride declared here is the logical one and is not
+    # load-bearing.
+    stat_w = tl.make_tensor_descriptor(
+        stat_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    # Read side: the same bytes seen as the [M, S] the splat made, one lane wide.
+    stat_r = tl.make_tensor_descriptor(
+        stat_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    tl.spyre_tensor_layout(x_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(out_desc, TILE_LAYOUT)
+    tl.spyre_tensor_layout(stat_w, STAT_LAYOUT)
+
+    # G1: fold the stick axis, store the statistic stick-wide.
+    x1 = x_desc.load([0, 0])
+    stat_w.store([0], tl.sum(x1, axis=1))
+
+    # G2: read lane 0 of the statistic and apply it across each row.
+    x2 = x_desc.load([0, 0])
+    s = stat_r.load([0, 0])
+    out_desc.store([0, 0], x2 - s)

@@ -15,9 +15,13 @@ serve the whole fixture: the output shape is the input's with axis 1 dropped.
 ## Variant hierarchy
 
 ```
-Level D  device               loop-free, stick-tiled; 2 variants, 1 launches
-         one_tile              1 key (folds the NON-stick axis; compiles_to_binary)
-         one_tile_on_stick     1 key (folds the STICK axis; ktir_cpu only)
+Level D  device               loop-free, stick-tiled; 5 variants, 4 launch
+         one_tile                   1 key (folds the NON-stick axis; launches)
+         one_tile_on_stick          1 key (folds the STICK axis, split; ktir_cpu only)
+         one_tile_on_stick_splat    1 key (the stick axis, statistic SPLAT; launches)
+      -- the reduce's CONSUMER: out = x - sum(x, axis), statistic through HBM
+         stat_chain_off_stick       1 key (launches; checked on both tiers)
+         stat_chain_on_stick        1 key (launches; ktir_cpu arm strict-xfailed)
 
 Level C  layout                stick physicalization, one dtype per variant
          spyre_stick               1 key (fp16, stick on the REDUCED axis)
@@ -102,16 +106,16 @@ checked more loosely than it can be.
 
 ### Level D — device
 
-**Two variants, one of which launches.** Both are the whole reduce in a single
+**Five variants, four of which launch**, in two groups: three that WRITE a
+statistic, and two that read one back. Every one is the whole reduce in a single
 stick-tiled tile with no `tl.program_id` and no loop — elementwise's Level D
 shape, the one that does reach a binary — so what they hit is reduce's own
 obstacle rather than the `scf.for` refusal every other variant here shares.
 
-They are two variants rather than one `AXIS` sweep because what divides them is
-`compiles_to_binary` and `atol`, which are *fields*: one variant cannot carry two
-answers. That is the same constraint that keeps Level C at two variants. Collapse
-them into a single `AXIS: [0, 1]` sweep the day the on-stick arm reaches the
-device too.
+The first group is three variants rather than one `AXIS` sweep because what
+divides them is `compiles_to_binary` and `atol`, which are *fields*: one variant
+cannot carry two answers. That is the same constraint that keeps Level C at two
+variants.
 
 The first obstacle is shared, and neither variant asserts it. dbo-opt stops on
 
@@ -128,10 +132,12 @@ emission matches torch-spyre's, whose emitter never writes a fill in the first
 place.
 
 It lives on the binary path rather than in the pipeline every path crosses because
-it is a requirement of dbo-opt, not of the IR — and because the pass refuses any
-combiner whose identity is not zero: the scheduler resets a reduction accumulator
-to zero whatever the combiner is, so it reports rather than miscompile. On the
-KTIR path a `max` reduce still lowers and still runs on `ktir_cpu`.
+it is a requirement of dbo-opt, not of the IR: a reduce stripped of its neutral
+element means what it says only because a later pass writes the accumulator before
+it is read, and no KTIR reader can see that. Its gate is shape alone — it does not
+look at the combiner, which the scheduler initialises correctly whatever it is.
+See the header of `DropReductionInitFill.cpp`. On the KTIR path a `max` reduce
+still lowers and still runs on `ktir_cpu`.
 
 Past that the two diverge, on what happens to the stick split:
 
@@ -168,5 +174,22 @@ Past that the two diverge, on what happens to the stick split:
   since nothing here runs on the device and it drifts only 0.0122 = 0.78 ulp —
   inheriting the sibling's 0.25 would check it 20x looser than it needs.
 
-Both assert the absence of `scf.for` structurally: no distribution loop and no
-stick loop.
+- **one_tile_on_stick_splat** (`reduce__one_tile_on_stick_splat[...]`) — the same
+  stick-axis fold, storing the statistic **splat** across a stick rather than
+  split across one. A splat replicates where a floordiv/mod partitions, which is
+  what gives the surviving extent somewhere to go, and the emitted reduce matches
+  what torch-spyre's own backend emits for `torch.sum(x, dim=-1)`. This is the arm
+  that reaches a binary where the split form cannot.
+
+All three assert the absence of `scf.for` structurally: no distribution loop and
+no stick loop.
+
+**The second group — the reduce's consumer.** `stat_chain_off_stick` and
+`stat_chain_on_stick` are `out = x - sum(x, axis)` with the statistic going
+through HBM: each arm's first compute group is verbatim one of the three above,
+and what is new is a SECOND group reading that statistic back and applying it to a
+full tile. Both launch. What they needed was not a layout change but a pass:
+reading a statistic back is a Triton broadcast, which used to survive to the
+layout pass as a generic with no descriptor and get bridged with a linearizing
+operand map; `FoldDataMovementGenerics` folds it into its consumer's map instead.
+The group banner in `meta.py` has the maps and the measurements.

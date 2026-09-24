@@ -16,4 +16,8 @@ add_triton_library(KTDPUtils
   MLIRIR
   # arith.index_cast, built by buildAccessTile.
   MLIRArithDialect
+  # linalg.generic, the far end of collectAdjacentGenerics.  The walk starts at
+  # a ktdp view and ends at a linalg op, which is exactly why it is shared: both
+  # of its callers span that same gap.
+  MLIRLinalgDialect
 )

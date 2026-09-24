@@ -4,6 +4,7 @@
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPTypes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -103,6 +104,48 @@ Value buildAccessTile(OpBuilder &builder, Location loc, Value memView,
       /*symbol_operands=*/ValueRange{}, buildRangeSetND(ctx, blockShape),
       identityMap);
   return accessTile.getResult();
+}
+
+//===----------------------------------------------------------------------===//
+// The layout rewrite's seed traversals
+//===----------------------------------------------------------------------===//
+
+void collectViewAccesses(Operation *memView,
+                         SmallVectorImpl<Operation *> &loads,
+                         SmallVectorImpl<Operation *> &stores) {
+  if (!memView || memView->getNumResults() != 1)
+    return;
+  for (Operation *tile : memView->getResult(0).getUsers()) {
+    if (!isa<mlir::ktdp::ConstructAccessTilesOp,
+             mlir::ktdp::ConstructIndirectAccessTilesOp>(tile))
+      continue;
+    for (Operation *user : tile->getResult(0).getUsers()) {
+      if (isa<mlir::ktdp::LoadOp>(user))
+        loads.push_back(user);
+      else if (isa<mlir::ktdp::StoreOp>(user))
+        stores.push_back(user);
+    }
+  }
+}
+
+void collectAdjacentGenerics(ArrayRef<Operation *> memViews,
+                             SmallVectorImpl<Operation *> &out) {
+  SmallPtrSet<Operation *, 8> seen;
+  auto note = [&](Operation *op) {
+    if (isa_and_nonnull<linalg::GenericOp>(op) && seen.insert(op).second)
+      out.push_back(op);
+  };
+  SmallVector<Operation *> loads, stores;
+  for (Operation *view : memViews) {
+    loads.clear();
+    stores.clear();
+    collectViewAccesses(view, loads, stores);
+    for (Operation *load : loads)
+      for (Operation *consumer : load->getResult(0).getUsers())
+        note(consumer);
+    for (Operation *store : stores)
+      note(cast<mlir::ktdp::StoreOp>(store).getDataTile().getDefiningOp());
+  }
 }
 
 } // namespace mlir::triton::ktdp

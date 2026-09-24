@@ -139,16 +139,42 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   //
   // Why DropReductionInitFill exists at all: LowerComputeOps gives every reduction
   // a zero `linalg.fill` on its `outs` per upstream linalg semantics, and the
-  // scheduler's allowlist is add/mul/sub/reduce. Device-only in both senses the
-  // stage's rule names -- it admits addf/subf alone, because the scheduler resets
-  // an accumulator to zero whatever the combiner is, so mul and max/min would get
-  // the wrong answer and are refused rather than silently lowered. A reduce
-  // stripped of its neutral element is correct only given that same zero-reset
-  // guarantee, which no KTIR reader can see.
+  // scheduler's allowlist is add/mul/sub/reduce, which rejects the fill.
+  //
+  // Device-only by the SECOND half of the stage's rule in Pipeline.h -- its output
+  // is not standalone KTIR. A reduce stripped of its neutral element means what it
+  // says only because a downstream pass writes the accumulator before it is read,
+  // and that pass is MapReductionPartials' initializer, which ktir_cpu never runs.
+  // No KTIR reader can see that.
+  //
+  // NOT by the first half, which used to be stated here and is false: the
+  // scheduler does not reset an accumulator to zero whatever the combiner is.
+  // MapReductionPartials' lowerIterArgInitializer asks getNeutralAttr and fills
+  // with the answer -- 0.0 for addf/subf, 1.0 for mulf, -inf for maximumf, +inf
+  // for minimumf, and the integer counterparts. So the combiner a reduction uses
+  // is not by itself a reason to refuse it, which is why the pass no longer
+  // gates on the combiner or on the fill value at all: its gate is shape only.
+  // See the header of DropReductionInitFill.cpp.
+  //
+  // The conclusion is unchanged and the pass does not move. Recorded because the
+  // wrong reason is the more memorable one, and it is the reason that would
+  // justify moving the pass back.
   pm.addPass(createDropReductionInitFillPass());
   pm.addPass(mlir::createConvertElementwiseToLinalgPass());
   pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
   pm.addPass(createUnaliasLinalgOutsPass());
+
+  // Every coordinate change becomes an `indexing_maps` entry on the generic that
+  // consumes it, so nothing whose only effect is to re-index survives.
+  //
+  // Both neighbours fix the position. It must follow the three passes above,
+  // which are what make every compute a linalg.generic: the fusion it drives
+  // matches generic -> generic, so a named producer or consumer blocks it whatever
+  // the control function says. And it must precede the layout pass below, whose
+  // behaviour it changes -- left in place, a data-movement generic has no layout
+  // marker, so that pass leaves its result logical and bridges the gap with a
+  // linearizing operand map the scheduler cannot project loop IVs through.
+  pm.addPass(createFoldDataMovementGenericsPass());
 
   // Logical descriptors -> physical (stick-tiled) layout, rooted on the
   // `tts.tensor_layout` attribute LowerTTSMarkers wrote onto each annotated
