@@ -81,6 +81,13 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
 
 void mlir::triton::spyre::buildSpyrecodePipeline(
     OpPassManager &pm, const SpyrecodePipelineOptions &options) {
+  // Ahead of everything else in the stage, and not part of what follows:
+  // upstream ops this tree emits legally but the toolchain below will not take
+  // become ones it will. A pattern host, so a future case is a pattern there
+  // rather than a line here; Passes.td has its ordering constraint and why it
+  // is in this stage rather than the one above.
+  pm.addPass(createNormalizeForDevicePass());
+
   // Physicalization is this stage's job, and the four passes below are it. The
   // `ktir` artifact carries LOGICAL descriptors plus a `tts.tensor_layout`
   // attribute on each annotated memory view; stick-tiling them happens here, on

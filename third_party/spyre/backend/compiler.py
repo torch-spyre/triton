@@ -122,6 +122,23 @@ _MAX_POINTER_ARGS = 7
 # ones, with no reverse map in tree — hence a regex rather than a second table.
 _MLIR_ELEM_BITS = re.compile(r"^(?:bf|[fiu])(\d+)")
 
+# Dtypes admitted into a tl.* math op beyond the allowlist upstream declares on
+# it, keyed by the op's name in triton.language.math and served through the
+# `extra_math_dtypes` codegen hook.
+#
+# These are the math-dialect ops LowerSpyreOps converts, whose
+# isSpyreOpScalarType is isa<Float16Type, Float32Type>. Its other patterns are
+# arith, which no @_check_dtype-decorated op reaches. That pass is the authority;
+# test_frontend_guards.py pins the two together.
+#
+# bf16 is excluded: standard.py's _promote_bfloat16_to_float32 widens bf16
+# reduces, so admitting it would claim support the frontend lacks.
+_EXTRA_MATH_DTYPES = {
+    "exp": ("fp16", ),
+    "sqrt": ("fp16", ),
+    "rsqrt": ("fp16", ),
+}
+
 
 def _elem_bytes(pointee: str) -> int:
     match = _MLIR_ELEM_BITS.match(pointee)
@@ -510,8 +527,17 @@ class SpyreBackend(BaseBackend):
         handles arbitrary tile sizes), so we return ``(1, 1, 1)``
         matching AMD and the interpreter. Revisit this if a future
         KTIR matmul path needs a minimum.
+
+        ``extra_math_dtypes(op_name)`` returns the dtype names this
+        target's intrinsic for that ``tl.*`` math op covers beyond the
+        allowlist upstream declares on it. See ``_EXTRA_MATH_DTYPES``.
+        Unlike ``min_dot_size`` the frontend treats it as optional, so a
+        backend that omits it keeps upstream's allowlists unchanged.
         """
-        return {"min_dot_size": lambda lhsType, rhsType: (1, 1, 1)}
+        return {
+            "min_dot_size": lambda lhsType, rhsType: (1, 1, 1),
+            "extra_math_dtypes": lambda op_name: _EXTRA_MATH_DTYPES.get(op_name, ()),
+        }
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}

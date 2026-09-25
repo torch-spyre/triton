@@ -28,7 +28,7 @@ with a GPU.
 import numpy as np
 import pytest
 
-from conftest import EXAMPLES
+from conftest import EXAMPLES, tolerances
 
 # torch BEFORE torch_spyre, and that order is a finding rather than a style
 # choice: torch auto-loads torch_spyre as a device-backend extension, so reaching
@@ -133,5 +133,4 @@ class TestDeviceLaunch:
             f"launched with (shape {output.shape})")
 
         np.testing.assert_allclose(output, entry["reference"](inputs),
-                                   rtol=entry.get("rtol", 1e-6),
-                                   atol=entry.get("atol", 0.0))
+                                   **tolerances(entry, key=compilable_example))

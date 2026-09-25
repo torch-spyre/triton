@@ -19,7 +19,7 @@ fixture.
 """
 
 import pytest
-from conftest import EXAMPLES, KTIRCpuTester
+from conftest import EXAMPLES, KTIRCpuTester, tolerances
 
 # ---------------------------------------------------------------------------
 # Discovered variants — subset of EXAMPLES that came in via meta.py discovery
@@ -129,5 +129,4 @@ class TestExample(KTIRCpuTester):
         ref = entry["reference"](inputs)
         output_key = entry["output_key"]
         np.testing.assert_allclose(outputs[output_key], ref,
-                                   rtol=entry.get("rtol", 1e-6),
-                                   atol=entry.get("atol", 0))
+                                   **tolerances(entry, key=key))

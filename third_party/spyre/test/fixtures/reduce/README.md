@@ -99,10 +99,11 @@ The two arms are chosen for where the stick lands relative to the reduced axis.
   indices would be the identity here and reduce the wrong axis.
 
 One dtype per variant, spelled once, in the `params` row that carries `N` (or
-`D2`) and the layouts that follow from it. A second dtype row would be one line;
-what keeps it out is that `rtol`/`atol` are fields rather than params, so both
-rows would share the tolerance the wider dtype needs and the fp32 arm would be
-checked more loosely than it can be.
+`D2`) and the layouts that follow from it. A second dtype row would be one line,
+and the tolerance no longer keeps it out: `rtol`/`atol` take a dict keyed by
+dtype (`tolerances` in `test/conftest.py`), so one entry can hold both rows and
+still check the fp32 arm as tightly as it deserves. Collapsing the pair is a
+rewrite nobody has done, not one the grammar refuses.
 
 ### Level D — device
 
