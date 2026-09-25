@@ -28,26 +28,31 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // would handle the tensor-of-pointers tt.load this one leaves legal.]
   pm.addPass(createLowerScalarLoadPass());
 
-  // Each tts marker op's annotation -> an attribute on the op the value it
-  // names resolved to. Bounded on both sides: after LowerDescriptorMemory,
-  // because the op a tts.tensor_layout lands on is the memory view that pass
-  // builds and the bridge cast it resolves through is that pass's; before
-  // LowerComputeOps, which is a partial conversion that knows nothing of tts
-  // and would fail the marker as unconverted. LowerScalarLoad in between is
-  // indifferent to markers and merely keeps them legal.
-  pm.addPass(tts::createLowerTTSMarkersPass());
-
-  // Each tts.pin -> the buffer it asked for, plus the store and loads that route
-  // the value through it. Bounded on the same two sides and for the same reasons,
-  // so this and LowerTTSMarkers share a window; their order within it does not
-  // matter, because that pass reaches views built for DESCRIPTORS and this one
-  // builds views for INTERMEDIATES, which carry no layout annotation. The grid is
-  // passed because a pinned address may be affine in tl.program_id(0), and
-  // prod(grid) is what bounds the set of addresses such a pin occupies.
-  pm.addPass(tts::createPlacePinnedValuesPass(options.grid));
-
   // tt.reduce/broadcast/expand_dims/dot -> linalg + tensor, and a dead-op sweep.
   pm.addPass(createLowerComputeOpsPass());
+
+  // Each tts marker op's annotation -> an attribute on the op the value it
+  // names resolved to. Bounded below by two passes, one per marker:
+  //
+  //   LowerDescriptorMemory  a tts.tensor_layout lands on the memory view that
+  //                          pass builds, reached through the bridge cast it
+  //                          also builds.
+  //   LowerComputeOps        a tts.pin lands on the op PRODUCING the pinned
+  //                          value, so that op has to be its final form. A
+  //                          pinned reduction is a tt.reduce until here and a
+  //                          linalg.reduce after, and this pass replaces the
+  //                          one with the other -- an attribute written on the
+  //                          tt.reduce would go with it.
+  //
+  // Both markers are legal through the passes between: LowerComputeOps converts
+  // by an explicit illegal-op list, which names no tts op, so a marker reaching
+  // it passes through untouched, and it marks the bridge cast legal.
+  //
+  // Nothing bounds this from above yet. The pass that consumes the tts.pin
+  // attribute -- building the buffer, the store and the loads -- belongs at the
+  // head of the `spyrecode` stage, ahead of every pass there that replaces a
+  // compute op and would drop the annotation. It is not written.
+  pm.addPass(tts::createLowerTTSMarkersPass());
 
   // tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery. After
   // LowerComputeOps, because the partials it consumes have to be linalg/tensor

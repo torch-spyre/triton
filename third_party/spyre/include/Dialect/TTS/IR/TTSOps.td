@@ -97,32 +97,40 @@ def TTS_PinOp : TTS_Op<"pin", []> {
     address, matching what `ktdp.construct_memory_view`'s `$offset` operand
     feeds. It is optional because the design's baseline is that the compiler
     places every intermediate and a pin is an override; no pass honours an
-    unaddressed pin yet. It is an SSA operand rather than an attribute because that is the form
-    the offset is consumed in, and `i32` rather than `index` because that is what
-    `tl.program_id` yields, which keeps the verifier's structural walk free of
-    casts. Two forms are admitted and nothing else:
+    unaddressed pin yet.
 
-      constant                 one address, the same on every core
-      base + pid * stride      affine in the program id, constant coefficients
+    It is an ATTRIBUTE and not an SSA operand, which is what lets the marker
+    become an attribute on the op producing the pinned value -- an operand would
+    have nowhere to go. Two spellings, and the difference is per-core:
 
-    The restriction is what keeps a pin's address SET finite and enumerable, and
-    so keeps capacity, alignment and disjointness answerable about it. An address
-    read from memory forfeits all three.
+      `address = 4096 : i32`               one address, the same on every core
+      `address = array<i32: 4096, 6144>`   one per program id, positionally
+
+    Both are numbers rather than an expression, so the set of addresses a pin
+    occupies is known here and needs no matcher to recover: capacity, alignment
+    and disjointness are all answerable by arithmetic on the attribute. An
+    address computed in the IR would forfeit that, which is why the operand form
+    is gone.
+
+    An author writing an affine address states the arm per core rather than the
+    coefficients. The array is therefore what a `lambda pid: ...` surface would
+    evaluate to, and a consumer wanting `base + ctid*stride` recovers the two
+    coefficients by asking whether the array is an arithmetic progression --
+    a question about integers, not about op structure.
 
     Example:
     ```mlir
-      %c4096 = arith.constant 4096 : i32
-      tts.pin %e, address %c4096 {memory_space = "ct_local"} : tensor<2x11x2049xf16>
+      tts.pin %e {memory_space = "ct_local", address = 4096 : i32} : tensor<2x11x2049xf16>
     ```
   }];
 
   let arguments = (ins
     AnyStaticShapeTensor:$value,
-    Optional<I32>:$address,
-    StrAttr:$memory_space
+    StrAttr:$memory_space,
+    OptionalAttr<AnyAttrOf<[I32Attr, DenseI32ArrayAttr]>>:$address
   );
 
-  let assemblyFormat = "$value (`,` `address` $address^)? attr-dict `:` type($value)";
+  let assemblyFormat = "$value attr-dict `:` type($value)";
   let hasVerifier = 1;
 }
 

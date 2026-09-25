@@ -9,9 +9,9 @@
 // the `tts.tensor_layout` *attribute*, which the lowered IR carries on the
 // memory view — and the one structural checker both are enforced by.
 //
-// And one placement marker, `tts.pin`, which has no attribute form: see the op's
-// description for why a value pin cannot become one. What it shares with its
-// consumer is `matchPinAddress` at the bottom of this header.
+// And one placement marker, `tts.pin`, in the same two spellings: the op, which
+// a kernel authors on a value, and the `tts.pin` attribute, which the lowered IR
+// carries on the op producing that value.
 //
 //===----------------------------------------------------------------------===//
 
@@ -251,26 +251,32 @@ LogicalResult readTensorLayoutArrays(
     ArrayRef<int64_t> &physArg,
     llvm::function_ref<InFlightDiagnostic()> emitError);
 
-/// Recover a pinned address expression's `(base, stride)`, or fail.
+/// The rules a `tts.pin`'s fields obey, checked once for the two forms that hold
+/// them: `PinOp::verify`, where they are the op's own ODS attributes, and the
+/// dialect's `verifyOperationAttribute`, where they are entries in a dictionary.
 ///
-/// The two forms `tts.pin` admits — a constant, or `base + tl.program_id(0) *
-/// stride` with constant coefficients — reduced to the two numbers that describe
-/// the whole set of addresses the pin will occupy, `{base + i*stride : i < grid}`.
-/// A bare constant gives `stride = 0`, so one pair covers both forms and a
-/// consumer needs no case analysis.
+/// Split from `readPinAttr` below for the same reason the layout's pair is split:
+/// the op form arrives with both fields already typed by ODS and needs only the
+/// semantics, while the attribute form has to get past its spelling first.
 ///
-/// Shared by the two callers for the same reason `verifyTensorLayoutArrays` is:
-/// `PinOp::verify` asks only *whether* the expression has one of those shapes,
-/// `PlacePinnedValues` asks *what* it is in order to check capacity, alignment
-/// and overlap — and a second matcher would answer the first question
-/// differently from the second on the next form anyone admits.
+/// `address` may be null, which is the unaddressed pin and is accepted here --
+/// whether a consumer can do anything with one is that consumer's rule.
 ///
-/// Conservative where it is cheaper to be: two program-id terms describe an
-/// admissible set and are refused rather than summed. See the definition.
-///
-/// `addr` may be null, which fails: a pin with no address has no range, and the
-/// caller that cares has already decided what that means.
-LogicalResult matchPinAddress(Value addr, int64_t &base, int64_t &stride);
+/// What it enforces:
+///   - `memorySpace` names a `ktdp::MemorySpaceKind`;
+///   - that kind is `ct_local`, the only one a pin may name;
+///   - a non-null `address` is an `i32` or a non-empty dense i32 array.
+LogicalResult
+verifyPinFields(StringRef memorySpace, Attribute address,
+                llvm::function_ref<InFlightDiagnostic()> emitError);
+
+/// Read `tts.pin` off an op and check its shape as an attribute: a dictionary of
+/// a `memory_space` string and an optional `address`. On success both are handed
+/// back, `address` null when the dictionary omitted it; on failure a diagnostic
+/// has been emitted through `emitError`.
+LogicalResult readPinAttr(Attribute value, StringRef &memorySpace,
+                          Attribute &address,
+                          llvm::function_ref<InFlightDiagnostic()> emitError);
 
 } // namespace mlir::triton::tts
 

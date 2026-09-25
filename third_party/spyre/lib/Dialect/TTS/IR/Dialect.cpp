@@ -297,35 +297,135 @@ LogicalResult readTensorLayoutArrays(
   return success();
 }
 
+LogicalResult
+verifyPinFields(StringRef memorySpace, Attribute address,
+                llvm::function_ref<InFlightDiagnostic()> emitError) {
+  // The memory-space vocabulary is ktdp's, reached through its own symbolizer so
+  // the two names are never restated here.
+  auto kind = mlir::ktdp::symbolizeMemorySpaceKind(memorySpace);
+  if (!kind)
+    return emitError() << "tts.pin: unknown memory space '" << memorySpace
+                       << "': expected 'ct_local'";
+
+  // `global` is a KNOWN kind and still not pinnable, so it gets its own message
+  // rather than being reported as a misspelling: an intermediate in HBM is
+  // written as a descriptor with an explicit store and load.
+  if (*kind != mlir::ktdp::MemorySpaceKind::ct_local)
+    return emitError() << "tts.pin: memory space '" << memorySpace
+                       << "' cannot be pinned: only 'ct_local' is";
+
+  if (!address)
+    return success();
+
+  // An EMPTY array names no address for any core, so it is neither the uniform
+  // spelling nor the per-core one, and a consumer indexing it by the program id
+  // reads out of bounds on the first core.
+  if (auto perCore = dyn_cast<DenseI32ArrayAttr>(address)) {
+    if (perCore.empty())
+      return emitError() << "tts.pin: address array is empty: state one address "
+                            "per program id, or a single i32 for an address "
+                            "that is the same on every core";
+    return success();
+  }
+
+  // On the op these two spellings are a type constraint ODS enforces; in a
+  // dictionary nothing has checked them yet, so this is where the attribute form
+  // earns the same guarantee.
+  auto uniform = dyn_cast<IntegerAttr>(address);
+  if (!uniform || !uniform.getType().isInteger(32))
+    return emitError() << "tts.pin: address must be an i32 or a dense i32 array";
+  return success();
+}
+
+LogicalResult readPinAttr(Attribute value, StringRef &memorySpace,
+                          Attribute &address,
+                          llvm::function_ref<InFlightDiagnostic()> emitError) {
+  auto dict = dyn_cast<DictionaryAttr>(value);
+  if (!dict)
+    return emitError() << "tts.pin: expected a dictionary attribute";
+
+  Attribute space = dict.get(TTSDialect::kMemorySpaceName);
+  if (!space)
+    return emitError() << "tts.pin: missing '" << TTSDialect::kMemorySpaceName
+                       << "' entry";
+  auto spaceStr = dyn_cast<StringAttr>(space);
+  if (!spaceStr)
+    return emitError() << "tts.pin: '" << TTSDialect::kMemorySpaceName
+                       << "' must be a string";
+  memorySpace = spaceStr.getValue();
+
+  // Optional, and its absence is meaningful: 0 is a legitimate element index, so
+  // "stated no address" cannot be spelled as a number.
+  address = dict.get(TTSDialect::kAddressName);
+
+  // Counted rather than ignored, so a typo'd entry name is an error instead of a
+  // field that silently does nothing.
+  size_t expected = address ? 2 : 1;
+  if (dict.size() != expected)
+    return emitError() << "tts.pin: expected the entries "
+                       << TTSDialect::kMemorySpaceName << " and optionally "
+                       << TTSDialect::kAddressName << ", got " << dict.size()
+                       << " entries";
+  return success();
+}
+
 LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
                                                    NamedAttribute attribute) {
   StringRef name = attribute.getName().strref();
-  if (name != kTensorLayoutAttrName)
-    return op->emitError("attribute '")
-           << name << "' is not one the tts dialect defines";
-
-  // The layout describes the tensor a memory view addresses, so there is
-  // nothing for it to mean anywhere else — and on the wrong op it would be
-  // inert rather than wrong, which is the failure worth catching here.
-  auto view = dyn_cast<mlir::ktdp::ConstructMemoryViewOp>(op);
-  if (!view)
-    return op->emitError("'")
-           << kTensorLayoutAttrName
-           << "' is only meaningful on a ktdp.construct_memory_view, which "
-              "this op is not";
-
   auto emitError = [&]() { return op->emitError(); };
-  ArrayRef<int64_t> physSrc, physOp, physArg;
-  if (failed(readTensorLayoutArrays(attribute.getValue(), physSrc, physOp,
-                                    physArg, emitError)))
-    return failure();
 
-  // The logical rank is the view's own rank. That is the same rank the op form
-  // measured against — it read the descriptor's BLOCK type, whose extents
-  // differ from the view's but whose rank does not.
-  auto memrefTy = cast<MemRefType>(view.getResult().getType());
-  return verifyTensorLayoutArrays(physSrc, physOp, physArg,
-                                  memrefTy.getRank(), emitError);
+  if (name == kTensorLayoutAttrName) {
+    // The layout describes the tensor a memory view addresses, so there is
+    // nothing for it to mean anywhere else — and on the wrong op it would be
+    // inert rather than wrong, which is the failure worth catching here.
+    auto view = dyn_cast<mlir::ktdp::ConstructMemoryViewOp>(op);
+    if (!view)
+      return op->emitError("'")
+             << kTensorLayoutAttrName
+             << "' is only meaningful on a ktdp.construct_memory_view, which "
+                "this op is not";
+
+    ArrayRef<int64_t> physSrc, physOp, physArg;
+    if (failed(readTensorLayoutArrays(attribute.getValue(), physSrc, physOp,
+                                      physArg, emitError)))
+      return failure();
+
+    // The logical rank is the view's own rank. That is the same rank the op form
+    // measured against — it read the descriptor's BLOCK type, whose extents
+    // differ from the view's but whose rank does not.
+    auto memrefTy = cast<MemRefType>(view.getResult().getType());
+    return verifyTensorLayoutArrays(physSrc, physOp, physArg,
+                                    memrefTy.getRank(), emitError);
+  }
+
+  if (name == kPinAttrName) {
+    // No constraint on WHICH op, unlike the layout: a pin is about a value, and
+    // any op producing one is an equally valid carrier. What is constrained is
+    // that the carrier produce exactly one value, because the annotation names
+    // no result index -- on a multi-result op it could not say which result it
+    // is about, and guessing the first would be silent.
+    if (op->getNumResults() != 1)
+      return op->emitError("'")
+             << kPinAttrName << "' is about one value, so it needs an op with "
+             << "exactly one result to name; this op has "
+             << op->getNumResults();
+
+    if (!isa<RankedTensorType>(op->getResult(0).getType()))
+      return op->emitError("'")
+             << kPinAttrName
+             << "' annotates a buffer for a tensor, but this op's result is "
+             << op->getResult(0).getType();
+
+    StringRef memorySpace;
+    Attribute address;
+    if (failed(readPinAttr(attribute.getValue(), memorySpace, address,
+                           emitError)))
+      return failure();
+    return verifyPinFields(memorySpace, address, emitError);
+  }
+
+  return op->emitError("attribute '")
+         << name << "' is not one the tts dialect defines";
 }
 
 } // namespace mlir::triton::tts

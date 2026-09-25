@@ -66,6 +66,26 @@ def TTS_Dialect : Dialect {
     static constexpr ::llvm::StringLiteral kPhysSrcName = "phys_src";
     static constexpr ::llvm::StringLiteral kPhysOpName = "phys_op";
     static constexpr ::llvm::StringLiteral kPhysArgName = "phys_arg";
+
+    /// Where a pinned intermediate's buffer lives, as a `DictionaryAttr` on the
+    /// op PRODUCING the value, with the two entries `tts.pin` carried as an op:
+    ///
+    ///   memory_space : a `ktdp::MemorySpaceKind` name, today only "ct_local"
+    ///   address      : an element index -- one `i32` for an address that is the
+    ///                  same on every core, or a `DenseI32ArrayAttr` holding one
+    ///                  per program id. Absent when the pin named no address.
+    ///
+    /// The producing op is the carrier because a pin names a VALUE, and a value's
+    /// only op is the one defining it. That is also why a pinned block argument
+    /// has no attribute form: see `LowerTTSMarkers`, which refuses one.
+    ///
+    /// Discardable, and builtin-valued like the layout above, so a consumer that
+    /// does not load this dialect still round-trips it.
+    static constexpr ::llvm::StringLiteral kPinAttrName = "tts.pin";
+
+    /// The two entry names of that dictionary.
+    static constexpr ::llvm::StringLiteral kMemorySpaceName = "memory_space";
+    static constexpr ::llvm::StringLiteral kAddressName = "address";
   }];
 
   let hasOperationAttrVerify = 1;
