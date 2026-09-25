@@ -116,13 +116,24 @@ tt.func @accepted_forms(%x: tensor<4x64xf16>) {
 }
 
 // -----
-// A BLOCK ARGUMENT, refused for where it already lives rather than for anything
-// about the annotation. An entry input is global: it sits at the address its base
-// pointer supplies, which the launcher fills in, so pinning one to `ct_local`
-// asks to relocate a kernel argument. A pin places an intermediate -- something
-// an op in this function produced.
+// A BLOCK ARGUMENT. Refused because no op produces it, so nothing can carry the
+// annotation -- and the message says only that, because there are two kinds of
+// block argument and they are unalike:
+//
+//   an ENTRY input        is global, at the address its base pointer supplies.
+//                         Pinning it asks to relocate a kernel argument.
+//   a LOOP-CARRIED value  is an `scf.for` iter_arg -- an attention accumulator is
+//                         one, see RewriteDescriptorLayout/parallel-scatter-iter-arg.mlir
+//                         -- and is NOT global. It is a live intermediate and a
+//                         plausible thing to pin; it is refused because nothing
+//                         has decided what pinning one means, one buffer reused
+//                         each iteration or one per iteration. Its RESULT, outside
+//                         the loop, has a producer and is pinnable.
+//
+// Asserting "entry input" would therefore be false half the time, which is why the
+// diagnostic names the shared fact and points at the loop-result workaround.
 tt.func @block_argument(%x: tensor<4x64xf16>) {
-  // expected-error @+1 {{names a block argument, which is an entry input and lives where its base pointer says}}
+  // expected-error @+1 {{names a block argument, which no op produces, so there is nothing to carry the annotation}}
   tts.pin %x {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<4x64xf16>
   tt.return
 }

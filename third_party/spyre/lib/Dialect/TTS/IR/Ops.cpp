@@ -43,21 +43,30 @@ LogicalResult TensorLayoutOp::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult PinOp::verify() {
-  // A block argument is refused, and the reason is about WHERE IT ALREADY LIVES
-  // rather than about the annotation. An entry input is global: it lives at the
-  // address its base pointer supplies, which the launcher fills in, so a pin
-  // asking for it in `ct_local` is asking to relocate a kernel argument. That is
-  // not what a pin does -- a pin says where an INTERMEDIATE's buffer goes, and an
-  // intermediate is by definition something an op in this function produced.
+  // A block argument has no op to carry the annotation, and there are two kinds
+  // with two different reasons -- so the message says the common fact and does not
+  // assert either.
+  //
+  //   an ENTRY input        is global, living at the address its base pointer
+  //                         supplies, which the launcher fills in. Pinning it to
+  //                         `ct_local` asks to relocate a kernel argument, which
+  //                         is not what a pin does.
+  //   a LOOP-CARRIED value  is an `scf.for` iter_arg, and is emphatically NOT
+  //                         global -- it is a live intermediate, an accumulator,
+  //                         and a plausible thing to want pinned. It is refused
+  //                         because nothing has decided what pinning one means:
+  //                         one buffer reused every iteration, or one per
+  //                         iteration. Its RESULT, outside the loop, is pinnable.
   //
   // Here rather than in the lowering because it is answerable from the op alone:
   // whether a value is a block argument needs no pass context. The lowering has
   // its own reason to want a defining op -- it is the attribute's carrier -- but
   // that is a consequence, not the rule.
   if (isa<BlockArgument>(getValue()))
-    return emitError() << "tts.pin names a block argument, which is an entry "
-                          "input and lives where its base pointer says; a pin "
-                          "places an intermediate some op here produced";
+    return emitError() << "tts.pin names a block argument, which no op produces, "
+                          "so there is nothing to carry the annotation; pin a "
+                          "value an op in this function produces -- for a value "
+                          "carried by a loop, the loop's result outside it";
 
   // Everything below is a rule about the FIELDS, and this is the only place they
   // are checked. The attribute form is built from fields that have already passed

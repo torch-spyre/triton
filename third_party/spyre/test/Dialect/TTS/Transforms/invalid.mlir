@@ -66,18 +66,23 @@ tt.func @two_pins_on_one_value(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
 
 // -----
 
-// A producer with several results. An attribute attaches to an OP and not to a
-// value, so on a multi-result producer it could not say which result is pinned,
-// and taking it to mean the first would be silent. `tt.split` is the multi-result
-// op this tree has.
+// A producer with several results. UNSUPPORTED rather than ill formed: the value
+// is a good thing to pin and what is missing is a spelling, since one attribute on
+// the producer can carry one pin and has no way to say which result it is for.
+//
+// Reachable from a loop carrying more than one value -- softmax/meta.py records a
+// `%denom:2 = scf.for ... -> (T, T)` -- so the workaround is at the kernel level:
+// one carried value per loop, which every loop in that fixture's kernel already
+// does. `tt.split` stands in for it here because it is the multi-result op that
+// needs no loop to write.
 //
 // The pinned VALUE is well formed, which is why this is the lowering's rule and
-// not the op's: the op holds its value as an operand and can check that: only
-// resolution knows which op is about to carry the annotation.
+// not the op's: the op holds its value as an operand and can check that, while
+// only resolution knows which op is about to carry the annotation.
 tt.func @multi_result_producer(%t: tensor<8x2xf32>) -> tensor<8xf32> {
   // expected-note @+1 {{the producer is here}}
   %0, %1 = tt.split %t : tensor<8x2xf32> -> tensor<8xf32>
-  // expected-error @+1 {{tts.pin names a value whose producer has 2 results, so an attribute on it could not say which one is pinned}}
+  // expected-error @+1 {{pinning one result of a 2-result op is not supported: the annotation is one attribute on the producer, so it cannot say which result it is for}}
   tts.pin %0 {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<8xf32>
   tt.return %0 : tensor<8xf32>
 }

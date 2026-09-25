@@ -212,17 +212,34 @@ static Operation *resolvePin(mlir::triton::tts::PinOp marker) {
     return nullptr;
   }
 
-  // An attribute attaches to an OP, not to a value, so it cannot say which result
-  // it is about. On a producer with several -- `tt.split` is the one this tree has
-  // -- the annotation would be ambiguous, and taking it to mean the first would be
-  // silent. The pinned value is well formed either way, which is why this is not
-  // the op's rule: what fails is that its producer has no unambiguous slot.
+  // UNSUPPORTED rather than ill formed, and the difference is worth the wording:
+  // the value is a perfectly good thing to pin, and what is missing is a spelling.
+  // An attribute attaches to an OP and not to a value, so one dictionary can carry
+  // one pin; a producer with several results needs the annotation to say which
+  // result each pin is for, and it has no way to.
+  //
+  // Reachable from a loop carrying more than one value -- `%acc:2 = scf.for ... ->
+  // (T, T)` -- so the workaround is at the kernel level: carry one value per loop,
+  // which every loop in the softmax fixture already does and which makes both its
+  // accumulators pinnable.
+  //
+  // TODO: when this is wanted, make the attribute a LIST positional in the
+  // results -- `[{}, {...}]` -- with an empty dictionary for a result nobody
+  // pinned and a length equal to the result count. Position carries the result
+  // number, so no entry needs to name its own index.
+  //
+  // List-only, replacing today's bare dictionary rather than joining it. The
+  // attribute is an internal handoff: LowerTTSMarkers writes it and one pass in
+  // `spyrecode` consumes it, and nothing outside this tree ever reads it, since it
+  // is gone before the artifact goes out. So changing its shape costs nothing now,
+  // while two accepted spellings would cost every consumer forever.
   if (producer->getNumResults() != 1) {
     InFlightDiagnostic diag =
         marker.emitError()
-        << "tts.pin names a value whose producer has "
-        << producer->getNumResults()
-        << " results, so an attribute on it could not say which one is pinned";
+        << "pinning one result of a " << producer->getNumResults()
+        << "-result op is not supported: the annotation is one attribute on the "
+           "producer, so it cannot say which result it is for. Carry one value "
+           "per op -- for a loop, one value per loop";
     diag.attachNote(producer->getLoc()) << "the producer is here";
     return nullptr;
   }
