@@ -297,97 +297,6 @@ LogicalResult readTensorLayoutArrays(
   return success();
 }
 
-LogicalResult
-verifyPinFields(mlir::ktdp::MemorySpaceAttr memorySpace, Attribute address,
-                llvm::function_ref<InFlightDiagnostic()> emitError) {
-  // Which kinds EXIST is ktdp's business and is settled before this runs: the
-  // attribute would not have parsed otherwise. What is left is which of them a
-  // pin may name, and `global` is a known kind that it may not -- an intermediate
-  // in HBM is written as a descriptor with an explicit store and load.
-  if (memorySpace.getKind() != mlir::ktdp::MemorySpaceKind::ct_local)
-    return emitError() << "tts.pin: memory space '"
-                       << mlir::ktdp::stringifyMemorySpaceKind(
-                              memorySpace.getKind())
-                       << "' cannot be pinned: only 'ct_local' is";
-
-  // A pin means the scratchpad of whichever core is running, so there is no core
-  // to name. `ct_id = 7` would ask for core 7's scratchpad, which is a different
-  // request and one nothing here honours -- and an unhonoured ct_id would be
-  // silent, since the buffer would simply be built somewhere else.
-  if (memorySpace.hasCTIdSpecified())
-    return emitError() << "tts.pin: memory space names ct_id "
-                       << memorySpace.getCtId()
-                       << "; a pin is always the running core's own scratchpad, "
-                          "so leave ct_id unspecified";
-
-  // An addressless pin is the design's baseline -- the compiler places every
-  // intermediate and a pin only overrides where -- and it is refused because
-  // nothing in this tree can act on it. There is no address analysis and nothing
-  // that allocates a buffer which is not a kernel argument, so a pin naming no
-  // address names no location at all. Accepting it would put an annotation in the
-  // artifact that no consumer can honour, and offset 0 is not the fallback: it is
-  // a legitimate address that would collide with the scheduler's own pool.
-  //
-  // TODO: admit this form once something can place it. The op keeps the field
-  // optional so the surface does not have to change shape when that happens.
-  if (!address)
-    return emitError() << "tts.pin: no address, and nothing here can choose one "
-                          "-- there is no address analysis and nothing "
-                          "allocates a buffer that is not a kernel argument; "
-                          "state an address";
-
-  // An EMPTY array names no address for any core, so it is neither the uniform
-  // spelling nor the per-core one, and a consumer indexing it by the program id
-  // reads out of bounds on the first core.
-  if (auto perCore = dyn_cast<DenseI32ArrayAttr>(address)) {
-    if (perCore.empty())
-      return emitError() << "tts.pin: address array is empty: state one address "
-                            "per program id, or a single i32 for an address "
-                            "that is the same on every core";
-    return success();
-  }
-
-  // On the op these two spellings are a type constraint ODS enforces; in a
-  // dictionary nothing has checked them yet, so this is where the attribute form
-  // earns the same guarantee.
-  auto uniform = dyn_cast<IntegerAttr>(address);
-  if (!uniform || !uniform.getType().isInteger(32))
-    return emitError() << "tts.pin: address must be an i32 or a dense i32 array";
-  return success();
-}
-
-LogicalResult readPinAttr(Attribute value,
-                          mlir::ktdp::MemorySpaceAttr &memorySpace,
-                          Attribute &address,
-                          llvm::function_ref<InFlightDiagnostic()> emitError) {
-  auto dict = dyn_cast<DictionaryAttr>(value);
-  if (!dict)
-    return emitError() << "tts.pin: expected a dictionary attribute";
-
-  Attribute space = dict.get(TTSDialect::kMemorySpaceName);
-  if (!space)
-    return emitError() << "tts.pin: missing '" << TTSDialect::kMemorySpaceName
-                       << "' entry";
-  memorySpace = dyn_cast<mlir::ktdp::MemorySpaceAttr>(space);
-  if (!memorySpace)
-    return emitError() << "tts.pin: '" << TTSDialect::kMemorySpaceName
-                       << "' must be a #ktdp.memory_space";
-
-  // Optional, and its absence is meaningful: 0 is a legitimate element index, so
-  // "stated no address" cannot be spelled as a number.
-  address = dict.get(TTSDialect::kAddressName);
-
-  // Counted rather than ignored, so a typo'd entry name is an error instead of a
-  // field that silently does nothing.
-  size_t expected = address ? 2 : 1;
-  if (dict.size() != expected)
-    return emitError() << "tts.pin: expected the entries "
-                       << TTSDialect::kMemorySpaceName << " and optionally "
-                       << TTSDialect::kAddressName << ", got " << dict.size()
-                       << " entries";
-  return success();
-}
-
 LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
                                                    NamedAttribute attribute) {
   StringRef name = attribute.getName().strref();
@@ -417,31 +326,24 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
                                     memrefTy.getRank(), emitError);
   }
 
-  if (name == kPinAttrName) {
-    // No constraint on WHICH op, unlike the layout: a pin is about a value, and
-    // any op producing one is an equally valid carrier. What is constrained is
-    // that the carrier produce exactly one value, because the annotation names
-    // no result index -- on a multi-result op it could not say which result it
-    // is about, and guessing the first would be silent.
-    if (op->getNumResults() != 1)
-      return op->emitError("'")
-             << kPinAttrName << "' is about one value, so it needs an op with "
-             << "exactly one result to name; this op has "
-             << op->getNumResults();
-
-    if (!isa<RankedTensorType>(op->getResult(0).getType()))
-      return op->emitError("'")
-             << kPinAttrName
-             << "' annotates a buffer for a tensor, but this op's result is "
-             << op->getResult(0).getType();
-
-    mlir::ktdp::MemorySpaceAttr memorySpace;
-    Attribute address;
-    if (failed(readPinAttr(attribute.getValue(), memorySpace, address,
-                           emitError)))
-      return failure();
-    return verifyPinFields(memorySpace, address, emitError);
-  }
+  // `tts.pin` is ours, and that is the whole of what this branch says. Its rules
+  // are established BEFORE the attribute exists: the op's verifier checks the
+  // fields an author wrote, and LowerTTSMarkers checks the move -- that the value
+  // resolves to a carrier, that the carrier can hold one annotation, and that no
+  // other marker already claimed it. The attribute is then built from fields that
+  // have already passed, so re-deriving those rules out of the dictionary here
+  // would establish nothing and would state them a second place to drift.
+  //
+  // The branch cannot simply be absent: an unhandled `tts.` name falls through to
+  // the refusal below, so without this the annotation would fail to verify the
+  // moment it was attached.
+  //
+  // When something consumes this attribute it will read the dictionary back, and
+  // being invocable on hand-written IR it will have to check the spelling it finds
+  // -- as RewriteDescriptorLayoutGeneric's readCoordMap does for the layout, for
+  // exactly that reason. That reader belongs with that consumer.
+  if (name == kPinAttrName)
+    return success();
 
   return op->emitError("attribute '")
          << name << "' is not one the tts dialect defines";

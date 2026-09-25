@@ -59,17 +59,57 @@ LogicalResult PinOp::verify() {
                           "input and lives where its base pointer says; a pin "
                           "places an intermediate some op here produced";
 
-  // The rest delegates rather than restates, for the reason `tensor_layout`'s
-  // does: the same rules are checked again on the ATTRIBUTE form by the dialect's
-  // `verifyOperationAttribute`, and a second copy would answer differently the
-  // first time anyone admits a new memory space.
+  // Everything below is a rule about the FIELDS, and this is the only place they
+  // are checked. The attribute form is built from fields that have already passed
+  // here, so the dialect's `verifyOperationAttribute` acknowledges the name and
+  // re-derives nothing -- see the note there.
+  mlir::ktdp::MemorySpaceAttr space = getMemorySpaceAttr();
+
+  // Which kinds EXIST is ktdp's business and is settled before this runs: the
+  // attribute would not have parsed otherwise. What is left is which of them a pin
+  // may name, and `global` is a known kind that it may not -- an intermediate in
+  // HBM is written as a descriptor with an explicit store and load.
+  if (space.getKind() != mlir::ktdp::MemorySpaceKind::ct_local)
+    return emitError() << "tts.pin: memory space '"
+                       << mlir::ktdp::stringifyMemorySpaceKind(space.getKind())
+                       << "' cannot be pinned: only 'ct_local' is";
+
+  // A pin means the scratchpad of whichever core is running, so there is no core
+  // to name. `ct_id = 7` would ask for core 7's scratchpad, which is a different
+  // request and one nothing here honours -- and an unhonoured ct_id would be
+  // silent, since the buffer would simply be built somewhere else.
+  if (space.hasCTIdSpecified())
+    return emitError() << "tts.pin: memory space names ct_id " << space.getCtId()
+                       << "; a pin is always the running core's own scratchpad, "
+                          "so leave ct_id unspecified";
+
+  // An addressless pin is the design's baseline -- the compiler places every
+  // intermediate and a pin only overrides where -- and it is refused because
+  // nothing in this tree can act on it. There is no address analysis and nothing
+  // that allocates a buffer which is not a kernel argument, so a pin naming no
+  // address names no location at all. Offset 0 is not the fallback: it is a
+  // legitimate address that would collide with the scheduler's own pool.
   //
-  // `emitError` and not `emitOpError`: every message the shared checker produces
-  // already names `tts.pin`, so the op-error prefix would say it twice -- and
-  // identical text either side of the lowering is what makes the op and the
-  // attribute diagnosable as one contract.
-  auto emitError = [&]() { return this->emitError(); };
-  return verifyPinFields(getMemorySpace(), getAddressAttr(), emitError);
+  // TODO: admit this form once something can place it. The field stays optional in
+  // ODS so the surface does not have to change shape when that happens.
+  Attribute address = getAddressAttr();
+  if (!address)
+    return emitError() << "tts.pin: no address, and nothing here can choose one "
+                          "-- there is no address analysis and nothing allocates "
+                          "a buffer that is not a kernel argument; state an "
+                          "address";
+
+  // An EMPTY array names no address for any core, so it is neither the uniform
+  // spelling nor the per-core one, and a consumer indexing it by the program id
+  // reads out of bounds on the first core. The only address rule left to check --
+  // that it is an i32 or an i32 array is ODS's, from the type constraint.
+  if (auto perCore = dyn_cast<DenseI32ArrayAttr>(address))
+    if (perCore.empty())
+      return emitError() << "tts.pin: address array is empty: state one address "
+                            "per program id, or a single i32 for an address that "
+                            "is the same on every core";
+
+  return success();
 }
 
 } // namespace mlir::triton::tts

@@ -192,13 +192,18 @@ static Attribute buildTensorLayoutAttr(mlir::triton::tts::TensorLayoutOp marker)
 /// so a `math.exp`, a `linalg.reduce` and a `ktdp.load` are equally valid
 /// carriers and the consumer never reads the op's identity.
 ///
-/// A value with no defining op cannot be reached, because the op's own verifier
-/// refuses a pinned block argument -- an entry input lives where its base pointer
-/// says, so it is not an intermediate to place. Checked anyway rather than
-/// asserted, since this pass is invocable on hand-written IR and a null here would
-/// otherwise be a crash rather than a diagnostic.
+/// Two things are checked here rather than by the op, and both are about the MOVE
+/// rather than about what the author wrote. The op holds its value as an operand
+/// and can say whether that value is well formed; only resolution knows which op
+/// is about to carry the annotation, and therefore whether it can.
 static Operation *resolvePin(mlir::triton::tts::PinOp marker) {
   Value value = marker.getValue();
+
+  // A value with no defining op is unreachable, because the op's verifier refuses
+  // a pinned block argument -- an entry input lives where its base pointer says,
+  // so it is not an intermediate to place. Checked anyway rather than asserted,
+  // since this pass is invocable on hand-written IR and a null would otherwise be
+  // a crash instead of a diagnostic.
   Operation *producer = value.getDefiningOp();
   if (!producer) {
     marker.emitError()
@@ -206,6 +211,22 @@ static Operation *resolvePin(mlir::triton::tts::PinOp marker) {
            "refused by the op's verifier";
     return nullptr;
   }
+
+  // An attribute attaches to an OP, not to a value, so it cannot say which result
+  // it is about. On a producer with several -- `tt.split` is the one this tree has
+  // -- the annotation would be ambiguous, and taking it to mean the first would be
+  // silent. The pinned value is well formed either way, which is why this is not
+  // the op's rule: what fails is that its producer has no unambiguous slot.
+  if (producer->getNumResults() != 1) {
+    InFlightDiagnostic diag =
+        marker.emitError()
+        << "tts.pin names a value whose producer has "
+        << producer->getNumResults()
+        << " results, so an attribute on it could not say which one is pinned";
+    diag.attachNote(producer->getLoc()) << "the producer is here";
+    return nullptr;
+  }
+
   return producer;
 }
 

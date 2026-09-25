@@ -254,36 +254,6 @@ LogicalResult readTensorLayoutArrays(
     ArrayRef<int64_t> &physArg,
     llvm::function_ref<InFlightDiagnostic()> emitError);
 
-/// The rules a `tts.pin`'s fields obey, checked once for the two forms that hold
-/// them: `PinOp::verify`, where they are the op's own ODS attributes, and the
-/// dialect's `verifyOperationAttribute`, where they are entries in a dictionary.
-///
-/// Split from `readPinAttr` below for the same reason the layout's pair is split:
-/// the op form arrives with both fields already typed by ODS and needs only the
-/// semantics, while the attribute form has to get past its spelling first.
-///
-/// What it enforces:
-///   - the kind is `ct_local`, the only one a pin may name;
-///   - `ct_id` is unspecified, since a pin is the running core's own scratchpad;
-///   - `address` is present, because nothing in this tree can choose one;
-///   - it is an `i32` or a non-empty dense i32 array.
-///
-/// `address` being required is temporary and the op keeps the field optional for
-/// it: the unaddressed form is the design's baseline and returns when something
-/// can place it. See the refusal for what is missing.
-LogicalResult
-verifyPinFields(mlir::ktdp::MemorySpaceAttr memorySpace, Attribute address,
-                llvm::function_ref<InFlightDiagnostic()> emitError);
-
-/// Read `tts.pin` off an op and check its shape as an attribute: a dictionary of
-/// a `memory_space` string and an optional `address`. On success both are handed
-/// back, `address` null when the dictionary omitted it; on failure a diagnostic
-/// has been emitted through `emitError`.
-LogicalResult readPinAttr(Attribute value,
-                          mlir::ktdp::MemorySpaceAttr &memorySpace,
-                          Attribute &address,
-                          llvm::function_ref<InFlightDiagnostic()> emitError);
-
 } // namespace mlir::triton::tts
 
 #endif // TRITON_SPYRE_DIALECT_TTS_IR_DIALECT_H
