@@ -2159,12 +2159,6 @@ class TritonSemantic(Generic[TensorTy]):
         """Emit tts.tensor_layout — annotates a descriptor with its
         physical device layout as parallel arrays (phys_src, phys_op, phys_arg),
         one entry per physical dimension."""
-        target = driver.active.get_current_target()
-        if target.backend != "spyre":
-            raise ValueError(
-                "tl.spyre_tensor_layout is only supported on the 'spyre' "
-                f"backend, not '{target.backend}'")
-
         src, op, arg = [], [], []
         for i, entry in enumerate(layout):
             s, o, a = self._parse_coord_entry(i, entry)
@@ -2174,9 +2168,8 @@ class TritonSemantic(Generic[TensorTy]):
 
         # The builder lives in the Spyre pybind module, not in ir.cc's, because
         # the op is in our dialect and the dependency only points one way. The
-        # import is inside the function for the same reason the guard above is:
-        # the submodule exists only in a Spyre build, and this file is every
-        # backend's.
+        # import is inside the function because the submodule exists only in a
+        # Spyre build, and this file is every backend's.
         from triton._C.libtriton import spyre
         spyre.ir_builders.create_tensor_layout(self.builder, desc.handle, src,
                                                op, arg)

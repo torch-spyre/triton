@@ -112,9 +112,19 @@ Current upstream touch points:
 | `setup.py` | Default `TRITON_BACKENDS=spyre`; auto TTIR-only/Proton; resolve LLVM via `setup_mlir.py`; Spyre-only package discovery; `spyre-test` extra; `--recursive` submodule init |
 | `CMakeLists.txt` | Guard GPU dialect / blob logic behind the TTIR-only build |
 | `python/src/main.cc` | Register empty `gluon_ir` / `linear_layout` pybind modules so `import triton` works in TTIR-only builds |
+| `python/src/ir.cc` | `create_inter_tile_reduce` / `create_spyre_tensor_layout` op builders on `TritonOpBuilder` |
 | `python/triton/experimental/gluon/__init__.py`, `.../language/__init__.py` | Guard GPU-only arch shim imports absent from a Spyre-only wheel |
 | `include/triton/Dialect/Triton/IR/Dialect.h`, `lib/Target/LLVMIR/LLVMDIUtils.cpp` | Source compatibility with the Spyre LLVM pin |
+| `include/triton/Dialect/Triton/IR/TritonOps.td` | `TT_SpyreTensorLayoutOp`, `TT_InterTileReduceOp` |
+| `lib/Dialect/Triton/IR/Ops.cpp` | `SpyreTensorLayoutOp::verify()`, plus `#ifdef TRITON_BUILD_TTIR_ONLY` guards |
 | `python/triton/language/target_info.py` | Runtime frontend backend guards: `is_spyre()` predicate + `requires_backend()` decorator |
+| `python/triton/language/core.py`, `.../__init__.py` | `tl.inter_tile`, `tl.spyre_tensor_layout`, `tl.wk_slice_coord`, and their `__all__` entries |
+| `python/triton/language/semantic.py` | Emission for those three |
+| `python/triton/knobs.py` | `knobs.spyre`, beside `knobs.nvidia` / `knobs.amd` |
+| `python/triton/backends/compiler.py`, `python/triton/runtime/jit.py` | `compile_time_launch_options` hook, returning `{}` for every other backend, and its call site |
+
+Regenerate this list with `grep -rn 'added for spyre'`, excluding `third_party/spyre`
+and `build/`.
 
 ## Where the Spyre code lives
 
@@ -287,6 +297,33 @@ That feature re-spells the rule in `resolve_dbo_opt()` rather than importing it
 literal, a bare name goes through `PATH`. Keep the two in step. And note lit scans a
 test file's *whole* text for directives, so writing `REQUIRES` followed by a colon in
 a docstring creates a second, malformed one and the test comes out `Unresolved`.
+
+**A `dbo-opt` outside the system install needs its whole chain named with it, the
+device file included.** `TRITON_SPYRE_DBO_OPT` alone is not enough. That tool resolves
+its shared libraries, its `share/` data and the target device description
+independently, so pointing only the binary elsewhere pairs a new tool with whatever
+the old ones were — usually the system install's, or nothing. Set alongside it:
+
+| | |
+|---|---|
+| `TRITON_SPYRE_DEVICE` | the device description (arch spec) to compile against |
+| `LD_LIBRARY_PATH` | that build's `lib` |
+| `DEEPTOOLS_PATH` | that build's `share` |
+
+All four must name **one** build. The failure mode is why this is worth a note rather
+than a config: a missing `TRITON_SPYRE_DEVICE` does not report a missing device — the
+tool falls back to a default one and then refuses ordinary IR against it, e.g.
+
+```
+warning: unsupported vector scalar type 'f32'
+error: 'dataflow.send' op unsupported ldtype
+```
+
+which reads as a compiler or fixture bug, names nothing about the environment, and
+reproduces identically on every branch. If a `spyrecode` test fails on a dtype or op
+that has always worked, check these four before reading the diagnostic. Keep them in a
+file you source per worktree; a worktree without one inherits nothing and gives no hint
+that it should.
 
 **Generating FileCheck patterns** — use `utils/generate-test-checks.py`
 (from upstream LLVM) to auto-generate CHECK lines from printed IR:
