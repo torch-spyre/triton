@@ -5,24 +5,16 @@
 // and REJECTS the ones it cannot fold, where leaving them would emit a program
 // the scheduler silently cannot take.
 //
-// Why:
-//   Every compute op reaches this pass as a linalg.generic. A coordinate change
-//   -- broadcast, transpose, inserted unit dim -- arrives as its own generic
-//   whose body computes nothing: it yields its input, and only its indexing maps
-//   differ. That op has no descriptor and no layout marker, so
-//   RewriteDescriptorLayoutGeneric leaves its result LOGICAL while its consumer
-//   is physical; the consumer's operand map then has to bridge the two and the
-//   pass folds a LINEARIZATION into it (`(d0, d1, d2) -> (d1, d0 * 64 + d2)`).
-//   dbo-opt cannot schedule that:
-//
-//     error: could not locate matching linalg operand to project loop IVs and
-//     tile sizes through; the data_transfer rank would not match the underlying
-//     memref
-//
-//   Folded into the consumer instead, the coordinate change becomes part of an
-//   operand map the layout pass restates at physical rank like any other -- a
-//   statistic read at a constant lane comes out as `(d0, d1, d2) -> (d1, 0)`,
-//   which is what hand-written reference KTIR states.
+// Every compute op reaches this pass as a linalg.generic. A coordinate change --
+// broadcast, transpose, inserted unit dim -- arrives as its own generic whose
+// body computes nothing: it yields its input, and only its indexing maps differ.
+// That op has no descriptor and no layout marker, so
+// RewriteDescriptorLayoutGeneric leaves its result LOGICAL while its consumer is
+// physical, and the consumer's operand map then bridges the two with a
+// LINEARIZATION -- `(d0, d1, d2) -> (d1, d0 * 64 + d2)` -- which the scheduler
+// cannot project loop IVs and tile sizes through. Folded into the consumer
+// instead, the coordinate change becomes part of an operand map the layout pass
+// restates at physical rank like any other.
 //
 // So the standing goal is: leave NOTHING between a load and a compute except
 // indexing maps. Three parts, and they are separable on purpose --
@@ -38,12 +30,7 @@
 //            or a constant. Not the raw map -- see below.
 //
 // WHY THE CHECK BELONGS ON THE COMPOSED MAP.
-//   The reason to decline a linearizing collapse is NOT that it is inexpressible.
-//   AffineExpr has FloorDiv and Mod, so `[64,2] -> [128]` is perfectly writable
-//   as `(d0) -> (d0 floordiv 2, d0 mod 2)` and this file emits exactly that. The
-//   real reason is downstream: the scheduler projects loop IVs and tile sizes
-//   through an operand map, and it cannot project them through floordiv or mod.
-//   That is a property of the map the CONSUMER ends up holding, not of the
+//   What has to be projectable is the map the CONSUMER ends up holding, not the
 //   reassociation -- and the two can differ, because composition folds. A
 //   linearizing collapse read at a constant coordinate composes to
 //   `(d0, d1) -> (0, 0)`, which projects fine and is absorbed. Checking the
@@ -53,55 +40,29 @@
 // THE STORE SIDE IS REJECTION ONLY, NEVER ABSORPTION.
 //   Everything above is the `ins` side. A shape op between a generic and the
 //   `ktdp.store` that consumes its result is the same hazard mirrored, and this
-//   pass refuses it -- but never absorbs it, and that is a decision rather than
-//   an unfinished case. Absorbing there is not a variation on
+//   pass refuses it without absorbing it. Absorbing there is not a variation on
 //   AbsorbCoordinateOp: it would have to change the generic's RESULT type,
 //   replace the `tensor.empty` behind `outs`, restate the outs map and repoint
 //   the store's data operand -- and it needs the map in the OPPOSITE direction,
 //   which is an inversePermutation that is null for exactly the linearizing
 //   cases this is about. AbsorbCoordinateOp's `outs` is untouched, as it says.
 //
-//   The eventual fix is an open choice between doing that and teaching
-//   RewriteDescriptorLayoutGeneric's findLayoutForResult to look through a
-//   unit-dim reshape. The latter is arguably the better home: `ktdp.store`
-//   carries no indexing map, so on the store side there is nothing to absorb
-//   INTO, and what goes wrong is a walk that stops one op too early.
-//
 // The mechanism is upstream's, the POLICY is ours:
 //   Elementwise fusion is upstream's `populateElementwiseOpsFusionPatterns`,
-//   which takes a `ControlFusionFn` deciding each fusion. Upstream's own pass
-//   (--linalg-fuse-elementwise-ops) supplies `producer && producer->hasOneUse()`
-//   -- a claim about the producer's USE COUNT and nothing about what it computes.
-//   That is blanket as far as we are concerned, and it over-fuses in two measured
-//   ways: two plain computes merge into one generic holding both, and a compute
-//   already carrying a shape change in its operand map merges with a downstream
-//   compute. The backend takes one compute op per group, so blanket fusion
-//   manufactures exactly the multi-compute bodies other machinery then has to
-//   undo. Our control function is narrower, and narrow along a different axis: it
-//   asks what the producer IS.
+//   which takes a `ControlFusionFn` deciding each fusion. Where upstream's own
+//   pass asks the producer's USE COUNT, ours asks what the producer IS: it
+//   permits a fusion only when the PRODUCER is pure data movement, tested
+//   STRUCTURALLY -- a linalg.generic whose body is exactly one operation, a
+//   linalg.yield of an input block argument.
 //
-//   It permits a fusion only when the PRODUCER is pure data movement, tested
-//   STRUCTURALLY: a linalg.generic whose body is exactly one operation, a
-//   linalg.yield of an input block argument. Nothing computed, only re-indexed.
+//   Structural rather than an attribute, because the predicate gates every
+//   fusion decision and a stale label would silently change the emitted program.
 //
-//   Structural rather than an attribute, because nothing in this pipeline labels
-//   these ops and nothing would maintain a label if it did. They arrive here from
-//   --linalg-generalize-named-ops rewriting the linalg.broadcast and
-//   linalg.transpose LowerComputeOps emits, neither of which records its
-//   provenance; and RewriteDescriptorLayoutGeneric REBUILDS every generic on a
-//   physicalized chain, so any label would additionally have to be copied by a
-//   pass with no other reason to know it exists. A stale or missing label would
-//   not merely mislead a reader: this predicate gates every fusion decision, so
-//   it would silently change the emitted program. A property of the op cannot go
-//   stale.
-//
-//   The predicate deliberately does NOT check hasOneUse. A data-movement generic
-//   feeding two consumers is folded into each and then dies, and that is what we
-//   want -- the goal is that NO data-movement generic survives, not that each is
-//   folded at most once. Duplicating a coordinate change costs nothing, because
-//   there is no body to duplicate: what the second consumer gains is an operand
-//   map, not an op. This is the one place our control function is LOOSER than
-//   upstream's, whose hasOneUse would decline exactly that fusion.
+//   The predicate deliberately does NOT check hasOneUse: a data-movement generic
+//   feeding two consumers is folded into each and then dies, which is the goal.
+//   Duplicating a coordinate change costs nothing, there being no body to
+//   duplicate. This is the one place our control function is LOOSER than
+//   upstream's.
 //
 //   Two things fall out rather than needing cases of their own:
 //     - A generic that is both a compute and a shape change is declined as a
@@ -114,44 +75,32 @@
 //
 // The shape ops absorbed, and when they are even on the path:
 //   `tt.broadcast` lowers to `tensor.collapse_shape` + `linalg.broadcast`,
-//   because linalg.broadcast takes its input rank-reduced. But that collapse only
+//   because linalg.broadcast takes its input rank-reduced. That collapse only
 //   SURVIVES to this pass when the broadcast's source already carries the unit
 //   dim as a real tensor dim -- a `ktdp.load` of `tensor<64x1xf16>` off a narrow
 //   access tile, say. Where the unit dim was itself just inserted, the usual
 //   `tt.expand_dims` on a rank-1 reduce result, the collapse is the exact inverse
 //   of that `tensor.expand_shape` and the pair cancels in the canonicalize that
-//   closes the `ktir` stage; what reaches this pass is then a bare
-//   `linalg.broadcast` over a rank-1 value with no tensor op in front of it at
-//   all (measured). So the absorber is not always on the path. It is on it for
-//   the loaded-statistic shape, which is the shape that needed it.
-//
-//   Where it is on the path it is load-bearing: being a tensor op rather than a
-//   generic it blocks the composition, and fusing the broadcast alone leaves the
-//   consumer reading a rank-1 value that no longer matches the rank-2 access tile
-//   its load came from -- dbo-opt then reports the same diagnostic as above
-//   (measured).
+//   closes the `ktir` stage, leaving a bare `linalg.broadcast` with no tensor op
+//   in front of it. So the absorber is not always on the path; where it is, it is
+//   load-bearing, a tensor op rather than a generic blocking the composition.
 //
 //   The `tensor.expand_shape` from `tt.expand_dims` is absorbed by the same
 //   machinery and needs no case of its own -- it is the mirror image, its
 //   reassociation reading source dim -> result dims instead of result dim ->
 //   source dims. It survives to this pass where the collapse that would have
-//   cancelled it is not there, which is the `softmax_2pass` shape:
-//   `tensor<4xf32>` expanded to `tensor<4x1xf32>` feeding a rank-2 loop-carried
-//   accumulator.
+//   cancelled it is not there: the `softmax_2pass` shape, `tensor<4xf32>`
+//   expanded to `tensor<4x1xf32>` feeding a rank-2 loop-carried accumulator.
 //
 // Why upstream's reshape patterns are NOT used:
 //   Upstream exposes `populateFoldReshapeOpsBy{Expansion,Collapsing}Patterns`
 //   with the same control-function type, but they solve a different problem: a
 //   general reshape is not expressible as an operand map, so they change the
-//   consumer's ITERATION SPACE and push a reshape onto the other operands. On
-//   this kernel that emits `tensor.expand_shape` on the physicalized data path,
-//   and RewriteDescriptorLayoutGeneric rejects it outright:
-//
-//     error: this op reads a value the rewrite retyped, but the rewrite restates
-//     only linalg.generic, so this op still names the logical type
-//
-//   The absorber keeps the iteration space and moves the coordinate change into
-//   one operand's map, which is the whole of the difference.
+//   consumer's ITERATION SPACE and push a reshape onto the other operands, which
+//   lands a `tensor.expand_shape` on the physicalized data path that
+//   RewriteDescriptorLayoutGeneric rejects. The absorber keeps the iteration
+//   space and moves the coordinate change into one operand's map, which is the
+//   whole of the difference.
 //
 //   It is deliberately not gated on what consumes the reshape, so the fixpoint
 //   does not depend on the order the greedy driver picks: absorbed first, the
@@ -168,16 +117,9 @@
 //
 //   Left in front of a generic the layout pass will physicalize, each of those is
 //   a program that fails later, in dbo-opt, with a diagnostic that names neither
-//   the op nor this pass. So they are rejected here -- and ONLY on such a path.
-//
-//   WHY THE REJECTION IS GATED, and the reason is forward-looking rather than
-//   protective. As annotation coverage grows toward everything on a device path
-//   being physicalized, the gate fires more often and converges to the ungated
-//   behaviour by itself, so it never needs removing. Shipping ungated would
-//   instead mean ADDING a gate later, the moment an unannotated path has to be
-//   legal. It is kept pending the LX roundtrip, at which point the better move
-//   may be to INVERT it -- into an assertion that anything on a device path IS
-//   annotated.
+//   the op nor this pass. So they are rejected here -- and ONLY on such a path,
+//   so that an unannotated path stays legal. As annotation coverage grows the
+//   gate fires more often and converges to the ungated behaviour by itself.
 //
 //   THE GATE is the layout rewrite's own scope, asked with the layout rewrite's
 //   own traversals (Dialect/KTDP/Utils, shared rather than copied): seed from
@@ -192,12 +134,12 @@
 //     BACKWARD from each `ins` operand of a to-be-rewritten generic, through
 //     every generic that is not itself in the rewrite set, stopping at anything
 //     that is not a coordinate restatement. This is the half that matters. It
-//     catches a re-indexing op whose OWN load is on an UNANNOTATED view -- which
-//     is the real `stat_chain_on_stick` situation, its statistic read view
-//     deliberately carrying no layout because its logical shape already is its
-//     physical one. Nothing else looks there: RewriteDescriptorLayoutGeneric
-//     calls retypeToPhysical only for an operand that HAS a layout, so an operand
-//     that has none is bridged by rebuildMap with no check at all.
+//     catches a re-indexing op whose OWN load is on an UNANNOTATED view -- the
+//     `stat_chain_on_stick` shape, its statistic read view deliberately carrying
+//     no layout because its logical shape already is its physical one. Nothing
+//     else looks there: RewriteDescriptorLayoutGeneric calls retypeToPhysical
+//     only for an operand that HAS a layout, so an operand that has none is
+//     bridged by rebuildMap with no check at all.
 //
 //     BACKWARD from the DATA of each store over an annotated view, which is the
 //     exact mirror. findLayoutForResult walks a generic's result users for a
@@ -205,46 +147,35 @@
 //     shape op between the generic and the store makes it return null, the outs
 //     gets CoordOp::Identity, and the LINEARIZATION lands on the outs map
 //     instead of an ins map. `gather__1d` carries an 8x1 -> 8 `tt.reshape` into a
-//     store, so the shape is real and in the tree today -- on a kernel this pass
-//     never sees, since it stops at the `ktir` stage. Rejection only on this
-//     side, never absorption: see THE STORE SIDE, above.
+//     store, so the shape is real and in the tree -- on a kernel this pass never
+//     sees, since it stops at the `ktir` stage. Rejection only on this side,
+//     never absorption: see THE STORE SIDE, above.
 //
 //     FORWARD, one hop off each physicalized load, for a `load -> reshape`
 //     whose result goes somewhere neither of the backward walks reaches. Where it
-//     does go to a store the store seed reaches it too, and where it goes to a
-//     generic this is REDUNDANT with RewriteDescriptorLayoutGeneric's own
-//     checkConsumersAreRewritable, which already refuses a non-generic non-store
-//     consumer of such a load. It is kept because it fires a stage earlier and
-//     says which property of the op is the problem, where that check can only say
-//     the op is not a linalg.generic.
+//     goes to a generic this is REDUNDANT with
+//     RewriteDescriptorLayoutGeneric's checkConsumersAreRewritable; it is kept
+//     because it fires a stage earlier and names which property of the op is the
+//     problem.
 //
 //   REJECTION IS DERIVED, not a declared op list. The condition is exactly
 //   *absorption failed* and *on a physicalized path*, and "absorption failed" is
 //   asked of `resultToSourceMap` -- the same function the absorber asks. Teaching
 //   that function a static `tensor.reshape` therefore stops the rejection for it
-//   with nothing here to update. What `resultToSourceMap` does own is the
-//   three-way distinction that makes this possible: an op is not a coordinate
-//   restatement at all (a compute, an scf result, a cast -- nothing here is about
-//   it), or it is one with a usable map, or it is one without. The middle
-//   category is the absorber's inventory of what it handles; the last is its
-//   inventory of what it has yet to. Neither is a list of things to refuse.
+//   with nothing here to update.
 //
-//   Two limits worth naming rather than hiding. The backward walk stops at any op
-//   that is neither a coordinate restatement nor a linalg.generic, so a reshape
-//   behind an `scf.for` result is not found -- and could not be absorbed either,
-//   so reporting it would name a problem this pass cannot describe. And the
-//   linearization hazard is wider than re-indexing ops: ANY unphysicalized
-//   operand of a generic whose domain got split is bridged by rebuildMap's
-//   linearizeStickLane, a plain compute chain included. That is not this gate's,
-//   because absorption is not its fix.
+//   Two limits. The backward walk stops at any op that is neither a coordinate
+//   restatement nor a linalg.generic, so a reshape behind an `scf.for` result is
+//   not found -- and could not be absorbed either. And the linearization hazard
+//   is wider than re-indexing ops: ANY unphysicalized operand of a generic whose
+//   domain got split is bridged by rebuildMap's linearizeStickLane, a plain
+//   compute chain included. That is not this gate's, because absorption is not
+//   its fix.
 //
-// SEEING WHAT IT DECIDED: every decision here is a silent accept-or-decline, so
 // `--debug-only=fold-data-movement-generics` traces the decisions rather than the
-// control flow -- one line per restatement asked for and the answer, one per
+// control flow: one line per restatement asked for and the answer, one per
 // operand the absorber considered with the composition spelled out, the gate's
-// seeds and scope, and each rejection with the PATH that reached it. The path is
-// the part worth having: a bare "rejected op X" leaves the reader to re-derive
-// why X was on a physicalized path at all.
+// seeds and scope, and each rejection with the PATH that reached it.
 //
 // Position in the pipeline: after unalias_linalg_outs, and in any case after
 // convert_elementwise_to_linalg and linalg_generalize_named_ops -- fusion matches
@@ -358,13 +289,11 @@ bool isPureDataMovement(Operation *op) {
 ///                             `why` says which, in the words the diagnostic
 ///                             uses.
 ///
-/// `why` is filled HERE, by the code that read the reassociation, because that is
-/// the only place that knows how many non-unit dims a group fused. The absorber
-/// does not consult it: its authority is the projection check on the COMPOSED
-/// map, which can accept a map `why` describes as linearizing (composition folds
-/// a floordiv against a constant). The two never disagree in a way that matters,
-/// because the absorber runs first and removes what it accepts, so the gate only
-/// ever sees ops the absorber declined.
+/// `why` is filled HERE, by the code that read the reassociation, that being the
+/// only place that knows how many non-unit dims a group fused. The absorber does
+/// not consult it: its authority is the projection check on the COMPOSED map,
+/// which can accept a map `why` describes as linearizing. The absorber runs
+/// first and removes what it accepts, so the gate only sees what it declined.
 struct CoordinateRestatement {
   /// The value a consumer should read instead of this op's result.
   Value source;
@@ -578,26 +507,21 @@ CoordinateRestatement expandRestatement(tensor::ExpandShapeOp op) {
 ///                       collapse_shape x2    extract_slice deliberately NOT a
 ///                                            restatement -- see below
 ///
-/// WHY `tensor.extract_slice` IS NOT HERE, and it is not the reason one might
-/// expect. Its coordinate map is perfectly derivable -- static offsets and unit
-/// strides give `(d0, d1) -> (d0 + o0, d1 + o1)`. What is not derivable is its
-/// EXTENT change, and a linalg operand map cannot state one: linalg infers its
-/// loop bounds from the operand shapes THROUGH the indexing maps, so repointing
-/// an operand at the larger, unsliced source under any map makes the inferred
-/// extents inconsistent and fails linalg's own verifier. A slice crops; an
-/// operand map re-indexes. Those are different powers, and no amount of affine
-/// expression closes the gap.
+/// WHY `tensor.extract_slice` IS NOT HERE. Its coordinate map is derivable --
+/// static offsets and unit strides give `(d0, d1) -> (d0 + o0, d1 + o1)` -- but
+/// its EXTENT change is not, and a linalg operand map cannot state one: linalg
+/// infers its loop bounds from the operand shapes THROUGH the indexing maps, so
+/// repointing an operand at the larger, unsliced source under any map makes the
+/// inferred extents inconsistent and fails linalg's own verifier. A slice crops;
+/// an operand map re-indexes.
 ///
-/// Two further facts make the omission cost nothing. The offset part would be
-/// declined by the projection check anyway (`d0 + o0` is neither a bare dim nor a
-/// constant), so a sound version of this case would absorb only a zero-offset
-/// slice, which is the case the canonicalizer already removes. And the scheduler
-/// already looks through the op: `findIndexingMapForLoadResult` tries the direct
-/// operand and then exactly one alternative, an extract_slice user -- verified in
-/// its source, not assumed. So it is the one shape op downstream handles, and
-/// there are ZERO occurrences of it across all 163 fixture artifacts. It is left
-/// as "not a coordinate restatement", which means it is neither absorbed nor
-/// refused: exactly the status quo, deliberately.
+/// The omission costs nothing. The offset part would be declined by the
+/// projection check anyway (`d0 + o0` is neither a bare dim nor a constant), so a
+/// sound version of this case would absorb only a zero-offset slice, which the
+/// canonicalizer already removes. And the scheduler looks through the op itself:
+/// `findIndexingMapForLoadResult` tries the direct operand and then one
+/// alternative, an extract_slice user. So it is left as "not a coordinate
+/// restatement" -- neither absorbed nor refused.
 CoordinateRestatement resultToSourceMap(Operation *shapeOp) {
   CoordinateRestatement r = [&]() -> CoordinateRestatement {
     if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(shapeOp))
@@ -616,9 +540,9 @@ CoordinateRestatement resultToSourceMap(Operation *shapeOp) {
     return notReindex();
   }();
 
-  // The single most useful line in the pass: one op, and the answer the whole
-  // rest of the file is derived from. A non-restatement says nothing -- every
-  // load, empty, constant and cast the gate's walk touches goes through here.
+  // One op, and the answer the rest of the file is derived from. A
+  // non-restatement says nothing: every load, empty, constant and cast the
+  // gate's walk touches goes through here.
   LLVM_DEBUG(if (r.isReindex()) {
     llvm::dbgs() << "[" DEBUG_TYPE "] restatement of " << shapeOp->getName()
                  << " at " << shapeOp->getLoc() << ": ";
@@ -819,14 +743,9 @@ LogicalResult rejectOnPhysicalizedPaths(ModuleOp mod, Tally &tally) {
   //   for a ktdp.store DIRECTLY (`dyn_cast<StoreOp>`, `continue` otherwise), so a
   //   shape op between the two makes it return null and the LINEARIZATION lands
   //   on the `outs` map instead. `gather__1d` carries an 8x1 -> 8 tt.reshape into
-  //   a store, which is that shape in the tree today -- unannotated, hence the
-  //   gate.
+  //   a store, which is that shape in the tree -- unannotated, hence the gate.
   //
-  // Nothing here absorbs on the store side: that rewrite would have to change
-  // the generic's result type, replace the tensor.empty behind `outs`, restate
-  // the outs map and repoint the store, and it needs the map in the opposite
-  // direction, which is an inversePermutation that is null for exactly the
-  // linearizing cases. Rejection only.
+  // Nothing here absorbs on the store side; rejection only, per the header.
   SmallPtrSet<Operation *, 16> visited;
   SmallVector<std::pair<Value, Operation *>> worklist;
   auto seed = [&](Value v, Operation *user) { worklist.emplace_back(v, user); };

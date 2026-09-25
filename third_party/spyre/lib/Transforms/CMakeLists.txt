@@ -1,18 +1,20 @@
 # Passes whose subject is upstream structure or the whole program rather than
 # any one dialect's abstractions: UnaliasLinalgOuts, DropReductionInitFill and
 # FoldDataMovementGenerics act on linalg form -- generic bodies, indexing maps,
-# reshape reassociations -- and MaterializeBaseAddresses on the entry function
-# signature.  Sitting at the top level does not stop them including dialect
-# headers.
+# reshape reassociations -- NormalizeForDevice hosts patterns rewriting upstream
+# ops the toolchain downstream of this tree will not take, wherever they appear,
+# and MaterializeBaseAddresses acts on the entry function signature.  Sitting at
+# the top level does not stop them including dialect headers.
 #
 # LINK_LIBS derived from actual #includes plus Passes.td's dependentDialects.
 # One absence is the interesting content here: no TritonIR, because none of the
-# four touches a tt op.  MLIRTransformUtils used to be a second such absence,
-# every pass here walking and rewriting directly; FoldDataMovementGenerics ended
-# that by driving the greedy rewriter, so the claim now is only about the
-# dialects, not about the rewrite machinery.
+# five touches a tt op.  MLIRTransformUtils used to be a second such absence,
+# every pass here walking and rewriting directly; FoldDataMovementGenerics and
+# NormalizeForDevice both drive the greedy rewriter now, so the claim is only
+# about the dialects, not about the rewrite machinery.
 add_triton_library(SpyreTransforms
   UnaliasLinalgOuts.cpp
+  NormalizeForDevice.cpp
   DropReductionInitFill.cpp
   FoldDataMovementGenerics.cpp
   MaterializeBaseAddresses.cpp
@@ -44,7 +46,7 @@ add_triton_library(SpyreTransforms
   # For populateElementwiseOpsFusionPatterns, the composition
   # FoldDataMovementGenerics supplies a control function to.
   MLIRLinalgTransforms
-  # For applyPatternsGreedily, which the same pass drives its two pattern kinds
-  # with.
+  # For applyPatternsGreedily, which that pass drives its two pattern kinds with
+  # and NormalizeForDevice its own.
   MLIRTransformUtils
 )
