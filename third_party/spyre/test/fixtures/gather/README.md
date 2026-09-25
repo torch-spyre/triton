@@ -1,8 +1,8 @@
 # gather
 
 End-to-end test fixture for **`tl.descriptor_gather`** — Triton's
-indirect row-indexed load. The fixture carries three `@triton.jit`
-functions sharing one source file:
+indirect row-indexed load. Several `@triton.jit` functions share this
+fixture; the ones below form the foundation the rest build on:
 
 - **`gather_kernel`** — the fixture's `default`. Fixed
   `[y_offset, y_offset + BLOCK_COLS)` column slice, same row-level
@@ -24,6 +24,30 @@ functions sharing one source file:
 
 All three back the same downstream pattern: **embedding lookups** and
 **indirect row-gather access into a 2D source**.
+
+## Variant hierarchy
+
+```
+Level A  shape/distribution   fp32 data, i32 indices (gather has one
+                               operation, so there is no OP axis to pin)
+         default, y_offset_zero, full_row, slice_large_row,
+         min_block_cols, slice_at_end, wide_slice, 1core, large_k,
+         2d, 2d_serial, 2d_large_table, 2d_large_table_serial, 1d,
+         3d, 3d_large_k, 3d_group, 3d_group_end, 4d, 4d_boundary,
+         3d_partial, scatter_3d, scatter_3d_partial,
+         2d_index_gather, 2d_index_roundtrip,
+         2d_index_3d_block, 2d_index_3d_block_large           27 keys
+
+Level B  compute correctness   DTYPE sweep on gather_kernel_1core, the
+                                simplest legal shape (still no OP axis)
+         1core_compute[DTYPE=fp16|fp32|i32]                    3 keys
+```
+
+Level D has no gather variant: no variant reaches a Spyre binary. The
+layout-carrying trio (`spyre_stick`, `spyre_stick_output_only`,
+`4d_spyre_stick_output`) sits outside Level A, deliberately
+unclassified — see the `Unclassified` section under `## Variants`
+below.
 
 ### Pythonic semantics
 
@@ -143,7 +167,15 @@ the degenerate path where `rows_per_core = m_blocks` and
 
 ## Variants
 
-### Distributed (`gather_kernel`)
+### Level A — shape and distribution (fp32 data, i32 indices)
+
+No `OP` axis: gather has exactly one operation, so nothing here sweeps
+a combiner. `4d` / `4d_boundary` carry `IN_LAYOUT`/`OUT_LAYOUT`
+constexprs but pin them to `None` — layout plumbing with no
+annotation — so nothing at this level carries a real layout annotation
+either; that would be Level C, which this fixture does not cover.
+
+#### Distributed (`gather_kernel`)
 
 | Variant           | M    | N   | K_INDICES | BLOCK_ROWS | BLOCK_COLS | y_offset | y_off+BLOCK | dups | Pinned bug class                                     |
 |-------------------|------|-----|-----------|------------|------------|----------|-------------|------|-------------------------------------------------------|
@@ -163,7 +195,7 @@ total number of rows gathered and `BLOCK_ROWS` the per-gather tile size.
 shape the kernel accepts, and what makes the `m_end` clamp in
 `gather_kernel` load-bearing rather than decorative.
 
-### Single-program (`gather_kernel_1core`)
+#### Single-program (`gather_kernel_1core`)
 
 | Variant   | M    | N  | K_INDICES | BLOCK_COLS | y_offset | y_off+BLOCK | dups | Pinned bug class                        |
 |-----------|------|----|-----------|------------|----------|-------------|------|--------------------------------------------|
@@ -178,7 +210,7 @@ size at all. `large_k` stays on this kernel rather than moving onto
 `BLOCK_ROWS`, silently changing what it pins — at K_INDICES=128 it is
 the largest single-shot fan-out in the fixture.
 
-### 2D-tiled (`gather_2d_kernel`)
+#### 2D-tiled (`gather_2d_kernel`)
 
 | Variant                 | M    | N   | K_INDICES | BLOCK_ROWS × BLOCK_COLS | grid   | What it pins                                       |
 |-------------------------|------|-----|-----------|--------------------------|--------|----------------------------------------------------|
@@ -194,6 +226,133 @@ per-core *tile count* is unchanged, only the data dimensions grow.
 The two `_serial` flavours drop to `grid = [1, 1]`; they run
 `test_numerical` against the NumPy oracle and reuse the data shape +
 input generator of the corresponding multi-core variant.
+
+#### 1D-source (`gather_1d_kernel`)
+
+| Variant | K    | K_INDICES | BLOCK_ROWS | Pinned bug class                                    |
+|---------|------|-----------|------------|------------------------------------------------------|
+| `1d`    | 1024 | 256       | 8          | 1D source/output gather, one core per gather call     |
+
+Distributed across `grid=[32]`; `K_INDICES=256`, `BLOCK_ROWS=8` gives
+`m_blocks = 32`, so each core owns exactly one gather call.
+`BLOCK_ROWS=8` is the frontend gather verifier's minimum
+(`x_offsets.shape[0] >= 8`). Internally the 1D source is described as
+`[K, 1]` with `block_shape=[1, 1]`.
+
+#### Rank-3 block-fetch (`gather_3d_kernel`)
+
+| Variant      | M   | BLOCK_SIZE | HEAD_DIM | K_INDICES | Pinned bug class                              |
+|--------------|-----|------------|----------|-----------|------------------------------------------------|
+| `3d`         | 256 | 16         | 64       | 32        | each index names a full `[BLOCK_SIZE, HEAD_DIM]` block |
+| `3d_large_k` | 256 | 16         | 64       | 128       | same path at a 4× larger fan-out               |
+
+Source is rank-3 `[M, BLOCK_SIZE, HEAD_DIM]`; each index selects dim 0
+and the full extent of dims 1–2 is gathered (`y_offset=0`, no
+sub-block slicing).
+
+#### Rank-3 group-indexed (`gather_3d_group_kernel`)
+
+| Variant        | M   | NUM_GROUPS | HEAD_DIM | K_INDICES | group_idx | Pinned bug class                                        |
+|----------------|-----|------------|----------|-----------|-----------|-----------------------------------------------------------|
+| `3d_group`     | 256 | 8          | 64       | 32        | 3         | non-zero, mid-range `group_idx` makes the `c_y` capture load-bearing |
+| `3d_group_end` | 256 | 8          | 64       | 32        | 7         | `group_idx` at the last valid group (boundary condition)   |
+
+Source is `[M, NUM_GROUPS, HEAD_DIM]`, block `[1, 1, HEAD_DIM]`;
+`group_idx` selects dim 1. Block dim 1 is 1, so neither variant pins
+the partial-vs-full-extent contrast on a middle dim — `3d_partial` /
+`scatter_3d_partial` below cover that.
+
+#### Rank-4 (`gather_4d_kernel`)
+
+| Variant       | NUM_BLOCKS | NUM_GROUPS | BLOCK_SIZE | INNER_DIM | K_INDICES | group_idx | Pinned bug class                                                          |
+|---------------|------------|------------|------------|-----------|-----------|-----------|-----------------------------------------------------------------------------|
+| `4d`          | 64         | 4          | 16         | 64        | 32        | 1         | rank-4 gather with a leading block-index axis on top of the group axis      |
+| `4d_boundary` | 64         | 4          | 16         | 64        | 64        | 3         | `group_idx` at the last group + `K_INDICES == NUM_BLOCKS` (every block selected) |
+
+`IN_LAYOUT`/`OUT_LAYOUT` are declared as constexprs on both variants
+but pinned to `None` — layout plumbing with no annotation, not layout
+coverage.
+
+#### Rank-3 partial-extent (`gather_3d_partial_kernel`)
+
+| Variant       | M   | NUM_TOKENS | TOKEN_BLOCK | HEAD_DIM | K_INDICES | Pinned bug class                                                          |
+|---------------|-----|------------|-------------|----------|-----------|-----------------------------------------------------------------------------|
+| `3d_partial`  | 256 | 64         | 16          | 64       | 32        | windowed gather along dim 1 via an `scf.for`, `y_offset` computed in-loop  |
+
+`TOKEN_BLOCK` is a strict divisor of `NUM_TOKENS` (`16 | 64`, 4
+windows); the full sweep reconstructs `in[idx, :, :]`, so the oracle
+is the same as `3d`'s.
+
+#### Rank-3 scatter (`scatter_3d_kernel` / `scatter_3d_partial_kernel`)
+
+| Variant               | Base         | Pinned bug class                                                  |
+|-----------------------|--------------|---------------------------------------------------------------------|
+| `scatter_3d`          | `3d`         | write-back mirror: reads `K_INDICES` blocks and scatters into `dst_ptr` |
+| `scatter_3d_partial`  | `3d_partial` | write-back mirror of the windowed partial-extent sweep              |
+
+Both use unique indices (no aliasing), so the oracle is deterministic.
+Neither carries a layout constexpr: no annotation direction compiles
+today for the scatter side — see the comment on `scatter_3d` in
+`meta.py`.
+
+#### Rank-2 index grid (`gather_2d_index_kernel` / `gather_scatter_2d_index_kernel`)
+
+| Variant               | M    | N  | S0 | S1 | BLOCK_COLS | y_offset | Pinned bug class                                                         |
+|-----------------------|------|----|----|----|------------|----------|-----------------------------------------------------------------------------|
+| `2d_index_gather`     | 1024 | 64 | 8  | 4  | 32         | 16       | 2D `[S0, S1]` index grid instead of a 1D index list                        |
+| `2d_index_roundtrip`  | 1024 | 64 | 8  | 4  | 64         | 0        | gather→scatter round-trip over a shared index grid; the only numerical coverage of the rank-2 scatter path |
+
+Numerical oracles for the rank-K `x_offsets` relaxation: they confirm
+the K-D indirect read (and scatter write) executes with correct
+numerics on `ktir_cpu`.
+
+#### Rank-2 index grid × rank-3 block (`gather_2d_index_3d_block_kernel`)
+
+| Variant                    | CACHE_SZ | HEAD | D   | B  | L   | BLOCK_B | BLOCK_L | BLOCK_H | h_offset | Pinned bug class                                             |
+|----------------------------|----------|------|-----|----|-----|---------|---------|---------|----------|---------------------------------------------------------------|
+| `2d_index_3d_block`        | 16       | 6    | 8   | 4  | 8   | 2       | 4       | 2       | 2        | both relaxations at once: 2D index grid *and* rank-3 source block, non-zero `h_offset` on the inner axis |
+| `2d_index_3d_block_large`  | 32768    | 32   | 128 | 12 | 256 | 2       | 64      | 4       | 8        | same path at paged-KV-cache scale                            |
+
+### Level B — compute correctness
+
+| Variant                     | M  | N  | K_INDICES | BLOCK_COLS | y_offset | DTYPE            | Pinned bug class                                    |
+|------------------------------|----|----|-----------|------------|----------|------------------|------------------------------------------------------|
+| `1core_compute[DTYPE=fp16]` | 16 | 16 | 8         | 16         | 0        | fp16             | descriptor_gather correctness at fp16                |
+| `1core_compute[DTYPE=fp32]` | 16 | 16 | 8         | 16         | 0        | fp32             | descriptor_gather correctness at fp32                |
+| `1core_compute[DTYPE=i32]`  | 16 | 16 | 8         | 16         | 0        | i32              | descriptor_gather correctness on an integer payload   |
+
+Reuses `gather_kernel_1core` unchanged — no dtype-specific code in the
+kernel, so this variant exists purely to sweep `in_ptr`/`out_ptr`'s
+element type through `SIGNATURE`. `idx_ptr` is pinned `i32` in every
+key: index dtype is a fixed contract, not a compute axis, the same way
+`reduce`'s axis being reduced is fixed while `OP`/`DTYPE` sweep. There
+is no `OP` axis here either — gather has exactly one operation, so the
+sweep is DTYPE alone.
+
+The shape is the smallest `gather_kernel_1core`'s preconditions allow
+across all three dtypes: `BLOCK_COLS ≥ 32 / bitwidth * 8` needs 16 for
+fp16 and only 8 for fp32/i32, so `BLOCK_COLS = 16` is the smallest value
+that satisfies every arm with one shared shape row (see
+`## Preconditions` below). `y_offset = 0` with `N = BLOCK_COLS` reads
+the full row, the simplest case. Because gather has no arithmetic —
+it is pure indexed data movement — all three dtypes are bit-exact
+against the NumPy oracle; unlike `reduce`/`elementwise`'s compute
+sweeps, no `rtol`/`atol` override is needed.
+
+### Unclassified — layout-carrying (level deliberately unstated)
+
+| Variant                    | Base kernel           | Layout annotation                     |
+|-----------------------------|------------------------|-----------------------------------------|
+| `spyre_stick`               | `gather_kernel_spyre` | `in_desc` and `out_desc` both stick-on-N |
+| `spyre_stick_output_only`   | `gather_kernel_spyre` | `out_desc` alone, stick-on-N            |
+| `4d_spyre_stick_output`     | `gather_4d_kernel`    | `out_desc` alone, stick-on-INNER_DIM    |
+
+None of these is labelled Level C: stick physicalization moved from
+the `ktir` stage to `spyrecode`, and this suite's numerical tier runs
+only `ktir`, so the annotation here is carried but inert — these three
+execute the same IR an unannotated variant would. A Level C label
+would claim layout coverage that isn't actually happening at this
+tier.
 
 ## Descriptor-based index loading
 

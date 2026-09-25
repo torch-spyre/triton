@@ -18,43 +18,68 @@ Vocabulary (matches ``kernel.py``):
                            ``gather_2d_kernel``); the kernel reads
                            ``source[idx[i], y_offset : y_offset + BLOCK_COLS]``
 
-Three kernel families share this fixture:
+Several kernel functions share this fixture, most of them under the
+Level A banner below (shape, rank and distribution; no ``OP`` axis since
+gather has exactly one operation, fp32 data with i32 indices, no real
+layout annotation). One variant sits under a Level B banner (compute
+correctness: a DTYPE sweep on ``gather_kernel_1core`` at the simplest
+shape, since there's still no ``OP`` axis to cross it against):
 
-  - **distributed** (``gather_kernel``) — the ``default``. Fixed
-    column slice via ``y_offset``, rows tiled by ``BLOCK_ROWS`` and
-    distributed across a 1D core grid via ``tl.program_id(0)``. Variants:
-      - ``default``       — sanity case with non-zero ``y_offset``.
-      - **edge-case set** — six variants rebased onto this kernel, each
-        pinning a specific bug class (zero offset, full row, minimum
-        legal sizes, slice ending at row edge, wider slice).
+  - **distributed** (``gather_kernel``) — the ``default``, plus six
+    edge-case variants rebased onto it, each pinning a specific bug
+    class in the column-slice machinery (zero offset, full row, minimum
+    legal sizes, slice ending at the row edge, wider slice).
+  - **single-program** (``gather_kernel_1core``) — ``1core`` and
+    ``large_k``; one ``descriptor_gather`` call consumes the whole index
+    array, no ``tl.program_id``, so DistributeWork is a no-op.
+  - **2D-tiled** (``gather_2d_kernel``) — ``2d``, ``2d_serial``,
+    ``2d_large_table``, ``2d_large_table_serial``; tiled across a 2D
+    core grid, full row width via column-tile walk, no ``y_offset``.
+  - **1D-source** (``gather_1d_kernel``) — ``1d``; 1D source and output,
+    distributed across grid=[32].
+  - **rank-3 block-fetch** (``gather_3d_kernel``) — ``3d``,
+    ``3d_large_k``; gathers a full ``[BLOCK_SIZE, HEAD_DIM]`` block per
+    index.
+  - **rank-3 group-indexed** (``gather_3d_group_kernel``) — ``3d_group``,
+    ``3d_group_end``; a non-zero ``group_idx`` selects one group per row.
+  - **rank-4** (``gather_4d_kernel``) — ``4d``, ``4d_boundary``; adds a
+    leading block-index axis on top of the group axis.
+  - **rank-3 partial-extent** (``gather_3d_partial_kernel``) —
+    ``3d_partial``; an ``scf.for`` sweeps windows along dim 1.
+  - **rank-3 scatter** (``scatter_3d_kernel`` /
+    ``scatter_3d_partial_kernel``) — ``scatter_3d``,
+    ``scatter_3d_partial``; write-back mirrors of ``3d`` / ``3d_partial``.
+  - **rank-2 index grid** (``gather_2d_index_kernel`` /
+    ``gather_scatter_2d_index_kernel``) — ``2d_index_gather``,
+    ``2d_index_roundtrip``; a 2D ``[S0, S1]`` index grid instead of a
+    1D index list.
+  - **rank-2 index grid x rank-3 block** (``gather_2d_index_3d_block_kernel``)
+    — ``2d_index_3d_block``, ``2d_index_3d_block_large``; both
+    generalisations at once (2-D x_offsets AND a rank-3 source block),
+    at paged-KV-cache shapes.
 
-  - **single-program** (``gather_kernel_1core``) — one kernel invocation
-    consumes the whole index array in one ``descriptor_gather`` call, no
-    row tiling. No ``tl.program_id``, so DistributeWork is a no-op.
-    Variants:
-      - ``1core``   — the ``gather_kernel_1core`` sanity case itself
-                      (formerly ``default``).
-      - ``large_k`` — larger ``K_INDICES`` fan-out in one shot;
-                      kept single-program because row-tiling would
-                      change what it tests (the fan-out size).
+One region sits outside the Level A banner, deliberately unclassified —
+see the banner comment above it in ``VARIANTS`` for why:
 
-  - **2D-tiled** (``gather_2d_kernel``) — tiled across a 2D core grid.
-    ``tl.program_id(0)`` and ``tl.program_id(1)`` both active; each
-    core runs an inner ``scf.for`` over its row-tile chunk. No
-    ``y_offset`` — gathers the full row width by column-tiling instead.
-    Variants:
-      - ``2d``             — small source matrix (M=1024, N=128).
-      - ``2d_large_table`` — same distribution at larger source dims
-                              (M=4096, N=256), per-core tile count
-                              unchanged.
+  - ``spyre_stick``, ``spyre_stick_output_only`` (``gather_kernel_spyre``)
+    and ``4d_spyre_stick_output`` (``gather_4d_kernel``) — carry a real
+    stick layout annotation that the numerical tier no longer
+    physicalizes (that moved from ``ktir`` to ``spyrecode``), so it would
+    be misleading to call them Level C.
+
+Level D is a real gap here, not an omission — gather has no variant that
+reaches a Spyre binary. See ``fixtures/README.md`` for the field
+reference and discovery rules.
 """
 
 import functools
+from dataclasses import dataclass
 
 import numpy as np
 
+import conftest
 from . import kernel
-from utils import sticksize
+from utils import sticksize, DTYPE_MAP
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +88,7 @@ from utils import sticksize
 
 def _make_inputs(
     M: int, N: int, K_INDICES: int, BLOCK_COLS: int, y_offset: int,
-    *, seed: int, allow_duplicates: bool,
+    *, seed: int, allow_duplicates: bool, dtype: str = "fp32",
 ) -> dict:
     """Shared input builder for both variants.
 
@@ -78,15 +103,25 @@ def _make_inputs(
     separate kwarg path through ``test_numerical``. The same value is
     also threaded through ``run_cpu`` as a kernel runtime arg via the
     ``params``/``runtime_scalars`` flow.
+
+    ``dtype`` is a :data:`DTYPE_MAP` key for the source/output payload
+    (defaults to ``"fp32"`` so every pre-existing call site is
+    unaffected); ``idx_ptr`` is always ``i32`` regardless. Integers take
+    their own branch for the same reason ``reduce``'s ``_make_inputs``
+    does: ``standard_normal`` cast to ``int32`` truncates to -1/0/1.
     """
+    np_dtype = DTYPE_MAP[dtype]
     rng = np.random.default_rng(seed)
-    in_data = rng.standard_normal((M, N)).astype(np.float32)
+    if np.issubdtype(np_dtype, np.integer):
+        in_data = rng.integers(-100, 100, size=(M, N)).astype(np_dtype)
+    else:
+        in_data = rng.standard_normal((M, N)).astype(np_dtype)
     if allow_duplicates:
         idx_data = rng.integers(0, M, size=(K_INDICES,)).astype(np.int32)
     else:
         # Sample without replacement to force unique indices (sanity case).
         idx_data = rng.choice(M, size=K_INDICES, replace=False).astype(np.int32)
-    out_data = np.zeros((K_INDICES, BLOCK_COLS), dtype=np.float32)
+    out_data = np.zeros((K_INDICES, BLOCK_COLS), dtype=np_dtype)
     return {
         "in_ptr":   in_data,
         "out_ptr":  out_data,
@@ -145,6 +180,13 @@ def make_inputs_large_k(M, N, K_INDICES, BLOCK_COLS, y_offset,
                         **_unused) -> dict:
     return _make_inputs(M, N, K_INDICES, BLOCK_COLS, y_offset,
                         seed=1006, allow_duplicates=True)
+
+
+def make_inputs_1core_compute(M, N, K_INDICES, BLOCK_COLS, y_offset,
+                              DTYPE="fp32", **_unused) -> dict:
+    """Level B inputs: DTYPE-swept payload; idx_ptr stays i32 always."""
+    return _make_inputs(M, N, K_INDICES, BLOCK_COLS, y_offset,
+                        seed=2001, allow_duplicates=False, dtype=DTYPE)
 
 
 def make_inputs_spyre(M, N, K_INDICES, BLOCK_COLS, y_offset,
@@ -590,20 +632,19 @@ def run_2d_index_roundtrip(inputs: dict) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# rank-2 index grid x rank-3 source block -> rank-4 output (f16).
+# rank-2 index grid x rank-3 source block -> rank-4 output.
 #
 # Drives ``gather_2d_index_3d_block_kernel``: a 2-D (S0 x S1) index grid
 # gathers from a rank-3 source [M, D1, D2] with block [1, C1, D2] (leading 1 =
 # the fanned-out page), producing a rank-4 [S0, S1, C1, D2] result stored into
 # the [0,0,0,0] corner of a [IS0, IS1, D1, D2] output table. ``y_offset`` is
-# non-zero, exercising the direct subscript on the inner (D1) axis. f16 source
-# (a pure indexed copy, so the oracle compares bit-exactly).
+# non-zero, exercising the direct subscript on the inner (D1) axis.
 # ---------------------------------------------------------------------------
 
 def _make_inputs_2d_index_4d_out(
     M, D1, D2, IS0, IS1, S0, S1, C1, h_offset, *, seed,
 ) -> dict:
-    """Rank-3 f16 source + a full [IS0, IS1] index buffer of page indices.
+    """Rank-3 source + a full [IS0, IS1] index buffer of page indices.
 
     The index buffer matches the *descriptor* full shape [IS0, IS1]; the
     kernel loads only the [0:S0, 0:S1] block from it (so the buffer must
@@ -615,9 +656,9 @@ def _make_inputs_2d_index_4d_out(
     table; the kernel writes only the [S0, S1, C1, D2] corner.
     """
     rng = np.random.default_rng(seed)
-    in_data = rng.standard_normal((M, D1, D2)).astype(np.float16)
+    in_data = rng.standard_normal((M, D1, D2)).astype(np.float32)
     idx_data = rng.integers(0, M, size=(IS0, IS1)).astype(np.int32)
-    out_data = np.zeros((IS0, IS1, D1, D2), dtype=np.float16)
+    out_data = np.zeros((IS0, IS1, D1, D2), dtype=np.float32)
     return {
         "in_ptr":   in_data,
         "out_ptr":  out_data,
@@ -851,11 +892,11 @@ _SIG_2D_INDEX = {
     "BLOCK_COLS": "i32",
 }
 
-# rank-2 index grid x rank-3 source block -> rank-4 output (f16 source).
+# rank-2 index grid x rank-3 source block -> rank-4 output.
 # Runtime args (in/out/idx pointers + h_offset) first; the rest are constexpr.
 _SIG_2D_INDEX_4D = {
-    "in_ptr":   "*fp16",
-    "out_ptr":  "*fp16",
+    "in_ptr":   "*fp32",
+    "out_ptr":  "*fp32",
     "idx_ptr":  "*i32",
     "h_offset": "i32",
     "CACHE_SZ": "i32",
@@ -881,11 +922,40 @@ _SIG_1D = {
 }
 
 
+@dataclass(frozen=True)
+class Gather1Core(conftest.VariantFactory):
+    """Level B factory: swept payload dtype for ``gather_kernel_1core``.
+
+    ``idx_ptr`` always stays ``i32`` -- index dtype is a fixed contract,
+    not a compute axis -- so only ``in_ptr``/``out_ptr`` in SIGNATURE vary
+    with DTYPE. The oracle (``run``) has no dtype-specific code and
+    ``make_inputs_1core_compute`` already reads DTYPE from ``params``
+    directly, so neither needs a hook here -- only ``signature`` does,
+    since SIGNATURE is a literal dict rather than something invoked with
+    the combination at run time.
+    """
+
+    def signature(self, DTYPE, **_):
+        return {**_SIG_1CORE, "in_ptr": f"*{DTYPE}", "out_ptr": f"*{DTYPE}"}
+
+
 # ---------------------------------------------------------------------------
 # VARIANTS
 # ---------------------------------------------------------------------------
 
 VARIANTS = {
+    # -----------------------------------------------------------------------
+    # Level A -- shape and distribution
+    #
+    # Swept over rank, source/output shape, grid partition, and how the
+    # work distributes across cores -- gather has exactly one operation,
+    # so there is no OP axis to pin the way reduce pins OP="sum". Data is
+    # fp32 with i32 indices throughout this block. ``4d``/``4d_boundary``
+    # carry IN_LAYOUT/OUT_LAYOUT constexprs but pin them to ``[None]`` --
+    # layout plumbing with no annotation -- so nothing here carries a real
+    # layout annotation; that would be Level C, which this fixture does
+    # not cover.
+    # -----------------------------------------------------------------------
     "default": {
         # Non-zero y_offset exercises the column-slice subscript map;
         # K_INDICES=256/BLOCK_ROWS=8 fills the 32-core grid exactly.
@@ -930,6 +1000,40 @@ VARIANTS = {
         "grid":       [32],
         "reference":  run,
         "inputs":     make_inputs,
+        "output_key": "out_ptr",
+    },
+    # -----------------------------------------------------------------------
+    # Level B -- compute correctness
+    #
+    # gather has exactly one operation, so there's no OP axis to sweep the
+    # way reduce sweeps OP="sum"/"max"/"min" -- this is a pure DTYPE sweep on
+    # gather_kernel_1core at the simplest legal shape. idx_ptr is pinned i32
+    # throughout: index dtype is a fixed contract, not a compute axis.
+    # -----------------------------------------------------------------------
+    "1core_compute": {
+        "base":       None,
+        "kernel_fn":  kernel.gather_kernel_1core,
+        "factory":    Gather1Core(),
+        "constexpr":  ["M", "N", "K_INDICES", "BLOCK_COLS"],
+        "params": {
+            "DTYPE":      ["fp16", "fp32", "i32"],
+            "M":          [16],
+            "N":          [16],
+            "K_INDICES":  [8],
+            "BLOCK_COLS": [16],
+            "y_offset":   [0],
+        },
+        "tags":       ["descriptor-gather", "1core", "gather-compute"],
+        "summary": (
+            "Compute-correctness sweep: gather_kernel_1core at the "
+            "simplest legal shape across fp16/fp32/i32 payload dtypes, "
+            "confirming descriptor_gather is dtype-agnostic. idx_ptr "
+            "stays i32 throughout -- index dtype is a fixed contract, "
+            "not a swept axis."
+        ),
+        "grid":       [1],
+        "reference":  run,
+        "inputs":     make_inputs_1core_compute,
         "output_key": "out_ptr",
     },
     # ------------------------------------------------------------------
@@ -1147,6 +1251,19 @@ VARIANTS = {
         },
         "inputs": make_inputs_2d_large_table,
     },
+    "2d_large_table_serial": {
+        # ``2d_large_table`` data shape on a 1-core grid. Same intent
+        # as ``2d_serial``: pin the degenerate tiling path numerically
+        # at the larger source dims.
+        "base":     "2d_large_table",
+        "tags":     ["descriptor-gather"],
+        "grid":     [1, 1],
+    },
+    # ------------------------------------------------------------------
+    # 1D-source gather: distributed across grid=[32], one core per gather
+    # call. Kept after the 2D-tiled block above since it shares neither
+    # that group's kernel_fn nor its SIGNATURE.
+    # ------------------------------------------------------------------
     "1d": {
         # 1D-source gather distributed across grid=[32].
         # K_INDICES=256, BLOCK_ROWS=8 → m_blocks = 256/8 = 32, so each
@@ -1175,14 +1292,6 @@ VARIANTS = {
         "inputs":       make_inputs_1d,
         "output_key":   "out_ptr",
     },
-    "2d_large_table_serial": {
-        # ``2d_large_table`` data shape on a 1-core grid. Same intent
-        # as ``2d_serial``: pin the degenerate tiling path numerically
-        # at the larger source dims.
-        "base":     "2d_large_table",
-        "tags":     ["descriptor-gather"],
-        "grid":     [1, 1],
-    },
     # ------------------------------------------------------------------
     # Rank-N (N ≥ 3) gather / scatter variants.
     # ------------------------------------------------------------------
@@ -1209,6 +1318,18 @@ VARIANTS = {
         "reference":    run_3d,
         "inputs":       make_inputs_3d,
         "output_key":   "out_ptr",
+    },
+    "3d_large_k": {
+        # Same 3D block-fetch path as "3d" but K_INDICES=128 (4x the base).
+        # Stresses the descriptor_gather fan-out at higher row count without
+        # changing the lowering path.
+        "base":   "3d",
+        "params": {
+            "M":          [256],
+            "BLOCK_SIZE": [16],
+            "HEAD_DIM":   [64],
+            "K_INDICES":  [128],
+        },
     },
     "3d_group": {
         # Rank-3 with non-trivial y_offset: source [M, NUM_GROUPS, HEAD_DIM],
@@ -1278,18 +1399,6 @@ VARIANTS = {
         "inputs":       make_inputs_4d,
         "output_key":   "out_ptr",
     },
-    "3d_large_k": {
-        # Same 3D block-fetch path as "3d" but K_INDICES=128 (4x the base).
-        # Stresses the descriptor_gather fan-out at higher row count without
-        # changing the lowering path.
-        "base":   "3d",
-        "params": {
-            "M":          [256],
-            "BLOCK_SIZE": [16],
-            "HEAD_DIM":   [64],
-            "K_INDICES":  [128],
-        },
-    },
     "4d_boundary": {
         # Last group index (group_idx=3, NUM_GROUPS=4) + K_INDICES equal to
         # NUM_BLOCKS (64). Both are upper-boundary conditions: group_idx at
@@ -1308,59 +1417,6 @@ VARIANTS = {
             "OUT_LAYOUT": [None],
         },
     },
-    "4d_spyre_stick_output": {
-        # 4D gather with the output annotated stick-on-INNER_DIM. Only the
-        # output can carry a layout here: rewriteIndirectAccessTile gates
-        # source physicalization on logical rank 2, so annotating the rank-4
-        # source is rejected by design.
-        # out [K_INDICES, 1, BLOCK_SIZE, INNER_DIM] stick-on-dim-3
-        #   -> phys [INNER/S, K_INDICES, 1, BLOCK_SIZE, INNER%S]
-        "base":      "4d",
-        "tags":      ["descriptor-gather-4d", "spyre-tensor-layout"],
-        "summary": (
-            "4D gather with the output annotated stick-on-INNER_DIM. The "
-            "output layout drives the store sink; the rank-4 source gather "
-            "stays logical."
-        ),
-        "SIGNATURE": _SIG_4D_SPYRE,
-        "constexpr": ["NUM_BLOCKS", "NUM_GROUPS", "BLOCK_SIZE", "INNER_DIM",
-                      "K_INDICES", "IN_LAYOUT", "OUT_LAYOUT"],
-        "params": {
-            "NUM_BLOCKS": [64],
-            "NUM_GROUPS": [4],
-            "BLOCK_SIZE": [16],
-            # INNER_DIM = 64 = exactly one fp16 stick.
-            "INNER_DIM":  [64],
-            "K_INDICES":  [32],
-            "group_idx":  [1],
-            "IN_LAYOUT":  [None],
-            "OUT_LAYOUT": [[(3, "floordiv", _S4("out_ptr")), 0, 1, 2,
-                            (3, "mod", _S4("out_ptr"))]],
-        },
-        "inputs":    functools.partial(make_inputs_4d, dtype=np.float16),
-        "rtol":      1e-2,
-        "atol":      5e-2,
-    },
-    "scatter_3d": {
-        # Write-back mirror of the "3d" variant.  Reads K_INDICES blocks from
-        # data_ptr and scatters them into dst_ptr[M, BLOCK_SIZE, HEAD_DIM].
-        # Uses unique indices (no aliasing) so the oracle is deterministic.
-        "base":       "3d",
-        "kernel_fn":  kernel.scatter_3d_kernel,
-        "SIGNATURE":  _SIG_SCATTER_3D,
-        "tags":       ["descriptor-scatter-nd"],
-        "reference":  run_scatter_3d,
-        "inputs":     make_inputs_scatter_3d,
-        "output_key": "dst_ptr",
-    },
-    # No scatter layout variant: neither annotation direction compiles today.
-    #  - DST_LAYOUT  (the indirect side, rank 3) is rejected by the documented
-    #    rank-2 capability gate in rewriteIndirectAccessTile.
-    #  - DATA_LAYOUT physicalizes the direct data load to rank 4, but the
-    #    unannotated indirect scatter tile stays rank 3, so ktdp.store rejects
-    #    the mismatch (same root cause as gather source-only).
-    # scatter_3d_kernel is therefore left without layout constexprs until one
-    # of the two paths is supported.
     # ------------------------------------------------------------------
     # Partial-extent rank-3 variants: block dim 1 is a strict divisor of
     # source dim 1 (``TOKEN_BLOCK | NUM_TOKENS``, ``TOKEN_BLOCK < NUM_TOKENS``);
@@ -1397,6 +1453,26 @@ VARIANTS = {
         "inputs":       make_inputs_3d_partial,
         "output_key":   "out_ptr",
     },
+    "scatter_3d": {
+        # Write-back mirror of the "3d" variant.  Reads K_INDICES blocks from
+        # data_ptr and scatters them into dst_ptr[M, BLOCK_SIZE, HEAD_DIM].
+        # Uses unique indices (no aliasing) so the oracle is deterministic.
+        "base":       "3d",
+        "kernel_fn":  kernel.scatter_3d_kernel,
+        "SIGNATURE":  _SIG_SCATTER_3D,
+        "tags":       ["descriptor-scatter-nd"],
+        "reference":  run_scatter_3d,
+        "inputs":     make_inputs_scatter_3d,
+        "output_key": "dst_ptr",
+    },
+    # No scatter layout variant: neither annotation direction compiles today.
+    #  - DST_LAYOUT  (the indirect side, rank 3) is rejected by the documented
+    #    rank-2 capability gate in rewriteIndirectAccessTile.
+    #  - DATA_LAYOUT physicalizes the direct data load to rank 4, but the
+    #    unannotated indirect scatter tile stays rank 3, so ktdp.store rejects
+    #    the mismatch (same root cause as gather source-only).
+    # scatter_3d_kernel is therefore left without layout constexprs until one
+    # of the two paths is supported.
     "scatter_3d_partial": {
         # Write-back mirror of "3d_partial": same shape and sweep
         # structure, so gather/scatter exercise symmetric partial-extent
@@ -1471,8 +1547,7 @@ VARIANTS = {
     # ------------------------------------------------------------------
     # rank-2 index grid x rank-3 source block -> rank-4 output.  Both
     # generalisations at once (2-D x_offsets AND a rank-3 block), with a
-    # non-zero h_offset on the inner axis.  f16 source; the gather is a
-    # pure indexed copy so the oracle compares bit-exactly.
+    # non-zero h_offset on the inner axis, at paged-KV-cache shapes.
     # ------------------------------------------------------------------
     "2d_index_3d_block": {
         # 2x4 index grid into a [16, 6, 8] source, block [1, 2, 8]:
@@ -1519,13 +1594,26 @@ VARIANTS = {
         "reference": functools.partial(run_2d_index_3d_block, BLOCK_B=2, BLOCK_L=64, BLOCK_H=4),
         "inputs":    make_inputs_2d_index_3d_block_large,
     },
-    # ------------------------------------------------------------------
-    # Spyre physical-layout variant.
-    # in_desc [M, N] annotated stick-on-N; out_desc [K_INDICES, BLOCK_COLS]
-    # annotated stick-on-N. idx_desc is not annotated.
-    # Loops over all N columns in BLOCK_COLS-wide sticks so the full row
-    # is gathered into out_ptr[K_INDICES, N].
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Unclassified -- layout-carrying, level deliberately unstated
+    #
+    # Three variants carry a real IN_LAYOUT/OUT_LAYOUT stick annotation:
+    # ``spyre_stick`` (in_desc [M, N] stick-on-N, out_desc [K_INDICES,
+    # BLOCK_COLS] stick-on-N, idx_desc unannotated; loops over all N columns
+    # in BLOCK_COLS-wide sticks so the full row lands in out_ptr[K_INDICES,
+    # N]), its ``spyre_stick_output_only`` sibling (out_desc alone
+    # annotated), and ``4d_spyre_stick_output`` (the rank-4 gather's output
+    # annotated stick-on-INNER_DIM; the rank-4 source cannot be, since
+    # rewriteIndirectAccessTile gates source physicalization on logical
+    # rank 2).
+    #
+    # None of these is labelled Level C: stick physicalization moved from
+    # the ``ktir`` stage to ``spyrecode``, and this suite's numerical tier
+    # runs only ``ktir``, so the annotation here is carried but inert --
+    # these three execute the same IR an unannotated variant would. A
+    # Level C label would claim layout coverage that isn't actually
+    # happening at this tier.
+    # -----------------------------------------------------------------------
     "spyre_stick": {
         "kernel_fn":  kernel.gather_kernel_spyre,
         "SIGNATURE":  _SIG_SPYRE,
@@ -1582,5 +1670,38 @@ VARIANTS = {
             "IN_LAYOUT":  [None],
             "OUT_LAYOUT": [[(1, "floordiv", _SS("out_ptr")), 0, (1, "mod", _SS("out_ptr"))]],
         },
+    },
+    "4d_spyre_stick_output": {
+        # 4D gather with the output annotated stick-on-INNER_DIM. Only the
+        # output can carry a layout here: rewriteIndirectAccessTile gates
+        # source physicalization on logical rank 2, so annotating the rank-4
+        # source is rejected by design.
+        # out [K_INDICES, 1, BLOCK_SIZE, INNER_DIM] stick-on-dim-3
+        #   -> phys [INNER/S, K_INDICES, 1, BLOCK_SIZE, INNER%S]
+        "base":      "4d",
+        "tags":      ["descriptor-gather-4d", "spyre-tensor-layout"],
+        "summary": (
+            "4D gather with the output annotated stick-on-INNER_DIM. The "
+            "output layout drives the store sink; the rank-4 source gather "
+            "stays logical."
+        ),
+        "SIGNATURE": _SIG_4D_SPYRE,
+        "constexpr": ["NUM_BLOCKS", "NUM_GROUPS", "BLOCK_SIZE", "INNER_DIM",
+                      "K_INDICES", "IN_LAYOUT", "OUT_LAYOUT"],
+        "params": {
+            "NUM_BLOCKS": [64],
+            "NUM_GROUPS": [4],
+            "BLOCK_SIZE": [16],
+            # INNER_DIM = 64 = exactly one fp16 stick.
+            "INNER_DIM":  [64],
+            "K_INDICES":  [32],
+            "group_idx":  [1],
+            "IN_LAYOUT":  [None],
+            "OUT_LAYOUT": [[(3, "floordiv", _S4("out_ptr")), 0, 1, 2,
+                            (3, "mod", _S4("out_ptr"))]],
+        },
+        "inputs":    functools.partial(make_inputs_4d, dtype=np.float16),
+        "rtol":      1e-2,
+        "atol":      5e-2,
     },
 }
