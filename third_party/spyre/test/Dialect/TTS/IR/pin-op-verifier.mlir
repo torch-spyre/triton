@@ -11,9 +11,9 @@
 //
 // What is left is what a type constraint cannot say. ODS narrows the address to
 // an i32 or an i32 array, and the memory space to a `#ktdp.memory_space`; the
-// verifier adds the three rules that are about MEANING rather than shape -- which
-// kind a pin may name, that it names no core, and the one array shape that parses
-// but addresses nothing.
+// verifier adds the rules that are about MEANING rather than shape: what may be
+// pinned at all, which kind a pin may name, that it names no core, that it states
+// an address, and the one array shape that parses but addresses nothing.
 //
 // Note what is NOT here any more: a misspelled memory space. It used to be a
 // string checked against ktdp's enum, so `"lx"` and `"CT_LOCAL"` were verifier
@@ -104,7 +104,6 @@ tt.func @dynamic_shape(%x: tensor<?x64xf16>) {
 tt.func @accepted_forms(%x: tensor<4x64xf16>) {
   %e0 = math.exp %x : tensor<4x64xf16>
   %e1 = math.exp %x : tensor<4x64xf16>
-  %e2 = math.exp %x : tensor<4x64xf16>
 
   // One i32: the same address on every core.
   tts.pin %e0 {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<4x64xf16>
@@ -113,9 +112,34 @@ tt.func @accepted_forms(%x: tensor<4x64xf16>) {
   // increasing, evenly spaced, or distinct -- those are a consumer's questions.
   tts.pin %e1 {memory_space = #ktdp.memory_space<ct_local>, address = array<i32: 4096, 6144, 8192>} : tensor<4x64xf16>
 
-  // No address at all: the design's baseline, where the compiler places every
-  // intermediate and a pin only names the space.
-  tts.pin %e2 {memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
+  tt.return
+}
 
+// -----
+// A BLOCK ARGUMENT, refused for where it already lives rather than for anything
+// about the annotation. An entry input is global: it sits at the address its base
+// pointer supplies, which the launcher fills in, so pinning one to `ct_local`
+// asks to relocate a kernel argument. A pin places an intermediate -- something
+// an op in this function produced.
+tt.func @block_argument(%x: tensor<4x64xf16>) {
+  // expected-error @+1 {{names a block argument, which is an entry input and lives where its base pointer says}}
+  tts.pin %x {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<4x64xf16>
+  tt.return
+}
+
+// -----
+// No address. The field is OPTIONAL in ODS and required here, which is the honest
+// statement of what exists: the unaddressed form is the design's baseline -- the
+// compiler places every intermediate and a pin only overrides where -- but nothing
+// in this tree can act on one, so accepting it would put an annotation in the
+// artifact that no consumer could honour. Offset 0 is not the fallback; it is a
+// real address that would collide with the scheduler's own pool.
+//
+// Keeping the field optional is what lets this refusal be lifted without the
+// surface changing shape.
+tt.func @no_address(%x: tensor<4x64xf16>) {
+  %e = math.exp %x : tensor<4x64xf16>
+  // expected-error @+1 {{no address, and nothing here can choose one}}
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
   tt.return
 }

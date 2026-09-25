@@ -173,19 +173,18 @@ static Attribute buildTensorLayoutAttr(mlir::triton::tts::TensorLayoutOp marker)
 /// so a `math.exp`, a `linalg.reduce` and a `ktdp.load` are equally valid
 /// carriers and the consumer never reads the op's identity.
 ///
-/// The one refusal is a value with no defining op, i.e. a block argument. It has
-/// no carrier, and the alternative -- a function argument attribute -- is dropped
-/// by `ConvertFunctions` on the way to `func.func`, so it would not survive to a
-/// consumer. Diagnosed rather than skipped: a pin silently dropped leaves the
-/// value in registers, which is a correct-looking artifact that quietly did not
-/// do what the kernel asked.
+/// A value with no defining op cannot be reached, because the op's own verifier
+/// refuses a pinned block argument -- an entry input lives where its base pointer
+/// says, so it is not an intermediate to place. Checked anyway rather than
+/// asserted, since this pass is invocable on hand-written IR and a null here would
+/// otherwise be a crash rather than a diagnostic.
 static Operation *resolvePin(mlir::triton::tts::PinOp marker) {
   Value value = marker.getValue();
   Operation *producer = value.getDefiningOp();
   if (!producer) {
     marker.emitError()
-        << "tts.pin names a block argument, which has no defining op to carry "
-           "the annotation; pin a value some op in this function produces";
+        << "tts.pin names a value with no defining op; this should have been "
+           "refused by the op's verifier";
     return nullptr;
   }
   return producer;

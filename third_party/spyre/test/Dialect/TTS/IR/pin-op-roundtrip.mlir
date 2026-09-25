@@ -12,20 +12,10 @@
 // verifier in pin-op-verifier.mlir, and by the lowering in
 // Transforms/pin-attribute.mlir, both of which parse this op to do it.
 //
-// What is left is the two things the OP itself decides:
-
-// A block argument. Admitted -- a `tensor` is a value whichever way it was
-// defined -- and this is the positive half of a deliberate split: the op says
-// well-formed, and LowerTTSMarkers refuses it, because the annotation's carrier
-// is the op DEFINING the value and a block argument has none. See
-// @pinned_block_argument in Transforms/invalid.mlir for the other half. Neither
-// file states the rule alone.
-// CHECK-LABEL: tt.func @block_argument(
-// CHECK: tts.pin %arg0 {address = 4096 : i32, memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
-tt.func @block_argument(%x: tensor<4x64xf16>) {
-  tts.pin %x {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<4x64xf16>
-  tt.return
-}
+// What is left is the one property the OP itself decides, and a check that it
+// prints at all -- which nothing else covers, since pin-op-verifier.mlir only
+// parses and Transforms/pin-attribute.mlir checks the ATTRIBUTE's printed form
+// after the op is gone.
 
 // Rank 0. A reduction can produce one and a rank-0 buffer is a legal memory view
 // (buildRangeSetND has a rank-0 case), so `AnyStaticShapeTensor` must admit it --

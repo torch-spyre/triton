@@ -84,12 +84,13 @@ def TTS_PinOp : TTS_Op<"pin", []> {
     address would mean supplying a dtype from somewhere as well; a value has a
     type already.
 
-    A block argument verifies here and is refused by the lowering. It is a value
-    like any other -- a `tensor` is a value whichever way it was defined -- so
-    nothing about it is ill formed; what it lacks is a defining op for the
-    attribute to land on. The two halves are split that way on purpose:
-    well-formedness is this op's question, and whether a carrier exists is the
-    lowering's.
+    A block argument is refused, and the reason is where it already lives rather
+    than anything about the annotation. An entry input is global: it sits at the
+    address its base pointer supplies, which the launcher fills in. Pinning one to
+    `ct_local` would be asking to relocate a kernel argument, and a pin places an
+    INTERMEDIATE -- something an op in this function produced. That the annotation
+    also has no op to land on is a consequence of the same fact, not a second
+    rule.
 
     `memory_space` is ktdp's own `#ktdp.memory_space`, not a string checked against
     its enum. The dialect still defines no attribute type of its own -- using one
@@ -112,9 +113,18 @@ def TTS_PinOp : TTS_Op<"pin", []> {
 
     `address` is where in the scratchpad, as an **element index** and not a byte
     address, matching what `ktdp.construct_memory_view`'s `$offset` operand
-    feeds. It is optional because the design's baseline is that the compiler
-    places every intermediate and a pin is an override; no pass honours an
-    unaddressed pin yet.
+    feeds.
+
+    It is optional in ODS and REQUIRED by the verifier, and the asymmetry is the
+    honest statement of what exists. The design's baseline is that the compiler
+    places every intermediate and a pin only overrides where, so an unaddressed
+    pin is a form the surface should keep; but nothing in this tree can act on one
+    -- there is no address analysis, and nothing allocates a buffer that is not a
+    kernel argument -- so accepting it would put an annotation in the artifact
+    that no consumer can honour. Offset 0 is not the fallback either: it is a
+    legitimate address that would collide with the scheduler's own pool, which is
+    exactly what an author cannot check. Keeping the field optional is what lets
+    the refusal be lifted without the surface changing shape.
 
     It is an ATTRIBUTE and not an SSA operand, which is what lets the marker
     become an attribute on the op producing the pinned value -- an operand would

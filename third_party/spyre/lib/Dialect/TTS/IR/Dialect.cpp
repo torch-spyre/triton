@@ -320,8 +320,21 @@ verifyPinFields(mlir::ktdp::MemorySpaceAttr memorySpace, Attribute address,
                        << "; a pin is always the running core's own scratchpad, "
                           "so leave ct_id unspecified";
 
+  // An addressless pin is the design's baseline -- the compiler places every
+  // intermediate and a pin only overrides where -- and it is refused because
+  // nothing in this tree can act on it. There is no address analysis and nothing
+  // that allocates a buffer which is not a kernel argument, so a pin naming no
+  // address names no location at all. Accepting it would put an annotation in the
+  // artifact that no consumer can honour, and offset 0 is not the fallback: it is
+  // a legitimate address that would collide with the scheduler's own pool.
+  //
+  // TODO: admit this form once something can place it. The op keeps the field
+  // optional so the surface does not have to change shape when that happens.
   if (!address)
-    return success();
+    return emitError() << "tts.pin: no address, and nothing here can choose one "
+                          "-- there is no address analysis and nothing "
+                          "allocates a buffer that is not a kernel argument; "
+                          "state an address";
 
   // An EMPTY array names no address for any core, so it is neither the uniform
   // spelling nor the per-core one, and a consumer indexing it by the program id

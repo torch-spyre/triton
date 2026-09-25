@@ -43,8 +43,24 @@ LogicalResult TensorLayoutOp::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult PinOp::verify() {
-  // Delegates rather than restates, for the reason `tensor_layout`'s does: the
-  // same rules are checked again on the ATTRIBUTE form by the dialect's
+  // A block argument is refused, and the reason is about WHERE IT ALREADY LIVES
+  // rather than about the annotation. An entry input is global: it lives at the
+  // address its base pointer supplies, which the launcher fills in, so a pin
+  // asking for it in `ct_local` is asking to relocate a kernel argument. That is
+  // not what a pin does -- a pin says where an INTERMEDIATE's buffer goes, and an
+  // intermediate is by definition something an op in this function produced.
+  //
+  // Here rather than in the lowering because it is answerable from the op alone:
+  // whether a value is a block argument needs no pass context. The lowering has
+  // its own reason to want a defining op -- it is the attribute's carrier -- but
+  // that is a consequence, not the rule.
+  if (isa<BlockArgument>(getValue()))
+    return emitError() << "tts.pin names a block argument, which is an entry "
+                          "input and lives where its base pointer says; a pin "
+                          "places an intermediate some op here produced";
+
+  // The rest delegates rather than restates, for the reason `tensor_layout`'s
+  // does: the same rules are checked again on the ATTRIBUTE form by the dialect's
   // `verifyOperationAttribute`, and a second copy would answer differently the
   // first time anyone admits a new memory space.
   //
@@ -52,11 +68,6 @@ LogicalResult PinOp::verify() {
   // already names `tts.pin`, so the op-error prefix would say it twice -- and
   // identical text either side of the lowering is what makes the op and the
   // attribute diagnosable as one contract.
-  //
-  // A block argument is deliberately NOT refused here. A `tensor` is a value
-  // whether an op or a block argument defines it, so it is well formed as a pin;
-  // what has no answer is which op would carry the annotation, and that is
-  // `LowerTTSMarkers`' question rather than this one.
   auto emitError = [&]() { return this->emitError(); };
   return verifyPinFields(getMemorySpace(), getAddressAttr(), emitError);
 }

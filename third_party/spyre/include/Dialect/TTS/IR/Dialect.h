@@ -262,13 +262,15 @@ LogicalResult readTensorLayoutArrays(
 /// the op form arrives with both fields already typed by ODS and needs only the
 /// semantics, while the attribute form has to get past its spelling first.
 ///
-/// `address` may be null, which is the unaddressed pin and is accepted here --
-/// whether a consumer can do anything with one is that consumer's rule.
-///
 /// What it enforces:
 ///   - the kind is `ct_local`, the only one a pin may name;
 ///   - `ct_id` is unspecified, since a pin is the running core's own scratchpad;
-///   - a non-null `address` is an `i32` or a non-empty dense i32 array.
+///   - `address` is present, because nothing in this tree can choose one;
+///   - it is an `i32` or a non-empty dense i32 array.
+///
+/// `address` being required is temporary and the op keeps the field optional for
+/// it: the unaddressed form is the design's baseline and returns when something
+/// can place it. See the refusal for what is missing.
 LogicalResult
 verifyPinFields(mlir::ktdp::MemorySpaceAttr memorySpace, Attribute address,
                 llvm::function_ref<InFlightDiagnostic()> emitError);

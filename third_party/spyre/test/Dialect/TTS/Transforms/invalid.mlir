@@ -42,23 +42,3 @@ tt.func @no_memory_view() {
      phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x64xf32>
   tt.return
 }
-
-// -----
-
-// A pinned BLOCK ARGUMENT, which is the pin's whole resolution rule as a refusal.
-// The OP admits one -- a `tensor` is a value whichever way it was defined, and
-// pin-op-roundtrip.mlir round trips exactly this -- so what fails is resolving it
-// to a carrier: a block argument has no defining op, and the annotation has to
-// live on the op producing the value.
-//
-// The candidate carrier a reader will think of is a function argument attribute,
-// and it does not work: ConvertFunctions rewrites tt.func into func.func without
-// forwarding argument attributes, so an annotation put there would be gone before
-// any consumer in the `spyrecode` stage could read it. Refused rather than moved
-// there for that reason, not because a block argument is an unreasonable thing to
-// pin.
-tt.func @pinned_block_argument(%x: tensor<4x64xf16>) {
-  // expected-error @+1 {{tts.pin names a block argument, which has no defining op to carry the annotation; pin a value some op in this function produces}}
-  tts.pin %x {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<4x64xf16>
-  tt.return
-}

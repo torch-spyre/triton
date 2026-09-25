@@ -70,19 +70,6 @@ tt.func @per_core_address(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
 }
 
 // -----
-// No address. The entry is ABSENT from the dictionary rather than zero, which is
-// what keeps "stated no address" distinguishable from "stated 0" -- 0 being a
-// legitimate element index.
-// CHECK-LABEL: tt.func @no_address
-// CHECK: math.exp {{.*}} {tts.pin = {memory_space = #ktdp.memory_space<ct_local>}}
-// CHECK-NOT: address
-tt.func @no_address(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
-  %e = math.exp %x : tensor<4x64xf16>
-  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
-  tt.return %e : tensor<4x64xf16>
-}
-
-// -----
 // Two pins on two values produced by the same KIND of op, to show the attribute
 // is per-op and not per-function: each lands on its own producer with its own
 // address.
