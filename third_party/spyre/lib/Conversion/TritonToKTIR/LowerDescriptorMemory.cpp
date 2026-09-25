@@ -12,7 +12,8 @@
 #include "Conversion/TritonToKTIR/Passes.h"
 #include "ConversionUtils.h"
 #include "Dialect/KTDP/Utils/Utility.h"
-// For `tts::TensorLayoutOp`, which this pass only has to keep legal.
+// For `tts::TensorLayoutOp`, which this pass only has to keep legal, and
+// `tts::MakeDistributedDescriptorOp`, whose reads it has to let through.
 #include "Dialect/TTS/IR/Dialect.h"
 #include "Utils/Utility.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
@@ -47,6 +48,24 @@ using mlir::triton::ktdp::isLoweredDescriptor;
 using mlir::triton::spyre::getBasePtrAsIndex;
 using mlir::triton::spyre::getConstantInt;
 using mlir::triton::spyre::getDescriptorLogicalLayout;
+
+/// True iff `desc` is a DISTRIBUTED descriptor -- composed by
+/// `tts.make_distributed_descriptor` rather than based on a pointer.
+///
+/// Such a descriptor has no shape or stride operands to recover a view from, and
+/// is not meant to: the view it reads through is composed by LowerInterTile, five
+/// passes later, because a partition's address comes from the buffer
+/// PlacePinnedValues builds and that has not run when this pass does. So a read
+/// through one travels with its descriptor and is lowered there.
+///
+/// One predicate for the two places that must agree about it -- the precondition
+/// walk and the conversion target. Two copies would diverge on the next producer
+/// anyone adds, and the failure would be the precondition rejecting what the
+/// target admits.
+static bool isDistributedDescriptor(Value desc) {
+  return desc.getDefiningOp<mlir::triton::tts::MakeDistributedDescriptorOp>() !=
+         nullptr;
+}
 
 //===----------------------------------------------------------------------===//
 // Shared memory view construction
@@ -584,6 +603,13 @@ struct LowerDescriptorMemoryPass
       if (!isa<triton::DescriptorLoadOp, triton::DescriptorStoreOp,
                triton::DescriptorGatherOp, triton::DescriptorScatterOp>(op))
         return WalkResult::advance();
+      // A read on a distributed descriptor is exempt, and for the same reason the
+      // target admits it: there is no view for walk 1 to have built. A STORE is
+      // not exempt -- this design composes no destination view -- so it falls
+      // through to the message below.
+      if (isa<triton::DescriptorLoadOp>(op) &&
+          isDistributedDescriptor(op->getOperand(0)))
+        return WalkResult::advance();
       if (!isLoweredDescriptor(op->getOperand(0)))
         return op->emitError(
             "cannot lower descriptor op: shape and stride info is only "
@@ -598,10 +624,24 @@ struct LowerDescriptorMemoryPass
 
     ConversionTarget target(*ctx);
     // Illegal: Triton descriptor ops that have conversion patterns below.
-    //   Direct path: descriptor_load, descriptor_store
+    //   Direct path: descriptor_store
     //   Indirect path: descriptor_gather, descriptor_scatter
-    target.addIllegalOp<triton::DescriptorLoadOp, triton::DescriptorStoreOp,
-                        triton::DescriptorGatherOp, triton::DescriptorScatterOp>();
+    target.addIllegalOp<triton::DescriptorStoreOp, triton::DescriptorGatherOp,
+                        triton::DescriptorScatterOp>();
+    // descriptor_load is illegal EXCEPT on a distributed descriptor, which this
+    // pass has nothing to lower it against: the view such a read goes through is
+    // composed by LowerInterTile, five passes later, because a partition's address
+    // comes from the buffer PlacePinnedValues builds and that has not run yet. So
+    // the read travels with its descriptor and is lowered there, alongside the
+    // compose it belongs to.
+    //
+    // A dynamic predicate rather than dropping the entry, so that an ordinary
+    // descriptor_load this pass fails to match is still reported here rather than
+    // surviving silently into a stage that cannot see what it was.
+    target.addDynamicallyLegalOp<triton::DescriptorLoadOp>(
+        [](triton::DescriptorLoadOp op) {
+          return isDistributedDescriptor(op.getDesc());
+        });
     // Legal: output dialects that conversion patterns lower into.
     //   ktdp (construct_memory_view, construct_access_tile, load, store),
     //   arith (constants, index casts), memref (alloc for index buffers)
@@ -642,7 +682,8 @@ struct LowerDescriptorMemoryPass
     //     fail the pass.
     target.addLegalOp<ModuleOp, UnrealizedConversionCastOp,
                       triton::SpyreTensorLayoutOp,
-                      mlir::triton::tts::TensorLayoutOp>();
+                      mlir::triton::tts::TensorLayoutOp,
+                      mlir::triton::tts::MakeDistributedDescriptorOp>();
 
     RewritePatternSet patterns(ctx);
     patterns.add<ConvertDescriptorLoad, ConvertDescriptorStore,

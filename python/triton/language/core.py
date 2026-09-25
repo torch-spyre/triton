@@ -3874,4 +3874,102 @@ def spyre_tensor_layout(desc, layout, _semantic=None):
     Only valid on the ``spyre`` backend — raises on any other target.
     """
     return _semantic.spyre_tensor_layout(desc, layout)
+
+
+@builtin
+def spyre_pin(v, memory_space, address=None, _semantic=None):
+    """(Spyre only) Place a named value's buffer in a chosen memory space.
+
+    The scheduler admits one compute per local schedule, so a value handed from
+    one compute to the next has to go through memory. This says *which* memory,
+    and for the scratchpad, where in it. It lowers to a ``tts.pin`` marker, which
+    ``PlacePinnedValues`` turns into the buffer plus the store and loads that
+    route the value through it.
+
+    Pinning also SPLITS the producer from its consumers, since the value now
+    reaches them through memory — which is what makes a pin the way to stop two
+    pointwise ops fusing into one compute.
+
+    Args:
+        v:            The value to place. It must be one the kernel NAMED:
+                      ``y = tl.exp(x)`` can be pinned, ``tl.exp(x)`` inside a
+                      larger expression cannot, and neither can a kernel argument
+                      (it lives where its base says).
+        memory_space: ``"ct_local"``, the per-core scratchpad, and nothing else.
+                      ``"global"`` is refused: an intermediate in HBM is written as
+                      a ``tl.make_tensor_descriptor`` with an explicit store and
+                      load, and nothing places an anonymous device buffer. The
+                      parameter exists so the surface does not change shape if that
+                      ever becomes possible.
+        address:      Where in the scratchpad, as an ELEMENT INDEX and not a byte
+                      address. Two forms::
+
+                          tl.spyre_pin(v, "ct_local", address=0x100)
+                          tl.spyre_pin(v, "ct_local", address=BASE + pid * STRIDE)
+
+                      The second may name ``tl.program_id(0)`` once, with
+                      ``tl.constexpr`` coefficients, and nothing else — that is
+                      what keeps the set of addresses the pin occupies finite, and
+                      so keeps its capacity and its disjointness from other pins
+                      checkable. Note a ``program_id`` term does not spread one
+                      value across cores: the scratchpad is per-core, so it moves
+                      each core's own value to a different offset in that core's
+                      own scratchpad, and every core then has to leave room for
+                      the whole set.
+
+    Only valid on the ``spyre`` backend — raises on any other target.
+    """
+    return _semantic.spyre_pin(v, memory_space, address)
+
+
+@builtin
+def make_distributed_descriptor(partial, work_slices, axes, block_shape,
+                                _semantic=None):
+    """(Spyre only) Compose every instance's share of a tensor into one descriptor.
+
+    Each instance passes ITS OWN share and gets back a descriptor over the whole
+    tensor. Reading it at an offset of the instance's choosing is the
+    redistribution, and the offsets differing per instance is what makes it one::
+
+        share = ...                                   # produced on-chip
+        tl.spyre_pin(share, "ct_local", address=0)    # where my share lives
+        whole = tl.make_distributed_descriptor(
+            share, work_slices=SRC, axes=[None, "n"], block_shape=[64, 64])
+        mine  = whole.load([0, my_offset])            # my region under the new division
+        tl.spyre_pin(mine, "ct_local", address=DEST)  # where the received tile lands
+
+    Both pins are load-bearing. The first is what gives a partition an address at
+    all — nothing else supplies one. The second is the landing a received tile
+    needs before a compute unit can read it.
+
+    ``.load()`` on the result is a TRANSFER, syntactically identical to a local
+    descriptor read; and the call itself is an implicit barrier over the instances
+    that reach it, so the participant set must not depend on data.
+
+    Args:
+        partial:     This instance's share, a value. It must be pinned.
+        work_slices: The PARTITION table — one entry per region the view is
+                     composed from, NOT one per tile — as a ``tl.constexpr`` list
+                     of dicts mapping a dimension key to a slice index, every
+                     entry carrying the same keys. Written the way
+                     :func:`inter_tile`'s ``work_slices`` is. The slice count
+                     along a key is one more than the largest index appearing
+                     under it, and is deliberately not written down.
+        axes:        One entry per tensor dimension, naming the partition key that
+                     dimension is divided along, or ``None`` for a dimension the
+                     work was not divided on.
+        block_shape: The extent of one ``.load()``, bounded by the COMPOSED extent
+                     rather than by the share's — so it may be larger than the
+                     share. Less is a relayout reading the region this instance
+                     ends up holding; exactly a share is one region per load; more
+                     is a gather across partitions, and the whole composed axis is
+                     what makes a fold over it an all-reduce.
+
+    There is no destination table: the destination arrangement is the offset each
+    instance passes to ``.load()``.
+
+    Only valid on the ``spyre`` backend — raises on any other target.
+    """
+    return _semantic.make_distributed_descriptor(partial, work_slices, axes,
+                                                 block_shape)
 # --- END --- added for spyre

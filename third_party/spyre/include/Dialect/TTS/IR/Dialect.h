@@ -9,6 +9,15 @@
 // the `tts.tensor_layout` *attribute*, which the lowered IR carries on the
 // memory view — and the one structural checker both are enforced by.
 //
+// And one placement marker, `tts.pin`, which has no attribute form: see the op's
+// description for why a value pin cannot become one. What it shares with its
+// consumer is `matchPinAddress` at the bottom of this header.
+//
+// And one op that is not a marker at all -- `tts.make_distributed_descriptor`,
+// which HAS a result, because what it spells is a value rather than a fact about
+// one. It shares `readWorkSliceTable` with its lowering, for the same reason the
+// layout checker is shared: the rules on that table have one owner.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef TRITON_SPYRE_DIALECT_TTS_IR_DIALECT_H
@@ -19,6 +28,7 @@
 #include "mlir/IR/Dialect.h"
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -245,6 +255,59 @@ LogicalResult verifyTensorLayoutArrays(
 LogicalResult readTensorLayoutArrays(
     Attribute value, ArrayRef<int64_t> &physSrc, ArrayRef<int64_t> &physOp,
     ArrayRef<int64_t> &physArg,
+    llvm::function_ref<InFlightDiagnostic()> emitError);
+
+/// Recover a pinned address expression's `(base, stride)`, or fail.
+///
+/// The two forms `tts.pin` admits — a constant, or `base + tl.program_id(0) *
+/// stride` with constant coefficients — reduced to the two numbers that describe
+/// the whole set of addresses the pin will occupy, `{base + i*stride : i < grid}`.
+/// A bare constant gives `stride = 0`, so one pair covers both forms and a
+/// consumer needs no case analysis.
+///
+/// Shared by the two callers for the same reason `verifyTensorLayoutArrays` is:
+/// `PinOp::verify` asks only *whether* the expression has one of those shapes,
+/// `PlacePinnedValues` asks *what* it is in order to check capacity, alignment
+/// and overlap — and a second matcher would answer the first question
+/// differently from the second on the next form anyone admits.
+///
+/// Conservative where it is cheaper to be: two program-id terms describe an
+/// admissible set and are refused rather than summed. See the definition.
+///
+/// `addr` may be null, which fails: a pin with no address has no range, and the
+/// caller that cares has already decided what that means.
+LogicalResult matchPinAddress(Value addr, int64_t &base, int64_t &stride);
+
+/// One entry of a `tts.make_distributed_descriptor` partition table: the slice
+/// index this partition owns along each divided dimension, keyed by dimension
+/// name.
+using WorkSliceEntry = llvm::SmallVector<std::pair<StringRef, int64_t>, 4>;
+
+/// Read and check a partition table, and report the slice count per key.
+///
+/// `table` is the op's `work_slices`: an `ArrayAttr` of `DictionaryAttr`, one
+/// entry per REGION the view is composed from -- not one per tile. On success
+/// `entries` holds one `WorkSliceEntry` per table entry in table order, and
+/// `sliceCounts` maps each key to one more than the largest index appearing under
+/// it anywhere in the table, which is the count the design deliberately does not
+/// write down.
+///
+/// What it enforces, and nothing else:
+///   - the table is non-empty and every entry is a dictionary;
+///   - every entry carries the same key set (a table with ragged keys describes
+///     no grid);
+///   - every value is a non-negative i64.
+///
+/// Deliberately NOT here: that the keys are the ones `axes` names, and that the
+/// table's length matches the launch grid. The first is the op's, which has
+/// `axes` to compare against; the second is the lowering's, which has the grid.
+///
+/// Shared by `MakeDistributedDescriptorOp::verify` and by the lowering, which
+/// needs the projected counts rather than merely a verdict -- so a second reader
+/// would answer "is this well formed" differently from "what does it say".
+LogicalResult readWorkSliceTable(
+    ArrayAttr table, llvm::SmallVectorImpl<WorkSliceEntry> &entries,
+    llvm::MapVector<StringRef, int64_t> &sliceCounts,
     llvm::function_ref<InFlightDiagnostic()> emitError);
 
 } // namespace mlir::triton::tts

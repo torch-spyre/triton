@@ -84,7 +84,8 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
 
 void init_triton_spyre_ir_builders(py::module &&m) {
   // Op builders for the `tts` dialect, called from the Triton frontend --
-  // tl.spyre_tensor_layout, through triton.language.semantic.
+  // tl.spyre_tensor_layout and tl.spyre_pin, through
+  // triton.language.semantic.
   //
   // The frontend reaches this as `from triton._C.libtriton import spyre`, lazily
   // -- an import at module scope in semantic.py would make every backend's
@@ -118,6 +119,94 @@ void init_triton_spyre_ir_builders(py::module &&m) {
               builder.getDenseI64ArrayAttr(physOp),
               builder.getDenseI64ArrayAttr(physArg));
         });
+
+  // tl.spyre_pin. The memory space arrives as the string the kernel wrote and is
+  // stored as one: `tts.pin` spells it that way so the dialect keeps defining no
+  // attribute type, and its verifier is what checks the string against ktdp's
+  // enum. The frontend restates the two names as well, so that a misspelling is a
+  // traceback at the pin rather than a verifier failure after the whole function
+  // has been traced -- but neither place symbolizes it, and the op is where the
+  // rule lives.
+  //
+  // `address` is optional, and a missing one is a null Value rather than a
+  // sentinel: that is how ODS spells an absent optional operand, and it keeps
+  // "the author stated no address" distinguishable from "the author stated 0".
+  m.def(
+      "create_pin",
+      [](TritonOpBuilder &self, mlir::Value &value,
+         const std::string &memorySpace,
+         std::optional<mlir::Value> address) -> void {
+        // LOAD, not register -- see create_tensor_layout above for why the
+        // frontend is the one place that has to ask.
+        self.getContext()->loadDialect<mlir::triton::tts::TTSDialect>();
+
+        auto &builder = self.getBuilder();
+        self.create<mlir::triton::tts::PinOp>(
+            value, address ? *address : mlir::Value(),
+            builder.getStringAttr(memorySpace));
+      },
+      py::arg("builder"), py::arg("value"), py::arg("memory_space"),
+      py::arg("address") = py::none());
+
+  // tl.make_distributed_descriptor. The partition table arrives the way
+  // `create_inter_tile_reduce` takes its own: flat parallel lists from Python,
+  // assembled into the DictionaryAttr / ArrayAttr shape here. That split is
+  // deliberate and worth keeping -- pybind moves lists of scalars across
+  // cheaply, and MLIR attribute construction needs a context the Python side
+  // does not hold.
+  //
+  // Given work_slices = [{n: 0}, {n: 1}]:
+  //   ws_keys = ["n"], ws_vals = [[0], [1]]  ->  [{n = 0}, {n = 1}]
+  //
+  // `axes` carries one entry per tensor dimension, "" for a dimension the work
+  // was not divided on, so its length is the share's rank and not the number of
+  // keys. The result type is built here rather than passed in because it is
+  // derived: the block shape plus the share's element type, which is exactly
+  // what the op's verifier then checks it against.
+  m.def(
+      "create_make_distributed_descriptor",
+      [](TritonOpBuilder &self, mlir::Value &partial,
+         std::vector<std::string> &ws_keys,
+         std::vector<std::vector<int64_t>> &ws_vals,
+         std::vector<std::string> &axes,
+         std::vector<int64_t> &block_shape) -> mlir::Value {
+        self.getContext()->loadDialect<mlir::triton::tts::TTSDialect>();
+
+        auto &builder = self.getBuilder();
+        mlir::MLIRContext *ctx = builder.getContext();
+        auto i64Ty = builder.getI64Type();
+
+        llvm::SmallVector<mlir::Attribute> tableAttrs;
+        for (auto &vals : ws_vals) {
+          llvm::SmallVector<mlir::NamedAttribute> entry;
+          for (size_t j = 0; j < ws_keys.size(); ++j)
+            entry.push_back({mlir::StringAttr::get(ctx, ws_keys[j]),
+                             mlir::IntegerAttr::get(i64Ty, vals[j])});
+          tableAttrs.push_back(mlir::DictionaryAttr::get(ctx, entry));
+        }
+
+        llvm::SmallVector<mlir::Attribute> axisAttrs;
+        for (auto &axis : axes)
+          axisAttrs.push_back(mlir::StringAttr::get(ctx, axis));
+
+        auto elemType =
+            mlir::cast<mlir::RankedTensorType>(partial.getType()).getElementType();
+        // The shape + elementType + sharedLayout builder, with no layout: a
+        // shared-memory encoding is assigned during lowering on targets that have
+        // one, and this target's descriptors never acquire it. The context is
+        // inferred from the element type, so `ctx` is not passed.
+        auto descType = mlir::triton::TensorDescType::get(
+            block_shape, elemType, mlir::Attribute{});
+
+        return self
+            .create<mlir::triton::tts::MakeDistributedDescriptorOp>(
+                descType, partial, mlir::ArrayAttr::get(ctx, tableAttrs),
+                mlir::ArrayAttr::get(ctx, axisAttrs),
+                builder.getDenseI64ArrayAttr(block_shape))
+            .getResult();
+      },
+      py::arg("builder"), py::arg("partial"), py::arg("ws_keys"),
+      py::arg("ws_vals"), py::arg("axes"), py::arg("block_shape"));
 }
 
 /// One `tts.tensor_layout` marker, reduced to what a footprint is computed from.

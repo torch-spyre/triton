@@ -26,7 +26,9 @@ std::unique_ptr<OperationPass<ModuleOp>> createLowerScalarLoadPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerComputeOpsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerSpyreOpsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createConvertFunctionsPass();
-std::unique_ptr<OperationPass<ModuleOp>> createLowerInterTilePass();
+/// `grid` is the pass option of the same name, read by the compose mode only.
+std::unique_ptr<OperationPass<ModuleOp>> createLowerInterTilePass(
+    llvm::ArrayRef<int64_t> grid = {});
 std::unique_ptr<OperationPass<ModuleOp>> createDistributeWorkPass(
     llvm::ArrayRef<int64_t> grid = {});
 

@@ -67,17 +67,48 @@ IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape) {
   return IntegerSet::get(rank, symCount, constraints, eqFlags);
 }
 
+IntegerSet buildBoxSetND(MLIRContext *ctx, ArrayRef<int64_t> los,
+                         ArrayRef<int64_t> his) {
+  assert(los.size() == his.size() && "box bounds must be parallel");
+  unsigned rank = los.size();
+
+  SmallVector<AffineExpr> constraints;
+  SmallVector<bool> eqFlags;
+  for (unsigned i = 0; i < rank; ++i) {
+    auto di = getAffineDimExpr(i, ctx);
+    // `d_i - lo >= 0` and `(hi - 1) - d_i >= 0`, which is buildRangeSetND's pair
+    // shifted by `lo`; at `lo = 0, hi = extent` the two agree exactly.
+    constraints.push_back(di - getAffineConstantExpr(los[i], ctx));
+    eqFlags.push_back(false);
+    constraints.push_back(getAffineConstantExpr(his[i] - 1, ctx) - di);
+    eqFlags.push_back(false);
+  }
+  if (constraints.empty()) {
+    // Rank 0, and the same always-true `0 >= 0` buildRangeSetND uses: an
+    // IntegerSet cannot be built with no constraints at all.
+    constraints.push_back(getAffineConstantExpr(0, ctx));
+    eqFlags.push_back(false);
+  }
+  return IntegerSet::get(rank, /*symCount=*/0, constraints, eqFlags);
+}
+
 Value buildMemoryView(OpBuilder &builder, Location loc, Value baseIndex,
                       ArrayRef<int64_t> staticSizes,
                       ArrayRef<int64_t> staticStrides, ValueRange dynSizes,
                       ValueRange dynStrides, Type elemType,
-                      mlir::ktdp::MemorySpaceAttr memorySpace) {
+                      mlir::ktdp::MemorySpaceAttr memorySpace,
+                      IntegerSet coordinateSet, bool spaceInResultType) {
   MLIRContext *ctx = builder.getContext();
-  auto memrefType = MemRefType::get(staticSizes, elemType);
+  auto memrefType =
+      spaceInResultType
+          ? MemRefType::get(staticSizes, elemType, MemRefLayoutAttrInterface{},
+                            memorySpace)
+          : MemRefType::get(staticSizes, elemType);
   auto memView = mlir::ktdp::ConstructMemoryViewOp::create(
       builder, loc, memrefType, baseIndex, dynSizes, dynStrides, staticSizes,
       staticStrides, memorySpace,
-      IntegerSetAttr::get(buildRangeSetND(ctx, staticSizes)));
+      IntegerSetAttr::get(coordinateSet ? coordinateSet
+                                        : buildRangeSetND(ctx, staticSizes)));
   return memView.getResult();
 }
 
@@ -126,6 +157,21 @@ void collectViewAccesses(Operation *memView,
         stores.push_back(user);
     }
   }
+}
+
+Value traceLoadToMemoryView(Value tensor) {
+  auto loadOp = tensor.getDefiningOp<mlir::ktdp::LoadOp>();
+  if (!loadOp)
+    return {};
+  auto tileOp =
+      loadOp.getAccessTile().getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>();
+  if (!tileOp)
+    return {};
+  auto viewOp =
+      tileOp.getBase().getDefiningOp<mlir::ktdp::ConstructMemoryViewOp>();
+  if (!viewOp)
+    return {};
+  return viewOp.getResult();
 }
 
 void collectAdjacentGenerics(ArrayRef<Operation *> memViews,

@@ -22,6 +22,19 @@ helpers: ``language/math.py``'s ``_check_dtype`` admits the extra dtypes a targe
 declares through the ``extra_math_dtypes`` codegen hook, alongside
 ``min_dot_size``. The table of which ops qualify lives in the backend, so these
 tests drive the hook rather than a backend predicate.
+
+The last two sections are the argument checking of two Spyre-only ops,
+``tl.spyre_pin`` and ``tl.make_distributed_descriptor``.
+It belongs with the guards rather than with the op's own tests because what it
+measures is which refusals the FRONTEND owns: a misspelled memory space and an
+address of the wrong Python type are reported at the kernel line, while the
+address's admissible *shape* is the op verifier's, over IR the frontend has
+already built. Driven through real tracing, since the backend guard resolves the
+target first and so a monkeypatched one never reaches the checks under test.
+
+The same division holds for the compose: a ragged table or an ``axes`` of the wrong
+length is the frontend's, while whether the table has one entry per tile is the
+lowering's, since only a pass sees the grid.
 """
 
 import pytest
@@ -279,3 +292,275 @@ class TestExtraMathDtypesInTracedIR:
         # not pass either.
         assert "math.exp %" in ttir
         assert "tensor<64x64xf16>" in ttir.split("math.exp %")[1].split("\n")[0]
+
+
+# ---------------------------------------------------------------------------
+# tl.spyre_pin — the refusals the frontend owns, and the op it builds
+# ---------------------------------------------------------------------------
+
+class TestSpyrePin:
+
+    SIGNATURE = {"x_ptr": "*fp16", "out_ptr": "*fp16",
+                 "M": "constexpr", "N": "constexpr"}
+    CONSTANTS = {"M": 64, "N": 64}
+
+    @staticmethod
+    def _trace(kernel):
+        from utils import compile_to_ttir
+        return compile_to_ttir(kernel, TestSpyrePin.SIGNATURE,
+                               TestSpyrePin.CONSTANTS)
+
+    @staticmethod
+    def _raises(kernel, match):
+        from triton.compiler.errors import CompilationError
+        with pytest.raises(CompilationError) as exc:
+            TestSpyrePin._trace(kernel)
+        assert match in str(exc.value)
+
+    def test_constant_address_reaches_the_ir(self):
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def k(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+            x_desc = tl.make_tensor_descriptor(
+                x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            out_desc = tl.make_tensor_descriptor(
+                out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            e = tl.exp(x_desc.load([0, 0]))
+            tl.spyre_pin(e, "ct_local", address=4096)
+            out_desc.store([0, 0], e)
+
+        ttir = self._trace(k)
+        # The int becomes a scalar constant, and the space is carried as the
+        # string the kernel wrote — the ktdp attribute is built by the lowering.
+        assert "tts.pin" in ttir
+        assert 'memory_space = "ct_local"' in ttir
+        assert "arith.constant 4096 : i32" in ttir
+
+    def test_affine_address_traces_as_arithmetic(self):
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def k(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+            pid = tl.program_id(0)
+            x_desc = tl.make_tensor_descriptor(
+                x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            out_desc = tl.make_tensor_descriptor(
+                out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            e = tl.exp(x_desc.load([0, 0]))
+            tl.spyre_pin(e, "ct_local", address=4096 + pid * 256)
+            out_desc.store([0, 0], e)
+
+        ttir = self._trace(k)
+        # Nothing folds it: the address is an operand, and the shape restriction
+        # is checked over this arithmetic by the op's verifier.
+        assert "tt.get_program_id" in ttir
+        assert "arith.muli" in ttir and "arith.addi" in ttir
+        assert "tts.pin" in ttir
+
+    def test_no_address_traces(self):
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def k(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+            x_desc = tl.make_tensor_descriptor(
+                x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            out_desc = tl.make_tensor_descriptor(
+                out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            e = tl.exp(x_desc.load([0, 0]))
+            tl.spyre_pin(e, "ct_local")
+            out_desc.store([0, 0], e)
+
+        ttir = self._trace(k)
+        # An absent optional operand, not a sentinel: the op prints no `address`
+        # at all, which is what keeps "stated none" and "stated 0" apart.
+        assert "tts.pin" in ttir
+        assert "address" not in ttir.split("tts.pin")[1].split("\n")[0]
+
+    def test_unknown_memory_space_is_refused_at_the_kernel_line(self):
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def k(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+            x_desc = tl.make_tensor_descriptor(
+                x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            out_desc = tl.make_tensor_descriptor(
+                out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            e = tl.exp(x_desc.load([0, 0]))
+            tl.spyre_pin(e, "lx", address=4096)
+            out_desc.store([0, 0], e)
+
+        # Restated in the frontend so this is a traceback at the pin, rather than
+        # the op verifier's failure after the whole function has been traced.
+        self._raises(k, "memory_space must be 'ct_local'")
+
+    def test_global_is_refused_and_says_why(self):
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def k(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+            x_desc = tl.make_tensor_descriptor(
+                x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            out_desc = tl.make_tensor_descriptor(
+                out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            e = tl.exp(x_desc.load([0, 0]))
+            tl.spyre_pin(e, "global")
+            out_desc.store([0, 0], e)
+
+        # `global` is a real ktdp memory space and the design's prose names it, so
+        # the message has to say a pin cannot place an HBM intermediate rather than
+        # imply the spelling is wrong — otherwise the author goes looking for a
+        # third name.
+        self._raises(k, "'global' cannot be pinned")
+        self._raises(k, "tl.make_tensor_descriptor")
+
+    def test_non_integer_address_is_refused(self):
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def k(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr):
+            x_desc = tl.make_tensor_descriptor(
+                x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            out_desc = tl.make_tensor_descriptor(
+                out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            e = tl.exp(x_desc.load([0, 0]))
+            tl.spyre_pin(e, "ct_local", address="4096")
+            out_desc.store([0, 0], e)
+
+        self._raises(k, "address must be an int or an int32 scalar")
+
+
+# ---------------------------------------------------------------------------
+# tl.make_distributed_descriptor — the surface, and the refusals it owns
+# ---------------------------------------------------------------------------
+
+class TestMakeDistributedDescriptor(TestSpyrePin):
+    """Reuses TestSpyrePin's tracing helpers: the two ops are checked the same way,
+    through a real trace, and inheriting says so rather than copying them."""
+
+    @staticmethod
+    def _kernel(work_slices, axes, block_shape):
+        """A relayout kernel, parameterised on the three things under test.
+
+        The pin is not optional decoration: it is what gives the share an address,
+        and the compose refuses a share without one. Its absence is the lowering's
+        diagnostic rather than the frontend's, so it is tested in
+        Conversion/TritonToKTIR/LowerInterTile/distributed-view-invalid.mlir.
+        """
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def k(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr, WS: tl.constexpr,
+              AX: tl.constexpr, BS: tl.constexpr):
+            pid = tl.program_id(0)
+            x_desc = tl.make_tensor_descriptor(
+                x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            out_desc = tl.make_tensor_descriptor(
+                out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            share = tl.exp(x_desc.load([0, 0]))
+            tl.spyre_pin(share, "ct_local", address=0)
+            whole = tl.make_distributed_descriptor(share, WS, AX, BS)
+            mine = whole.load([0, pid * N])
+            out_desc.store([0, 0], mine)
+
+        from utils import compile_to_ttir
+        signature = {"x_ptr": "*fp16", "out_ptr": "*fp16", "M": "constexpr",
+                     "N": "constexpr", "WS": "constexpr", "AX": "constexpr",
+                     "BS": "constexpr"}
+        constants = {"M": 64, "N": 32, "WS": work_slices, "AX": axes,
+                     "BS": block_shape}
+        return lambda: compile_to_ttir(k, signature, constants)
+
+    @staticmethod
+    def _refuses(run, match):
+        from triton.compiler.errors import CompilationError
+        with pytest.raises(CompilationError) as exc:
+            run()
+        assert match in str(exc.value)
+
+    def test_it_traces(self):
+        ttir = self._kernel([{"n": 0}, {"n": 1}], [None, "n"], [64, 32])()
+        assert "tts.make_distributed_descriptor" in ttir
+        # None becomes "" in the IR: an attribute array cannot hold a Python None,
+        # and "" is what the op's verifier reads as "not divided on this dim".
+        assert 'axes = ["", "n"]' in ttir
+        assert "work_slices = [{n = 0 : i64}, {n = 1 : i64}]" in ttir
+        # The result is a descriptor, so the read through it is the ordinary
+        # tt.descriptor_load and needed no new surface.
+        assert "tt.descriptor_load" in ttir
+
+    def test_the_result_is_a_descriptor_of_the_block_shape(self):
+        # A block smaller than the share: the descriptor follows block_shape, not
+        # the share's extents, so the two being different is what proves which one
+        # the type came from. Its own kernel, because the output descriptor has to
+        # match what is stored and the shared kernel's is the share's shape.
+        import triton
+        import triton.language as tl
+        from utils import compile_to_ttir
+
+        # BM/BN as scalars rather than a list, because make_tensor_descriptor needs
+        # a real Python list and a constexpr wrapping one has no len().
+        @triton.jit
+        def k(x_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr, WS: tl.constexpr,
+              AX: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+            x_desc = tl.make_tensor_descriptor(
+                x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+            out_desc = tl.make_tensor_descriptor(
+                out_ptr, shape=[M, N], strides=[N, 1], block_shape=[BM, BN])
+            share = tl.exp(x_desc.load([0, 0]))
+            tl.spyre_pin(share, "ct_local", address=0)
+            whole = tl.make_distributed_descriptor(share, WS, AX, [BM, BN])
+            out_desc.store([0, 0], whole.load([0, 0]))
+
+        ttir = compile_to_ttir(
+            k,
+            {"x_ptr": "*fp16", "out_ptr": "*fp16", "M": "constexpr",
+             "N": "constexpr", "WS": "constexpr", "AX": "constexpr",
+             "BM": "constexpr", "BN": "constexpr"},
+            {"M": 64, "N": 32, "WS": [{"n": 0}, {"n": 1}], "AX": [None, "n"],
+             "BM": 64, "BN": 16})
+        assert "tensordesc<64x16xf16>" in ttir
+
+    def test_ragged_table_is_refused(self):
+        self._refuses(self._kernel([{"n": 0}, {"m": 1}], [None, "n"], [64, 32]),
+                      "work_slices[1] has keys ['m'], expected ['n']")
+
+    def test_empty_table_is_refused(self):
+        self._refuses(self._kernel([], [None, "n"], [64, 32]),
+                      "work_slices must not be empty")
+
+    def test_table_entry_must_be_a_dict(self):
+        self._refuses(self._kernel([0], [None, "n"], [64, 32]),
+                      "work_slices[0] must be a dict")
+
+    def test_axes_length_is_the_rank(self):
+        # Per tensor DIMENSION, not per key — so a one-entry axes for a rank-2
+        # share is wrong even though there is one key.
+        self._refuses(self._kernel([{"n": 0}, {"n": 1}], ["n"], [64, 32]),
+                      "axes has 1 entries for a rank-2 share")
+
+    def test_block_shape_length_is_the_rank(self):
+        self._refuses(self._kernel([{"n": 0}, {"n": 1}], [None, "n"], [64]),
+                      "block_shape has 1 entries for a rank-2 share")
+
+    def test_axis_must_be_a_string_or_none(self):
+        self._refuses(self._kernel([{"n": 0}, {"n": 1}], [None, 1], [64, 32]),
+                      "axes[1] must be a string or None")
+
+    def test_the_table_check_is_shared_with_inter_tile(self):
+        # One checker, two callers, and the message names which one rejected the
+        # table — so a third caller cannot quietly get different rules.
+        from triton.language.semantic import TritonSemantic
+        check = TritonSemantic._check_work_slices
+        with pytest.raises(ValueError, match="tl.inter_tile: work_slices"):
+            check([{"n": 0}, {"m": 0}], "tl.inter_tile")
+        with pytest.raises(ValueError,
+                           match="tl.make_distributed_descriptor: work_slices"):
+            check([{"n": 0}, {"m": 0}], "tl.make_distributed_descriptor")

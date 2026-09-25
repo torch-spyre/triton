@@ -1921,6 +1921,39 @@ class TritonSemantic(Generic[TensorTy]):
         return tl.tensor_descriptor(handle, shape, strides, type)
 
     # --- START --- added for spyre
+    @staticmethod
+    def _check_work_slices(work_slices, who):
+        """Check a work-slice table: a non-empty list of dicts with identical keys.
+
+        Shared by `inter_tile` and `make_distributed_descriptor`, which pass the
+        same shape of table in two different ROLES -- tile to coordinate for the
+        first, partition to region for the second (they differ in length, not in
+        form). `who` names the caller, since a table is rejected at the kernel line
+        and the message has to say which op rejected it.
+
+        Not a restatement of `tts`'s own reader: that one runs on the attribute the
+        builder assembled and is what a module parsed from text is checked by. This
+        one exists so a Python-level mistake -- a tuple, a ragged dict -- is a
+        traceback at the call rather than a verifier failure after tracing.
+        """
+        if not isinstance(work_slices, list):
+            raise ValueError(
+                f"{who}: work_slices must be a list, got {type(work_slices).__name__!r}")
+        if len(work_slices) == 0:
+            raise ValueError(f"{who}: work_slices must not be empty")
+        for i, entry in enumerate(work_slices):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"{who}: work_slices[{i}] must be a dict, "
+                    f"got {type(entry).__name__!r}")
+        ref_keys = set(work_slices[0].keys())
+        for i, entry in enumerate(work_slices[1:], start=1):
+            if set(entry.keys()) != ref_keys:
+                raise ValueError(
+                    f"{who}: work_slices[{i}] has keys "
+                    f"{sorted(entry.keys())}, expected {sorted(ref_keys)} "
+                    f"(keys must be identical across all tiles)")
+
     def inter_tile(self, x, axis, combiner, mode, *, work_slices,
                    dep_work_slices=None, scatter_dimension=None):
         """Emit tt.inter_tile_reduce with work-slice op attributes."""
@@ -1970,23 +2003,7 @@ class TritonSemantic(Generic[TensorTy]):
                         f"integer type {scalar}")
 
         # Validate and normalize work_slices.
-        if not isinstance(work_slices, list):
-            raise ValueError(
-                f"tl.inter_tile: work_slices must be a list, got {type(work_slices).__name__!r}")
-        if len(work_slices) == 0:
-            raise ValueError("tl.inter_tile: work_slices must not be empty")
-        for i, entry in enumerate(work_slices):
-            if not isinstance(entry, dict):
-                raise ValueError(
-                    f"tl.inter_tile: work_slices[{i}] must be a dict, "
-                    f"got {type(entry).__name__!r}")
-        ref_keys = set(work_slices[0].keys())
-        for i, entry in enumerate(work_slices[1:], start=1):
-            if set(entry.keys()) != ref_keys:
-                raise ValueError(
-                    f"tl.inter_tile: work_slices[{i}] has keys "
-                    f"{sorted(entry.keys())}, expected {sorted(ref_keys)} "
-                    f"(keys must be identical across all tiles)")
+        self._check_work_slices(work_slices, "tl.inter_tile")
         for i, entry in enumerate(work_slices):
             if axis not in entry:
                 raise ValueError(
@@ -2181,4 +2198,113 @@ class TritonSemantic(Generic[TensorTy]):
         spyre.ir_builders.create_tensor_layout(self.builder, desc.handle, src,
                                                op, arg)
         return tl.tensor(None, tl.void)
+
+    def spyre_pin(self, v, memory_space, address):
+        """Emit tts.pin -- names the memory space a value's buffer lives in, and
+        for the scratchpad the element index it starts at."""
+        target = driver.active.get_current_target()
+        if target.backend != "spyre":
+            raise ValueError(
+                "tl.spyre_pin is only supported on the 'spyre' "
+                f"backend, not '{target.backend}'")
+
+        # Restated here so a misspelling is reported at the kernel line rather than
+        # as an MLIR verifier failure after tracing. `tts.pin`'s verifier is what
+        # enforces it -- the same split as _parse_coord_entry above, and for the
+        # same reason.
+        #
+        # `global` gets its own message because it is a plausible thing to write:
+        # ktdp has the kind and the design's prose names it, but a pin cannot place
+        # an HBM intermediate. Telling the author the spelling is wrong would send
+        # them looking for a third name.
+        space = tl._unwrap_if_constexpr(memory_space)
+        if space == "global":
+            raise ValueError(
+                "spyre_pin: memory_space 'global' cannot be pinned -- an "
+                "intermediate in HBM is written as a tl.make_tensor_descriptor "
+                "with an explicit store and load. Only 'ct_local' is admitted.")
+        if space != "ct_local":
+            raise ValueError(
+                f"spyre_pin: memory_space must be 'ct_local', got {space!r}")
+
+        # An int becomes a scalar constant; anything already traced is passed
+        # through as its handle. Whether the expression has an admitted SHAPE --
+        # a constant, or affine in tl.program_id(0) -- is not decidable here: what
+        # arrives is an MLIR value, so the op's verifier is where that is checked,
+        # over the IR it was built into.
+        addr = tl._unwrap_if_constexpr(address)
+        if addr is None:
+            handle = None
+        elif isinstance(addr, int):
+            handle = self.scalar_constant(addr, tl.int32).handle
+        elif isinstance(addr, tl.tensor):
+            if addr.type != tl.int32:
+                raise ValueError(
+                    f"spyre_pin: address must be an int32 scalar, got "
+                    f"{addr.type}")
+            handle = addr.handle
+        else:
+            raise ValueError(
+                f"spyre_pin: address must be an int or an int32 scalar, got "
+                f"{addr!r}")
+
+        from triton._C.libtriton import spyre
+        spyre.ir_builders.create_pin(self.builder, v.handle, space, handle)
+        return tl.tensor(None, tl.void)
+
+    def make_distributed_descriptor(self, partial, work_slices, axes,
+                                    block_shape):
+        """Emit tts.make_distributed_descriptor -- composes every instance's share
+        into one descriptor over the whole tensor."""
+        target = driver.active.get_current_target()
+        if target.backend != "spyre":
+            raise ValueError(
+                "tl.make_distributed_descriptor is only supported on the "
+                f"'spyre' backend, not '{target.backend}'")
+
+        work_slices = tl._unwrap_if_constexpr(work_slices)
+        axes = tl._unwrap_if_constexpr(axes)
+        block_shape = tl._unwrap_if_constexpr(block_shape)
+
+        self._check_work_slices(work_slices, "tl.make_distributed_descriptor")
+
+        # `axes` is per tensor DIMENSION, so its length is the share's rank. A
+        # dimension the work was not divided on is spelled None here and "" in the
+        # IR -- None reads better in a kernel, and an attribute array cannot hold
+        # a Python None.
+        rank = len(partial.shape)
+        if len(axes) != rank:
+            raise ValueError(
+                f"tl.make_distributed_descriptor: axes has {len(axes)} entries "
+                f"for a rank-{rank} share; give one per dimension, with None for "
+                f"a dimension the work was not divided on")
+        if len(block_shape) != rank:
+            raise ValueError(
+                f"tl.make_distributed_descriptor: block_shape has "
+                f"{len(block_shape)} entries for a rank-{rank} share")
+
+        axis_strs = []
+        for d, axis in enumerate(axes):
+            axis = tl._unwrap_if_constexpr(axis)
+            if axis is None:
+                axis_strs.append("")
+            elif isinstance(axis, str):
+                axis_strs.append(axis)
+            else:
+                raise ValueError(
+                    f"tl.make_distributed_descriptor: axes[{d}] must be a string "
+                    f"or None, got {axis!r}")
+
+        # Flat parallel lists, the shape create_inter_tile_reduce takes: the key
+        # order is fixed once here so every entry is serialized against it.
+        ws_keys = [str(k) for k in work_slices[0].keys()]
+        ws_vals = [[int(entry[k]) for k in ws_keys] for entry in work_slices]
+
+        from triton._C.libtriton import spyre
+        handle = spyre.ir_builders.create_make_distributed_descriptor(
+            self.builder, partial.handle, ws_keys, ws_vals, axis_strs,
+            [int(b) for b in block_shape])
+
+        block_ty = tl.block_type(partial.dtype, [int(b) for b in block_shape])
+        return tl.tensor_descriptor_base(handle, block_ty)
     # --- END --- added for spyre

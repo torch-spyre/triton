@@ -37,14 +37,29 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // indifferent to markers and merely keeps them legal.
   pm.addPass(tts::createLowerTTSMarkersPass());
 
+  // Each tts.pin -> the buffer it asked for, plus the store and loads that route
+  // the value through it. Bounded on the same two sides and for the same reasons,
+  // so this and LowerTTSMarkers share a window; their order within it does not
+  // matter, because that pass reaches views built for DESCRIPTORS and this one
+  // builds views for INTERMEDIATES, which carry no layout annotation. The grid is
+  // passed because a pinned address may be affine in tl.program_id(0), and
+  // prod(grid) is what bounds the set of addresses such a pin occupies.
+  pm.addPass(tts::createPlacePinnedValuesPass(options.grid));
+
   // tt.reduce/broadcast/expand_dims/dot -> linalg + tensor, and a dead-op sweep.
   pm.addPass(createLowerComputeOpsPass());
 
-  // tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery. After
-  // LowerComputeOps, because the partials it consumes have to be linalg/tensor
-  // by then; before the layout pass, which has no propagation pattern for a
-  // !ktdp.tile_future and so must not be reached with one live.
-  pm.addPass(createLowerInterTilePass());
+  // Inter-tile communication, both kinds. tt.inter_tile_reduce ->
+  // ktdp.inter_tile_produce + delivery, and tts.make_distributed_descriptor ->
+  // one memory view per partition plus the compose, with the reads through it.
+  // After LowerComputeOps, because the partials a reduce consumes have to be
+  // linalg/tensor by then; before the layout pass, which has no propagation
+  // pattern for a !ktdp.tile_future and so must not be reached with one live.
+  //
+  // The compose mode has a second, tighter reason to be after
+  // PlacePinnedValues: it recovers each share's address from the buffer that pass
+  // built, so running earlier would find a pin that had not been placed yet.
+  pm.addPass(createLowerInterTilePass(options.grid));
 
   // Logical tensor descriptors -> physical (stick-tiled) layout, from the
   // tt.spyre_tensor_layout annotations. After LowerComputeOps so a tt.dot is

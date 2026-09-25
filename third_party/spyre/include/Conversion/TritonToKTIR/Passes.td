@@ -238,11 +238,18 @@ def ConvertFunctions : Pass<"convert-ttir-functions", "mlir::ModuleOp"> {
 }
 
 def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
-    let summary = "Lower tt.inter_tile_reduce to ktdp inter-tile produce/reduce pairs.";
+    let summary = "Lower inter-tile communication -- a cross-core fold, and a "
+                  "redistribution -- to ktdp ops.";
     let description = [{
-        Input: TTIR after LowerComputeOps — tt.inter_tile_reduce ops whose
-        partial operands are already linalg/tensor values; enclosing func.func
-        carries numWkSlicesPerDim and coreIdToWkSlice function attributes.
+        Input: TTIR after LowerComputeOps. Either or both of:
+        - tt.inter_tile_reduce, whose partial operands are already linalg/tensor
+          values, and which carries numWkSlicesPerDim and coreIdToWkSlice as its
+          OWN op attributes (the frontend sets them there; an earlier revision of
+          this text called them function attributes, which readWorkSliceAttrs
+          never read);
+        - tts.make_distributed_descriptor, whose share operand is by now a
+          ktdp.load from the buffer tl.spyre_pin asked for, together with the
+          tt.descriptor_load ops reading its result.
 
         Lowering:
         - tt.inter_tile_reduce (mode=all_reduce) →
@@ -271,8 +278,16 @@ def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
         That combination is not diagnosed — it fails downstream as a type
         mismatch.
 
-        Output: no tt.inter_tile_reduce ops remain; ktdp.inter_tile_produce /
-        inter_tile_reduce pairs are introduced; the tile_future is single-use.
+        Output: no tt.inter_tile_reduce and no tts.make_distributed_descriptor
+        remains. A reduce leaves a ktdp.inter_tile_produce / inter_tile_reduce
+        pair with a single-use tile_future; a compose leaves one
+        ktdp.construct_memory_view per partition, a
+        ktdp.construct_distributed_memory_view over them, and an access tile plus
+        ktdp.load for each read that went through it.
+
+        The landing store a received tile needs before a compute unit can read it
+        is NOT emitted here. It is a tl.spyre_pin on the loaded value, which
+        PlacePinnedValues has already placed by the time this pass runs.
     }];
 
     let dependentDialects = [
@@ -280,6 +295,16 @@ def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
         "mlir::arith::ArithDialect",
         "mlir::linalg::LinalgDialect",
         "mlir::tensor::TensorDialect"
+    ];
+
+    // The grid is the compose mode's, not the reduce mode's: a reduce reads its
+    // grid from its own work-slice attributes, while a compose has to decide
+    // whether its partition table has one entry per TILE -- which is a claim
+    // about the launch grid and unanswerable from the table alone.
+    let options = [
+        ListOption<"grid", "grid", "int64_t",
+                   "Per-axis partition of the Spyre hardware grid, as "
+                   "DistributeWork takes it. Default [32].">
     ];
 }
 
