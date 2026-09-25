@@ -87,6 +87,25 @@ static LogicalResult lowerMarkers(ModuleOp module, StringRef attrName,
     if (!subject)
       return failure();
 
+    // Two markers of one kind resolving to the same subject would collide, and
+    // `setAttr` resolves a collision by overwriting: the later marker wins and
+    // the earlier one is gone with nothing said. Refused instead, because which
+    // of the two survived would be a fact about this loop's order rather than
+    // about anything the author wrote.
+    //
+    // Generic, like the rest of this driver, because the hazard is: one subject
+    // can be reached from more than one marker. For `tts.pin` that is two pins
+    // on one value -- they share a producer. For `tts.tensor_layout` it is two
+    // layouts on one descriptor -- they share a memory view.
+    if (Attribute existing = subject->getAttr(attrName)) {
+      InFlightDiagnostic diag = marker.emitError()
+                                << "second " << MarkerOp::getOperationName()
+                                << " resolving to the same op, which can carry "
+                                   "only one; the first states " << existing;
+      diag.attachNote(subject->getLoc()) << "the op both resolve to is here";
+      return failure();
+    }
+
     subject->setAttr(attrName, buildAttr(marker));
 
     // Read the operands out before the erase invalidates them.
