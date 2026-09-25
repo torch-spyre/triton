@@ -37,6 +37,15 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // indifferent to markers and merely keeps them legal.
   pm.addPass(tts::createLowerTTSMarkersPass());
 
+  // Each tts.pin -> the buffer it asked for, plus the store and loads that route
+  // the value through it. Bounded on the same two sides and for the same reasons,
+  // so this and LowerTTSMarkers share a window; their order within it does not
+  // matter, because that pass reaches views built for DESCRIPTORS and this one
+  // builds views for INTERMEDIATES, which carry no layout annotation. The grid is
+  // passed because a pinned address may be affine in tl.program_id(0), and
+  // prod(grid) is what bounds the set of addresses such a pin occupies.
+  pm.addPass(tts::createPlacePinnedValuesPass(options.grid));
+
   // tt.reduce/broadcast/expand_dims/dot -> linalg + tensor, and a dead-op sweep.
   pm.addPass(createLowerComputeOpsPass());
 

@@ -63,4 +63,82 @@ def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
     // already done it.
 }
 
+def PlacePinnedValues : Pass<"place-pinned-values", "mlir::ModuleOp"> {
+    let summary = "Give each tts.pin'd value a buffer in the memory space its "
+                  "pin names, and route its uses through it.";
+    let description = [{
+        Input: TTIR-with-ktdp, after LowerDescriptorMemory, carrying `tts.pin`
+        markers. A pinned value is still a `tensor` produced by an arith/math op,
+        a `tt.reduce` or a `ktdp.load`.
+
+        Lowering: per `tts.pin`, one ktdp.construct_memory_view over the pinned
+        value's own shape in the pin's memory space -- at the pinned address when
+        there is one -- then a ktdp.store of the value through an access tile, and
+        one access tile + ktdp.load per remaining use, each use rewritten to read
+        the buffer. The marker is erased.
+
+        Unlike `tts.tensor_layout`, this marker does NOT become an attribute, and
+        that is forced rather than chosen: a value pin's only possible carrier is
+        the op PRODUCING the value, and elementwise-to-linalg conversion replaces
+        that op, which would drop a discardable attribute silently. So the buffer
+        is built while the marker is still here.
+
+        Position: after LowerDescriptorMemory, whose views this one is modelled on
+        and whose `ktdp` ops must already be legal here; before LowerComputeOps,
+        which knows nothing of `tts` and would fail the marker as unconverted. The
+        same window LowerTTSMarkers runs in, and order against it does not matter:
+        that pass reaches memory views built for DESCRIPTORS and this one builds
+        views for INTERMEDIATES, which carry no layout annotation.
+
+        Placing the intermediates nobody pinned is deliberately not here. That is
+        every compute-to-compute edge, named or not, and it is a different pass's
+        subject; this one does only what a marker asked for.
+
+        For the same reason a pin with NO address is refused here although the op
+        admits one: nothing in this tree allocates a buffer that is not a kernel
+        argument, so an unaddressed pin names no location a view could be built
+        at, and offset 0 would be a fabricated address rather than an allocation.
+        Since an address is admitted only in `ct_local`, this is also why a
+        `global` pin does not compile today.
+
+        Output: no `tts.pin` remains. Every value one named is stored to, and read
+        back from, a buffer in the named space.
+    }];
+
+    // dependentDialects, unlike LowerTTSMarkers: this pass constructs ktdp ops
+    // (memory view, access tile, load, store) and an arith index cast, so both
+    // dialects have to be LOADED and not merely loadable. `tts` itself is loaded
+    // by whoever parsed the marker.
+    let dependentDialects = [
+        "::mlir::ktdp::KtdpDialect",
+        "::mlir::arith::ArithDialect"
+    ];
+
+    // The grid is here for the same reason DistributeWork has it: a pinned
+    // address may be affine in tl.program_id(0), and prod(grid) is what makes
+    // that expression's address SET finite -- which is what capacity and overlap
+    // are checked over.
+    //
+    // The overlap check is TEMPORARY, and the pass says so where it performs it:
+    // reusing one scratchpad region for two values whose live ranges do not
+    // overlap is legitimate, and refusing every intersection forbids it.  The two byte counts are hardware facts this tree does
+    // not otherwise hold: `SpyreUtils.get_device_properties` states that the LX
+    // scratchpad "is sized by the device description and allocated by the
+    // scheduler", so they arrive as options rather than as literals in the pass,
+    // and 0 means "do not check" rather than "zero bytes".
+    let options = [
+        ListOption<"grid", "grid", "int64_t",
+                   "Per-axis partition of the Spyre hardware grid, as "
+                   "DistributeWork takes it. Default [32].">,
+        Option<"lxCapacityBytes", "lx-capacity-bytes", "int64_t",
+               /*default=*/"2097152",
+               "Bytes of per-core scratchpad a pinned range must fit in. The "
+               "default is the capacity dbo-opt reports. 0 disables the check.">,
+        Option<"alignmentBytes", "alignment-bytes", "int64_t",
+               /*default=*/"128",
+               "Byte alignment every pinned address must meet -- one stick. "
+               "0 disables the check.">
+    ];
+}
+
 #endif // TTS_TRANSFORMS_PASSES

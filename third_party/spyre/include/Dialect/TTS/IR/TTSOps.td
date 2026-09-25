@@ -58,4 +58,72 @@ def TTS_TensorLayoutOp : TTS_Op<"tensor_layout", []> {
   let hasVerifier = 1;
 }
 
+def TTS_PinOp : TTS_Op<"pin", []> {
+  let summary = "Place a named value's buffer in a chosen memory space";
+
+  let description = [{
+    `tts.pin` is the **authoring** spelling of where an intermediate's buffer
+    lives. The scheduler admits one compute per local schedule, so a value handed
+    from one compute to the next has to go through memory; this op is how a
+    kernel says *which* memory, and for the scratchpad, where in it.
+
+    No result; the op is a marker, and the value it names keeps its own type and
+    its own uses. `PlacePinnedValues` consumes it, and unlike
+    `tts.tensor_layout` it does not become an attribute -- see that pass for why.
+
+    The pin names a **value** and not a `!tt.tensordesc`. A descriptor takes its
+    element type from the `!tt.ptr` it is based on, so giving one a scratchpad
+    address would mean supplying a dtype from somewhere as well; a value has a
+    type already.
+
+    Only a value the author can point at may be pinned -- `y = tl.exp(x)` can be
+    pinned, `tl.exp(x)` inside a larger expression cannot -- and that is enforced
+    by the SURFACE rather than here: an anonymous subexpression has no name to
+    pass to `tl.spyre_pin`. So a block argument is pinnable like any other value.
+    A `tensor` is a value whichever way it was defined, and receiving one is the
+    same state a `ktdp.load` result is in; placing the intermediates nobody named
+    is a separate job and not this op's.
+
+    `memory_space` is a plain string, checked against `ktdp::MemorySpaceKind` by
+    the verifier rather than typed as `#ktdp.memory_space`. The dialect defines no
+    attribute type on purpose -- see the note in TTSDialect.td -- and this keeps
+    that true for its second marker. Only `ct_local` is admitted: an intermediate
+    in HBM is written as a `tl.make_tensor_descriptor` with an explicit store and
+    load, which is lx-placement.md's first assumption, and nothing here allocates
+    an anonymous global buffer. The parameter stays a memory space anyway, so the
+    surface does not change shape if `global` ever becomes placeable.
+
+    `address` is where in the scratchpad, as an **element index** and not a byte
+    address, matching what `ktdp.construct_memory_view`'s `$offset` operand
+    feeds. It is optional because the design's baseline is that the compiler
+    places every intermediate and a pin is an override; no pass honours an
+    unaddressed pin yet. It is an SSA operand rather than an attribute because that is the form
+    the offset is consumed in, and `i32` rather than `index` because that is what
+    `tl.program_id` yields, which keeps the verifier's structural walk free of
+    casts. Two forms are admitted and nothing else:
+
+      constant                 one address, the same on every core
+      base + pid * stride      affine in the program id, constant coefficients
+
+    The restriction is what keeps a pin's address SET finite and enumerable, and
+    so keeps capacity, alignment and disjointness answerable about it. An address
+    read from memory forfeits all three.
+
+    Example:
+    ```mlir
+      %c4096 = arith.constant 4096 : i32
+      tts.pin %e, address %c4096 {memory_space = "ct_local"} : tensor<2x11x2049xf16>
+    ```
+  }];
+
+  let arguments = (ins
+    AnyStaticShapeTensor:$value,
+    Optional<I32>:$address,
+    StrAttr:$memory_space
+  );
+
+  let assemblyFormat = "$value (`,` `address` $address^)? attr-dict `:` type($value)";
+  let hasVerifier = 1;
+}
+
 #endif // TTS_OPS

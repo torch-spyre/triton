@@ -2181,4 +2181,57 @@ class TritonSemantic(Generic[TensorTy]):
         spyre.ir_builders.create_tensor_layout(self.builder, desc.handle, src,
                                                op, arg)
         return tl.tensor(None, tl.void)
+
+    def spyre_pin(self, v, memory_space, address):
+        """Emit tts.pin -- names the memory space a value's buffer lives in, and
+        for the scratchpad the element index it starts at."""
+        target = driver.active.get_current_target()
+        if target.backend != "spyre":
+            raise ValueError(
+                "tl.spyre_pin is only supported on the 'spyre' "
+                f"backend, not '{target.backend}'")
+
+        # Restated here so a misspelling is reported at the kernel line rather than
+        # as an MLIR verifier failure after tracing. `tts.pin`'s verifier is what
+        # enforces it -- the same split as _parse_coord_entry above, and for the
+        # same reason.
+        #
+        # `global` gets its own message because it is a plausible thing to write:
+        # ktdp has the kind and the design's prose names it, but a pin cannot place
+        # an HBM intermediate. Telling the author the spelling is wrong would send
+        # them looking for a third name.
+        space = tl._unwrap_if_constexpr(memory_space)
+        if space == "global":
+            raise ValueError(
+                "spyre_pin: memory_space 'global' cannot be pinned -- an "
+                "intermediate in HBM is written as a tl.make_tensor_descriptor "
+                "with an explicit store and load. Only 'ct_local' is admitted.")
+        if space != "ct_local":
+            raise ValueError(
+                f"spyre_pin: memory_space must be 'ct_local', got {space!r}")
+
+        # An int becomes a scalar constant; anything already traced is passed
+        # through as its handle. Whether the expression has an admitted SHAPE --
+        # a constant, or affine in tl.program_id(0) -- is not decidable here: what
+        # arrives is an MLIR value, so the op's verifier is where that is checked,
+        # over the IR it was built into.
+        addr = tl._unwrap_if_constexpr(address)
+        if addr is None:
+            handle = None
+        elif isinstance(addr, int):
+            handle = self.scalar_constant(addr, tl.int32).handle
+        elif isinstance(addr, tl.tensor):
+            if addr.type != tl.int32:
+                raise ValueError(
+                    f"spyre_pin: address must be an int32 scalar, got "
+                    f"{addr.type}")
+            handle = addr.handle
+        else:
+            raise ValueError(
+                f"spyre_pin: address must be an int or an int32 scalar, got "
+                f"{addr!r}")
+
+        from triton._C.libtriton import spyre
+        spyre.ir_builders.create_pin(self.builder, v.handle, space, handle)
+        return tl.tensor(None, tl.void)
     # --- END --- added for spyre

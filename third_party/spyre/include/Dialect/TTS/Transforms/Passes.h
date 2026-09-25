@@ -11,6 +11,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/ArrayRef.h"
 #include <memory>
 
 namespace mlir::triton::tts {
@@ -22,6 +23,12 @@ namespace mlir::triton::tts {
 #include "Dialect/TTS/Transforms/Passes.h.inc"
 
 std::unique_ptr<OperationPass<ModuleOp>> createLowerTTSMarkersPass();
+
+/// `grid` is the pass option of the same name; the two byte counts keep their
+/// tablegen defaults when not given, so a caller that has only the grid -- which
+/// is every caller in the pipeline -- passes only that.
+std::unique_ptr<OperationPass<ModuleOp>> createPlacePinnedValuesPass(
+    llvm::ArrayRef<int64_t> grid = {});
 
 } // namespace mlir::triton::tts
 
