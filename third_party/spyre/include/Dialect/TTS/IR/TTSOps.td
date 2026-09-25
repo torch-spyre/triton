@@ -21,11 +21,13 @@ def TTS_TensorLayoutOp : TTS_Op<"tensor_layout", []> {
     entry per physical dim, in the OpSpec `device_coordinates` form. See the
     `tts` dialect's `kTensorLayoutAttrName` note for what the three arrays mean.
 
-    No result; the op is a marker. `LowerDescriptorMemory` consumes it: the
-    three arrays are written onto the `ktdp.construct_memory_view` built for the
+    No result; the op is a marker. `LowerTTSMarkers` consumes it: the three
+    arrays are written onto the `ktdp.construct_memory_view` built for the
     descriptor as the `tts.tensor_layout` **attribute**, and the op is erased
     along with the `unrealized_conversion_cast` that bridged the view's memref
-    back to `!tt.tensordesc` for this operand's sake.
+    back to `!tt.tensordesc` for this operand's sake. The view and that cast are
+    `LowerDescriptorMemory`'s, which is why this marker cannot be lowered before
+    that pass has run.
 
     So the dialect spells the same layout twice, and the two spellings are a
     before/after pair rather than alternatives:
@@ -68,21 +70,22 @@ def TTS_PinOp : TTS_Op<"pin", []> {
     kernel says *which* memory, and for the scratchpad, where in it.
 
     No result; the op is a marker, and the value it names keeps its own type and
-    its own uses. `PlacePinnedValues` consumes it, and unlike
-    `tts.tensor_layout` it does not become an attribute -- see that pass for why.
+    its own uses. `LowerTTSMarkers` consumes it, writing the `tts.pin`
+    **attribute** onto the op PRODUCING the pinned value -- so like
+    `tts.tensor_layout` this is the authoring half of a before/after pair, and
+    what differs is only where the attribute lands.
 
     The pin names a **value** and not a `!tt.tensordesc`. A descriptor takes its
     element type from the `!tt.ptr` it is based on, so giving one a scratchpad
     address would mean supplying a dtype from somewhere as well; a value has a
     type already.
 
-    Only a value the author can point at may be pinned -- `y = tl.exp(x)` can be
-    pinned, `tl.exp(x)` inside a larger expression cannot -- and that is enforced
-    by the SURFACE rather than here: an anonymous subexpression has no name to
-    pass to `tl.spyre_pin`. So a block argument is pinnable like any other value.
-    A `tensor` is a value whichever way it was defined, and receiving one is the
-    same state a `ktdp.load` result is in; placing the intermediates nobody named
-    is a separate job and not this op's.
+    A block argument verifies here and is refused by the lowering. It is a value
+    like any other -- a `tensor` is a value whichever way it was defined -- so
+    nothing about it is ill formed; what it lacks is a defining op for the
+    attribute to land on. The two halves are split that way on purpose:
+    well-formedness is this op's question, and whether a carrier exists is the
+    lowering's.
 
     `memory_space` is a plain string, checked against `ktdp::MemorySpaceKind` by
     the verifier rather than typed as `#ktdp.memory_space`. The dialect defines no

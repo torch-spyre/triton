@@ -31,13 +31,19 @@ def TTS_Dialect : Dialect {
     `dbo-opt` loads ours. So the value of `tts.tensor_layout` is built out of
     builtin attributes only, and must stay that way.
 
-    The one op the dialect does define, `tts.tensor_layout`, is the *authoring*
-    form of that same layout and is bound by the same rule from the other side:
-    it is fully consumed before any artifact is written, by
-    `LowerDescriptorMemory`, which turns it into the attribute. An op does have
-    to be constructed, so one surviving into an artifact would fail at parse in
-    a consumer that does not load us — which is why the op and the attribute are
-    a before/after pair and never a choice of encoding for the same IR.
+    The two ops the dialect does define, `tts.tensor_layout` and `tts.pin`, are
+    the *authoring* forms of two such annotations, and are bound by the same rule
+    from the other side: both are fully consumed before any artifact is written,
+    by `LowerTTSMarkers`, which turns each into its attribute. An op does have to
+    be constructed, so one surviving into an artifact would fail at parse in a
+    consumer that does not load us — which is why each op and its attribute are a
+    before/after pair and never a choice of encoding for the same IR.
+
+    Where the attribute lands is the marker's own business and differs between
+    the two: a layout names a descriptor and lands on the memory view that
+    descriptor became, a pin names a value and lands on the op producing it.
+    What does not differ is that the value of either is built out of builtin
+    attributes only.
   }];
 
   let extraClassDeclaration = [{
@@ -74,6 +80,14 @@ def TTS_Dialect : Dialect {
     ///   address      : an element index -- one `i32` for an address that is the
     ///                  same on every core, or a `DenseI32ArrayAttr` holding one
     ///                  per program id. Absent when the pin named no address.
+    ///
+    /// The KIND only, and not a whole `#ktdp.memory_space`: that attribute pairs
+    /// a kind with a `ct_id`, and every site in this tree that constructs one
+    /// passes `ct_id = -1` -- LowerDescriptorMemory and LowerScalarLoad both do.
+    /// A pin means the scratchpad of whichever core is running, never a named
+    /// peer's, so a consumer building the attribute from this one passes -1 as
+    /// well. Recorded here because the string cannot carry it and nothing else
+    /// would say so.
     ///
     /// The producing op is the carrier because a pin names a VALUE, and a value's
     /// only op is the one defining it. That is also why a pinned block argument
