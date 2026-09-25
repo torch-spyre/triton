@@ -1,29 +1,45 @@
-//===- LowerSpyreOps.cpp - Lower scalar math ops to spyreop intrinsics ---===//
+//===- LowerSpyreOps.cpp - Lower elementwise math ops to spyreop ---------===//
 //
-// Lowers scalar math/arith dialect ops to spyreop dialect intrinsics.
-// spyreop's intrinsics are scalar-only (f16/df16/f32, or i32/i64 for the
-// integer ops below), so this pass only matches an op that is already
-// scalar -- typically the body of a linalg.generic after
-// ConvertElementwiseToLinalg has scalarized a tensor-level op.
+// Lowers math/arith dialect ops to spyreop dialect intrinsics, at TENSOR level.
 //
-// math.sqrt/exp/rsqrt and arith.divf are matched unconditionally on scalar
-// type: those ops only ever appear in real floating-point compute, never in
-// address/index arithmetic, so every scalar occurrence is expected to be
-// convertible and an unsupported type (e.g. f64) is reported as illegal
-// rather than left alone.
+// Position: this pass runs BEFORE ConvertElementwiseToLinalg, so the ops it sees
+// are still tensor-typed -- `math.sqrt` on `tensor<128xf32>`, not `f32`. That is
+// the opposite of where this pass used to sit, and the reason for the move is in
+// Pipeline.cpp, where the move is justified: a mask cast can only be absorbed
+// into its comparison while the two are adjacent ops in one block, and after
+// scalarization they are in separate linalg.generic bodies with the producer a
+// block argument that has no defining op. No pattern here absorbs one yet; the
+// position is what makes adding one possible.
 //
-// arith.divf has two targets rather than one: a numerator of constant 1
-// becomes the unary spyreop.reciprocal and everything else the binary
-// spyreop.realdiv.
+// spyreop's elementwise intrinsics are SCALAR-ONLY by declaration -- their
+// operands are AnyTypeOf<[F16, SpyreOp_DF16, F32]>, never a shaped type, so a
+// tensor-level spyreop op does not verify. Each pattern therefore emits a
+// `linalg.generic` whose body holds the scalar intrinsic: tensor in, tensor out,
+// scalar op inside. `wrapElementwise` below builds that, and every pattern goes
+// through it so the shape is written once.
 //
-// arith.addi/arith.muli are different: plain scalar integer add/mul is used
-// throughout a kernel for loop indices, offsets, and tile addressing, not
-// just scalarized tensor compute. Converting every scalar occurrence would
-// also rewrite that index arithmetic. So the integer patterns below only
-// match inside a linalg.generic body (the structural signal that this is
-// scalarized elementwise compute, not address math), and only for the
-// specific bit-widths spyreop has an intrinsic for -- anything else (other
-// widths, or outside a linalg.generic) is left legal rather than reported.
+// A generic built here is NOT re-wrapped by ConvertElementwiseToLinalg
+// afterwards: that pass keys on the `ElementwiseMappable` trait, which a
+// linalg.generic does not carry.
+//
+// What each op matches on:
+//
+//   math.sqrt/exp/rsqrt, arith.divf -- any tensor of a width spyreop supports.
+//     These appear only in real floating-point compute, never in address
+//     arithmetic, so every such tensor occurrence is expected to be convertible
+//     and an unsupported element type (e.g. f64) is reported rather than ignored.
+//
+//   arith.divf has two targets rather than one: a numerator of constant 1
+//     becomes the unary spyreop.reciprocal and everything else the binary
+//     spyreop.realdiv.
+//
+//   arith.addi/arith.muli -- a TENSOR of i32/i64 only. Plain scalar integer
+//     add/mul is used throughout a kernel for loop indices, offsets and tile
+//     addressing; converting those would rewrite address arithmetic into compute
+//     intrinsics. Being tensor-typed is what separates the two, and it separates
+//     them exactly: address math is never a tensor. (This replaces an earlier
+//     `isInsideLinalgGeneric` test that asked the same question by IR position
+//     rather than by type, and was only meaningful after scalarization.)
 //
 //===----------------------------------------------------------------------===//
 
@@ -34,6 +50,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
@@ -51,23 +68,79 @@ namespace mlir::triton::spyre {
 
 namespace {
 
-/// Whether spyreop's scalar float intrinsics accept this operand type.
-static bool isSpyreOpScalarType(Type type) {
-  return isa<Float16Type, Float32Type>(type);
+/// Whether spyreop's float intrinsics accept this element type.
+static bool isSpyreOpFloatElemType(Type elemType) {
+  return isa<Float16Type, Float32Type>(elemType);
 }
 
-/// Whether this op is (transitively) inside a linalg.generic body -- the
-/// structural signal that it is scalarized elementwise compute rather than
-/// address/index arithmetic.
-static bool isInsideLinalgGeneric(Operation *op) {
-  return op->getParentOfType<linalg::GenericOp>() != nullptr;
+/// The ranked tensor `type` is, or null if it is not one.
+///
+/// Every pattern here starts by asking this. A null answer means the op is not
+/// tensor-typed, which at this point in the pipeline means it is scalar
+/// address/index arithmetic rather than elementwise compute -- so the pattern
+/// declines and the op is left alone.
+static RankedTensorType asRankedTensor(Type type) {
+  return dyn_cast<RankedTensorType>(type);
 }
 
-/// The bit width of `type` if it's a scalar integer, or 0 otherwise (e.g. for
-/// a not-yet-scalarized tensor/vector of integers).
-static unsigned getScalarIntBitWidth(Type type) {
-  auto intTy = dyn_cast<IntegerType>(type);
+/// The element type of a ranked tensor, or null for anything else.
+static Type tensorElemType(Type type) {
+  auto ty = asRankedTensor(type);
+  return ty ? ty.getElementType() : nullptr;
+}
+
+/// The bit width of `type` if it is a TENSOR of integers, or 0 otherwise.
+///
+/// Zero for a scalar integer as well as for a non-integer, which is what the
+/// integer patterns want: a scalar `arith.muli` here is a tile offset, not
+/// compute.
+static unsigned tensorIntBitWidth(Type type) {
+  auto intTy = dyn_cast_or_null<IntegerType>(tensorElemType(type));
   return intTy ? intTy.getWidth() : 0;
+}
+
+/// Wrap a scalar spyreop intrinsic in a `linalg.generic` over `operands`.
+///
+/// This is the one place a generic is built, so the shape is stated once rather
+/// than nine times. Everything is DERIVED from the operands -- rank, indexing
+/// maps, iterator types, shape and destination -- because a literal rank or a
+/// parsed `affine_map` string here would break on the first 2D or f16 kernel.
+///
+/// `resultElemType` is separate from the operands' element type because a
+/// comparison's result width need not match what it compared in general; for
+/// every op here they happen to coincide, and passing it explicitly keeps that a
+/// statement rather than an assumption.
+///
+/// `body` receives the scalar block arguments for the inputs only -- the
+/// destination's block argument is dropped, since an elementwise body never
+/// reads its own uninitialized destination -- and returns the scalar result,
+/// which this function yields.
+static Value wrapElementwise(
+    OpBuilder &b, Location loc, ValueRange operands, Type resultElemType,
+    function_ref<Value(OpBuilder &, Location, ValueRange)> body) {
+  auto operandTy = cast<RankedTensorType>(operands.front().getType());
+  int64_t rank = operandTy.getRank();
+
+  auto resultTy = RankedTensorType::get(operandTy.getShape(), resultElemType);
+  Value dest = tensor::EmptyOp::create(b, loc, operandTy.getShape(),
+                                       resultElemType);
+
+  // One identity map per operand plus one for the destination. Identity is
+  // correct because every op here is elementwise: iteration (d0..dn) reads
+  // element (d0..dn) of each operand.
+  auto identity = AffineMap::getMultiDimIdentityMap(rank, b.getContext());
+  SmallVector<AffineMap> maps(operands.size() + 1, identity);
+  SmallVector<utils::IteratorType> iterators(rank,
+                                             utils::IteratorType::parallel);
+
+  auto generic = linalg::GenericOp::create(
+      b, loc, TypeRange{resultTy}, operands, ValueRange{dest}, maps, iterators,
+      /*doc=*/"", /*libraryCall=*/"",
+      [&](OpBuilder &nested, Location nestedLoc, ValueRange args) {
+        Value scalar = body(nested, nestedLoc, args.drop_back());
+        linalg::YieldOp::create(nested, nestedLoc, scalar);
+      });
+  return generic.getResult(0);
 }
 
 //===----------------------------------------------------------------------===//
@@ -80,10 +153,18 @@ struct ConvertMathSqrt : public OpConversionPattern<math::SqrtOp> {
   LogicalResult
   matchAndRewrite(math::SqrtOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!isSpyreOpScalarType(op.getType()))
+    Type elemTy = tensorElemType(op.getType());
+    if (!elemTy || !isSpyreOpFloatElemType(elemTy))
       return failure();
-    rewriter.replaceOpWithNewOp<spyreop::Sqrt>(op, op.getType(),
-                                               adaptor.getOperand());
+    // Hoisted into a local rather than nested inside replaceOp: C++ leaves the
+    // evaluation order of call arguments unspecified, and wrapElementwise has
+    // the side effect of inserting ops.
+    Value wrapped = wrapElementwise(
+        rewriter, op.getLoc(), {adaptor.getOperand()}, elemTy,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          return spyreop::Sqrt::create(b, loc, args[0].getType(), args[0]);
+        });
+    rewriter.replaceOp(op, wrapped);
     return success();
   }
 };
@@ -98,10 +179,18 @@ struct ConvertMathExp : public OpConversionPattern<math::ExpOp> {
   LogicalResult
   matchAndRewrite(math::ExpOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!isSpyreOpScalarType(op.getType()))
+    Type elemTy = tensorElemType(op.getType());
+    if (!elemTy || !isSpyreOpFloatElemType(elemTy))
       return failure();
-    rewriter.replaceOpWithNewOp<spyreop::Exp>(op, op.getType(),
-                                              adaptor.getOperand());
+    // Hoisted into a local rather than nested inside replaceOp: C++ leaves the
+    // evaluation order of call arguments unspecified, and wrapElementwise has
+    // the side effect of inserting ops.
+    Value wrapped = wrapElementwise(
+        rewriter, op.getLoc(), {adaptor.getOperand()}, elemTy,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          return spyreop::Exp::create(b, loc, args[0].getType(), args[0]);
+        });
+    rewriter.replaceOp(op, wrapped);
     return success();
   }
 };
@@ -116,10 +205,18 @@ struct ConvertMathRsqrt : public OpConversionPattern<math::RsqrtOp> {
   LogicalResult
   matchAndRewrite(math::RsqrtOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!isSpyreOpScalarType(op.getType()))
+    Type elemTy = tensorElemType(op.getType());
+    if (!elemTy || !isSpyreOpFloatElemType(elemTy))
       return failure();
-    rewriter.replaceOpWithNewOp<spyreop::RSqrt>(op, op.getType(),
-                                                adaptor.getOperand());
+    // Hoisted into a local rather than nested inside replaceOp: C++ leaves the
+    // evaluation order of call arguments unspecified, and wrapElementwise has
+    // the side effect of inserting ops.
+    Value wrapped = wrapElementwise(
+        rewriter, op.getLoc(), {adaptor.getOperand()}, elemTy,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          return spyreop::RSqrt::create(b, loc, args[0].getType(), args[0]);
+        });
+    rewriter.replaceOp(op, wrapped);
     return success();
   }
 };
@@ -134,24 +231,44 @@ struct ConvertArithDivF : public OpConversionPattern<arith::DivFOp> {
   LogicalResult
   matchAndRewrite(arith::DivFOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!isSpyreOpScalarType(op.getType()))
+    Type elemTy = tensorElemType(op.getType());
+    if (!elemTy || !isSpyreOpFloatElemType(elemTy))
       return failure();
+
     // A numerator of one becomes the UNARY intrinsic, so no float immediate
     // reaches the device at all. Matched through m_OneFloat, which accepts a
-    // scalar float constant or a splat, so no shape is assumed here.
+    // scalar float constant or a splat -- at tensor level it is always the
+    // splat form, which is why no shape is assumed here.
     if (matchPattern(adaptor.getLhs(), m_OneFloat())) {
       // The numerator's own op goes with it when the divide was its only
-      // reader. Guarded, because a CSE'd constant may have another.
+      // reader. Guarded, because a CSE'd splat may have another.
       Operation *numerator = adaptor.getLhs().getDefiningOp();
       bool sole = numerator && adaptor.getLhs().hasOneUse();
-      rewriter.replaceOpWithNewOp<spyreop::Reciprocal>(op, op.getType(),
-                                                       adaptor.getRhs());
+      // Hoisted into a local rather than nested inside replaceOp: C++ leaves the
+      // evaluation order of call arguments unspecified, and wrapElementwise has
+      // the side effect of inserting ops.
+      Value wrapped = wrapElementwise(
+          rewriter, op.getLoc(), {adaptor.getRhs()}, elemTy,
+          [](OpBuilder &b, Location loc, ValueRange args) {
+            return spyreop::Reciprocal::create(b, loc, args[0].getType(),
+                                               args[0]);
+          });
+      rewriter.replaceOp(op, wrapped);
       if (sole)
         rewriter.eraseOp(numerator);
       return success();
     }
-    rewriter.replaceOpWithNewOp<spyreop::RealDiv>(
-        op, op.getType(), adaptor.getLhs(), adaptor.getRhs());
+
+    // Hoisted into a local rather than nested inside replaceOp: C++ leaves the
+    // evaluation order of call arguments unspecified, and wrapElementwise has
+    // the side effect of inserting ops.
+    Value wrapped = wrapElementwise(
+        rewriter, op.getLoc(), {adaptor.getLhs(), adaptor.getRhs()}, elemTy,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          return spyreop::RealDiv::create(b, loc, args[0].getType(), args[0],
+                                          args[1]);
+        });
+    rewriter.replaceOp(op, wrapped);
     return success();
   }
 };
@@ -167,15 +284,26 @@ struct ConvertArithAddI : public OpConversionPattern<arith::AddIOp> {
   LogicalResult
   matchAndRewrite(arith::AddIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!isInsideLinalgGeneric(op))
+    // Tensor-typed only: a scalar integer add here is a loop index or a tile
+    // offset, and rewriting it would turn address arithmetic into a compute
+    // intrinsic. tensorIntBitWidth returns 0 for a scalar, so this declines.
+    unsigned width = tensorIntBitWidth(op.getType());
+    if (width != 32 && width != 64)
       return failure();
-    unsigned width = getScalarIntBitWidth(op.getType());
-    if (width == 32)
-      rewriter.replaceOpWithNewOp<spyreop::AddI32ToI32>(
-          op, op.getType(), adaptor.getLhs(), adaptor.getRhs());
-    else if (width == 64)
-      rewriter.replaceOpWithNewOp<spyreop::AddI64ToI64>(
-          op, op.getType(), adaptor.getLhs(), adaptor.getRhs());
+    Type elemTy = tensorElemType(op.getType());
+    // Hoisted into a local rather than nested inside replaceOp: C++ leaves the
+    // evaluation order of call arguments unspecified, and wrapElementwise has
+    // the side effect of inserting ops.
+    Value wrapped = wrapElementwise(
+        rewriter, op.getLoc(), {adaptor.getLhs(), adaptor.getRhs()}, elemTy,
+        [width](OpBuilder &b, Location loc, ValueRange args) -> Value {
+          if (width == 32)
+            return spyreop::AddI32ToI32::create(b, loc, args[0].getType(),
+                                                args[0], args[1]);
+          return spyreop::AddI64ToI64::create(b, loc, args[0].getType(),
+                                              args[0], args[1]);
+        });
+    rewriter.replaceOp(op, wrapped);
     return success();
   }
 };
@@ -190,10 +318,20 @@ struct ConvertArithMulI : public OpConversionPattern<arith::MulIOp> {
   LogicalResult
   matchAndRewrite(arith::MulIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!isInsideLinalgGeneric(op) || getScalarIntBitWidth(op.getType()) != 32)
+    // Tensor-typed i32 only -- see ConvertArithAddI on why a scalar declines.
+    if (tensorIntBitWidth(op.getType()) != 32)
       return failure();
-    rewriter.replaceOpWithNewOp<spyreop::MulI32ToI32>(
-        op, op.getType(), adaptor.getLhs(), adaptor.getRhs());
+    Type elemTy = tensorElemType(op.getType());
+    // Hoisted into a local rather than nested inside replaceOp: C++ leaves the
+    // evaluation order of call arguments unspecified, and wrapElementwise has
+    // the side effect of inserting ops.
+    Value wrapped = wrapElementwise(
+        rewriter, op.getLoc(), {adaptor.getLhs(), adaptor.getRhs()}, elemTy,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          return spyreop::MulI32ToI32::create(b, loc, args[0].getType(),
+                                              args[0], args[1]);
+        });
+    rewriter.replaceOp(op, wrapped);
     return success();
   }
 };
@@ -210,38 +348,55 @@ struct LowerSpyreOpsPass
     MLIRContext *ctx = &getContext();
 
     ConversionTarget target(*ctx);
-    // A math op still on a tensor/vector hasn't been scalarized yet (that's
-    // ConvertElementwiseToLinalg's job) -- leave it legal, quietly, rather
-    // than reporting it. Any scalar type is illegal here: the pattern
-    // converts the ones spyreop supports and leaves the rest illegal so
-    // conversion reports them instead of silently dropping them.
+    // These callbacks say what is allowed to REMAIN. They are the mirror of the
+    // patterns above: a pattern says what to convert, and the callback says
+    // whether an unconverted leftover is an error or is fine.
+    //
+    // For the float ops, a TENSOR is now illegal -- that is the thing this pass
+    // exists to convert. A scalar is legal and left alone: at this point in the
+    // pipeline a scalar float op is not elementwise compute (nothing has
+    // scalarized yet), so it is not ours. An unsupported element type such as
+    // f64 on a tensor stays illegal, so conversion reports it rather than
+    // silently shipping it to the device.
+    //
+    // Note this is the opposite of what these callbacks said when the pass ran
+    // after scalarization, where `isa<ShapedType>` meant "a tensor has not been
+    // scalarized yet, leave it". Keeping that here would make the pass a silent
+    // no-op: the patterns would decline AND the leftovers would be declared
+    // fine, so applyPartialConversion would report success having converted
+    // nothing.
     target.addDynamicallyLegalOp<math::SqrtOp>([](math::SqrtOp op) {
-      return isa<ShapedType>(op.getType());
+      return !asRankedTensor(op.getType());
     });
     target.addDynamicallyLegalOp<math::ExpOp>([](math::ExpOp op) {
-      return isa<ShapedType>(op.getType());
+      return !asRankedTensor(op.getType());
     });
     target.addDynamicallyLegalOp<math::RsqrtOp>([](math::RsqrtOp op) {
-      return isa<ShapedType>(op.getType());
+      return !asRankedTensor(op.getType());
     });
     target.addDynamicallyLegalOp<arith::DivFOp>([](arith::DivFOp op) {
-      return isa<ShapedType>(op.getType());
+      return !asRankedTensor(op.getType());
     });
     // arith.addi/muli are also used for plain index/address arithmetic, so
-    // (unlike the ops above) they stay legal everywhere except the one
-    // context and bit-width this pass actually converts: scalarized
-    // elementwise compute inside a linalg.generic, at a width spyreop has an
-    // intrinsic for. Everything else -- other widths, or outside a
-    // linalg.generic -- is left alone rather than reported.
+    // (unlike the ops above) they stay legal everywhere except the one shape and
+    // bit-width this pass converts: a TENSOR of i32/i64. A scalar add or
+    // multiply is a loop index or a tile offset and is left alone rather than
+    // reported -- tensorIntBitWidth returns 0 for one, so both callbacks below
+    // call it legal.
     target.addDynamicallyLegalOp<arith::AddIOp>([](arith::AddIOp op) {
-      unsigned width = getScalarIntBitWidth(op.getType());
-      return !isInsideLinalgGeneric(op) || (width != 32 && width != 64);
+      unsigned width = tensorIntBitWidth(op.getType());
+      return width != 32 && width != 64;
     });
     target.addDynamicallyLegalOp<arith::MulIOp>([](arith::MulIOp op) {
-      return !isInsideLinalgGeneric(op) ||
-             getScalarIntBitWidth(op.getType()) != 32;
+      return tensorIntBitWidth(op.getType()) != 32;
     });
+
     target.addLegalDialect<spyreop::SpyreOpDialect>();
+    // Created by the patterns above, so they must be legal or the conversion
+    // driver rolls the pattern back and then reports the original op as
+    // unlegalizable -- which reads as "the pattern never fired".
+    target.addLegalDialect<linalg::LinalgDialect>();
+    target.addLegalDialect<tensor::TensorDialect>();
     target.addLegalOp<ModuleOp>();
 
     // No TypeConverter is installed, so adaptor operands are the original

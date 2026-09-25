@@ -132,67 +132,89 @@ def LowerComputeOps : Pass<"lower-compute-ops", "mlir::ModuleOp"> {
 }
 
 def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
-    let summary = "Lower scalar math/arith ops to spyreop dialect intrinsics.";
+    let summary = "Lower elementwise math/arith ops to spyreop dialect intrinsics.";
     let description = [{
-        Input: any IR containing scalar math/arith ops — typically the body
-        of a linalg.generic after ConvertElementwiseToLinalg has scalarized
-        a tensor-level op. spyreop's intrinsics are scalar-only
-        (f16/df16/f32, or i32/i64 for the integer ops), so an op still on a
-        tensor or vector is left alone rather than matched — this pass is
-        not the one that will eventually convert it.
+        Input: IR containing TENSOR-level math/arith ops, before any
+        scalarization. A scalar op is left alone -- at this point in the
+        pipeline nothing has scalarized, so a scalar float op is not
+        elementwise compute and a scalar integer op is address arithmetic.
 
-        Lowering:
-        - math.sqrt  (operand f16 or f32)        → spyreop.sqrt
-        - math.exp   (operand f16 or f32)        → spyreop.exp
-        - math.rsqrt (operand f16 or f32)        → spyreop.rsqrt
-        - arith.divf (operand f16 or f32)        → spyreop.realdiv,
+        Output shape: spyreop's intrinsics are declared scalar-only
+        (AnyTypeOf<[F16, SpyreOp_DF16, F32]>, or I32/I64 for the integer
+        ops), so a tensor-level spyreop op does not verify. Each pattern
+        therefore emits the intrinsic WRAPPED in a linalg.generic whose body
+        holds the scalar op: tensor in, tensor out, scalar op inside. One
+        helper builds that shape for every pattern, deriving rank, indexing
+        maps, iterator types and element type from the operand rather than
+        assuming any of them.
+
+        A generic built here is not re-wrapped by ConvertElementwiseToLinalg
+        afterwards: that pass keys on the ElementwiseMappable trait, which a
+        linalg.generic does not carry.
+
+        Lowering (all operands tensors):
+        - math.sqrt  (element f16 or f32)  → spyreop.sqrt
+        - math.exp   (element f16 or f32)  → spyreop.exp
+        - math.rsqrt (element f16 or f32)  → spyreop.rsqrt
+        - arith.divf (element f16 or f32)  → spyreop.realdiv,
           or spyreop.reciprocal when the numerator is a constant 1.0
-        - arith.addi (i32, inside linalg.generic) → spyreop.addi32toi32
-        - arith.addi (i64, inside linalg.generic) → spyreop.addi64toi64
-        - arith.muli (i32, inside linalg.generic) → spyreop.muli32toi32
-
-        math.sqrt/exp/rsqrt and arith.divf are matched unconditionally on
-        scalar type: those ops only ever appear in real floating-point
-        compute, never in address/index arithmetic, so a scalar occurrence
-        still on an unsupported type (f64, bf16, ...) has no spyreop
-        intrinsic to lower to and is left illegal, reported with a
-        diagnostic rather than silently skipped. Still on a tensor/vector,
-        they are left legal, quietly, since ConvertElementwiseToLinalg (not
-        this pass) is what will eventually scalarize them.
+        - arith.addi (element i32)         → spyreop.addi32toi32
+        - arith.addi (element i64)         → spyreop.addi64toi64
+        - arith.muli (element i32)         → spyreop.muli32toi32
+        math.sqrt/exp/rsqrt and arith.divf are matched on any TENSOR of a
+        float type: those ops only ever appear in real floating-point
+        compute, never in address/index arithmetic. A tensor of an
+        unsupported element type (f64, bf16, ...) has no spyreop intrinsic
+        to lower to and is left ILLEGAL, reported with a diagnostic rather
+        than silently skipped -- so the legality callback marks a float op on
+        a tensor illegal whatever its element type, and marking only the
+        supported types illegal would let an f64 tensor pass through
+        undetected. A SCALAR float op is left legal, quietly.
 
         arith.divf splits on its NUMERATOR as well as its type: a numerator
         of one goes to the UNARY spyreop.reciprocal, so no float immediate
         reaches the device at all. Matched by value with m_OneFloat, which
-        accepts a scalar float constant or a splat. No other value is
-        special-cased.
+        accepts a scalar float constant or a splat -- at tensor level it is
+        always the splat form. No other value is special-cased. The
+        numerator's own op is erased when the divide was its only reader.
 
-        arith.addi/arith.muli are different: plain scalar integer add/mul is
-        also used throughout a kernel for loop indices, offsets, and tile
-        addressing, not just scalarized tensor compute. So these two are
-        only matched inside a linalg.generic body (the structural signal
-        that this is scalarized elementwise compute, not address math), and
-        only at the specific bit-widths spyreop has an intrinsic for --
-        anything else (other widths, or outside a linalg.generic) is left
-        legal rather than reported.
+        arith.addi/arith.muli are different: plain integer add/mul is also
+        used throughout a kernel for loop indices, offsets and tile
+        addressing. Being TENSOR-typed is what separates the two, and it
+        separates them exactly -- address arithmetic is never a tensor. So
+        these two match a tensor of a supported width only; a scalar add or
+        multiply, or a tensor at an unsupported width, is left legal rather
+        than reported. There is no claim that every integer op was meant to
+        reach the device, which is why these are quiet where the float ops
+        are loud.
 
-        Ordering: must run after ConvertElementwiseToLinalg for a kernel
-        that computes over a tensor -- anchored earlier, the op is still
-        tensor-typed and left alone, never reaching its spyreop intrinsic.
+        Ordering: must run BEFORE ConvertElementwiseToLinalg. Anchored after
+        it, the ops are already scalars inside generic bodies and the
+        tensor-level patterns match nothing -- and the failure would be
+        silent, because the legality callbacks would find no tensor forms to
+        object to. The reason for this position rather than the other is that
+        a mask cast can only be absorbed into its comparison while the two
+        are adjacent ops in one block; after scalarization they are in
+        separate generic bodies and the cast's operand is a block argument
+        with no defining op.
 
-        Output: no math.sqrt/exp/rsqrt or arith.divf remains on a supported
-        scalar type (a divf by a constant-1.0 numerator leaving its constant
-        behind, dead, for the pipeline's own cleanup); no arith.addi/muli at
-        a supported bit-width remains
-        inside a linalg.generic. The corresponding spyreop intrinsic is
-        introduced in its place. Everything else -- unsupported types or
-        widths, tensor/vector operands, or index arithmetic outside a
-        linalg.generic -- passes through unchanged.
+        Output: no math.sqrt/exp/rsqrt or arith.divf remains on a tensor of a
+        supported element type, and no arith.addi/muli remains on a tensor at
+        a supported bit-width. Each is replaced by a linalg.generic holding
+        the corresponding spyreop intrinsic. Everything else -- scalars,
+        unsupported element types or widths -- passes through unchanged,
+        except an unsupported FLOAT element type on a tensor, which is
+        reported.
     }];
 
     let dependentDialects = [
         "mlir::spyreop::SpyreOpDialect",
         "mlir::math::MathDialect",
-        "mlir::arith::ArithDialect"
+        "mlir::arith::ArithDialect",
+        // Created by this pass, not merely read: every intrinsic is emitted
+        // wrapped in a linalg.generic over a tensor.empty destination.
+        "mlir::linalg::LinalgDialect",
+        "mlir::tensor::TensorDialect"
     ];
 }
 
