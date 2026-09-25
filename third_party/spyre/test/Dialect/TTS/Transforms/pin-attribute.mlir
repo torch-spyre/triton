@@ -31,11 +31,11 @@
 // itself -- ConvertElementwiseToLinalg runs in `spyrecode` -- so the attribute
 // lands on the math op.
 // CHECK-LABEL: tt.func @elementwise_producer
-// CHECK: math.exp {{.*}} {tts.pin = {address = 4096 : i32, memory_space = "ct_local"}}
+// CHECK: math.exp {{.*}} {tts.pin = {address = 4096 : i32, memory_space = #ktdp.memory_space<ct_local>}}
 // CHECK-NOT: tts.pin %
 tt.func @elementwise_producer(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
   %e = math.exp %x : tensor<4x64xf16>
-  tts.pin %e {memory_space = "ct_local", address = 4096 : i32} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<4x64xf16>
   %y = math.sqrt %e : tensor<4x64xf16>
   tt.return %y : tensor<4x64xf16>
 }
@@ -47,12 +47,12 @@ tt.func @elementwise_producer(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
 // on the tt.reduce would be dropped with it.
 // CHECK-LABEL: tt.func @linalg_producer
 // CHECK: linalg.reduce
-// CHECK-SAME: {tts.pin = {address = 8192 : i32, memory_space = "ct_local"}}
+// CHECK-SAME: {tts.pin = {address = 8192 : i32, memory_space = #ktdp.memory_space<ct_local>}}
 // CHECK-NOT: tts.pin %
 tt.func @linalg_producer(%x: tensor<4x64xf32>) -> tensor<4xf32> {
   %init = tensor.empty() : tensor<4xf32>
   %r = linalg.reduce { arith.addf } ins(%x : tensor<4x64xf32>) outs(%init : tensor<4xf32>) dimensions = [1]
-  tts.pin %r {memory_space = "ct_local", address = 8192 : i32} : tensor<4xf32>
+  tts.pin %r {memory_space = #ktdp.memory_space<ct_local>, address = 8192 : i32} : tensor<4xf32>
   tt.return %r : tensor<4xf32>
 }
 
@@ -61,11 +61,11 @@ tt.func @linalg_producer(%x: tensor<4x64xf32>) -> tensor<4xf32> {
 // unchanged -- not summarized into coefficients, and not collapsed when its
 // entries happen to be equal.
 // CHECK-LABEL: tt.func @per_core_address
-// CHECK: math.exp {{.*}} {tts.pin = {address = array<i32: 4096, 4352, 4608>, memory_space = "ct_local"}}
+// CHECK: math.exp {{.*}} {tts.pin = {address = array<i32: 4096, 4352, 4608>, memory_space = #ktdp.memory_space<ct_local>}}
 // CHECK-NOT: tts.pin %
 tt.func @per_core_address(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
   %e = math.exp %x : tensor<4x64xf16>
-  tts.pin %e {memory_space = "ct_local", address = array<i32: 4096, 4352, 4608>} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = array<i32: 4096, 4352, 4608>} : tensor<4x64xf16>
   tt.return %e : tensor<4x64xf16>
 }
 
@@ -74,11 +74,11 @@ tt.func @per_core_address(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
 // what keeps "stated no address" distinguishable from "stated 0" -- 0 being a
 // legitimate element index.
 // CHECK-LABEL: tt.func @no_address
-// CHECK: math.exp {{.*}} {tts.pin = {memory_space = "ct_local"}}
+// CHECK: math.exp {{.*}} {tts.pin = {memory_space = #ktdp.memory_space<ct_local>}}
 // CHECK-NOT: address
 tt.func @no_address(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
   %e = math.exp %x : tensor<4x64xf16>
-  tts.pin %e {memory_space = "ct_local"} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
   tt.return %e : tensor<4x64xf16>
 }
 
@@ -87,14 +87,14 @@ tt.func @no_address(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
 // is per-op and not per-function: each lands on its own producer with its own
 // address.
 // CHECK-LABEL: tt.func @two_pins
-// CHECK: math.exp {{.*}} {tts.pin = {address = 0 : i32, memory_space = "ct_local"}}
-// CHECK: math.sqrt {{.*}} {tts.pin = {address = 512 : i32, memory_space = "ct_local"}}
+// CHECK: math.exp {{.*}} {tts.pin = {address = 0 : i32, memory_space = #ktdp.memory_space<ct_local>}}
+// CHECK: math.sqrt {{.*}} {tts.pin = {address = 512 : i32, memory_space = #ktdp.memory_space<ct_local>}}
 // CHECK-NOT: tts.pin %
 tt.func @two_pins(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
   %e = math.exp %x : tensor<4x64xf16>
   %s = math.sqrt %x : tensor<4x64xf16>
-  tts.pin %e {memory_space = "ct_local", address = 0 : i32} : tensor<4x64xf16>
-  tts.pin %s {memory_space = "ct_local", address = 512 : i32} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = 0 : i32} : tensor<4x64xf16>
+  tts.pin %s {memory_space = #ktdp.memory_space<ct_local>, address = 512 : i32} : tensor<4x64xf16>
   %y = arith.addf %e, %s : tensor<4x64xf16>
   tt.return %y : tensor<4x64xf16>
 }
@@ -106,11 +106,11 @@ tt.func @two_pins(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
 // above the use. That is the difference between an annotation on a value and a
 // marker with a program point.
 // CHECK-LABEL: tt.func @pin_below_a_use
-// CHECK: math.exp {{.*}} {tts.pin = {address = 4096 : i32, memory_space = "ct_local"}}
+// CHECK: math.exp {{.*}} {tts.pin = {address = 4096 : i32, memory_space = #ktdp.memory_space<ct_local>}}
 // CHECK-NOT: tts.pin %
 tt.func @pin_below_a_use(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
   %e = math.exp %x : tensor<4x64xf16>
   %y = math.sqrt %e : tensor<4x64xf16>
-  tts.pin %e {memory_space = "ct_local", address = 4096 : i32} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<4x64xf16>
   tt.return %y : tensor<4x64xf16>
 }

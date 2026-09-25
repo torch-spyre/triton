@@ -298,21 +298,27 @@ LogicalResult readTensorLayoutArrays(
 }
 
 LogicalResult
-verifyPinFields(StringRef memorySpace, Attribute address,
+verifyPinFields(mlir::ktdp::MemorySpaceAttr memorySpace, Attribute address,
                 llvm::function_ref<InFlightDiagnostic()> emitError) {
-  // The memory-space vocabulary is ktdp's, reached through its own symbolizer so
-  // the two names are never restated here.
-  auto kind = mlir::ktdp::symbolizeMemorySpaceKind(memorySpace);
-  if (!kind)
-    return emitError() << "tts.pin: unknown memory space '" << memorySpace
-                       << "': expected 'ct_local'";
-
-  // `global` is a KNOWN kind and still not pinnable, so it gets its own message
-  // rather than being reported as a misspelling: an intermediate in HBM is
-  // written as a descriptor with an explicit store and load.
-  if (*kind != mlir::ktdp::MemorySpaceKind::ct_local)
-    return emitError() << "tts.pin: memory space '" << memorySpace
+  // Which kinds EXIST is ktdp's business and is settled before this runs: the
+  // attribute would not have parsed otherwise. What is left is which of them a
+  // pin may name, and `global` is a known kind that it may not -- an intermediate
+  // in HBM is written as a descriptor with an explicit store and load.
+  if (memorySpace.getKind() != mlir::ktdp::MemorySpaceKind::ct_local)
+    return emitError() << "tts.pin: memory space '"
+                       << mlir::ktdp::stringifyMemorySpaceKind(
+                              memorySpace.getKind())
                        << "' cannot be pinned: only 'ct_local' is";
+
+  // A pin means the scratchpad of whichever core is running, so there is no core
+  // to name. `ct_id = 7` would ask for core 7's scratchpad, which is a different
+  // request and one nothing here honours -- and an unhonoured ct_id would be
+  // silent, since the buffer would simply be built somewhere else.
+  if (memorySpace.hasCTIdSpecified())
+    return emitError() << "tts.pin: memory space names ct_id "
+                       << memorySpace.getCtId()
+                       << "; a pin is always the running core's own scratchpad, "
+                          "so leave ct_id unspecified";
 
   if (!address)
     return success();
@@ -337,7 +343,8 @@ verifyPinFields(StringRef memorySpace, Attribute address,
   return success();
 }
 
-LogicalResult readPinAttr(Attribute value, StringRef &memorySpace,
+LogicalResult readPinAttr(Attribute value,
+                          mlir::ktdp::MemorySpaceAttr &memorySpace,
                           Attribute &address,
                           llvm::function_ref<InFlightDiagnostic()> emitError) {
   auto dict = dyn_cast<DictionaryAttr>(value);
@@ -348,11 +355,10 @@ LogicalResult readPinAttr(Attribute value, StringRef &memorySpace,
   if (!space)
     return emitError() << "tts.pin: missing '" << TTSDialect::kMemorySpaceName
                        << "' entry";
-  auto spaceStr = dyn_cast<StringAttr>(space);
-  if (!spaceStr)
+  memorySpace = dyn_cast<mlir::ktdp::MemorySpaceAttr>(space);
+  if (!memorySpace)
     return emitError() << "tts.pin: '" << TTSDialect::kMemorySpaceName
-                       << "' must be a string";
-  memorySpace = spaceStr.getValue();
+                       << "' must be a #ktdp.memory_space";
 
   // Optional, and its absence is meaningful: 0 is a legitimate element index, so
   // "stated no address" cannot be spelled as a number.
@@ -416,7 +422,7 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
              << "' annotates a buffer for a tensor, but this op's result is "
              << op->getResult(0).getType();
 
-    StringRef memorySpace;
+    mlir::ktdp::MemorySpaceAttr memorySpace;
     Attribute address;
     if (failed(readPinAttr(attribute.getValue(), memorySpace, address,
                            emitError)))

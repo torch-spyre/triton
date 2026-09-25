@@ -81,13 +81,19 @@ def TTS_Dialect : Dialect {
     ///                  same on every core, or a `DenseI32ArrayAttr` holding one
     ///                  per program id. Absent when the pin named no address.
     ///
-    /// The KIND only, and not a whole `#ktdp.memory_space`: that attribute pairs
-    /// a kind with a `ct_id`, and every site in this tree that constructs one
-    /// passes `ct_id = -1` -- LowerDescriptorMemory and LowerScalarLoad both do.
-    /// A pin means the scratchpad of whichever core is running, never a named
-    /// peer's, so a consumer building the attribute from this one passes -1 as
-    /// well. Recorded here because the string cannot carry it and nothing else
-    /// would say so.
+    /// `memory_space` is ktdp's own attribute and not a string naming its enum,
+    /// which is allowed for a reason worth stating: the rule this dialect lives
+    /// by is that nothing here needs THIS dialect loaded to parse, and ktdp is
+    /// not this dialect. Every consumer that reads this annotation out of the
+    /// `ktir` artifact loads ktdp already, because the artifact's own memref
+    /// types carry `#ktdp.memory_space`. A `tts.`-defined attribute type would
+    /// break the rule; borrowing one does not.
+    ///
+    /// Its `ct_id` must be unspecified, which the attribute defaults to (-1), and
+    /// which is what every site in this tree that constructs one passes --
+    /// LowerDescriptorMemory and LowerScalarLoad both do. A pin means the
+    /// scratchpad of whichever core is running, never a named peer's, so a
+    /// consumer can use this attribute as it stands rather than rebuilding it.
     ///
     /// The producing op is the carrier because a pin names a VALUE, and a value's
     /// only op is the one defining it. That is also why a pinned block argument

@@ -9,29 +9,28 @@
 // terms were all well-formed arith that had to be refused one at a time. None of
 // them is spellable in an attribute, so none of them needs a rule.
 //
-// What is left is what a type constraint cannot say. ODS already narrows the
-// address to an i32 or an i32 array; the verifier adds the memory space, checked
-// against ktdp's enum, and the one array shape that parses but names nothing.
+// What is left is what a type constraint cannot say. ODS narrows the address to
+// an i32 or an i32 array, and the memory space to a `#ktdp.memory_space`; the
+// verifier adds the three rules that are about MEANING rather than shape -- which
+// kind a pin may name, that it names no core, and the one array shape that parses
+// but addresses nothing.
+//
+// Note what is NOT here any more: a misspelled memory space. It used to be a
+// string checked against ktdp's enum, so `"lx"` and `"CT_LOCAL"` were verifier
+// errors; typed as the attribute they are parse errors, caught before this
+// verifier runs and not worth a case of their own. The first case below is what
+// remains of them.
 //
 // The numeric rules -- a stick-aligned offset, a range that fits the scratchpad,
 // ranges that do not overlap -- are arithmetic on those numbers and belong to
 // whatever consumes the attribute. Nothing does yet.
 
-// The memory-space vocabulary is ktdp's MemorySpaceKind, reached through
-// `symbolizeMemorySpaceKind` so the two names are never restated in C++.
-tt.func @unknown_memory_space(%x: tensor<4x64xf16>) {
+// Not a `#ktdp.memory_space` at all. Refused by the ODS constraint, which is the
+// whole of what used to be two hand-written cases about misspelling.
+tt.func @not_a_memory_space(%x: tensor<4x64xf16>) {
   %e = math.exp %x : tensor<4x64xf16>
-  // expected-error @+1 {{unknown memory space 'lx': expected 'ct_local'}}
-  tts.pin %e {memory_space = "lx"} : tensor<4x64xf16>
-  tt.return
-}
-
-// -----
-// Case matters, since the enum's own spelling is lower case.
-tt.func @wrong_case(%x: tensor<4x64xf16>) {
-  %e = math.exp %x : tensor<4x64xf16>
-  // expected-error @+1 {{unknown memory space 'CT_LOCAL'}}
-  tts.pin %e {memory_space = "CT_LOCAL"} : tensor<4x64xf16>
+  // expected-error @+1 {{attribute 'memory_space' failed to satisfy constraint}}
+  tts.pin %e {memory_space = "ct_local"} : tensor<4x64xf16>
   tt.return
 }
 
@@ -44,7 +43,7 @@ tt.func @wrong_case(%x: tensor<4x64xf16>) {
 tt.func @global_memory_space(%x: tensor<4x64xf16>) {
   %e = math.exp %x : tensor<4x64xf16>
   // expected-error @+1 {{memory space 'global' cannot be pinned: only 'ct_local' is}}
-  tts.pin %e {memory_space = "global"} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<global>} : tensor<4x64xf16>
   tt.return
 }
 
@@ -54,7 +53,21 @@ tt.func @global_memory_space(%x: tensor<4x64xf16>) {
 tt.func @global_with_address(%x: tensor<4x64xf16>) {
   %e = math.exp %x : tensor<4x64xf16>
   // expected-error @+1 {{memory space 'global' cannot be pinned}}
-  tts.pin %e {memory_space = "global", address = 4096 : i32} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<global>, address = 4096 : i32} : tensor<4x64xf16>
+  tt.return
+}
+
+// -----
+// A ct_id, which the attribute can carry and a pin may not use. `ct_local` alone
+// means the scratchpad of whichever core is running; naming core 7 is a different
+// request, and one nothing here honours -- so it is refused rather than accepted
+// and then ignored, which would put the buffer somewhere the author did not ask
+// for with nothing saying so. This rule is only expressible because the memory
+// space is the typed attribute: a string could not carry a ct_id to reject.
+tt.func @ct_id_specified(%x: tensor<4x64xf16>) {
+  %e = math.exp %x : tensor<4x64xf16>
+  // expected-error @+1 {{memory space names ct_id 7; a pin is always the running core's own scratchpad}}
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local, ct_id = 7>, address = 4096 : i32} : tensor<4x64xf16>
   tt.return
 }
 
@@ -65,7 +78,7 @@ tt.func @global_with_address(%x: tensor<4x64xf16>) {
 tt.func @empty_address_array(%x: tensor<4x64xf16>) {
   %e = math.exp %x : tensor<4x64xf16>
   // expected-error @+1 {{address array is empty}}
-  tts.pin %e {memory_space = "ct_local", address = array<i32>} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = array<i32>} : tensor<4x64xf16>
   tt.return
 }
 
@@ -76,7 +89,7 @@ tt.func @empty_address_array(%x: tensor<4x64xf16>) {
 tt.func @dynamic_shape(%x: tensor<?x64xf16>) {
   %e = math.exp %x : tensor<?x64xf16>
   // expected-error @+1 {{operand #0 must be statically shaped tensor of any type values}}
-  tts.pin %e {memory_space = "ct_local", address = 4096 : i32} : tensor<?x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<?x64xf16>
   tt.return
 }
 
@@ -94,15 +107,15 @@ tt.func @accepted_forms(%x: tensor<4x64xf16>) {
   %e2 = math.exp %x : tensor<4x64xf16>
 
   // One i32: the same address on every core.
-  tts.pin %e0 {memory_space = "ct_local", address = 4096 : i32} : tensor<4x64xf16>
+  tts.pin %e0 {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<4x64xf16>
 
   // One per program id, positionally. Nothing here requires them to be
   // increasing, evenly spaced, or distinct -- those are a consumer's questions.
-  tts.pin %e1 {memory_space = "ct_local", address = array<i32: 4096, 6144, 8192>} : tensor<4x64xf16>
+  tts.pin %e1 {memory_space = #ktdp.memory_space<ct_local>, address = array<i32: 4096, 6144, 8192>} : tensor<4x64xf16>
 
   // No address at all: the design's baseline, where the compiler places every
   // intermediate and a pin only names the space.
-  tts.pin %e2 {memory_space = "ct_local"} : tensor<4x64xf16>
+  tts.pin %e2 {memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
 
   tt.return
 }

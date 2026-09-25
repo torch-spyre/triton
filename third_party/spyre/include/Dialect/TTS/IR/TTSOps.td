@@ -7,6 +7,10 @@ include "Dialect/TTS/IR/TTSDialect.td"
 // `tts` names a Triton type, Triton names nothing of ours. TritonTypes.td
 // defines no op, so `-gen-op-decls` over this file still emits only ours.
 include "triton/Dialect/Triton/IR/TritonTypes.td"
+// For Ktdp_MemorySpaceAttr, which `tts.pin` types its memory space as. Same
+// direction as above -- we name theirs, they name nothing of ours -- and neither
+// file defines an op, so `-gen-op-decls` still emits only ours.
+include "ktir/Dialect/KTDP/KTDPAttrs.td"
 
 class TTS_Op<string mnemonic, list<Trait> traits = []>
     : Op<TTS_Dialect, mnemonic, traits>;
@@ -87,10 +91,20 @@ def TTS_PinOp : TTS_Op<"pin", []> {
     well-formedness is this op's question, and whether a carrier exists is the
     lowering's.
 
-    `memory_space` is a plain string, checked against `ktdp::MemorySpaceKind` by
-    the verifier rather than typed as `#ktdp.memory_space`. The dialect defines no
-    attribute type on purpose -- see the note in TTSDialect.td -- and this keeps
-    that true for its second marker. Only `ct_local` is admitted: an intermediate
+    `memory_space` is ktdp's own `#ktdp.memory_space`, not a string checked against
+    its enum. The dialect still defines no attribute type of its own -- using one
+    another dialect defines is a different thing, and the consumers that read this
+    annotation out of the `ktir` artifact all load ktdp already, since the
+    artifact's own memref types carry that attribute. Typing it makes a misspelled
+    space a PARSE error rather than a verifier error, and carries `ct_id` as data
+    instead of as a convention.
+
+    `ct_id` must stay unspecified, which the attribute's own default already makes
+    the easy spelling. A pin means the scratchpad of whichever core is running the
+    kernel; `#ktdp.memory_space<ct_local, ct_id = 7>` would mean core 7's, which
+    is a different request and one nothing here honours.
+
+    Only `ct_local` is admitted: an intermediate
     in HBM is written as a `tl.make_tensor_descriptor` with an explicit store and
     load, which is lx-placement.md's first assumption, and nothing here allocates
     an anonymous global buffer. The parameter stays a memory space anyway, so the
@@ -123,13 +137,13 @@ def TTS_PinOp : TTS_Op<"pin", []> {
 
     Example:
     ```mlir
-      tts.pin %e {memory_space = "ct_local", address = 4096 : i32} : tensor<2x11x2049xf16>
+      tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<2x11x2049xf16>
     ```
   }];
 
   let arguments = (ins
     AnyStaticShapeTensor:$value,
-    StrAttr:$memory_space,
+    Ktdp_MemorySpaceAttr:$memory_space,
     OptionalAttr<AnyAttrOf<[I32Attr, DenseI32ArrayAttr]>>:$address
   );
 

@@ -59,6 +59,6 @@ tt.func @no_memory_view() {
 // pin.
 tt.func @pinned_block_argument(%x: tensor<4x64xf16>) {
   // expected-error @+1 {{tts.pin names a block argument, which has no defining op to carry the annotation; pin a value some op in this function produces}}
-  tts.pin %x {memory_space = "ct_local", address = 4096 : i32} : tensor<4x64xf16>
+  tts.pin %x {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<4x64xf16>
   tt.return
 }

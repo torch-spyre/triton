@@ -29,7 +29,10 @@
 #include <optional>
 
 // For the generated op classes: ODS emits Op<> subclasses that need the op
-// definition machinery, and TensorLayoutOp's operand is a Triton type.
+// definition machinery, TensorLayoutOp's operand is a Triton type, and PinOp's
+// memory_space is a ktdp attribute -- so all three have to be complete before
+// Ops.h.inc below, not merely declared.
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpDefinition.h"
@@ -263,18 +266,19 @@ LogicalResult readTensorLayoutArrays(
 /// whether a consumer can do anything with one is that consumer's rule.
 ///
 /// What it enforces:
-///   - `memorySpace` names a `ktdp::MemorySpaceKind`;
-///   - that kind is `ct_local`, the only one a pin may name;
+///   - the kind is `ct_local`, the only one a pin may name;
+///   - `ct_id` is unspecified, since a pin is the running core's own scratchpad;
 ///   - a non-null `address` is an `i32` or a non-empty dense i32 array.
 LogicalResult
-verifyPinFields(StringRef memorySpace, Attribute address,
+verifyPinFields(mlir::ktdp::MemorySpaceAttr memorySpace, Attribute address,
                 llvm::function_ref<InFlightDiagnostic()> emitError);
 
 /// Read `tts.pin` off an op and check its shape as an attribute: a dictionary of
 /// a `memory_space` string and an optional `address`. On success both are handed
 /// back, `address` null when the dictionary omitted it; on failure a diagnostic
 /// has been emitted through `emitError`.
-LogicalResult readPinAttr(Attribute value, StringRef &memorySpace,
+LogicalResult readPinAttr(Attribute value,
+                          mlir::ktdp::MemorySpaceAttr &memorySpace,
                           Attribute &address,
                           llvm::function_ref<InFlightDiagnostic()> emitError);
 

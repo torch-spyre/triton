@@ -25,10 +25,10 @@
 // ---------------------------------------------------------------------------
 // CHECK-LABEL: tt.func @uniform_address(
 // CHECK: %[[E:.*]] = math.exp
-// CHECK: tts.pin %[[E]] {address = 4096 : i32, memory_space = "ct_local"} : tensor<4x64xf16>
+// CHECK: tts.pin %[[E]] {address = 4096 : i32, memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
 tt.func @uniform_address(%x: tensor<4x64xf16>) {
   %e = math.exp %x : tensor<4x64xf16>
-  tts.pin %e {memory_space = "ct_local", address = 4096 : i32} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<4x64xf16>
   tt.return
 }
 
@@ -38,10 +38,10 @@ tt.func @uniform_address(%x: tensor<4x64xf16>) {
 //     coefficients of an expression that computes them.
 // ---------------------------------------------------------------------------
 // CHECK-LABEL: tt.func @per_core_address(
-// CHECK: tts.pin %{{.*}} {address = array<i32: 4096, 4352, 4608, 4864>, memory_space = "ct_local"} : tensor<4x64xf16>
+// CHECK: tts.pin %{{.*}} {address = array<i32: 4096, 4352, 4608, 4864>, memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
 tt.func @per_core_address(%x: tensor<4x64xf16>) {
   %e = math.exp %x : tensor<4x64xf16>
-  tts.pin %e {memory_space = "ct_local", address = array<i32: 4096, 4352, 4608, 4864>} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = array<i32: 4096, 4352, 4608, 4864>} : tensor<4x64xf16>
   tt.return
 }
 
@@ -52,10 +52,10 @@ tt.func @per_core_address(%x: tensor<4x64xf16>) {
 //     same claim.
 // ---------------------------------------------------------------------------
 // CHECK-LABEL: tt.func @uniform_array_stays_an_array(
-// CHECK: tts.pin %{{.*}} {address = array<i32: 4096, 4096>, memory_space = "ct_local"} : tensor<4x64xf16>
+// CHECK: tts.pin %{{.*}} {address = array<i32: 4096, 4096>, memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
 tt.func @uniform_array_stays_an_array(%x: tensor<4x64xf16>) {
   %e = math.exp %x : tensor<4x64xf16>
-  tts.pin %e {memory_space = "ct_local", address = array<i32: 4096, 4096>} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = array<i32: 4096, 4096>} : tensor<4x64xf16>
   tt.return
 }
 
@@ -64,11 +64,11 @@ tt.func @uniform_array_stays_an_array(%x: tensor<4x64xf16>) {
 //     the compiler places every intermediate -- would be written.
 // ---------------------------------------------------------------------------
 // CHECK-LABEL: tt.func @no_address(
-// CHECK: tts.pin %{{.*}} {memory_space = "ct_local"} : tensor<4x64xf16>
+// CHECK: tts.pin %{{.*}} {memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
 // CHECK-NOT: address
 tt.func @no_address(%x: tensor<4x64xf16>) {
   %e = math.exp %x : tensor<4x64xf16>
-  tts.pin %e {memory_space = "ct_local"} : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
   tt.return
 }
 
@@ -81,9 +81,9 @@ tt.func @no_address(%x: tensor<4x64xf16>) {
 //     question, and whether anything can carry the annotation is the lowering's.
 // ---------------------------------------------------------------------------
 // CHECK-LABEL: tt.func @block_argument(
-// CHECK: tts.pin %arg0 {address = 4096 : i32, memory_space = "ct_local"} : tensor<4x64xf16>
+// CHECK: tts.pin %arg0 {address = 4096 : i32, memory_space = #ktdp.memory_space<ct_local>} : tensor<4x64xf16>
 tt.func @block_argument(%x: tensor<4x64xf16>) {
-  tts.pin %x {memory_space = "ct_local", address = 4096 : i32} : tensor<4x64xf16>
+  tts.pin %x {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<4x64xf16>
   tt.return
 }
 
@@ -93,9 +93,9 @@ tt.func @block_argument(%x: tensor<4x64xf16>) {
 //     exclude it by accident.
 // ---------------------------------------------------------------------------
 // CHECK-LABEL: tt.func @rank0(
-// CHECK: tts.pin %{{.*}} {address = 0 : i32, memory_space = "ct_local"} : tensor<f16>
+// CHECK: tts.pin %{{.*}} {address = 0 : i32, memory_space = #ktdp.memory_space<ct_local>} : tensor<f16>
 tt.func @rank0(%x: tensor<f16>) {
   %e = math.exp %x : tensor<f16>
-  tts.pin %e {memory_space = "ct_local", address = 0 : i32} : tensor<f16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = 0 : i32} : tensor<f16>
   tt.return
 }
