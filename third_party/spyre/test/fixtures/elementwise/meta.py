@@ -802,10 +802,11 @@ VARIANTS = {
         # Its ``params`` would collapse into one of Level D's dtype groups, and its
         # SIGNATURE differs from its sibling's only in the pointer dtype the
         # factory already derives. What keeps the two apart is rtol/atol: an fp32
-        # add is exact and is checked as such, while its fp16 sibling is not.
-        # Those are fields, not params, and the params grammar has nothing to say
-        # about them -- collapsing the pair would mean a tolerance hook, growing
-        # the mechanism, or weakening the fp32 check.
+        # add is exact and is checked as such, while its fp16 sibling is not. Those
+        # now take a dict keyed by dtype (see ``tolerances`` in conftest.py), so
+        # collapsing the pair into one two-row entry no longer costs the fp32
+        # check; it is a rewrite nobody has done rather than one the grammar
+        # refuses.
         "base": "2d_spyre_stick",
         "summary": (
             "2D fp32 elementwise add with x/y/out all annotated stick-on-N. "

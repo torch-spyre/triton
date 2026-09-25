@@ -22,6 +22,7 @@ Quick-reference
 ---------------
 - :data:`EXAMPLES`              — registry of example kernels discovered
                                   from ``test/fixtures/*/meta.py``
+- :func:`tolerances`            — one variant's ``rtol``/``atol``, resolved
 - :class:`KTIRCpuTester`        — EXAMPLE-based setup + numerical CPU execution
 
 Most shared machinery (``compile_to_ttir``, ``make_ktir_mod``) lives in
@@ -115,6 +116,10 @@ from utils import (  # noqa: E402
 #   factory       : optional VariantFactory supplying the fields that vary
 #                   with the swept combination
 #   xfail_numerical : optional str | dict for the numerical-test xfail mark
+#   rtol, atol    : tolerances for the oracle comparison — each a scalar, or a
+#                   dict keyed by dtype string (``{"fp16": ..., "fp32": ...}``)
+#                   when one entry sweeps ``DTYPE`` and the arms need different
+#                   bounds. Resolved by :func:`tolerances`.
 #
 # The ``constexprs`` grammar supports only ``dict[str, scalar]`` — each entry
 # names one arg to bake into TTIR as a single compile-time constant. Sweeping
@@ -553,6 +558,60 @@ def _load_examples():
 
 
 EXAMPLES = _load_examples()
+
+
+# ---------------------------------------------------------------------------
+# tolerances — one variant's rtol/atol
+# ---------------------------------------------------------------------------
+
+#: The comparison's defaults when a variant states nothing. ``atol`` of 0 makes
+#: the check purely relative, which is what a variant declaring neither wants.
+_TOLERANCE_DEFAULTS = {"rtol": 1e-6, "atol": 0.0}
+
+
+def tolerances(entry: dict, *, key: str = "") -> dict:
+    """``{"rtol": float, "atol": float}`` for *entry*, to splat into
+    ``np.testing.assert_allclose``.
+
+    Both numerical consumers — ``test_ktir_examples`` and ``test_device_launch``
+    — resolve through here, because the two are meant to be the same comparison
+    against two backends and a rule written twice is a rule that will eventually
+    be two rules.
+
+    Either key may be written two ways:
+
+    - a **scalar**, which is the tolerance itself. Nearly every fixture.
+    - a **dict keyed by dtype string**, ``{"fp16": 2.5e-1, "fp32": 3e-5}``,
+      resolved against the variant's own ``DTYPE`` param. That is what lets ONE
+      entry carry a ``DTYPE`` sweep whose arms need different bounds, instead of
+      being split into a variant per dtype to carry a number — which is what
+      several banners under ``fixtures/`` used to give as the reason for a split.
+
+    A dict that does not name the variant's dtype raises. The alternative is the
+    default, and a silently-zero ``atol`` would decide a pass or a failure for a
+    reason nothing in the fixture states.
+
+    An explicit ``None`` is read as the absent key it resembles, rather than
+    forwarded. ``assert_allclose`` has no default of its own to fall back on, so
+    a forwarded ``None`` fails inside NumPy two frames from here, naming neither
+    the key nor the variant.
+    """
+    dtype = entry.get("param_values", {}).get("DTYPE")
+    resolved = {}
+    for name, default in _TOLERANCE_DEFAULTS.items():
+        value = entry.get(name, default)
+        if value is None:
+            value = default
+        if isinstance(value, dict):
+            if dtype not in value:
+                raise ValueError(
+                    f"{key or '<variant>'}: {name!r} is a per-dtype dict naming "
+                    f"{sorted(value)}, but the variant's DTYPE is {dtype!r}. Add "
+                    f"that dtype, or write {name!r} as one scalar covering all."
+                )
+            value = value[dtype]
+        resolved[name] = value
+    return resolved
 
 
 # ---------------------------------------------------------------------------
