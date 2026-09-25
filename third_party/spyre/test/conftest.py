@@ -590,11 +590,18 @@ def tolerances(entry: dict, *, key: str = "") -> dict:
     A dict that does not name the variant's dtype raises. The alternative is the
     default, and a silently-zero ``atol`` would decide a pass or a failure for a
     reason nothing in the fixture states.
+
+    An explicit ``None`` is read as the absent key it resembles, rather than
+    forwarded. ``assert_allclose`` has no default of its own to fall back on, so
+    a forwarded ``None`` fails inside NumPy two frames from here, naming neither
+    the key nor the variant.
     """
     dtype = entry.get("param_values", {}).get("DTYPE")
     resolved = {}
     for name, default in _TOLERANCE_DEFAULTS.items():
         value = entry.get(name, default)
+        if value is None:
+            value = default
         if isinstance(value, dict):
             if dtype not in value:
                 raise ValueError(

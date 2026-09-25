@@ -28,9 +28,9 @@ what lets one entry sweep ``DTYPE`` and still give its arms different bounds --
 tolerance being a property of the dtype, an fp16 ulp at a given magnitude is
 thousands of times an fp32 one.
 
-So the rules pinned here: a scalar passes through, an absent key takes the
-default, a dict selects by the variant's dtype, and a dict that does not name
-that dtype raises. The last is the one worth a test of its own: falling back to
+So the rules pinned here: a scalar passes through, an absent key -- or one
+written as an explicit ``None`` -- takes the default, a dict selects by the
+variant's dtype, and a dict that does not name that dtype raises. The last is the one worth a test of its own: falling back to
 the default would mean an ``atol`` of 0 deciding a pass or a failure for a reason
 nothing in the fixture states.
 
@@ -66,6 +66,14 @@ def test_an_absent_key_takes_its_default():
     variant declaring only ``rtol`` is asking for."""
     assert tolerances(_entry(rtol=1e-4)) == {"rtol": 1e-4, "atol": 0.0}
     assert tolerances(_entry()) == {"rtol": 1e-6, "atol": 0.0}
+
+
+def test_an_explicit_none_is_read_as_absent():
+    """``None`` is the absent key written out, not a bound. Forwarding it would
+    fail inside ``assert_allclose``, which has no default of its own, two frames
+    from the resolver and naming neither the key nor the variant."""
+    assert tolerances(_entry(rtol=None, atol=None)) == {"rtol": 1e-6, "atol": 0.0}
+    assert tolerances(_entry(rtol=1e-2, atol=None)) == {"rtol": 1e-2, "atol": 0.0}
 
 
 def test_a_scalar_is_not_resolved_against_the_dtype():

@@ -570,9 +570,10 @@ VARIANTS = {
         # relative), fp16 by 1.6e-2 (4.9e-2), against row sums up to 24.
         #
         # So it is fp16 sum that sets both numbers, and the fp32 arm is checked
-        # far more loosely than it could be. One tolerance covers all nine
-        # because rtol/atol are fields, not params; the alternative is nine
-        # variants, or a tolerance hook, which is mechanism.
+        # far more loosely than it could be. One tolerance covers all nine only
+        # because nobody has narrowed it: rtol/atol now take a dict keyed by
+        # dtype (see ``tolerances`` in conftest.py), so the fp32 arm can carry
+        # its own bound without splitting the variant or growing a hook.
         "rtol":         1e-2,
         "atol":         5e-2,
     },
@@ -587,10 +588,11 @@ VARIANTS = {
     # the layout rewrite never looks at it.
     #
     # One dtype per variant, each spelled once, in the row that carries
-    # everything following from it. A second dtype row would be one line and is
-    # not there for one reason: rtol/atol are fields, not params, so both rows
-    # would share the tolerance the wider dtype needs, and the fp32 arm would be
-    # checked more loosely than it can be.
+    # everything following from it. A second dtype row would be one line, and the
+    # tolerance no longer argues against it: rtol/atol take a dict keyed by dtype
+    # (see ``tolerances`` in conftest.py), so one entry can hold both rows and
+    # still check the fp32 arm as tightly as it deserves. Collapsing the pair is
+    # a rewrite nobody has done, not one the grammar refuses.
     # -----------------------------------------------------------------------
     "spyre_stick": {
         # in_ptr  [M, N] stick-on-N: phys [ceil(N/S), M, S]
@@ -693,9 +695,10 @@ VARIANTS = {
     #
     # TWO VARIANTS RATHER THAN ONE AXIS SWEEP, because the two axes have
     # different device stories and a variant is the unit that can say so. What
-    # divides them is not params -- ``compiles_to_binary`` and ``atol`` are
-    # fields, so one variant cannot carry two answers -- exactly the constraint
-    # that keeps Level C at two variants. Collapse them back into a single
+    # divides them is not params -- ``compiles_to_binary`` is a field, so one
+    # variant cannot carry two answers. (``atol`` was the other half of this
+    # reason and no longer is: it takes a per-dtype dict now. The split rests on
+    # ``compiles_to_binary`` alone.) Collapse them back into a single
     # ``AXIS: [0, 1]`` sweep the day the on-stick arm reaches the device too.
     #
     # The first wall is shared by both, and neither variant asserts it:
