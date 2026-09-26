@@ -42,3 +42,47 @@ tt.func @no_memory_view() {
      phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<64x64xf32>
   tt.return
 }
+
+// -----
+
+// Two markers reaching one subject. `setAttr` would resolve this by overwriting,
+// so the later marker would win and the earlier would be gone with nothing said --
+// and which one survived would be a fact about the driver's loop order rather than
+// about anything the author wrote.
+//
+// Two pins on one VALUE is the reachable shape of it: they share a producer, and
+// the producer is the carrier. The generic driver holds the check rather than the
+// pin, because the hazard is one subject reachable from two markers, which
+// `tts.tensor_layout` has its own spelling of -- two layouts on one descriptor
+// share a memory view.
+tt.func @two_pins_on_one_value(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
+  // expected-note @+1 {{the op both resolve to is here}}
+  %e = math.exp %x : tensor<4x64xf16>
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = 0 : i32} : tensor<4x64xf16>
+  // expected-error @+1 {{second tts.pin resolving to the same op, which can carry only one; the first states {address = 0 : i32, memory_space = #ktdp.memory_space<ct_local>}}}
+  tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = 512 : i32} : tensor<4x64xf16>
+  tt.return %e : tensor<4x64xf16>
+}
+
+// -----
+
+// A producer with several results. UNSUPPORTED rather than ill formed: the value
+// is a good thing to pin and what is missing is a spelling, since one attribute on
+// the producer can carry one pin and has no way to say which result it is for.
+//
+// Reachable from a loop carrying more than one value -- softmax/meta.py records a
+// `%denom:2 = scf.for ... -> (T, T)` -- so the workaround is at the kernel level:
+// one carried value per loop, which every loop in that fixture's kernel already
+// does. `tt.split` stands in for it here because it is the multi-result op that
+// needs no loop to write.
+//
+// The pinned VALUE is well formed, which is why this is the lowering's rule and
+// not the op's: the op holds its value as an operand and can check that, while
+// only resolution knows which op is about to carry the annotation.
+tt.func @multi_result_producer(%t: tensor<8x2xf32>) -> tensor<8xf32> {
+  // expected-note @+1 {{the producer is here}}
+  %0, %1 = tt.split %t : tensor<8x2xf32> -> tensor<8xf32>
+  // expected-error @+1 {{pinning one result of a 2-result op is not supported: the annotation is one attribute on the producer, so it cannot say which result it is for}}
+  tts.pin %0 {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<8xf32>
+  tt.return %0 : tensor<8xf32>
+}

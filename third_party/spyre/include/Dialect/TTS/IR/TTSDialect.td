@@ -31,13 +31,19 @@ def TTS_Dialect : Dialect {
     `dbo-opt` loads ours. So the value of `tts.tensor_layout` is built out of
     builtin attributes only, and must stay that way.
 
-    The one op the dialect does define, `tts.tensor_layout`, is the *authoring*
-    form of that same layout and is bound by the same rule from the other side:
-    it is fully consumed before any artifact is written, by
-    `LowerDescriptorMemory`, which turns it into the attribute. An op does have
-    to be constructed, so one surviving into an artifact would fail at parse in
-    a consumer that does not load us — which is why the op and the attribute are
-    a before/after pair and never a choice of encoding for the same IR.
+    The two ops the dialect does define, `tts.tensor_layout` and `tts.pin`, are
+    the *authoring* forms of two such annotations, and are bound by the same rule
+    from the other side: both are fully consumed before any artifact is written,
+    by `LowerTTSMarkers`, which turns each into its attribute. An op does have to
+    be constructed, so one surviving into an artifact would fail at parse in a
+    consumer that does not load us — which is why each op and its attribute are a
+    before/after pair and never a choice of encoding for the same IR.
+
+    Where the attribute lands is the marker's own business and differs between
+    the two: a layout names a descriptor and lands on the memory view that
+    descriptor became, a pin names a value and lands on the op producing it.
+    What does not differ is that the value of either is built out of builtin
+    attributes only.
   }];
 
   let extraClassDeclaration = [{
@@ -66,6 +72,40 @@ def TTS_Dialect : Dialect {
     static constexpr ::llvm::StringLiteral kPhysSrcName = "phys_src";
     static constexpr ::llvm::StringLiteral kPhysOpName = "phys_op";
     static constexpr ::llvm::StringLiteral kPhysArgName = "phys_arg";
+
+    /// Where a pinned intermediate's buffer lives, as a `DictionaryAttr` on the
+    /// op PRODUCING the value, with the two entries `tts.pin` carried as an op:
+    ///
+    ///   memory_space : a `ktdp::MemorySpaceKind` name, today only "ct_local"
+    ///   address      : an element index -- one `i32` for an address that is the
+    ///                  same on every core, or a `DenseI32ArrayAttr` holding one
+    ///                  per program id. Absent when the pin named no address.
+    ///
+    /// `memory_space` is ktdp's own attribute and not a string naming its enum,
+    /// which is allowed for a reason worth stating: the rule this dialect lives
+    /// by is that nothing here needs THIS dialect loaded to parse, and ktdp is
+    /// not this dialect. Every consumer that reads this annotation out of the
+    /// `ktir` artifact loads ktdp already, because the artifact's own memref
+    /// types carry `#ktdp.memory_space`. A `tts.`-defined attribute type would
+    /// break the rule; borrowing one does not.
+    ///
+    /// Its `ct_id` must be unspecified, which the attribute defaults to (-1), and
+    /// which is what every site in this tree that constructs one passes --
+    /// LowerDescriptorMemory and LowerScalarLoad both do. A pin means the
+    /// scratchpad of whichever core is running, never a named peer's, so a
+    /// consumer can use this attribute as it stands rather than rebuilding it.
+    ///
+    /// The producing op is the carrier because a pin names a VALUE, and a value's
+    /// only op is the one defining it. That is also why a pinned block argument
+    /// has no attribute form: see `LowerTTSMarkers`, which refuses one.
+    ///
+    /// Discardable, and builtin-valued like the layout above, so a consumer that
+    /// does not load this dialect still round-trips it.
+    static constexpr ::llvm::StringLiteral kPinAttrName = "tts.pin";
+
+    /// The two entry names of that dictionary.
+    static constexpr ::llvm::StringLiteral kMemorySpaceName = "memory_space";
+    static constexpr ::llvm::StringLiteral kAddressName = "address";
   }];
 
   let hasOperationAttrVerify = 1;

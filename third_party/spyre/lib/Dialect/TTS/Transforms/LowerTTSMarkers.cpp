@@ -9,11 +9,23 @@
 // than a clause in whichever conversion happens to have built the op the
 // attribute lands on. What differs per marker is only *how its operand
 // resolves*, and that is also the marker's "which ops may carry me" predicate:
-// `tts.tensor_layout` admits a lowered tensor descriptor and nothing else.
 //
-// One marker exists today. A second is expected -- the shape below is the
-// answer to what adding it costs, and the answer is a resolution function, an
-// attribute builder, and one line in `runOnOperation`.
+//   tts.tensor_layout  a lowered tensor descriptor, and nothing else. The
+//                      attribute lands on the `ktdp.construct_memory_view` the
+//                      descriptor became.
+//   tts.pin            any value with a DEFINING OP, which is the carrier,
+//                      because a pin names a value and a value's only op is the
+//                      one defining it.
+//
+// Two markers, two resolution functions and two attribute builders, which is
+// what the shape below was for.
+//
+// A pinned BLOCK ARGUMENT is therefore refused. It is a value like any other and
+// the op admits one, but it has no defining op, so there is nothing for the
+// attribute to live on -- a function argument attribute would be the candidate,
+// and `ConvertFunctions` does not carry those across `tt.func` -> `func.func`,
+// so it would not reach a consumer. Refused here rather than in the op's
+// verifier because "what counts as resolvable" is this pass's question.
 //
 //===----------------------------------------------------------------------===//
 
@@ -74,6 +86,25 @@ static LogicalResult lowerMarkers(ModuleOp module, StringRef attrName,
     Operation *subject = resolve(marker);
     if (!subject)
       return failure();
+
+    // Two markers of one kind resolving to the same subject would collide, and
+    // `setAttr` resolves a collision by overwriting: the later marker wins and
+    // the earlier one is gone with nothing said. Refused instead, because which
+    // of the two survived would be a fact about this loop's order rather than
+    // about anything the author wrote.
+    //
+    // Generic, like the rest of this driver, because the hazard is: one subject
+    // can be reached from more than one marker. For `tts.pin` that is two pins
+    // on one value -- they share a producer. For `tts.tensor_layout` it is two
+    // layouts on one descriptor -- they share a memory view.
+    if (Attribute existing = subject->getAttr(attrName)) {
+      InFlightDiagnostic diag = marker.emitError()
+                                << "second " << MarkerOp::getOperationName()
+                                << " resolving to the same op, which can carry "
+                                   "only one; the first states " << existing;
+      diag.attachNote(subject->getLoc()) << "the op both resolve to is here";
+      return failure();
+    }
 
     subject->setAttr(attrName, buildAttr(marker));
 
@@ -150,6 +181,92 @@ static Attribute buildTensorLayoutAttr(mlir::triton::tts::TensorLayoutOp marker)
 }
 
 //===----------------------------------------------------------------------===//
+// tts.pin
+//===----------------------------------------------------------------------===//
+
+/// `tts.pin` names a value, and its attribute belongs on the op DEFINING that
+/// value -- there is no other op the annotation could be about.
+///
+/// No admissibility test on what that op is. A pin says where a value's buffer
+/// goes, which is a statement about the value and not about how it was computed,
+/// so a `math.exp`, a `linalg.reduce` and a `ktdp.load` are equally valid
+/// carriers and the consumer never reads the op's identity.
+///
+/// Two things are checked here rather than by the op, and both are about the MOVE
+/// rather than about what the author wrote. The op holds its value as an operand
+/// and can say whether that value is well formed; only resolution knows which op
+/// is about to carry the annotation, and therefore whether it can.
+static Operation *resolvePin(mlir::triton::tts::PinOp marker) {
+  Value value = marker.getValue();
+
+  // A value with no defining op is unreachable, because the op's verifier refuses
+  // a pinned block argument -- an entry input lives where its base pointer says,
+  // so it is not an intermediate to place. Checked anyway rather than asserted,
+  // since this pass is invocable on hand-written IR and a null would otherwise be
+  // a crash instead of a diagnostic.
+  Operation *producer = value.getDefiningOp();
+  if (!producer) {
+    marker.emitError()
+        << "tts.pin names a value with no defining op; this should have been "
+           "refused by the op's verifier";
+    return nullptr;
+  }
+
+  // UNSUPPORTED rather than ill formed, and the difference is worth the wording:
+  // the value is a perfectly good thing to pin, and what is missing is a spelling.
+  // An attribute attaches to an OP and not to a value, so one dictionary can carry
+  // one pin; a producer with several results needs the annotation to say which
+  // result each pin is for, and it has no way to.
+  //
+  // Reachable from a loop carrying more than one value -- `%acc:2 = scf.for ... ->
+  // (T, T)` -- so the workaround is at the kernel level: carry one value per loop,
+  // which every loop in the softmax fixture already does and which makes both its
+  // accumulators pinnable.
+  //
+  // TODO: when this is wanted, make the attribute a LIST positional in the
+  // results -- `[{}, {...}]` -- with an empty dictionary for a result nobody
+  // pinned and a length equal to the result count. Position carries the result
+  // number, so no entry needs to name its own index.
+  //
+  // List-only, replacing today's bare dictionary rather than joining it. The
+  // attribute is an internal handoff: LowerTTSMarkers writes it and one pass in
+  // `spyrecode` consumes it, and nothing outside this tree ever reads it, since it
+  // is gone before the artifact goes out. So changing its shape costs nothing now,
+  // while two accepted spellings would cost every consumer forever.
+  if (producer->getNumResults() != 1) {
+    InFlightDiagnostic diag =
+        marker.emitError()
+        << "pinning one result of a " << producer->getNumResults()
+        << "-result op is not supported: the annotation is one attribute on the "
+           "producer, so it cannot say which result it is for. Carry one value "
+           "per op -- for a loop, one value per loop";
+    diag.attachNote(producer->getLoc()) << "the producer is here";
+    return nullptr;
+  }
+
+  return producer;
+}
+
+/// The attribute form of the same pin: the memory space, and the address when the
+/// marker stated one. The address attribute is reused as-is, so which of its two
+/// spellings the author chose survives into the attribute for a consumer to read.
+static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
+  using mlir::triton::tts::TTSDialect;
+  Builder builder(marker.getContext());
+
+  SmallVector<NamedAttribute> entries;
+  entries.push_back(builder.getNamedAttr(TTSDialect::kMemorySpaceName,
+                                         marker.getMemorySpaceAttr()));
+  // Absent rather than zero when the pin named no address: 0 is a legitimate
+  // element index, so it cannot double as "unstated".
+  if (Attribute address = marker.getAddressAttr())
+    entries.push_back(
+        builder.getNamedAttr(TTSDialect::kAddressName, address));
+
+  return builder.getDictionaryAttr(entries);
+}
+
+//===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
 
@@ -157,6 +274,7 @@ struct LowerTTSMarkersPass
     : public mlir::triton::tts::impl::LowerTTSMarkersBase<LowerTTSMarkersPass> {
 
   void runOnOperation() override {
+    using mlir::triton::tts::PinOp;
     using mlir::triton::tts::TensorLayoutOp;
     using mlir::triton::tts::TTSDialect;
 
@@ -165,6 +283,10 @@ struct LowerTTSMarkersPass
     if (failed(lowerMarkers<TensorLayoutOp>(
             getOperation(), TTSDialect::kTensorLayoutAttrName,
             resolveTensorLayout, buildTensorLayoutAttr)))
+      return signalPassFailure();
+
+    if (failed(lowerMarkers<PinOp>(getOperation(), TTSDialect::kPinAttrName,
+                                   resolvePin, buildPinAttr)))
       return signalPassFailure();
   }
 };

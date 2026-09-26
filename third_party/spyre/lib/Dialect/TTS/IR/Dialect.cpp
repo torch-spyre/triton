@@ -300,32 +300,53 @@ LogicalResult readTensorLayoutArrays(
 LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
                                                    NamedAttribute attribute) {
   StringRef name = attribute.getName().strref();
-  if (name != kTensorLayoutAttrName)
-    return op->emitError("attribute '")
-           << name << "' is not one the tts dialect defines";
-
-  // The layout describes the tensor a memory view addresses, so there is
-  // nothing for it to mean anywhere else — and on the wrong op it would be
-  // inert rather than wrong, which is the failure worth catching here.
-  auto view = dyn_cast<mlir::ktdp::ConstructMemoryViewOp>(op);
-  if (!view)
-    return op->emitError("'")
-           << kTensorLayoutAttrName
-           << "' is only meaningful on a ktdp.construct_memory_view, which "
-              "this op is not";
-
   auto emitError = [&]() { return op->emitError(); };
-  ArrayRef<int64_t> physSrc, physOp, physArg;
-  if (failed(readTensorLayoutArrays(attribute.getValue(), physSrc, physOp,
-                                    physArg, emitError)))
-    return failure();
 
-  // The logical rank is the view's own rank. That is the same rank the op form
-  // measured against — it read the descriptor's BLOCK type, whose extents
-  // differ from the view's but whose rank does not.
-  auto memrefTy = cast<MemRefType>(view.getResult().getType());
-  return verifyTensorLayoutArrays(physSrc, physOp, physArg,
-                                  memrefTy.getRank(), emitError);
+  if (name == kTensorLayoutAttrName) {
+    // The layout describes the tensor a memory view addresses, so there is
+    // nothing for it to mean anywhere else — and on the wrong op it would be
+    // inert rather than wrong, which is the failure worth catching here.
+    auto view = dyn_cast<mlir::ktdp::ConstructMemoryViewOp>(op);
+    if (!view)
+      return op->emitError("'")
+             << kTensorLayoutAttrName
+             << "' is only meaningful on a ktdp.construct_memory_view, which "
+                "this op is not";
+
+    ArrayRef<int64_t> physSrc, physOp, physArg;
+    if (failed(readTensorLayoutArrays(attribute.getValue(), physSrc, physOp,
+                                      physArg, emitError)))
+      return failure();
+
+    // The logical rank is the view's own rank. That is the same rank the op form
+    // measured against — it read the descriptor's BLOCK type, whose extents
+    // differ from the view's but whose rank does not.
+    auto memrefTy = cast<MemRefType>(view.getResult().getType());
+    return verifyTensorLayoutArrays(physSrc, physOp, physArg,
+                                    memrefTy.getRank(), emitError);
+  }
+
+  // `tts.pin` is ours, and that is the whole of what this branch says. Its rules
+  // are established BEFORE the attribute exists: the op's verifier checks the
+  // fields an author wrote, and LowerTTSMarkers checks the move -- that the value
+  // resolves to a carrier, that the carrier can hold one annotation, and that no
+  // other marker already claimed it. The attribute is then built from fields that
+  // have already passed, so re-deriving those rules out of the dictionary here
+  // would establish nothing and would state them a second place to drift.
+  //
+  // The branch cannot simply be absent: an unhandled `tts.` name falls through to
+  // the refusal below, so without this the annotation would fail to verify the
+  // moment it was attached.
+  //
+  // When something consumes this attribute it will read the dictionary back, and
+  // being invocable on hand-written IR it will have to check the spelling it finds
+  // -- as RewriteDescriptorLayoutGeneric's readCoordMap does for the layout, for
+  // exactly that reason. That reader belongs with that consumer.
+  if (name == kPinAttrName)
+    return success();
+
+  return op->emitError("attribute '")
+         << name << "' is not one the tts dialect defines";
 }
 
 } // namespace mlir::triton::tts

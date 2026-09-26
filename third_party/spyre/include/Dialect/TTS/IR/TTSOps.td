@@ -7,6 +7,10 @@ include "Dialect/TTS/IR/TTSDialect.td"
 // `tts` names a Triton type, Triton names nothing of ours. TritonTypes.td
 // defines no op, so `-gen-op-decls` over this file still emits only ours.
 include "triton/Dialect/Triton/IR/TritonTypes.td"
+// For Ktdp_MemorySpaceAttr, which `tts.pin` types its memory space as. Same
+// direction as above -- we name theirs, they name nothing of ours -- and neither
+// file defines an op, so `-gen-op-decls` still emits only ours.
+include "ktir/Dialect/KTDP/KTDPAttrs.td"
 
 class TTS_Op<string mnemonic, list<Trait> traits = []>
     : Op<TTS_Dialect, mnemonic, traits>;
@@ -21,11 +25,13 @@ def TTS_TensorLayoutOp : TTS_Op<"tensor_layout", []> {
     entry per physical dim, in the OpSpec `device_coordinates` form. See the
     `tts` dialect's `kTensorLayoutAttrName` note for what the three arrays mean.
 
-    No result; the op is a marker. `LowerDescriptorMemory` consumes it: the
-    three arrays are written onto the `ktdp.construct_memory_view` built for the
+    No result; the op is a marker. `LowerTTSMarkers` consumes it: the three
+    arrays are written onto the `ktdp.construct_memory_view` built for the
     descriptor as the `tts.tensor_layout` **attribute**, and the op is erased
     along with the `unrealized_conversion_cast` that bridged the view's memref
-    back to `!tt.tensordesc` for this operand's sake.
+    back to `!tt.tensordesc` for this operand's sake. The view and that cast are
+    `LowerDescriptorMemory`'s, which is why this marker cannot be lowered before
+    that pass has run.
 
     So the dialect spells the same layout twice, and the two spellings are a
     before/after pair rather than alternatives:
@@ -68,26 +74,38 @@ def TTS_PinOp : TTS_Op<"pin", []> {
     kernel says *which* memory, and for the scratchpad, where in it.
 
     No result; the op is a marker, and the value it names keeps its own type and
-    its own uses. `PlacePinnedValues` consumes it, and unlike
-    `tts.tensor_layout` it does not become an attribute -- see that pass for why.
+    its own uses. `LowerTTSMarkers` consumes it, writing the `tts.pin`
+    **attribute** onto the op PRODUCING the pinned value -- so like
+    `tts.tensor_layout` this is the authoring half of a before/after pair, and
+    what differs is only where the attribute lands.
 
     The pin names a **value** and not a `!tt.tensordesc`. A descriptor takes its
     element type from the `!tt.ptr` it is based on, so giving one a scratchpad
     address would mean supplying a dtype from somewhere as well; a value has a
     type already.
 
-    Only a value the author can point at may be pinned -- `y = tl.exp(x)` can be
-    pinned, `tl.exp(x)` inside a larger expression cannot -- and that is enforced
-    by the SURFACE rather than here: an anonymous subexpression has no name to
-    pass to `tl.spyre_pin`. So a block argument is pinnable like any other value.
-    A `tensor` is a value whichever way it was defined, and receiving one is the
-    same state a `ktdp.load` result is in; placing the intermediates nobody named
-    is a separate job and not this op's.
+    A block argument is refused, and the reason is where it already lives rather
+    than anything about the annotation. An entry input is global: it sits at the
+    address its base pointer supplies, which the launcher fills in. Pinning one to
+    `ct_local` would be asking to relocate a kernel argument, and a pin places an
+    INTERMEDIATE -- something an op in this function produced. That the annotation
+    also has no op to land on is a consequence of the same fact, not a second
+    rule.
 
-    `memory_space` is a plain string, checked against `ktdp::MemorySpaceKind` by
-    the verifier rather than typed as `#ktdp.memory_space`. The dialect defines no
-    attribute type on purpose -- see the note in TTSDialect.td -- and this keeps
-    that true for its second marker. Only `ct_local` is admitted: an intermediate
+    `memory_space` is ktdp's own `#ktdp.memory_space`, not a string checked against
+    its enum. The dialect still defines no attribute type of its own -- using one
+    another dialect defines is a different thing, and the consumers that read this
+    annotation out of the `ktir` artifact all load ktdp already, since the
+    artifact's own memref types carry that attribute. Typing it makes a misspelled
+    space a PARSE error rather than a verifier error, and carries `ct_id` as data
+    instead of as a convention.
+
+    `ct_id` must stay unspecified, which the attribute's own default already makes
+    the easy spelling. A pin means the scratchpad of whichever core is running the
+    kernel; `#ktdp.memory_space<ct_local, ct_id = 7>` would mean core 7's, which
+    is a different request and one nothing here honours.
+
+    Only `ct_local` is admitted: an intermediate
     in HBM is written as a `tl.make_tensor_descriptor` with an explicit store and
     load, which is lx-placement.md's first assumption, and nothing here allocates
     an anonymous global buffer. The parameter stays a memory space anyway, so the
@@ -95,34 +113,51 @@ def TTS_PinOp : TTS_Op<"pin", []> {
 
     `address` is where in the scratchpad, as an **element index** and not a byte
     address, matching what `ktdp.construct_memory_view`'s `$offset` operand
-    feeds. It is optional because the design's baseline is that the compiler
-    places every intermediate and a pin is an override; no pass honours an
-    unaddressed pin yet. It is an SSA operand rather than an attribute because that is the form
-    the offset is consumed in, and `i32` rather than `index` because that is what
-    `tl.program_id` yields, which keeps the verifier's structural walk free of
-    casts. Two forms are admitted and nothing else:
+    feeds.
 
-      constant                 one address, the same on every core
-      base + pid * stride      affine in the program id, constant coefficients
+    It is optional in ODS and REQUIRED by the verifier, and the asymmetry is the
+    honest statement of what exists. The design's baseline is that the compiler
+    places every intermediate and a pin only overrides where, so an unaddressed
+    pin is a form the surface should keep; but nothing in this tree can act on one
+    -- there is no address analysis, and nothing allocates a buffer that is not a
+    kernel argument -- so accepting it would put an annotation in the artifact
+    that no consumer can honour. Offset 0 is not the fallback either: it is a
+    legitimate address that would collide with the scheduler's own pool, which is
+    exactly what an author cannot check. Keeping the field optional is what lets
+    the refusal be lifted without the surface changing shape.
 
-    The restriction is what keeps a pin's address SET finite and enumerable, and
-    so keeps capacity, alignment and disjointness answerable about it. An address
-    read from memory forfeits all three.
+    It is an ATTRIBUTE and not an SSA operand, which is what lets the marker
+    become an attribute on the op producing the pinned value -- an operand would
+    have nowhere to go. Two spellings, and the difference is per-core:
+
+      `address = 4096 : i32`               one address, the same on every core
+      `address = array<i32: 4096, 6144>`   one per program id, positionally
+
+    Both are numbers rather than an expression, so the set of addresses a pin
+    occupies is known here and needs no matcher to recover: capacity, alignment
+    and disjointness are all answerable by arithmetic on the attribute. An
+    address computed in the IR would forfeit that, which is why the operand form
+    is gone.
+
+    An author writing an affine address states the arm per core rather than the
+    coefficients. The array is therefore what a `lambda pid: ...` surface would
+    evaluate to, and a consumer wanting `base + ctid*stride` recovers the two
+    coefficients by asking whether the array is an arithmetic progression --
+    a question about integers, not about op structure.
 
     Example:
     ```mlir
-      %c4096 = arith.constant 4096 : i32
-      tts.pin %e, address %c4096 {memory_space = "ct_local"} : tensor<2x11x2049xf16>
+      tts.pin %e {memory_space = #ktdp.memory_space<ct_local>, address = 4096 : i32} : tensor<2x11x2049xf16>
     ```
   }];
 
   let arguments = (ins
     AnyStaticShapeTensor:$value,
-    Optional<I32>:$address,
-    StrAttr:$memory_space
+    Ktdp_MemorySpaceAttr:$memory_space,
+    OptionalAttr<AnyAttrOf<[I32Attr, DenseI32ArrayAttr]>>:$address
   );
 
-  let assemblyFormat = "$value (`,` `address` $address^)? attr-dict `:` type($value)";
+  let assemblyFormat = "$value attr-dict `:` type($value)";
   let hasVerifier = 1;
 }
 
