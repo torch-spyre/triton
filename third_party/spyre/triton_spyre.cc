@@ -84,7 +84,8 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
 
 void init_triton_spyre_ir_builders(py::module &&m) {
   // Op builders for the `tts` dialect, called from the Triton frontend --
-  // tl.spyre_tensor_layout, through triton.language.semantic.
+  // tl.spyre_tensor_layout and tl.inter_tile, through
+  // triton.language.semantic.
   //
   // The frontend reaches this as `from triton._C.libtriton import spyre`, lazily
   // -- an import at module scope in semantic.py would make every backend's
@@ -118,6 +119,95 @@ void init_triton_spyre_ir_builders(py::module &&m) {
               builder.getDenseI64ArrayAttr(physOp),
               builder.getDenseI64ArrayAttr(physArg));
         });
+
+  // Python derives W from C and serializes both into flat parallel lists.
+  //
+  // Given a 3×2 grid with WORK_SLICES = [{x:0,n:0},{x:0,n:1},{x:1,n:0},
+  //                                      {x:1,n:1},{x:2,n:0},{x:2,n:1}]:
+  //
+  // w_keys / w_vals: numWkSlicesPerDim -- max+1 per axis.
+  //   w_keys=["x","n"], w_vals=[3,2]  ->  {x:3, n:2}
+  //
+  // c_keys / c_vals: coreIdToWkSlice -- per-tile coordinate dicts flattened.
+  //   c_keys=["x","n"], c_vals=[[0,0],[0,1],[1,0],[1,1],[2,0],[2,1]]
+  //   -> [{x:0,n:0}, {x:0,n:1}, {x:1,n:0}, {x:1,n:1}, {x:2,n:0}, {x:2,n:1}]
+  //
+  // dep_keys / dep_vals: depWkSlices (optional, currently unused) -- reserved
+  //   for producer-consumer dependencies when supported.
+  m.def(
+      "create_inter_tile_reduce",
+      [](TritonOpBuilder &self, std::vector<mlir::Value> &partials,
+         std::vector<mlir::Value> &identities, std::string axis,
+         std::string combiner, std::string mode, int64_t scatter_dimension,
+         std::vector<std::string> &w_keys, std::vector<int64_t> &w_vals,
+         std::vector<std::string> &c_keys,
+         std::vector<std::vector<int64_t>> &c_vals,
+         std::vector<std::string> &dep_keys,
+         std::vector<std::vector<int64_t>> &dep_vals)
+          -> std::vector<mlir::Value> {
+        // LOAD, not register -- see create_tensor_layout above.
+        self.getContext()->loadDialect<mlir::triton::tts::TTSDialect>();
+
+        auto &builder = self.getBuilder();
+        mlir::MLIRContext *ctx = builder.getContext();
+        auto i64Ty = mlir::IntegerType::get(ctx, 64);
+
+        // --- numWkSlicesPerDim (W) ---
+        mlir::SmallVector<mlir::NamedAttribute> wAttrs;
+        for (size_t i = 0; i < w_keys.size(); ++i)
+          wAttrs.push_back({mlir::StringAttr::get(ctx, w_keys[i]),
+                            mlir::IntegerAttr::get(i64Ty, w_vals[i])});
+        auto numWkSlicesPerDim = mlir::DictionaryAttr::get(ctx, wAttrs);
+
+        // --- coreIdToWkSlice (C) ---
+        mlir::SmallVector<mlir::Attribute> tileAttrs;
+        for (auto &tileVals : c_vals) {
+          mlir::SmallVector<mlir::NamedAttribute> tileMap;
+          for (size_t j = 0; j < c_keys.size(); ++j)
+            tileMap.push_back({mlir::StringAttr::get(ctx, c_keys[j]),
+                               mlir::IntegerAttr::get(i64Ty, tileVals[j])});
+          tileAttrs.push_back(mlir::DictionaryAttr::get(ctx, tileMap));
+        }
+        auto coreIdToWkSlice = mlir::ArrayAttr::get(ctx, tileAttrs);
+
+        // --- depWkSlices (D, optional) ---
+        mlir::DictionaryAttr depWkSlices;
+        if (!dep_keys.empty()) {
+          mlir::SmallVector<mlir::NamedAttribute> depAttrs;
+          for (size_t i = 0; i < dep_keys.size(); ++i) {
+            mlir::SmallVector<mlir::Attribute> prodIdxs;
+            for (int64_t v : dep_vals[i])
+              prodIdxs.push_back(mlir::IntegerAttr::get(i64Ty, v));
+            depAttrs.push_back({mlir::StringAttr::get(ctx, dep_keys[i]),
+                                mlir::ArrayAttr::get(ctx, prodIdxs)});
+          }
+          depWkSlices = mlir::DictionaryAttr::get(ctx, depAttrs);
+        }
+
+        // Result types == partial types. The ktdp.inter_tile_reduce op requires
+        // result_type == partial_type; this op mirrors that so the lowering can
+        // replace each use of a result with the corresponding partial value
+        // directly (no reshape needed).
+        mlir::SmallVector<mlir::Type> resultTypes;
+        for (auto &p : partials)
+          resultTypes.push_back(p.getType());
+
+        // --- optional scatter_dimension ---
+        mlir::IntegerAttr scatterDimAttr;
+        if (scatter_dimension >= 0)
+          scatterDimAttr = mlir::IntegerAttr::get(i64Ty, scatter_dimension);
+
+        auto op = self.create<mlir::triton::tts::InterTileReduceOp>(
+            resultTypes,
+            /*partials=*/mlir::ValueRange(partials),
+            /*identities=*/mlir::ValueRange(identities), axis, mode, combiner,
+            scatterDimAttr, numWkSlicesPerDim, coreIdToWkSlice, depWkSlices);
+
+        std::vector<mlir::Value> results;
+        for (auto r : op.getResults())
+          results.push_back(r);
+        return results;
+      });
 }
 
 /// One `tts.tensor_layout` marker, reduced to what a footprint is computed from.

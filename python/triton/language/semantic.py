@@ -1923,13 +1923,7 @@ class TritonSemantic(Generic[TensorTy]):
     # --- START --- added for spyre
     def inter_tile(self, x, axis, combiner, mode, *, work_slices,
                    dep_work_slices=None, scatter_dimension=None):
-        """Emit tt.inter_tile_reduce with work-slice op attributes."""
-        target = driver.active.get_current_target()
-        if target.backend != "spyre":
-            raise ValueError(
-                "tl.inter_tile is only supported on the 'spyre' "
-                f"backend, not '{target.backend}'")
-
+        """Emit tts.inter_tile_reduce with work-slice op attributes."""
         axis = tl._unwrap_if_constexpr(axis)
         combiner = tl._unwrap_if_constexpr(combiner)
         mode = tl._unwrap_if_constexpr(mode)
@@ -2039,7 +2033,13 @@ class TritonSemantic(Generic[TensorTy]):
                     self.full(list(p.type.shape),
                               _COMBINER_IDENTITY[combiner](scalar), scalar))
 
-        handles = self.builder.create_inter_tile_reduce(
+        # The builder lives in the Spyre pybind module, not in ir.cc's, because
+        # the op is in our dialect and the dependency only points one way. The
+        # import is inside the function because the submodule exists only in a
+        # Spyre build, and this file is every backend's.
+        from triton._C.libtriton import spyre
+        handles = spyre.ir_builders.create_inter_tile_reduce(
+            self.builder,
             [p.handle for p in partials],
             [t.handle for t in identity_tensors],
             axis, combiner, mode, scatter_dim_val,
@@ -2071,12 +2071,6 @@ class TritonSemantic(Generic[TensorTy]):
         All operands are i32 scalars, so the result is a runtime i32 scalar — no
         tensors, no reduction (spec E4).
         """
-        target = driver.active.get_current_target()
-        if target.backend != "spyre":
-            raise ValueError(
-                "tl.wk_slice_coord is only supported on the 'spyre' "
-                f"backend, not '{target.backend}'")
-
         axis = tl._unwrap_if_constexpr(axis)
         work_slices = tl._unwrap_if_constexpr(work_slices)
 
