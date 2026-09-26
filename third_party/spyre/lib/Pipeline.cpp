@@ -167,6 +167,20 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // wrong reason is the more memorable one, and it is the reason that would
   // justify moving the pass back.
   pm.addPass(createDropReductionInitFillPass());
+
+  // BEFORE ConvertElementwiseToLinalg, and the order is the point rather than a
+  // preference. LowerSpyreOps matches TENSOR-level math/arith and emits each
+  // intrinsic already wrapped in a linalg.generic, so by the time the upstream
+  // scalarizer runs there is nothing left of those ops for it to scalarize --
+  // and it does not re-wrap a generic, since it keys on the ElementwiseMappable
+  // trait which a linalg.generic does not carry.
+  //
+  // Why not after, where it used to sit: a mask cast (`(x > y).to(f32)`) can only
+  // be absorbed into its comparison while the two are adjacent ops in one block.
+  // After scalarization they are in separate generic bodies, the cast's operand
+  // is a block argument with no defining op, and the absorption is unreachable.
+  pm.addPass(createLowerSpyreOpsPass());
+
   pm.addPass(mlir::createConvertElementwiseToLinalgPass());
   pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
   pm.addPass(createUnaliasLinalgOutsPass());
@@ -209,11 +223,6 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // dbo-opt's compute-group extraction aborts. See issue #161.
   pm.addPass(mlir::createCanonicalizerPass());
 
-  // Scalar math/arith (math.sqrt/exp/rsqrt, arith.divf, arith.addi/muli inside
-  // a linalg.generic body) -> the spyreop spelling the scheduler expects. After
-  // ConvertElementwiseToLinalg above -- which is now in this stage rather than the
-  // previous one -- so the op it matches is already inside a linalg.generic body.
-  pm.addPass(createLowerSpyreOpsPass());
 
   if (options.bindBaseAddresses) {
     // The one genuine choice in this stage: symbolic and bound are real
