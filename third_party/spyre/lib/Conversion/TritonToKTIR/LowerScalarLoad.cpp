@@ -144,7 +144,7 @@ static Value resolveScalarAddress(OpBuilder &builder, Location loc,
 /// Emit the full single-element 1-D read: memory view -> access tile ->
 /// ktdp.load -> tensor.extract, returning the scalar `elemType` value.
 /// Built from the shared `buildMemoryView`/`buildAccessTile` helpers (also
-/// used by `LowerDescriptorMemory.cpp` and `RewriteDescriptorLayout.cpp`),
+/// used by `LowerDescriptorMemory.cpp`),
 /// with a single dim of extent 1 rather than rank 0 — rank-0 shaped types
 /// are not a supported interchange form downstream, while a single-element
 /// 1-D vector is. The one `arith.constant 0 : index` serves double duty, as
@@ -265,14 +265,10 @@ struct LowerScalarLoadPass
     // a `!tt.ptr` base pointer to `index`; the cast survives this pass and
     // is consumed by the later `ConvertFunctions` pass.
     //
-    // Both layout markers pass through untouched, and for different
-    // reasons: `tt.spyre_tensor_layout` survives to the named
-    // `rewrite-descriptor-layout`, while `tts.tensor_layout` survives only
-    // to `lower-tts-markers`, the very next pass. Neither is this pass's
-    // business; the entries exist so the conversion driver does not call
-    // them unconverted.
+    // `tts.tensor_layout` passes through untouched -- it survives to
+    // `lower-tts-markers`, the very next pass, and is not this pass's business.
+    // The entry exists so the conversion driver does not call it unconverted.
     target.addLegalOp<ModuleOp, UnrealizedConversionCastOp,
-                      triton::SpyreTensorLayoutOp,
                       mlir::triton::tts::TensorLayoutOp>();
 
     RewritePatternSet patterns(ctx);

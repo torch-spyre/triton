@@ -379,7 +379,7 @@ def _stick_2d_on_n(dtype: str) -> tuple:
     """``[M, N]`` -> ``[ceil(N/S), M, S]``: stick on the reduced axis.
 
     The reduced axis is split across the leading and trailing physical dims, so
-    this is the source-reduce path through ``RewriteDescriptorLayout``.
+    this is the source-reduce path through ``RewriteDescriptorLayoutGeneric``.
     """
     stick = _stick_of(dtype)
     return ("stick", ((1, "floordiv", stick), 0, (1, "mod", stick)))
@@ -710,7 +710,7 @@ VARIANTS = {
                  "program-id-1d", "spyre-tensor-layout"],
         "summary": (
             "Row-sum reduce with in_ptr stick-on-N and out_ptr 1D stick. "
-            "Exercises the RewriteDescriptorLayout source reduce path."
+            "Exercises the RewriteDescriptorLayoutGeneric source reduce path."
         ),
         "kernel_fn":  kernel.reduce_spyre,
         "factory":    Reduce(shape="2d"),
@@ -725,16 +725,11 @@ VARIANTS = {
             "M": [64], "BLOCK_M": [64], "OP": ["sum"],
         },
         "grid":        [1],
-        # No "data_layout". It selected the NAMED RewriteDescriptorLayout's
-        # "device"/"host" stride mode, and that pass roots on a
-        # tt.spyre_tensor_layout op. tl.spyre_tensor_layout authors
-        # tts.tensor_layout now, so the named pass no-ops on every kernel in this
-        # tree and the option reached nothing. The generic pass that physicalizes
-        # these -- in the spyrecode stage -- has no equivalent option and needs
-        # none: a caller wanting the logical form reads the ktir artifact, which
-        # is logical. Removed rather than left as dead config, because conftest
-        # forwards any key naming a SpyreOptions field and the field still
-        # exists, so it would have kept being passed and kept doing nothing.
+        # No "data_layout". It selected a stride mode on a layout pass that no
+        # longer exists, and neither the option nor the SpyreOptions field is in
+        # tree. The pass that physicalizes these -- in the spyrecode stage -- has
+        # no equivalent and needs none: a caller wanting the logical form reads
+        # the ktir artifact, which is logical.
         "output_key":  "out_ptr",
         "rtol":        1e-2,
         "atol":        5e-2,
@@ -821,13 +816,13 @@ VARIANTS = {
     # -----------------------------------------------------------------------
 
     # Folds M, the NON-stick axis -- a whole physical dimension. The stick split
-    # of N survives, so RewriteDescriptorLayout physicalizes the reduce's output
+    # of N survives, so RewriteDescriptorLayoutGeneric physicalizes the output
     # and the surviving stick index rides along as a batch dimension of the one
     # linalg.reduce (``ins tensor<2x64x64> outs tensor<2x64> dimensions = [1]``),
     # with ktdp.store consuming it directly. That is the shape torch-spyre's
     # working ``sum`` emits, and it is the one reduce here that reaches a binary
-    # and launches. ``rewrite-descriptor-layout-reduce-batch-dim.mlir`` pins the
-    # emitted form.
+    # and launches. ``RewriteDescriptorLayoutGeneric/rebuild-reduction.mlir``
+    # pins the emitted form.
     "one_tile": {
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",

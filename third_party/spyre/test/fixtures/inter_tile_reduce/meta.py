@@ -23,13 +23,10 @@ splitk (reduce_to_one, f32):
   Only pick₀ (``pid_in==0``) writes to C.  The outer distribution loop
   handles arbitrary M for the fixed grid.
 
-No tt.spyre_tensor_layout variant: LowerInterTile refuses a kernel carrying
-both a layout marker and a ``tt.inter_tile_reduce``. RewriteDescriptorLayout
-now runs after it, and cannot carry a physical type through the
-produce/reduce pair -- its forward walk follows ``RankedTensorType`` results,
-and the pair communicates through a ``!ktdp.tile_future`` whose tensor types
-are nested inside the type. Layout support here needs a physical-type
-propagation rule for the inter-tile op, added where the others live.
+No stick-layout variant: LowerInterTile refuses a kernel carrying both a layout
+marker and a ``tt.inter_tile_reduce``. The layout pass cannot carry a physical
+type through the produce/reduce pair either, which communicates through a
+``!ktdp.tile_future`` whose tensor types are nested inside the type.
 
 See ``fixtures/README.md`` for the field reference.
 """

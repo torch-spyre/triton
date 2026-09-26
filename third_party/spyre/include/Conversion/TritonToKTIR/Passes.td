@@ -39,12 +39,10 @@ def LowerDescriptorMemory : Pass<"lower-descriptor-memory", "mlir::ModuleOp"> {
         - tt.descriptor_gather/scatter → ktdp.construct_indirect_access_tile + ktdp.load/store
         - tt.make_tensor_descriptor — dead after uses are lowered, erased by cleanup
 
-        A layout marker on a descriptor — `tt.spyre_tensor_layout` or
-        `tts.tensor_layout` — is left untouched, along with the
-        builtin.unrealized_conversion_cast bridging the new view's memref back
-        to !tt.tensordesc so the marker's operand keeps verifying. Consuming
-        either is someone else's job: [RewriteDescriptorLayout] for the former,
-        [LowerTTSMarkers] for the latter.
+        A `tts.tensor_layout` marker on a descriptor is left untouched, along
+        with the builtin.unrealized_conversion_cast bridging the new view's
+        memref back to !tt.tensordesc so the marker's operand keeps verifying.
+        Consuming it is [LowerTTSMarkers]'s job.
 
         Output: triton ops that this pass doesn't handle (tt.reduce, tt.broadcast,
         tt.expand_dims, tt.func, tt.return, tt.get_program_id) remain unchanged.
@@ -84,9 +82,8 @@ def LowerScalarLoad : Pass<"lower-scalar-load", "mlir::ModuleOp"> {
 
         Output: tensor-of-pointers tt.load, and all other triton ops this
         pass doesn't handle, remain unchanged. New ktdp, arith, and tensor
-        ops are introduced. A layout marker left standing by
-        [LowerDescriptorMemory] — `tt.spyre_tensor_layout` or
-        `tts.tensor_layout` — passes through here too.
+        ops are introduced. A `tts.tensor_layout` marker left standing by
+        [LowerDescriptorMemory] passes through here too.
     }];
 
     let dependentDialects = [
@@ -258,11 +255,9 @@ def LowerInterTile : Pass<"lower-inter-tile", "mlir::ModuleOp"> {
         - depWkSlices present → producer_dependency_per_consumer affine set;
             absent → full-barrier (attribute omitted).
 
-        Must run after LowerComputeOps (partials must be linalg/tensor),
-        before RewriteDescriptorLayout (that pass has no physical-type
-        propagation pattern for tt.inter_tile_reduce, so no inter-tile op may
-        still be live when it runs), and before ConvertFunctions (reads function
-        attributes ConvertFunctions would rewrite).
+        Must run after LowerComputeOps (partials must be linalg/tensor) and
+        before ConvertFunctions (reads function attributes ConvertFunctions would
+        rewrite).
 
         A kernel that carries both a layout annotation and a
         tt.inter_tile_reduce is not supported: the layout pass cannot carry a

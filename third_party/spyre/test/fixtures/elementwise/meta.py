@@ -780,16 +780,11 @@ VARIANTS = {
             "DTYPE": ["fp16"], "OP": ["add"],
         },
         "grid":        [1],
-        # No "data_layout". It selected the NAMED RewriteDescriptorLayout's
-        # "device"/"host" stride mode, and that pass roots on a
-        # tt.spyre_tensor_layout op. tl.spyre_tensor_layout authors
-        # tts.tensor_layout now, so the named pass no-ops on every kernel in this
-        # tree and the option reached nothing. The generic pass that physicalizes
-        # these -- in the spyrecode stage -- has no equivalent option and needs
-        # none: a caller wanting the logical form reads the ktir artifact, which
-        # is logical. Removed rather than left as dead config, because conftest
-        # forwards any key naming a SpyreOptions field and the field still
-        # exists, so it would have kept being passed and kept doing nothing.
+        # No "data_layout". It selected a stride mode on a layout pass that no
+        # longer exists, and neither the option nor the SpyreOptions field is in
+        # tree. The pass that physicalizes these -- in the spyrecode stage -- has
+        # no equivalent and needs none: a caller wanting the logical form reads
+        # the ktir artifact, which is logical.
         "rtol":        1e-2,
         "atol":        5e-2,
     },

@@ -1559,7 +1559,7 @@ VARIANTS = {
     # Annotation asymmetry: gather_kernel_spyre guards IN_LAYOUT and
     # OUT_LAYOUT independently, so each can be annotated alone. Only the
     # output-only case is covered here — source-only currently fails to
-    # compile (RewriteDescriptorLayout rebuilds the indirect access tile over
+    # compile (the layout pass rebuilds the indirect access tile over
     # the rank-3 physical source view but leaves the unannotated store sink at
     # logical rank 2, so ktdp.store rejects the rank mismatch).
     "spyre_stick_output_only": {
