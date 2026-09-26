@@ -9,6 +9,10 @@
 // the `tts.tensor_layout` *attribute*, which the lowered IR carries on the
 // memory view — and the one structural checker both are enforced by.
 //
+// And one placement marker, `tts.pin`, which has no attribute form: see the op's
+// description for why a value pin cannot become one. What it shares with its
+// consumer is `matchPinAddress` at the bottom of this header.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef TRITON_SPYRE_DIALECT_TTS_IR_DIALECT_H
@@ -246,6 +250,27 @@ LogicalResult readTensorLayoutArrays(
     Attribute value, ArrayRef<int64_t> &physSrc, ArrayRef<int64_t> &physOp,
     ArrayRef<int64_t> &physArg,
     llvm::function_ref<InFlightDiagnostic()> emitError);
+
+/// Recover a pinned address expression's `(base, stride)`, or fail.
+///
+/// The two forms `tts.pin` admits — a constant, or `base + tl.program_id(0) *
+/// stride` with constant coefficients — reduced to the two numbers that describe
+/// the whole set of addresses the pin will occupy, `{base + i*stride : i < grid}`.
+/// A bare constant gives `stride = 0`, so one pair covers both forms and a
+/// consumer needs no case analysis.
+///
+/// Shared by the two callers for the same reason `verifyTensorLayoutArrays` is:
+/// `PinOp::verify` asks only *whether* the expression has one of those shapes,
+/// `PlacePinnedValues` asks *what* it is in order to check capacity, alignment
+/// and overlap — and a second matcher would answer the first question
+/// differently from the second on the next form anyone admits.
+///
+/// Conservative where it is cheaper to be: two program-id terms describe an
+/// admissible set and are refused rather than summed. See the definition.
+///
+/// `addr` may be null, which fails: a pin with no address has no range, and the
+/// caller that cares has already decided what that means.
+LogicalResult matchPinAddress(Value addr, int64_t &base, int64_t &stride);
 
 } // namespace mlir::triton::tts
 

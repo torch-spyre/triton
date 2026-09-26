@@ -84,7 +84,8 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
 
 void init_triton_spyre_ir_builders(py::module &&m) {
   // Op builders for the `tts` dialect, called from the Triton frontend --
-  // tl.spyre_tensor_layout, through triton.language.semantic.
+  // tl.spyre_tensor_layout and tl.spyre_pin, through
+  // triton.language.semantic.
   //
   // The frontend reaches this as `from triton._C.libtriton import spyre`, lazily
   // -- an import at module scope in semantic.py would make every backend's
@@ -118,6 +119,34 @@ void init_triton_spyre_ir_builders(py::module &&m) {
               builder.getDenseI64ArrayAttr(physOp),
               builder.getDenseI64ArrayAttr(physArg));
         });
+
+  // tl.spyre_pin. The memory space arrives as the string the kernel wrote and is
+  // stored as one: `tts.pin` spells it that way so the dialect keeps defining no
+  // attribute type, and its verifier is what checks the string against ktdp's
+  // enum. The frontend restates the two names as well, so that a misspelling is a
+  // traceback at the pin rather than a verifier failure after the whole function
+  // has been traced -- but neither place symbolizes it, and the op is where the
+  // rule lives.
+  //
+  // `address` is optional, and a missing one is a null Value rather than a
+  // sentinel: that is how ODS spells an absent optional operand, and it keeps
+  // "the author stated no address" distinguishable from "the author stated 0".
+  m.def(
+      "create_pin",
+      [](TritonOpBuilder &self, mlir::Value &value,
+         const std::string &memorySpace,
+         std::optional<mlir::Value> address) -> void {
+        // LOAD, not register -- see create_tensor_layout above for why the
+        // frontend is the one place that has to ask.
+        self.getContext()->loadDialect<mlir::triton::tts::TTSDialect>();
+
+        auto &builder = self.getBuilder();
+        self.create<mlir::triton::tts::PinOp>(
+            value, address ? *address : mlir::Value(),
+            builder.getStringAttr(memorySpace));
+      },
+      py::arg("builder"), py::arg("value"), py::arg("memory_space"),
+      py::arg("address") = py::none());
 }
 
 /// One `tts.tensor_layout` marker, reduced to what a footprint is computed from.
