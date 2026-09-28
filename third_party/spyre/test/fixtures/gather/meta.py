@@ -714,35 +714,6 @@ def run_2d_index_3d_block(inputs: dict, *, BLOCK_B: int, BLOCK_L: int, BLOCK_H: 
     return out
 
 
-# 1D-source gather — input maker + oracle
-#
-# The 1D kernel takes a 1D source vector and produces a 1D output. The
-# rank-2 ``[K, 1]`` shape used internally by the kernel descriptor is
-# an implementation detail to satisfy the gather verifier; the user-facing
-# buffers are 1D.
-# ---------------------------------------------------------------------------
-
-def make_inputs_1d(K: int, K_INDICES: int, BLOCK_ROWS: int) -> dict:
-    """Inputs for the ``1d`` variant. Source and output are 1D ``[K]``
-    and ``[K_INDICES]`` respectively. Distinct seed (2001) so this
-    variant doesn't share random data with any other gather variant."""
-    del BLOCK_ROWS
-    rng = np.random.default_rng(2001)
-    in_data = rng.standard_normal((K,)).astype(np.float32)
-    idx_data = rng.integers(0, K, size=(K_INDICES,)).astype(np.int32)
-    out_data = np.zeros((K_INDICES,), dtype=np.float32)
-    return {
-        "in_ptr":  in_data,
-        "out_ptr": out_data,
-        "idx_ptr": idx_data,
-    }
-
-
-def run_1d(inputs: dict) -> np.ndarray:
-    """NumPy oracle for the 1D-source kernel: ``out[i] = in[idx[i]]``."""
-    return inputs["in_ptr"][inputs["idx_ptr"]]
-
-
 # ---------------------------------------------------------------------------
 # SIGNATURE
 # ---------------------------------------------------------------------------
