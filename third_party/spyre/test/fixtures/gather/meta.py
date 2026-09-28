@@ -106,9 +106,16 @@ def _make_inputs(
 
     ``dtype`` is a :data:`DTYPE_MAP` key for the source/output payload
     (defaults to ``"fp32"`` so every pre-existing call site is
-    unaffected); ``idx_ptr`` is always ``i32`` regardless. Integers take
-    their own branch for the same reason ``reduce``'s ``_make_inputs``
-    does: ``standard_normal`` cast to ``int32`` truncates to -1/0/1.
+    unaffected); ``idx_ptr`` is always ``i32`` regardless.
+
+    Integer payloads get their own branch instead of reusing
+    ``standard_normal``: cast to ``int32``, its output truncates to
+    -1/0/1, which wouldn't exercise anything (same reasoning as
+    ``reduce``'s ``_make_inputs``). The ``[-100, 100)`` range — kept
+    identical to that convention — includes negative values even
+    though gather has no arithmetic to make the sign correctness-relevant;
+    the point is to exercise the sign bit rather than restrict the
+    payload to a suspiciously narrow non-negative subset.
     """
     np_dtype = DTYPE_MAP[dtype]
     rng = np.random.default_rng(seed)
@@ -186,7 +193,7 @@ def make_inputs_1core_compute(M, N, K_INDICES, BLOCK_COLS, y_offset,
                               DTYPE="fp32", **_unused) -> dict:
     """Level B inputs: DTYPE-swept payload; idx_ptr stays i32 always."""
     return _make_inputs(M, N, K_INDICES, BLOCK_COLS, y_offset,
-                        seed=2001, allow_duplicates=False, dtype=DTYPE)
+                        seed=2007, allow_duplicates=False, dtype=DTYPE)
 
 
 def make_inputs_spyre(M, N, K_INDICES, BLOCK_COLS, y_offset,
@@ -894,6 +901,9 @@ _SIG_2D_INDEX = {
 
 # rank-2 index grid x rank-3 source block -> rank-4 output.
 # Runtime args (in/out/idx pointers + h_offset) first; the rest are constexpr.
+#
+# fp32 so they'd fit Level A's pinned fp32/i32 dtype claim while accepting
+# cost of doubled memory requirement
 _SIG_2D_INDEX_4D = {
     "in_ptr":   "*fp32",
     "out_ptr":  "*fp32",

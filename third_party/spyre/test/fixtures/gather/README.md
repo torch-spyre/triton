@@ -333,7 +333,10 @@ The shape is the smallest `gather_kernel_1core`'s preconditions allow
 across all three dtypes: `BLOCK_COLS ≥ 32 / bitwidth * 8` needs 16 for
 fp16 and only 8 for fp32/i32, so `BLOCK_COLS = 16` is the smallest value
 that satisfies every arm with one shared shape row (see
-`## Preconditions` below). `y_offset = 0` with `N = BLOCK_COLS` reads
+`## Preconditions` below). This is the NVIDIA TMA `min_cols` swizzle
+rule (`semantic.py:descriptor_gather`), which Spyre's verifier skips
+entirely — honored here for portability across targets, not because
+Spyre requires it. `y_offset = 0` with `N = BLOCK_COLS` reads
 the full row, the simplest case. Because gather has no arithmetic —
 it is pure indexed data movement — all three dtypes are bit-exact
 against the NumPy oracle; unlike `reduce`/`elementwise`'s compute
