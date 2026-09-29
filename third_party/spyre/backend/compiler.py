@@ -225,6 +225,18 @@ class SpyreOptions:
     # 32 cores as 16x2 across axes x and y.
     grid: Tuple[int, ...] = (32,)
 
+    # Bytes of LX scratchpad a tl.spyre_pin may reach, per core. 0 (the default)
+    # does not check.
+    #
+    # There is deliberately no figure here, and the reason is that neither half of
+    # one is the compiler's to supply. How big the scratchpad IS belongs to the
+    # device description — SpyreUtils.get_device_properties states that it "is
+    # sized by the device description and allocated by the scheduler" — and how
+    # much of it a kernel may spend on pins is a budget that differs from kernel
+    # to kernel. So 0 means MaterializePinnedBuffers does not ask the capacity
+    # question, rather than that it answers it with a number nobody chose.
+    lx_capacity_bytes: int = 0
+
     # Explicit override for the kernel's HBM base addresses, positionally: entry
     # i is the address for the i-th `index` argument of the lowered function,
     # which ConvertFunctions produced from the i-th !tt.ptr argument. Empty (the
@@ -692,6 +704,7 @@ class SpyreBackend(BaseBackend):
             pm,
             bind_base_addresses=bind,
             base_addresses=list(base_addresses),
+            lx_capacity_bytes=options.lx_capacity_bytes,
         )
         pm.run(mod, "make_spyrecode")
 

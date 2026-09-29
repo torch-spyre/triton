@@ -70,14 +70,17 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   m.def(
       "add_spyrecode_pipeline",
       [](mlir::PassManager &pm, bool bind_base_addresses,
-         const std::vector<int64_t> &base_addresses) {
+         const std::vector<int64_t> &base_addresses,
+         int64_t lx_capacity_bytes) {
         mlir::triton::spyre::SpyrecodePipelineOptions options;
         options.bindBaseAddresses = bind_base_addresses;
         options.baseAddresses = base_addresses;
+        options.lxCapacityBytes = lx_capacity_bytes;
         mlir::triton::spyre::buildSpyrecodePipeline(pm, options);
       },
       py::arg("pm"), py::arg("bind_base_addresses") = false,
-      py::arg("base_addresses") = std::vector<int64_t>{});
+      py::arg("base_addresses") = std::vector<int64_t>{},
+      py::arg("lx_capacity_bytes") = 0);
   // No per-pass bindings. There were twelve, and by the end their only caller was
   // the table that turned a `SpyreOptions.required_fixes` pass *name* into a
   // pass; with that option gone, a stage's pass list is chosen in C++ from typed
