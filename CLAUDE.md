@@ -112,29 +112,124 @@ Current upstream touch points:
 | `setup.py` | Default `TRITON_BACKENDS=spyre`; auto TTIR-only/Proton; resolve LLVM via `setup_mlir.py`; Spyre-only package discovery; `spyre-test` extra; `--recursive` submodule init |
 | `CMakeLists.txt` | Guard GPU dialect / blob logic behind the TTIR-only build |
 | `python/src/main.cc` | Register empty `gluon_ir` / `linear_layout` pybind modules so `import triton` works in TTIR-only builds |
+| `python/src/ir.cc` | `create_inter_tile_reduce` / `create_spyre_tensor_layout` op builders on `TritonOpBuilder` |
 | `python/triton/experimental/gluon/__init__.py`, `.../language/__init__.py` | Guard GPU-only arch shim imports absent from a Spyre-only wheel |
 | `include/triton/Dialect/Triton/IR/Dialect.h`, `lib/Target/LLVMIR/LLVMDIUtils.cpp` | Source compatibility with the Spyre LLVM pin |
+| `include/triton/Dialect/Triton/IR/TritonOps.td` | `TT_SpyreTensorLayoutOp`, `TT_InterTileReduceOp` |
+| `lib/Dialect/Triton/IR/Ops.cpp` | `SpyreTensorLayoutOp::verify()`, plus `#ifdef TRITON_BUILD_TTIR_ONLY` guards |
 | `python/triton/language/target_info.py` | Runtime frontend backend guards: `is_spyre()` predicate + `requires_backend()` decorator |
+| `python/triton/language/core.py`, `.../__init__.py` | `tl.inter_tile`, `tl.spyre_tensor_layout`, `tl.wk_slice_coord`, and their `__all__` entries |
+| `python/triton/language/semantic.py` | Emission for those three |
+| `python/triton/knobs.py` | `knobs.spyre`, beside `knobs.nvidia` / `knobs.amd` |
+| `python/triton/backends/compiler.py`, `python/triton/runtime/jit.py` | `compile_time_launch_options` hook, returning `{}` for every other backend, and its call site |
+
+Regenerate this list with `grep -rn 'added for spyre'`, excluding `third_party/spyre`
+and `build/`.
 
 ## Where the Spyre code lives
 
-- `third_party/spyre/backend/compiler.py` — `SpyreBackend`; `add_stages()`
-  defines the `ttir` and `ktir` stages. `_make_ktir` runs the KTDP passes.
-- `third_party/spyre/lib/Dialect/KTDP/Transforms/` — the lowering passes
-  (C++). See the spyre / spyre-ktir agents for the pass pipeline.
-- `third_party/spyre/include/Dialect/KTDP/Transforms/Passes.td` — authoritative
-  per-pass contracts (input/lowering/output).
-- `third_party/spyre/test/` — structural + numerical tests; `fixtures/` holds
-  the kernel examples (vector_add, softmax, matmul, gather).
+- `third_party/spyre/backend/compiler.py` — `SpyreBackend`. `add_stages()`
+  registers **three** stages, and which one you are looking at is most of
+  debugging this backend:
+
+  | Stage | In → out | Method | Notes |
+  |-------|----------|--------|-------|
+  | `ttir` | Triton IR → Triton IR | `_make_ttir` | The standard upstream optimization passes. |
+  | `ktir` | Triton IR → KTIR | `_make_ktir` | The lowering. Also reads `metadata["name"]` and infers the base addresses, both of which have to happen before `ConvertFunctions` retypes the entry point. |
+  | `spyrecode` | KTIR → a loadable binary | `_make_spyrecode` | A KTIR → KTIR round trip that shapes the module for the device, then `dbo-opt`. Returns the export directory as ZIP bytes. |
+
+  The first two are pure IR-to-IR; only `spyrecode` shells out. Each artifact is
+  cached under the stage name and reachable as `asm["<stage>"]` on a
+  `CompiledKernel`.
+
+  **The two IR pipelines are registered MLIR pass pipelines**, built once in C++
+  (`lib/Pipeline.cpp`) and reachable as `spyre-triton-opt --spyre-ttir-to-ktir`
+  and `--spyre-prepare-spyrecode`. So a lit test can drive a whole stage rather
+  than one pass (`test/spyre-triton-opt/stage-pipelines.mlir`), and the module `dbo-opt`
+  receives can be reproduced by hand — see below.
+- The C++ passes live in three libraries, split by what each pass's subject is.
+  See the spyre / spyre-ktir agents for the pass pipeline.
+  - `third_party/spyre/lib/Conversion/TritonToKTIR/` — passes that cross a
+    dialect boundary, taking `tt` into KTIR (`ktdp`, linalg, tensor, func,
+    spyreop). `ktdp` is one dialect; KTIR is the language it composes with.
+  - `third_party/spyre/lib/Dialect/KTDP/Transforms/` — passes whose subject is
+    KTDP's own abstractions: memory views, access tiles.
+  - `third_party/spyre/lib/Transforms/` — passes acting on upstream structure or
+    the whole program, not on a dialect's own abstractions.
+  - `third_party/spyre/lib/Dialect/KTDP/Utils/` — shared helpers; kept out of the
+    peer libraries so neither has to depend on the other.
+- `Passes.td` under the matching `include/` directory for each of the three —
+  authoritative per-pass contracts (input/lowering/output). Note a pass's
+  `dependentDialects` there is a second source of link dependencies alongside
+  its `#include`s.
+- `third_party/spyre/test/` — structural + numerical tests. The lit tree mirrors
+  `lib/`; `fixtures/` holds the kernel examples (vector_add, softmax, matmul,
+  gather).
 - `third_party/spyre/ktir-mlir-frontend/` — KTIR MLIR frontend submodule
   (provides the `mlir_ktdp` bindings; supplies LLVM).
+
+## Seeing what the compiler did
+
+Three environment variables, and they are the whole story — **two of the three are
+upstream Triton's, not ours**, so do not go looking for a Spyre-specific dump flag.
+
+| Variable | Whose | Gives you |
+|----------|-------|-----------|
+| `MLIR_ENABLE_DUMP` | upstream | The module before each pass, all three stages |
+| `TRITON_KERNEL_DUMP` + `TRITON_DUMP_DIR` | upstream | One artifact file per stage |
+| `TRITON_SPYRE_DBO_DEBUG` | ours | `dbo-opt`'s own tree, inside the archive. On by default |
+
+**Between passes.** All three stages, since `_make_ttir` / `_make_ktir` /
+`_make_spyrecode` each call `pm.enable_debug()` — one call per pass manager, and a
+new pass manager needs its own or it is silently quiet.
+
+```bash
+MLIR_ENABLE_DUMP=1 python kernel.py           # every pass, every kernel
+MLIR_ENABLE_DUMP=my_kernel python kernel.py   # a function name narrows it
+```
+
+You get **"before" only** on a successful run: upstream passes
+`printAfterOnlyOnFailure=true`. An "IR Dump After" line therefore means *that pass
+failed* — read it as a diagnostic, not as ordinary output.
+
+**Per-stage artifacts.** `TRITON_ALWAYS_COMPILE=1` is not optional: a cache hit
+returns before any stage runs, so on a warm cache the dump directory stays empty
+and nothing says why.
+
+```bash
+TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/dump TRITON_ALWAYS_COMPILE=1 python kernel.py
+```
+
+**The module `dbo-opt` was handed.** Already recorded, on every compile: `dbo-opt`
+writes a `debug/` tree that `_make_spyrecode` packs into the archive, and its first
+entry *is* that module. Unpack `asm["spyrecode"]` (a ZIP) and read it — which is
+why no flag of ours exists for this.
+
+**Reproducing that module without the tool.** Run the two registered pipelines in
+sequence, with the options the compile recorded in its `metadata` (grid, data
+layout, base addresses):
+
+```bash
+spyre-triton-opt kernel.ttir \
+  --spyre-ttir-to-ktir="grid=32" \
+  --spyre-prepare-spyrecode="bind-base-addresses base-addresses=0,4294967296"
+```
+
+Use the **dumped** `kernel.ttir`, i.e. the `ttir` stage's *output*.
+`--spyre-ttir-to-ktir` does not inline, so raw `ASTSource.make_ir` output fails on
+a surviving `tt.call` from any `tl.*` helper. There is no flag for the `ttir` stage
+because it is upstream Triton's passes. Omit `bind-base-addresses` for the
+symbolic mode, which is what a launch uses.
 
 ## Tests
 
 ```bash
 uv run pytest third_party/spyre/test                    # full suite
-uv run pytest third_party/spyre/test -k "not numerical" # structural only
 uv run lit build/cmake.*/third_party/spyre/test -v      # lit/FileCheck tests
+
+# everything except the device launches -- use --ignore, NOT -k "not numerical",
+# which deselects the 162 numerical cases and SELECTS test_device_launch.py
+uv run pytest third_party/spyre/test --ignore=third_party/spyre/test/test_device_launch.py
 
 # fast loop on one python-driven lit test -- no cmake, no re-configure
 T=third_party/spyre/test/python/segment-addresses.py
@@ -143,6 +238,38 @@ PYTHONPATH=python:third_party/spyre uv run python $T | ./python/triton/FileCheck
 
 Numerical coverage is a work in progress; known gaps are strict-xfail'd and
 missing oracles skip, so the suite stays green while catching regressions.
+
+### Probes and timeouts — how long things take
+
+Build-and-test latency dominates any investigation here, so guessing at it is the
+main way to waste an hour. Approximate wall times, so nothing has to be discovered:
+
+| | |
+|---|---|
+| structural pytest (`--ignore` device) | ~165 s |
+| `test_device_launch.py` | ~16 s |
+| full lit suite | 1–2 min |
+| incremental rebuild, warm ccache | a few min; longer after a `.td` change, which regenerates tablegen widely |
+
+Four rules, each of which has cost real time:
+
+- **A long timeout is for a command already seen to succeed.** The first run of a new
+  tool, flag, path or test selector gets a *short* one — at that moment the likely
+  failure is that the command is wrong, not that it is slow, and finding that out
+  should cost seconds. A wrong command under a five-minute timeout costs five minutes.
+- **When a command times out, first assume the command is wrong.** A bad path, a flag
+  the tool lacks, a selector matching nothing, a missing `source spyre-env.sh`. Re-read
+  it before raising the limit; raising it on a wrong command buys nothing.
+- **Validate cheaply first.** `pytest --collect-only` confirms a selector in seconds,
+  `--help` confirms a flag exists, a trivial input confirms a tool runs at all.
+- **Size the probe to the question.** Run the single test that discriminates, not the
+  suite. Mutating one line and then running everything to watch nothing fail costs
+  minutes for what one `-k` or one `.mlir` answers. Full suites once, at the end,
+  before committing.
+
+Never `sleep`. The shell blocks until a command exits, so raise its timeout instead;
+the device releases on process exit, so sequential runs need no gap; and genuinely long
+work goes to the background, where completion is reported rather than polled.
 
 `test_device_launch.py` launches on hardware, in the pytest process itself, and a
 Spyre device admits one opener for that process's whole lifetime. It is in the
@@ -170,6 +297,33 @@ That feature re-spells the rule in `resolve_dbo_opt()` rather than importing it
 literal, a bare name goes through `PATH`. Keep the two in step. And note lit scans a
 test file's *whole* text for directives, so writing `REQUIRES` followed by a colon in
 a docstring creates a second, malformed one and the test comes out `Unresolved`.
+
+**A `dbo-opt` outside the system install needs its whole chain named with it, the
+device file included.** `TRITON_SPYRE_DBO_OPT` alone is not enough. That tool resolves
+its shared libraries, its `share/` data and the target device description
+independently, so pointing only the binary elsewhere pairs a new tool with whatever
+the old ones were — usually the system install's, or nothing. Set alongside it:
+
+| | |
+|---|---|
+| `TRITON_SPYRE_DEVICE` | the device description (arch spec) to compile against |
+| `LD_LIBRARY_PATH` | that build's `lib` |
+| `DEEPTOOLS_PATH` | that build's `share` |
+
+All four must name **one** build. The failure mode is why this is worth a note rather
+than a config: a missing `TRITON_SPYRE_DEVICE` does not report a missing device — the
+tool falls back to a default one and then refuses ordinary IR against it, e.g.
+
+```
+warning: unsupported vector scalar type 'f32'
+error: 'dataflow.send' op unsupported ldtype
+```
+
+which reads as a compiler or fixture bug, names nothing about the environment, and
+reproduces identically on every branch. If a `spyrecode` test fails on a dtype or op
+that has always worked, check these four before reading the diagnostic. Keep them in a
+file you source per worktree; a worktree without one inherits nothing and gives no hint
+that it should.
 
 **Generating FileCheck patterns** — use `utils/generate-test-checks.py`
 (from upstream LLVM) to auto-generate CHECK lines from printed IR:

@@ -7,19 +7,17 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
-#include "ktir/Dialect/KTDP/KTDPDialect.h"
-#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
-#include "Dialect/KTDP/Transforms/Passes.h"
+#include "RegisterEverything.h"
 
 int main(int argc, char **argv) {
   mlir::registerAllPasses();
   mlir::triton::registerTritonPasses();
-  mlir::triton::ktdp::registerKTDPPasses();
+  mlir::triton::spyre::registerPasses();
+  mlir::triton::spyre::registerPipelines();
 
   mlir::DialectRegistry registry;
   registry.insert<mlir::triton::TritonDialect>();
-  registry.insert<mlir::ktdp::KtdpDialect>();
-  registry.insert<mlir::spyreop::SpyreOpDialect>();
+  mlir::triton::spyre::registerDialects(registry);
   mlir::registerAllDialects(registry);
   mlir::registerAllExtensions(registry);
 

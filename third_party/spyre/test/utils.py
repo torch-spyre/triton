@@ -145,8 +145,7 @@ def make_ktir_mod(ttir_path, *, grid=None, metadata=None, **options):
 
     Unknown keys raise instead of being dropped. ``SpyreBackend.parse_options``
     silently filters anything it doesn't recognize, so a typo'd option would
-    otherwise become an invisible no-op — the same failure mode ``_make_ktir``
-    guards against by raising on a missing pass binding.
+    otherwise become an invisible no-op.
     """
     from triton._C.libtriton import ir
     from triton.backends.compiler import GPUTarget

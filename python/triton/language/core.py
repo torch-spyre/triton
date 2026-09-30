@@ -15,6 +15,7 @@ import inspect
 
 from .._C.libtriton import ir
 from .._utils import TRITON_MAX_TENSOR_NUMEL, validate_block_shape, get_primitive_bitwidth, _tuple_create
+from .target_info import requires_backend  # --- added for spyre
 
 T = TypeVar('T')
 
@@ -3848,6 +3849,7 @@ def wk_slice_coord(work_slices, axis, _semantic=None):
 
 
 @builtin
+@requires_backend("spyre")
 def spyre_tensor_layout(desc, layout, _semantic=None):
     """(Spyre only) Annotate a tensor descriptor with its physical device layout.
 
@@ -3857,6 +3859,10 @@ def spyre_tensor_layout(desc, layout, _semantic=None):
     - ``src`` (a bare int) — identity: ``phys_idx = logical_idx[src]``.
     - ``(src, "floordiv", div)`` — ``phys_idx = logical_idx[src] // div``.
     - ``(src, "mod", mod)`` — ``phys_idx = logical_idx[src] % mod``.
+    - ``(src, "splat", lanes)`` — a fresh axis of ``lanes`` over which
+      ``logical_idx[src]`` is replicated rather than partitioned. Pairs with an
+      identity entry on the same ``src``: that is the reduce-on-stick output
+      layout, where a rank-1 logical result is stored one stick wide.
 
     Example — ``[M, N]`` tensor stick-tiled on ``N``, physical layout
     ``[ceil(N/64), M, 64]``, indices ``[N//64, M, N%64]``::

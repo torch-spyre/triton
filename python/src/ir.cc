@@ -1968,15 +1968,6 @@ void init_triton_ir(py::module &&m) {
           results.push_back(r);
         return results;
       });
-
-  TritonOpBuilderBinding.def("create_spyre_tensor_layout",
-      [](TritonOpBuilder &self, Value &desc, std::vector<int64_t> &physSrc,
-         std::vector<int64_t> &physOp, std::vector<int64_t> &physArg) -> void {
-        self.create<triton::SpyreTensorLayoutOp>(
-            desc, self.getBuilder().getDenseI64ArrayAttr(physSrc),
-            self.getBuilder().getDenseI64ArrayAttr(physOp),
-            self.getBuilder().getDenseI64ArrayAttr(physArg));
-      });
 #endif // --- added for spyre
 
   // Add custom operations.

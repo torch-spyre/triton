@@ -61,7 +61,7 @@ body:
       - LowerComputeOps
       - LowerDescriptorMemory
       - LowerScalarLoad
-      - RewriteDescriptorLayout
+      - RewriteDescriptorLayoutGeneric
       - ConvertFunctions
       - DistributeWork
       - end-to-end kernel example (fixtures)

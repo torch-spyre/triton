@@ -23,13 +23,10 @@ splitk (reduce_to_one, f32):
   Only pick₀ (``pid_in==0``) writes to C.  The outer distribution loop
   handles arbitrary M for the fixed grid.
 
-No tt.spyre_tensor_layout variant: LowerInterTile refuses a kernel carrying
-both a layout marker and a ``tt.inter_tile_reduce``. RewriteDescriptorLayout
-now runs after it, and cannot carry a physical type through the
-produce/reduce pair -- its forward walk follows ``RankedTensorType`` results,
-and the pair communicates through a ``!ktdp.tile_future`` whose tensor types
-are nested inside the type. Layout support here needs a physical-type
-propagation rule for the inter-tile op, added where the others live.
+No stick-layout variant: LowerInterTile refuses a kernel carrying both a layout
+marker and a ``tt.inter_tile_reduce``. The layout pass cannot carry a physical
+type through the produce/reduce pair either, which communicates through a
+``!ktdp.tile_future`` whose tensor types are nested inside the type.
 
 See ``fixtures/README.md`` for the field reference.
 """
@@ -89,7 +86,7 @@ def run_element_sum(inputs: dict, BLOCK_M: int, BLOCK_N: int, NUM_N_TILES: int, 
 
     If the ``tl.inter_tile`` API or the fixture grid changes this oracle must
     be updated to match.  The exact KTIR structure (affine sets, combiner op)
-    is pinned by ``Conversion/lower-inter-tile.mlir``, so a lowering
+    is pinned by ``Conversion/TritonToKTIR/lower-inter-tile.mlir``, so a lowering
     regression surfaces there before this oracle becomes the only signal.
     """
     x = inputs["x_ptr"]

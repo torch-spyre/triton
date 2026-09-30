@@ -183,6 +183,150 @@ passing them silently. If instead you see a failure naming an unknown `ktdp`
 attribute, an older `dbo-opt` was found on `PATH` — the error says which binary ran
 and how it was chosen.
 
+## Compile Stages
+
+A compile runs three stages, and knowing which one you are looking at is most of
+debugging this backend. Each stage's output is cached under its own name, and
+`CompiledKernel.asm` is keyed the same way, so `asm["ttir"]`, `asm["ktir"]` and
+`asm["spyrecode"]` are the three artifacts a compile produces.
+
+| Stage | In → out | What it does |
+|-------|----------|--------------|
+| `ttir` | Triton IR → Triton IR | The standard upstream optimization passes: inline, canonicalize, combine, reorder broadcasts, CSE, symbol DCE. |
+| `ktir` | Triton IR → KTIR | The lowering: `tt` memory and compute ops become `ktdp` memory views, access tiles and `linalg`, the entry point becomes a `func.func`, and the grid is distributed. |
+| `spyrecode` | KTIR → a loadable binary | Two halves. A KTIR → KTIR round trip that shapes the module for the device, then `dbo-opt`, which schedules and emits the SpyreCode directory. The stage's artifact is that directory as a ZIP. |
+
+The first two are pure IR-to-IR; only `spyrecode` shells out to another tool.
+
+**The two IR pipelines are addressable from the command line.** Each stage's pass
+list is built once in C++ and registered as an MLIR pass pipeline, so
+`spyre-triton-opt` can run a whole stage rather than a single pass:
+
+```bash
+spyre-triton-opt kernel.ttir --spyre-ttir-to-ktir="grid=32"
+spyre-triton-opt kernel.ktir --spyre-prepare-spyrecode
+```
+
+Feed it a `kernel.ttir` that has been through the `ttir` stage — the one in the
+cache or the dump directory, which is that stage's *output*. Raw
+`ASTSource.make_ir` output has not been inlined yet, and `--spyre-ttir-to-ktir`
+does not inline: a kernel calling a `tl.*` helper fails on the surviving
+`tt.call`. The `ttir` stage is upstream Triton's passes, so there is no
+`spyre-triton-opt` flag for it.
+
+Two things follow. A `lit` test can cover a stage end to end, which no per-pass
+test could. And **the module `dbo-opt` receives is reproducible**: run both
+pipelines in sequence, with the options the compile used, and you have exactly the
+IR the tool was handed — with no tool and no device needed.
+
+```bash
+spyre-triton-opt kernel.ttir \
+  --spyre-ttir-to-ktir="grid=32" \
+  --spyre-prepare-spyrecode="bind-base-addresses base-addresses=0,4294967296"
+```
+
+The options that determine that module — the grid, the data layout, the base
+addresses — are recorded in the compile's `metadata` and folded into its cache
+key, so there is nothing to guess: read them off the compile you are reproducing.
+`--spyre-prepare-spyrecode` alone leaves the addresses symbolic, which is the
+default mode for a launch.
+
+## Seeing Inside a Compile
+
+Three environment variables cover the whole pipeline, and they are the whole
+story — there is no Spyre-specific dump flag to look for, and two of the three are
+upstream Triton's rather than ours. They meet at the module `dbo-opt` receives:
+ours cover everything up to it, `DBO_DEBUG` covers it and everything after.
+
+| Variable | Whose | What you get |
+|----------|-------|--------------|
+| `MLIR_ENABLE_DUMP=1` | upstream | The whole module printed before every pass, for all three stages. Set it to a function name instead to restrict the dump to that kernel. |
+| `TRITON_KERNEL_DUMP=1` with `TRITON_DUMP_DIR=<dir>` | upstream | Every stage's artifact written under `<dir>`, one file per stage. |
+| `TRITON_SPYRE_DBO_DEBUG` | ours | Passed to `dbo-opt` as `DBO_DEBUG`; it writes its own tree of per-stage artifacts, which the `spyrecode` archive carries. **On by default.** |
+
+`MLIR_ENABLE_DUMP` prints "before" only on a successful run: upstream passes
+`printAfterOnlyOnFailure=true`, so an "after" dump means that pass failed.
+
+`TRITON_KERNEL_DUMP` **silently does nothing on a warm cache** — a cache hit
+returns before any stage runs, so there is nothing to dump. Add
+`TRITON_ALWAYS_COMPILE=1`:
+
+```bash
+TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/dump TRITON_ALWAYS_COMPILE=1 python kernel.py
+```
+
+`DBO_DEBUG` is why nothing of ours needs to capture the module handed to
+`dbo-opt`: its tree's first entry *is* that module, and it is packed into the
+`spyrecode` artifact on every compile. To obtain that module without running the
+tool at all, use the two-pipeline recipe above.
+
+## Launching a Kernel
+
+A launch looks like any other Triton launch: host tensors go to the device, then the
+kernel is indexed by its grid and called.
+
+```python
+x   = torch.randn(64, 128, dtype=torch.float16).to("spyre")
+out = torch.empty(64, 128, dtype=torch.float16).to("spyre")
+my_kernel[(1,)](x, out, M=64, N=128, X_LAYOUT=..., OUT_LAYOUT=...)
+```
+
+`.to("spyre")` is correct for almost every buffer, including stick-tiled ones. A
+stick layout *partitions* a dimension — it decides where elements sit, not how many
+there are — so the device needs exactly the element count the host tensor already
+has.
+
+### When a layout replicates, you must allocate for it
+
+One kind of layout is different. A **splat** coordinate op does not partition a
+dimension, it *replicates* one: a rank-1 statistic annotated splat-on-lanes occupies
+`[M, S]` on the device, `S` copies of each value. That buffer needs `M × S` elements
+where the host tensor holds `M`.
+
+`.to("spyre")` cannot know this — it sizes from the host shape alone — so it
+allocates `M`, and the kernel writes past the end of it. You are expected to know
+your own layout and allocate accordingly, by handing `to` the device layout
+explicitly:
+
+```python
+import torch
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+# Required for this path, and only for this path: a plain .to("spyre")
+# initializes the runtime on its own, while the device_layout= branch
+# allocates directly and fails with "RuntimeContext not created" without it.
+torch.spyre._impl._lazy_init()
+
+host_stat = torch.zeros(64, dtype=torch.float16)
+stat = host_stat.to("spyre", device_layout=SpyreTensorLayout(
+    device_size=[1, 64, 64], stride_map=[-1, 1, -1],
+    device_dtype=get_device_dtype(host_stat.dtype)))
+
+my_kernel[(1,)](x, stat, M=64, N=128, X_LAYOUT=..., STAT_LAYOUT=...)
+```
+
+The host tensor's contents are copied over, so zeroing it on the host is how you
+tell a buffer the kernel never wrote from one that wrote the right answer.
+
+The rule for which buffers need this is the layout you annotated, not the buffer's
+role: a splat anywhere — on an input as much as an output — needs an explicit
+allocation, and a layout built only from identity, floordiv and mod does not.
+
+### You will be told if you get it wrong
+
+The launcher does not rely on you remembering. Every annotated argument is checked
+against the layout its kernel was compiled with, and a buffer too small is refused
+before the kernel runs rather than corrupting whatever follows it in device memory.
+The refusal names the argument, both device layouts with their byte counts, and the
+allocation call that would fix it — so the fastest way to discover the layout for a
+new kernel is to launch it with a plain `.to("spyre")` and read the error.
+
+Two limits worth knowing. An argument whose physical extents depend on a *runtime*
+value cannot be checked, because the size is not known at compile time; such a
+buffer passes unexamined, and a replicating layout on one would overrun it silently.
+And the check measures device storage, so it catches a buffer that is too small but
+not one whose contents are wrong.
+
 ## Device Launch Dependency
 
 `kernel[grid](x, y, out, ...)` runs on hardware in the calling process:

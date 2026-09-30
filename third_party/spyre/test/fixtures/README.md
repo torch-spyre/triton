@@ -32,9 +32,21 @@ reference oracle and input generator. Different functions
   partial-override rule for nested fields; a variant that wants to
   change `constexpr` (or `params`) replaces the whole list / dict.
 - The base is `"default"` unless the variant declares `"base": "<name>"`,
-  which names another variant in the same `VARIANTS` dict. The `"base"`
-  key is consumed at load time and does not appear in the registry entry.
-  Circular chains are caught at collection time.
+  which names another variant in the same `VARIANTS` dict, or
+  `"base": None`, which opts out of the fallback entirely (the variant's
+  dict is used as-is, with no merge). `"base"` is consumed at load time
+  and does not appear in the registry entry (`"base": None` is the one
+  exception — see the field reference below). Circular chains are caught
+  at collection time.
+- The `"default"`-fallback is implicit and applies to *every* variant that
+  omits `"base"`, not just ones that look like they want to inherit
+  something. So a field `"default"` sets reaches every sibling that does
+  not set its own or opt out with `"base": None` — if `"default"`'s
+  `SIGNATURE` and `constexpr` name an argument a sibling's kernel does not
+  take, that sibling inherits it and fails at collection time. Prefer
+  keeping `"default"` a representative, unexotic case for exactly this
+  reason: a `"default"` that is itself an edge case pushes its exotica
+  onto every sibling that forgot to opt out.
 - Registry keys: `<folder>` for the default variant and for
   single-variant kernels; `<folder>__<variant>` for every other entry.
   e.g. `vector_add`, `vector_add__dynamic`.
@@ -46,15 +58,18 @@ reference oracle and input generator. Different functions
 | `kernel_fn` | `@triton.jit` function | Compiled on demand via `compile_to_ttir` → `make_ktir_mod`. |
 | module-level `SIGNATURE` | `dict[str, str]` | Dtype per `@triton.jit` arg. Pure types — no values. Declared at module scope in `meta.py`, not inside `VARIANTS`. Used by every variant that doesn't redeclare it. |
 | variant `SIGNATURE` | `dict[str, str]` | Optional per-variant override. Replaces the module-level map wholesale — use when the variant's kernel has a different arg list (e.g. softmax's `multi_tile` has `BLOCK_N` where `single_tile` has `BLOCK_SIZE`). |
-| `base` | `str` | Optional. Name of another variant in the same `VARIANTS` dict to use as the merge base instead of `"default"`. Consumed at load time; not stored in the registry entry. |
+| `base` | `str \| None` | Optional. Name of another variant in the same `VARIANTS` dict to use as the merge base instead of `"default"`. Consumed at load time; not stored in the registry entry. `None` opts out of the implicit `"default"`-fallback entirely — use this when the variant must not inherit something `"default"` sets: a `SIGNATURE`/`constexpr` pair naming arguments its own kernel does not take (`gather`'s `1core`), or a literal `reference`/`inputs` that would collide with its own `factory` hooks (`elementwise`'s `1d_compute`). Unlike a named base, an explicit `"base": None` currently *does* survive into the resolved registry entry as a stray key: `_resolve_base` pops `"base"` only on the named-base path (a minor asymmetry in the loader — harmless since nothing reads it back). |
 | `constexpr` | `list[str]` | Which arg names are Triton constexprs for this variant. Each variant declares the full list explicitly (no partial override over default's list). Values for constexprs come from `params`. |
 | `params` | `dict[str \| tuple[str, ...], list[Any]]` | Single source of truth for argument values. A key naming one argument maps to a list of values; more than one is **swept** — one registry entry per value, its key suffixed `[name=value]`. Write a value as `(label, value)` to be named by the label instead, for values whose repr would make a key unreadable (a stick layout); a labelled value is named even when it is the only one. A key that is a **tuple of names** maps to a list of *rows* — one value per name, positionally — and sweeps those names jointly: only the rows written are enumerated. Use it to state a functional dependency, since the `N` a dtype implies sits on the dtype's own row and so cannot disagree with it, and to skip an invalid combination, by not listing its row. A group column is named in the key when it varies across rows or was labelled; a group's row count says nothing about a column held constant. The product runs across keys, and each combination partitions into `constexpr` and runtime the same way. |
 | `grid` | `list[int]` | Per-axis partition of the 32-core Spyre grid. One entry per `tl.program_id` axis the kernel reads; `prod(grid)` equals the hardware core count. Defaults to the backend's `(32,)` (1D on all cores) when omitted. |
 | `reference` | `(inputs) -> np.ndarray` | NumPy oracle for the numerical test. Omit for structure-only variants. Defined alongside `VARIANTS` in the same `meta.py`. |
 | `inputs` | `(**param_values) -> {"arg_name": np.array, ...}` | Pointer/tensor input generator. Called with kwargs matching `params` keys; returns pointer/tensor args only. Runtime scalars (params that aren't in `constexpr`) are merged in by the framework. |
 | `output_key` | `str` | Which `inputs` key holds the output buffer compared against `reference(inputs)`. |
+| `rtol`, `atol` | `float \| dict[str, float]` | Optional bounds for the `assert_allclose` against `reference`, defaulting to `1e-6` and `0`. A `float` is the bound. A **dict keyed by dtype string** (`{"fp16": 2.5e-1, "fp32": 3e-5}`) is resolved against the variant's own `DTYPE` param, which is what lets one entry sweep a `DTYPE` group whose arms need different bounds instead of being split into a variant per dtype to carry a number. A dict that does not name the variant's dtype is an error, not a silent default. Resolved by `tolerances` in `test/conftest.py`, which both the `ktir_cpu` test and the device test call, so the two tiers cannot drift apart. |
 | `func_name` | `str` | KTIR function name for `ktir_cpu`. Defaults to `kernel_fn.__name__`. |
 | `factory` | `VariantFactory` | Optional. Supplies the fields that vary with the swept `params` combination. Subclass `VariantFactory` (`test/conftest.py`) and override `signature()`, `reference()` or `inputs()`; each is called per combination with the combination as kwargs and returns that field's value, or `None` to leave it unset. Declaring a hook and the literal field it produces on one variant is an error. |
+| `tags` | `list[str]` | Optional. Free-form categorization strings (e.g. `"descriptor-gather"`, `"1core"`). Read by `scripts/dump_round_trip.py`, which emits them as a `// Demonstrates patterns:` header line on the dumped variant. Nothing in the test suite reads them. |
+| `summary` | `str` | Optional. One-line description of what the variant is, used by `scripts/dump_round_trip.py` for its top-level table of contents (`_resolve_doc`, which otherwise falls back to the first sentence of `doc`). Prose for a reader, not a field the suite branches on. |
 | `xfail_numerical` | `str \| dict` | Optional. `str` is shorthand for `{"reason": str, "strict": True}`; `dict` is forwarded to `pytest.mark.xfail(**d)` (so `raises=ValueError` etc. work). Attached at collection time so failures show as `XFAIL`, not `SKIP`. Use this when the kernel compiles but the numerical comparison fails (e.g. `ktir_cpu` can't parse a dynamic memref shape). |
 | `disabled` | `dict` | Optional. `{"reason": str, "tracking_test": str}`. Marks a variant as unable to compile through the TTIR→KTIR pipeline today. `test_numerical` becomes a strict xfail on the compile: the variant runs, the pipeline raises `RuntimeError`, xfail absorbs it — and when the gap closes the compile succeeds, strict fails the suite, and whoever closed it is told to remove this block. `tracking_test` is free text naming where the gap is pinned, normally a lit file; it is documentation for the reader, not a checked reference |
 
@@ -64,8 +79,33 @@ reference oracle and input generator. Different functions
 `test_numerical` compiles the kernel through the TTIR→KTIR pipeline, executes
 it on `ktir_cpu` and compares against the NumPy oracle.
 
+### The artifact it reads is the `ktir` stage's, and that artifact is logical
+
+`make_ktir_mod` runs the `ktir` stage and stops. It does **not** run the
+`spyrecode` stage, and physicalization lives there — so what `ktir_cpu` executes
+has the shapes and strides the kernel declared, with the device layout carried
+alongside as a `tts.tensor_layout` attribute that nothing in this tier reads.
+The same is true of `arith` on tensors: `convert-elementwise-to-linalg` is in the
+`spyrecode` stage too, so pointwise work reaches `ktir_cpu` as tensor arithmetic
+rather than as a `linalg.generic`.
+
+This bounds what a **Level C** variant can claim, and the bound is sharper than
+"less physical than it was". Say it plainly: **numerically, Level C is now
+Level B.** The annotation is present in the artifact and no pass or interpreter in
+this tier acts on it, so a Level C variant and a Level B variant of the same
+kernel execute the same IR and check the same thing. The band's remaining value is
+that the annotation *compiles* and does not change the answer — not that it
+physicalizes, which is what the name says.
+
+The physical form is pinned by the lit fixtures under
+`test/Dialect/KTDP/Transforms/RewriteDescriptorLayoutGeneric/` and by the device
+tier. Nothing numerical covers it. Closing that needs a fixture able to ask for
+the `spyrecode` stage's artifact, which no field does today; until then, do not
+read a green Level C variant as evidence about a layout.
+
 Structural claims about the lowered IR are **not** made here. They live in the
-lit/FileCheck suite under `test/Conversion/*.mlir`, which pins the exact IR a
+lit/FileCheck suite, whose layout mirrors `lib/` -- `test/Conversion/`,
+`test/Dialect/` and `test/Transforms/` -- which pins the exact IR a
 pass emits rather than asserting op presence over a compiled fixture. A fixture
 whose numerical result is right but whose IR shape matters belongs in a `.mlir`
 carrier, not in a field on the variant.

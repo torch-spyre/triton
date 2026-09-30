@@ -24,6 +24,8 @@ all. The decomposition is not free.
 
 import hashlib
 import io
+import sys
+import types
 import zipfile
 from pathlib import Path
 
@@ -79,31 +81,47 @@ class _Src:
         self.signature = signature
 
 
-class _FakeTorchSpyre:
-    """Stand-in for the two ``torch_spyre._C`` names the payload is built from.
+class _FakeSymbolKind:
+    """Stand-in for ``torch_spyre``'s ``SymbolKind``, with its real field names.
 
     Faked rather than imported, because this file runs everywhere, including
     machines with no torch-spyre — and where torch-spyre *is* installed but its
     shared libraries are not on ``LD_LIBRARY_PATH``, ``import torch`` itself
     raises ``RuntimeError`` from the device-extension autoload, which
     ``importorskip`` does not catch. What is under test is which entries the
-    launcher builds and in what order, not pybind's constructor; the keyword
-    names below are the pybind ones, so passing the wrong keyword still fails.
+    launcher builds and in what order, not torch-spyre's dataclass.
+
+    Only ``kernel`` is provided, which is the only variant the launcher builds.
+    Absent here, any other shows up as an AttributeError rather than as a
+    passing test.
     """
 
-    class _C:
+    def __init__(self, kind, arg_index):
+        self.kind = kind
+        self.arg_index = arg_index
 
-        class SymbolicArgKind:
-            kAddress = "kAddress"
-            kDimension = "kDimension"
+    @classmethod
+    def kernel(cls, arg_index):
+        return cls("kernel", arg_index)
 
-        class SymbolicArg:
 
-            def __init__(self, kind, tensor_id, dim_index=-1, value=-1):
-                self.kind = kind
-                self.tensor_id = tensor_id
-                self.dim_index = dim_index
-                self.value = value
+def _install_fake_symbol_kind(monkeypatch):
+    """Make ``from torch_spyre...compute_ops import SymbolKind`` find the fake.
+
+    The launcher imports ``SymbolKind`` from inside ``_symbol_kinds``, so the
+    module has to be resolvable in ``sys.modules`` at call time; stubbing the
+    whole package chain is what keeps this file importable with no torch-spyre.
+    ``_import_torch_spyre`` is stubbed out alongside, since the real one imports
+    torch.
+    """
+    monkeypatch.setattr(spyre_driver, "_import_torch_spyre", lambda: None)
+    for name in ("torch_spyre", "torch_spyre._inductor",
+                 "torch_spyre._inductor.codegen"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    compute_ops = types.ModuleType("torch_spyre._inductor.codegen.compute_ops")
+    compute_ops.SymbolKind = _FakeSymbolKind
+    monkeypatch.setitem(sys.modules,
+                        "torch_spyre._inductor.codegen.compute_ops", compute_ops)
 
 
 class _Metadata:
@@ -469,20 +487,26 @@ class TestSymbolicArgs:
         # form. Reached without torch-spyre on purpose -- an import here would
         # make the answer depend on a package that has nothing to say about it.
         launcher = SpyreLauncher(_Src({}), _Metadata(False))
-        assert launcher._symbolic_args(2) is None
+        assert launcher._symbol_kinds(2) is None
 
     def test_one_address_entry_per_tensor_in_order(self, monkeypatch):
-        monkeypatch.setattr(spyre_driver, "_import_torch_spyre",
-                            lambda: _FakeTorchSpyre)
+        _install_fake_symbol_kind(monkeypatch)
         launcher = SpyreLauncher(_Src({}), _Metadata(True))
-        payload = launcher._symbolic_args(3)
-        # Slot i is resolved from entry i, so tensor_id has to be the position:
-        # a right-length payload in the wrong order is silent wrong numerics.
-        assert [entry.tensor_id for entry in payload] == [0, 1, 2]
-        assert all(entry.kind == "kAddress" for entry in payload)
-        # kDimension's fields, left at their -1 defaults: that kind carries a
-        # runtime scalar dim and raises "not yet implemented" downstream.
-        assert all((entry.dim_index, entry.value) == (-1, -1) for entry in payload)
+        payload = launcher._symbol_kinds(3)
+        # The runner maps arg_index -> tensor_id, and slot i is resolved from
+        # entry i, so arg_index has to be the position: a right-length payload in
+        # the wrong order is silent wrong numerics, not an error.
+        assert [entry.arg_index for entry in payload] == [0, 1, 2]
+        assert all(entry.kind == "kernel" for entry in payload)
+
+    def test_payload_length_is_the_address_count(self, monkeypatch):
+        # The length is what JobPlanStepHostCompute::construct TORCH_CHECKs
+        # against the compiled symbol count, so it must track the addresses
+        # actually passed -- including the one-address edge of the range.
+        _install_fake_symbol_kind(monkeypatch)
+        launcher = SpyreLauncher(_Src({}), _Metadata(True))
+        for count in (1, 2, 7):
+            assert len(launcher._symbol_kinds(count)) == count
 
 
 class TestArgumentModeCheck:

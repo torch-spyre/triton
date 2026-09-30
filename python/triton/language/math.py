@@ -18,11 +18,23 @@ def _check_dtype(dtypes: List[str]) -> T:
 
         @wraps(fn)
         def check(*args, **kwargs):
+            # --- START --- added for spyre
+            # The target adds the widths its own intrinsic for this op covers,
+            # through the same codegen_fns channel as min_dot_size. Optional: with
+            # no hook, `dtypes` stands as written. Read per call because
+            # codegen_fns belongs to the compilation in progress; `_semantic` is
+            # present by construction, since @core.builtin wraps every op here.
+            accepted = dtypes
+            extra = kwargs["_semantic"].builder.codegen_fns.get("extra_math_dtypes")
+            if extra:
+                accepted = [*dtypes, *(d for d in extra(fn.__name__) if d not in dtypes)]
+            # --- END --- added for spyre
             # concatenate args and kwargs
             all_args = list(args) + list(kwargs.values())
             for arg in [a for a in all_args if isinstance(a, core.tensor)]:
-                if arg.type.scalar.name not in dtypes:
-                    raise ValueError(f"Expected dtype {dtypes} but got {arg.type.scalar.name}")
+                # --- added for spyre: ``accepted``, upstream reads ``dtypes``
+                if arg.type.scalar.name not in accepted:
+                    raise ValueError(f"Expected dtype {accepted} but got {arg.type.scalar.name}")
             return fn(*args, **kwargs)
 
         return check

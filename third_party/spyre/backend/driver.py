@@ -10,6 +10,7 @@ from triton import knobs
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import DriverBase
 
+from . import tensor_layout
 from .compiler import SPYRE_CODE_DIR, SPYRECODE_JSON
 
 
@@ -172,7 +173,9 @@ class SpyreLauncher:
 
     The launch itself is torch-spyre's — ``SpyreSDSCKernelRunner``, which owns
     ``prepare_kernel(<dir>/spyreCodeDir)`` for the JobPlan and
-    ``launch_jobplan(plan, tensors, symbolic_args)`` for the launch. Three things
+    ``launch_jobplan`` for the launch -- the typed per-symbol payload is the
+    runner's own, built in its constructor from the ``symbol_kinds`` handed to it
+    here, so ``run()`` itself takes only the tensors. Three things
     come with it that this backend did not have: the runtime initialization
     ``prepare_kernel`` requires, profiler events around both calls, and
     first-failure data capture — on a failed launch torch-spyre writes a JSON
@@ -216,8 +219,8 @@ class SpyreLauncher:
         # not have launched anyway.
         tensors = self._address_args(args)
 
-        runner = self._runner_for(function)
-        runner.run(*tensors, symbolic_args=self._symbolic_args(len(tensors)))
+        runner = self._runner_for(function, len(tensors))
+        runner.run(*tensors)
 
     def _address_args(self, args):
         """The launch arguments that carry an address, in kernel order.
@@ -231,11 +234,18 @@ class SpyreLauncher:
         launch-time channel at all — ``SymbolicArgKind::kDimension`` is where one
         would go, and it raises "not yet implemented" downstream. Passing one
         therefore comes out as an address-count disagreement, which
-        ``launch_jobplan`` rejects (see ``_symbolic_args``).
+        ``launch_jobplan`` rejects (see ``_symbol_kinds``).
 
         Order is the binding, not merely a convention: the correction flit is
         built by walking these positionally, so segment *i* belongs to argument
         *i* and a reordering silently patches the wrong segments.
+
+        That ordering is also what makes this the place the device-layout claims
+        are checked. The compile recorded them keyed by pointer *ordinal*, because
+        the IR carries no argument names; this loop produces exactly that sequence,
+        and it is the one place that has both the ordinal and the name a diagnostic
+        needs. See ``backend/tensor_layout.py`` for what the claim is and why the
+        two numbers it compares never met before.
         """
         names = list(self.src.signature)
         if len(args) != len(names):
@@ -244,6 +254,12 @@ class SpyreLauncher:
                 f"of {len(names)} ({names}). These are positionally paired, so "
                 "there is no safe way to guess which is which."
             )
+        # Absent, for a kernel compiled before this key existed or one entered at
+        # the .ktir stage, means no claim rather than no annotation -- so the
+        # lookup below simply finds nothing and every argument passes.
+        claims = tensor_layout.entries_by_ptr_index(
+            getattr(self.metadata, "device_layouts", None))
+
         tensors = []
         for name, arg in zip(names, args):
             if not str(self.src.signature[name]).startswith("*"):
@@ -259,10 +275,15 @@ class SpyreLauncher:
                     f"{getattr(arg, 'device', None)!r}. Move it with "
                     '.to("spyre") — there is no implicit host staging.'
                 )
+            # After the device check and before the launch: the claim is about a
+            # Spyre tensor's device storage, and a host tensor has none to measure.
+            claim = claims.get(len(tensors))
+            if claim is not None:
+                tensor_layout.check_fits(claim, name, arg)
             tensors.append(arg)
         return tensors
 
-    def _runner_for(self, code_dir):
+    def _runner_for(self, code_dir, address_count):
         """torch-spyre's runner for this artifact, built once and kept.
 
         *code_dir* is the unpacked export directory (``SpyreUtils.load_binary``
@@ -292,7 +313,9 @@ class SpyreLauncher:
             from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
 
             self._check_argument_mode_agrees()
-            self._runner = SpyreSDSCKernelRunner(self.metadata.name, str(code_dir))
+            self._runner = SpyreSDSCKernelRunner(
+                self.metadata.name, str(code_dir),
+                symbol_kinds=self._symbol_kinds(address_count))
         return self._runner
 
     def _check_argument_mode_agrees(self):
@@ -331,36 +354,38 @@ class SpyreLauncher:
             "for this process, or recompile with the value it already has."
         )
 
-    def _symbolic_args(self, count):
-        """The typed payload saying which tensor patches which symbol.
+    def _symbol_kinds(self, count):
+        """Which launch tensor patches which compiled address symbol.
 
-        One ``kAddress`` entry per address argument, in the order
-        ``_address_args`` returned them — which is the order the artifact's
+        One ``SymbolKind.kernel(i)`` per address argument, in the order
+        ``_address_args`` returned them -- which is the order the artifact's
         symbols were compiled in, so entry *i* resolves correction-vector slot
-        *i*.
+        *i*. ``SpyreSDSCKernelRunner`` turns each into a
+        ``SymbolicArg(kind=kAddress, tensor_id=arg_index)``; for this list that
+        is ``tensor_id == i``, i.e. the launch tensor at position *i*.
 
-        This is what replaced counting the artifact's own symbols here. With a
-        payload passed, ``JobPlanStepHostCompute::construct`` TORCH_CHECKs its
-        length against the compiled symbol count
-        (``hcm_->vdci.inputSym_.size()``) and a disagreement is loud. With an
-        empty one it takes the legacy path — walk every context tensor as an
-        address source, patch however many it finds — which is exactly the silent
-        wrong-segment failure the old ``_artifact_address_count`` check existed to
-        catch from outside.
+        Passing *something* is the point, not a formality. With a payload,
+        ``JobPlanStepHostCompute::construct`` TORCH_CHECKs its length against
+        the compiled symbol count (``hcm_->vdci.inputSym_.size()``) and a
+        disagreement raises. With none, the runner calls ``launch_jobplan``'s
+        two-argument form and the C++ takes the legacy path -- walk every
+        context tensor as an address source and patch however many it finds --
+        which is the silent wrong-segment failure the typed payload exists to
+        prevent.
 
         ``None`` in baked mode, where there are no symbols to patch: the
-        addresses are ``arith.constant`` in the binary, and the runner then takes
-        ``launch_jobplan``'s two-argument form.
+        addresses are ``arith.constant`` in the binary, and the runner then
+        takes ``launch_jobplan``'s two-argument form.
         """
         if not self.metadata.symbolic_args:
             return None
-        torch_spyre = _import_torch_spyre()
-        kind = torch_spyre._C.SymbolicArgKind.kAddress
-        # dim_index and value stay at their -1 defaults: they belong to
-        # kDimension, the runtime-scalar kind, which is not implemented
-        # downstream.
-        return [torch_spyre._C.SymbolicArg(kind=kind, tensor_id=index)
-                for index in range(count)]
+        _import_torch_spyre()
+        from torch_spyre._inductor.codegen.compute_ops import SymbolKind
+
+        # kernel() leaves offset/base_sym_idx at their defaults: those belong to
+        # the kernel_slice / kernel_derived variants, which describe addresses
+        # the compiler pre-offsets. Every address here is a whole-tensor base.
+        return [SymbolKind.kernel(index) for index in range(count)]
 
 
 class SpyreDriver(DriverBase):

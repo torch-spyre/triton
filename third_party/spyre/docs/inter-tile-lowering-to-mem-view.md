@@ -106,8 +106,7 @@ A redistribution needs only the **source** list. The destination arrangement is 
 each instance passes when it reads — see §2.
 
 The **stick** is the hardware's contiguous innermost unit, 128 bytes, so `S = 128 /
-itemsize` — 64 for fp16. Written `S` throughout, as in
-[spyre-tensor-layouts.md](spyre-tensor-layouts.md).
+itemsize` — 64 for fp16. Written `S` throughout.
 
 ### Assumptions this design relies on
 
@@ -568,7 +567,7 @@ collective call, a `mode` enum, one work-slice table, and a tensor result.
 
 **What lowers today.** `all_reduce` and `reduce_to_one`. `reduce_scatter` and `broadcast`
 are accepted by the Python surface and rejected by the pass
-([`LowerInterTile.cpp:340-346`](../lib/Dialect/KTDP/Transforms/LowerInterTile.cpp)), as are
+([`LowerInterTile.cpp:340-346`](../lib/Conversion/TritonToKTIR/LowerInterTile.cpp)), as are
 custom combiner regions (`:356`), non-contiguous groups (`:180-183`) and non-uniform `pick0`
 layouts for `reduce_to_one` (`:253-255`).
 

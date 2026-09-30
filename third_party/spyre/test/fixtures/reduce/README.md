@@ -15,9 +15,13 @@ serve the whole fixture: the output shape is the input's with axis 1 dropped.
 ## Variant hierarchy
 
 ```
-Level D  device               loop-free, stick-tiled; 2 variants, 1 launches
-         one_tile              1 key (folds the NON-stick axis; compiles_to_binary)
-         one_tile_on_stick     1 key (folds the STICK axis; ktir_cpu only)
+Level D  device               loop-free, stick-tiled; 5 variants, 4 launch
+         one_tile                   1 key (folds the NON-stick axis; launches)
+         one_tile_on_stick          1 key (folds the STICK axis, split; ktir_cpu only)
+         one_tile_on_stick_splat    1 key (the stick axis, statistic SPLAT; launches)
+      -- the reduce's CONSUMER: out = x - sum(x, axis), statistic through HBM
+         stat_chain_off_stick       1 key (launches; checked on both tiers)
+         stat_chain_on_stick        1 key (launches; ktir_cpu arm strict-xfailed)
 
 Level C  layout                stick physicalization, one dtype per variant
          spyre_stick               1 key (fp16, stick on the REDUCED axis)
@@ -68,14 +72,23 @@ No layout annotation anywhere here; that is Level C.
   dbo-opt refuses the loop that outlines from that. The one reduce that does
   reach a binary is the loop-free `one_tile` at `AXIS=0` (Level D).
 
-### Level C — layout (stick physicalization, on ktir_cpu)
+### Level C — layout (annotated kernels, on ktir_cpu)
+
+**What ktir_cpu sees here is no longer physicalized.** Physicalization moved to the
+`spyrecode` stage and the numerical tier reads the `ktir` stage's artifact, which
+is logical — see the note in `fixtures/README.md`. So these two arms check that an
+annotated kernel still computes the right answer, and the physical IR their
+descriptions below talk about is pinned by the lit fixtures under
+`test/Dialect/KTDP/Transforms/RewriteDescriptorLayoutGeneric/` and by the device
+tier instead. The descriptions are kept because they say what each variant is
+*for*, and the lit side is where they are now checked.
 
 The two arms are chosen for where the stick lands relative to the reduced axis.
 
 - **spyre_stick** (`reduce__spyre_stick[IN_LAYOUT=stick, OUT_LAYOUT=stick]`) —
   fp16. `in_ptr` is stick-on-N, so the **reduced** axis is the one split across
   the leading and trailing physical dims (`[M, N]` → `[ceil(N/S), M, S]`); this is
-  the source-reduce path through `RewriteDescriptorLayout`. `out_ptr` is a 1D
+  the source-reduce path through `RewriteDescriptorLayoutGeneric`. `out_ptr` is a 1D
   stick.
 - **middle_axis_spyre_stick** (`reduce__middle_axis_spyre_stick[IN_LAYOUT=stick]`)
   — fp32. `in_ptr` is stick-on-D2, an **unreduced** axis, which leaves the reduced
@@ -86,23 +99,24 @@ The two arms are chosen for where the stick lands relative to the reduced axis.
   indices would be the identity here and reduce the wrong axis.
 
 One dtype per variant, spelled once, in the `params` row that carries `N` (or
-`D2`) and the layouts that follow from it. A second dtype row would be one line;
-what keeps it out is that `rtol`/`atol` are fields rather than params, so both
-rows would share the tolerance the wider dtype needs and the fp32 arm would be
-checked more loosely than it can be.
+`D2`) and the layouts that follow from it. A second dtype row would be one line,
+and the tolerance no longer keeps it out: `rtol`/`atol` take a dict keyed by
+dtype (`tolerances` in `test/conftest.py`), so one entry can hold both rows and
+still check the fp32 arm as tightly as it deserves. Collapsing the pair is a
+rewrite nobody has done, not one the grammar refuses.
 
 ### Level D — device
 
-**Two variants, one of which launches.** Both are the whole reduce in a single
+**Five variants, four of which launch**, in two groups: three that WRITE a
+statistic, and two that read one back. Every one is the whole reduce in a single
 stick-tiled tile with no `tl.program_id` and no loop — elementwise's Level D
 shape, the one that does reach a binary — so what they hit is reduce's own
 obstacle rather than the `scf.for` refusal every other variant here shares.
 
-They are two variants rather than one `AXIS` sweep because what divides them is
-`compiles_to_binary` and `atol`, which are *fields*: one variant cannot carry two
-answers. That is the same constraint that keeps Level C at two variants. Collapse
-them into a single `AXIS: [0, 1]` sweep the day the on-stick arm reaches the
-device too.
+The first group is three variants rather than one `AXIS` sweep because what
+divides them is `compiles_to_binary` and `atol`, which are *fields*: one variant
+cannot carry two answers. That is the same constraint that keeps Level C at two
+variants.
 
 The first obstacle is shared, and neither variant asserts it. dbo-opt stops on
 
@@ -113,22 +127,25 @@ V1 only supports add/mul/sub/reduce compute ops; found unsupported compute op
 naming the neutral-element `linalg.fill` that `LowerComputeOps` puts on the
 reduction's `outs`. `linalg.reduce` is itself in that allowlist; the fill beside
 it is not. `DropReductionInitFill` removes exactly that fill, and the backend runs
-it unconditionally in `_make_spyrecode`, out of `_SPYRECODE_STAGE_PASSES` — the
-binary path only, since nothing that stops at KTIR cares. With it, our emission
-matches torch-spyre's, whose emitter never writes a fill in the first place.
+it unconditionally in the spyrecode stage, out of `buildSpyrecodePipeline`'s own
+list — the binary path only, since nothing that stops at KTIR cares. With it, our
+emission matches torch-spyre's, whose emitter never writes a fill in the first
+place.
 
 It lives on the binary path rather than in the pipeline every path crosses because
-it is a requirement of dbo-opt, not of the IR — and because the pass refuses any
-combiner whose identity is not zero: the scheduler resets a reduction accumulator
-to zero whatever the combiner is, so it reports rather than miscompile. On the
-KTIR path a `max` reduce still lowers and still runs on `ktir_cpu`.
+it is a requirement of dbo-opt, not of the IR: a reduce stripped of its neutral
+element means what it says only because a later pass writes the accumulator before
+it is read, and no KTIR reader can see that. Its gate is shape alone — it does not
+look at the combiner, which the scheduler initialises correctly whatever it is.
+See the header of `DropReductionInitFill.cpp`. On the KTIR path a `max` reduce
+still lowers and still runs on `ktir_cpu`.
 
 Past that the two diverge, on what happens to the stick split:
 
 - **one_tile** (`reduce__one_tile[IN_LAYOUT=stick, OUT_LAYOUT=stick]`) — folds M,
   the non-stick axis, deleting a whole physical dimension. The split of N
   survives, and because `OUT_LAYOUT` declares exactly the layout that leaves,
-  `RewriteDescriptorLayout` physicalizes the reduce's output and the surviving
+  `RewriteDescriptorLayoutGeneric` physicalizes the reduce's output and the surviving
   stick index becomes a **batch dimension** of the one `linalg.reduce`:
   `ins tensor<2x64x64> outs tensor<2x64> dimensions = [1]`, with `ktdp.store`
   consuming the result directly. That is the shape torch-spyre's working `sum`
@@ -136,8 +153,8 @@ Past that the two diverge, on what happens to the stick split:
 
   It used to walk the stick axis with an `scf.for` and a slice per stick, plus a
   second loop to re-tile for the store, and dbo-opt rejected the loop.
-  `Conversion/rewrite-descriptor-layout-reduce-batch-dim.mlir` pins the form that
-  replaced it; `docs/spyre-tensor-layouts.md` is the design.
+  `Dialect/KTDP/Transforms/RewriteDescriptorLayoutGeneric/rebuild-reduction.mlir`
+  pins the form that replaced it.
 
   Its `atol` is 0.25 rather than the elementwise-shaped 5e-2, set by the device
   arm and sized in ulp: the sums reach 24 where fp16 ulp is 0.015625, the device
@@ -158,5 +175,22 @@ Past that the two diverge, on what happens to the stick split:
   since nothing here runs on the device and it drifts only 0.0122 = 0.78 ulp —
   inheriting the sibling's 0.25 would check it 20x looser than it needs.
 
-Both assert the absence of `scf.for` structurally: no distribution loop and no
-stick loop.
+- **one_tile_on_stick_splat** (`reduce__one_tile_on_stick_splat[...]`) — the same
+  stick-axis fold, storing the statistic **splat** across a stick rather than
+  split across one. A splat replicates where a floordiv/mod partitions, which is
+  what gives the surviving extent somewhere to go, and the emitted reduce matches
+  what torch-spyre's own backend emits for `torch.sum(x, dim=-1)`. This is the arm
+  that reaches a binary where the split form cannot.
+
+All three assert the absence of `scf.for` structurally: no distribution loop and
+no stick loop.
+
+**The second group — the reduce's consumer.** `stat_chain_off_stick` and
+`stat_chain_on_stick` are `out = x - sum(x, axis)` with the statistic going
+through HBM: each arm's first compute group is verbatim one of the three above,
+and what is new is a SECOND group reading that statistic back and applying it to a
+full tile. Both launch. What they needed was not a layout change but a pass:
+reading a statistic back is a Triton broadcast, which used to survive to the
+layout pass as a generic with no descriptor and get bridged with a linearizing
+operand map; `FoldDataMovementGenerics` folds it into its consumer's map instead.
+The group banner in `meta.py` has the maps and the measurements.

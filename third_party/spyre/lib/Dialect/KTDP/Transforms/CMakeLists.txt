@@ -1,38 +1,32 @@
+# Transforms whose subject is the KTDP dialect's own abstractions -- memory
+# views and access tiles.
+#
+# LINK_LIBS derived from actual #includes plus Passes.td's dependentDialects.
+# No func, math, memref or spyreop: this pass touches none of them.
 add_triton_library(KTDPTransforms
-  ConvertFunctions.cpp
-  LowerDescriptorMemory.cpp
-  LowerScalarLoad.cpp
-  LowerComputeOps.cpp
-  LowerSpyreOps.cpp
-  LowerInterTile.cpp
-  RewriteDescriptorLayout.cpp
-  RewriteDescriptorLayout/Classify.cpp
-  RewriteDescriptorLayout/ContractionSynthesis.cpp
-  RewriteDescriptorLayout/IndexDomain.cpp
-  RewriteDescriptorLayout/PhysicalTypeAnalysis.cpp
-  RewriteDescriptorLayout/RequirementAnalysis.cpp
-  UnaliasLinalgOuts.cpp
-  DropReductionInitFill.cpp
-  DistributeWork.cpp
-  MaterializeBaseAddresses.cpp
-  Utility.cpp
+  RewriteDescriptorLayoutGeneric.cpp
 
   DEPENDS
   KTDPTransformsIncGen
+  # RewriteDescriptorLayoutGeneric.cpp includes the tts dialect's generated
+  # declarations through Dialect/TTS/IR/Dialect.h, so a clean parallel build
+  # must not rely on the link edge to order that tablegen ahead of it.
+  TTSIncGen
 
   LINK_LIBS PUBLIC
+  KTDPUtils
+  SpyreUtils
+  # For the shared tts.tensor_layout checker, which this library's generic
+  # layout pass and the dialect's own verifier both call.
+  TTSIR
   KTIR::KtdpDialect
-  KTIR::SpyreOpDialect
   TritonIR
   MLIRIR
   MLIRPass
-  MLIRFuncDialect
   MLIRArithDialect
   MLIRLinalgDialect
-  MLIRLinalgTransforms
-  MLIRMathDialect
-  MLIRMemRefDialect
   MLIRSCFDialect
   MLIRTensorDialect
+  # GreedyPatternRewriteDriver.cpp.
   MLIRTransformUtils
 )
