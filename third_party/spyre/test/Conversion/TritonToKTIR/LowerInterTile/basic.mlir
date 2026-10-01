@@ -1,16 +1,16 @@
 // RUN: spyre-triton-opt %s --lower-inter-tile -split-input-file | FileCheck %s
 
-// Tests for the --lower-inter-tile pass: tt.inter_tile_reduce → ktdp produce/reduce.
+// Tests for the --lower-inter-tile pass: tts.inter_tile_reduce → ktdp produce/reduce.
 
 // Fold-away: W[axis] == 1 → partial forwarded, no KTDP ops.
 
 // CHECK-LABEL: tt.func @fold_away_single_tile
 // CHECK-NOT:     ktdp.inter_tile_produce
 // CHECK-NOT:     ktdp.inter_tile_reduce
-// CHECK-NOT:     tt.inter_tile_reduce
+// CHECK-NOT:     tts.inter_tile_reduce
 // CHECK:         tt.return %arg0
 tt.func @fold_away_single_tile(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor<16xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<16xf32>)
          identities(%id : tensor<16xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -27,10 +27,10 @@ tt.func @fold_away_single_tile(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tenso
 // CHECK-LABEL: tt.func @fold_away_non_innermost_axis
 // CHECK-NOT:     ktdp.inter_tile_produce
 // CHECK-NOT:     ktdp.inter_tile_reduce
-// CHECK-NOT:     tt.inter_tile_reduce
+// CHECK-NOT:     tts.inter_tile_reduce
 // CHECK:         tt.return %arg0
 tt.func @fold_away_non_innermost_axis(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "y" mode = "all_reduce" combiner = "add"
@@ -43,10 +43,10 @@ tt.func @fold_away_non_innermost_axis(%p: tensor<8xf32>, %id: tensor<8xf32>) -> 
 
 // -----
 
-// all_reduce: produce/reduce pair emitted, tt.inter_tile_reduce erased.
+// all_reduce: produce/reduce pair emitted, tts.inter_tile_reduce erased.
 
 // CHECK-LABEL: tt.func @all_reduce_basic
-// CHECK-NOT:     tt.inter_tile_reduce
+// CHECK-NOT:     tts.inter_tile_reduce
 // CHECK:         %[[FUTURE:.*]] = ktdp.inter_tile_produce
 // CHECK:           ktdp.yield_partial %arg0
 // CHECK:         ktdp.inter_tile_reduce(%[[FUTURE]])
@@ -54,7 +54,7 @@ tt.func @fold_away_non_innermost_axis(%p: tensor<8xf32>, %id: tensor<8xf32>) -> 
 // CHECK:           ktdp.yield_reduced
 // CHECK:         tt.return
 tt.func @all_reduce_basic(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor<16xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<16xf32>)
          identities(%id : tensor<16xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -72,7 +72,7 @@ tt.func @all_reduce_basic(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor<16x
 // CHECK:         ktdp.inter_tile_produce producer_tiles_per_group = #[[$PROD:.*]] ->
 // CHECK:         ktdp.inter_tile_reduce({{.*}}) consumer_tiles_per_group = #[[$PROD]],
 tt.func @all_reduce_consumer_equals_producer(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -87,13 +87,13 @@ tt.func @all_reduce_consumer_equals_producer(%p: tensor<8xf32>, %id: tensor<8xf3
 // reduce_to_one: consumer set is pick0 (single-point equality).
 
 // CHECK-LABEL: tt.func @reduce_to_one_basic
-// CHECK-NOT:     tt.inter_tile_reduce
+// CHECK-NOT:     tts.inter_tile_reduce
 // CHECK:         ktdp.inter_tile_produce
 // CHECK:         ktdp.inter_tile_reduce({{.*}}) consumer_tiles_per_group = #[[$PICK0:.*]],
 // CHECK:           linalg.add
 // CHECK:           ktdp.yield_reduced
 tt.func @reduce_to_one_basic(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor<16xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<16xf32>)
          identities(%id : tensor<16xf32>)
          axis = "x" mode = "reduce_to_one" combiner = "add"
@@ -112,7 +112,7 @@ tt.func @reduce_to_one_basic(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor<
 // CHECK-LABEL: tt.func @reduce_to_one_pick0_not_lowest_tile
 // CHECK:         ktdp.inter_tile_reduce({{.*}}) consumer_tiles_per_group = #[[$PICK0]],
 tt.func @reduce_to_one_pick0_not_lowest_tile(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor<16xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<16xf32>)
          identities(%id : tensor<16xf32>)
          axis = "x" mode = "reduce_to_one" combiner = "add"
@@ -130,7 +130,7 @@ tt.func @reduce_to_one_pick0_not_lowest_tile(%p: tensor<16xf32>, %id: tensor<16x
 // CHECK:         ktdp.inter_tile_produce
 // CHECK:         ktdp.inter_tile_reduce
 tt.func @reduce_to_one_with_dep(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor<16xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<16xf32>)
          identities(%id : tensor<16xf32>)
          axis = "x" mode = "reduce_to_one" combiner = "add"
@@ -149,7 +149,7 @@ tt.func @reduce_to_one_with_dep(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tens
 // CHECK:         linalg.add
 // CHECK-SAME:      outs(%{{.*}} : tensor<8xf32>) -> tensor<8xf32>
 tt.func @combiner_add(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -165,7 +165,7 @@ tt.func @combiner_add(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
 // CHECK:         linalg.max
 // CHECK-SAME:      outs(%{{.*}} : tensor<8xf32>) -> tensor<8xf32>
 tt.func @combiner_max(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "max"
@@ -181,7 +181,7 @@ tt.func @combiner_max(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
 // CHECK:         linalg.mul
 // CHECK-SAME:      outs(%{{.*}} : tensor<8xf32>) -> tensor<8xf32>
 tt.func @combiner_mul(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "mul"
@@ -198,7 +198,7 @@ tt.func @combiner_mul(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
 // CHECK-LABEL: tt.func @result_type_f16
 // CHECK:         ktdp.inter_tile_reduce({{.*}}){{.*}}-> tensor<8xf16>
 tt.func @result_type_f16(%p: tensor<8xf16>, %id: tensor<8xf16>) -> tensor<8xf16> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf16>)
          identities(%id : tensor<8xf16>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -215,7 +215,7 @@ tt.func @result_type_f16(%p: tensor<8xf16>, %id: tensor<8xf16>) -> tensor<8xf16>
 // CHECK-LABEL: tt.func @result_type_preserves_rank
 // CHECK:         ktdp.inter_tile_reduce({{.*}}){{.*}}-> tensor<1x16xf32>
 tt.func @result_type_preserves_rank(%p: tensor<1x16xf32>, %id: tensor<1x16xf32>) -> tensor<1x16xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<1x16xf32>)
          identities(%id : tensor<1x16xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -230,13 +230,13 @@ tt.func @result_type_preserves_rank(%p: tensor<1x16xf32>, %id: tensor<1x16xf32>)
 // Multi-arity: 2 partials → 2 results.
 
 // CHECK-LABEL: tt.func @result_type_multi_arity
-// CHECK-NOT:     tt.inter_tile_reduce
+// CHECK-NOT:     tts.inter_tile_reduce
 // CHECK:         ktdp.inter_tile_produce
 // CHECK:         ktdp.inter_tile_reduce
 tt.func @result_type_multi_arity(%p0: tensor<8xf32>, %p1: tensor<8xf32>,
                                   %id0: tensor<8xf32>, %id1: tensor<8xf32>)
     -> (tensor<8xf32>, tensor<8xf32>) {
-  %0, %1 = tt.inter_tile_reduce
+  %0, %1 = tts.inter_tile_reduce
               partials(%p0, %p1 : tensor<8xf32>, tensor<8xf32>)
               identities(%id0, %id1 : tensor<8xf32>, tensor<8xf32>)
               axis = "x" mode = "all_reduce" combiner = "add"
@@ -251,11 +251,11 @@ tt.func @result_type_multi_arity(%p0: tensor<8xf32>, %p1: tensor<8xf32>,
 // Multi-axis: 2 groups x 2 tiles (axis="x" reduction, "y" group key).
 
 // CHECK-LABEL: tt.func @multi_axis_two_groups
-// CHECK-NOT:     tt.inter_tile_reduce
+// CHECK-NOT:     tts.inter_tile_reduce
 // CHECK:         ktdp.inter_tile_produce
 // CHECK:         ktdp.inter_tile_reduce
 tt.func @multi_axis_two_groups(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -271,7 +271,7 @@ tt.func @multi_axis_two_groups(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<
 // Double all_reduce: two independent reduces lower to 2 produce + 2 reduce.
 
 // CHECK-LABEL: tt.func @double_all_reduce
-// CHECK-NOT:     tt.inter_tile_reduce
+// CHECK-NOT:     tts.inter_tile_reduce
 // CHECK:         ktdp.inter_tile_produce
 // CHECK:         ktdp.inter_tile_reduce
 // CHECK:         linalg.max
@@ -281,7 +281,7 @@ tt.func @multi_axis_two_groups(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<
 tt.func @double_all_reduce(%pmax: tensor<8xf32>, %psum: tensor<8xf32>,
                             %idmax: tensor<8xf32>, %idsum: tensor<8xf32>)
     -> (tensor<8xf32>, tensor<8xf32>) {
-  %rowmax = tt.inter_tile_reduce
+  %rowmax = tts.inter_tile_reduce
               partials(%pmax : tensor<8xf32>)
               identities(%idmax : tensor<8xf32>)
               axis = "out" mode = "all_reduce" combiner = "max"
@@ -289,7 +289,7 @@ tt.func @double_all_reduce(%pmax: tensor<8xf32>, %psum: tensor<8xf32>,
                coreIdToWkSlice = [{mb = 0 : i64, out = 0 : i64}, {mb = 0 : i64, out = 1 : i64},
                                   {mb = 1 : i64, out = 0 : i64}, {mb = 1 : i64, out = 1 : i64}]}
               -> (tensor<8xf32>)
-  %rowsum = tt.inter_tile_reduce
+  %rowsum = tts.inter_tile_reduce
               partials(%psum : tensor<8xf32>)
               identities(%idsum : tensor<8xf32>)
               axis = "out" mode = "all_reduce" combiner = "add"
@@ -311,7 +311,7 @@ tt.func @double_all_reduce(%pmax: tensor<8xf32>, %psum: tensor<8xf32>,
 // CHECK:         ktdp.inter_tile_produce producer_tiles_per_group = #[[$PROD_4]] -> <(tensor<16xf32>), groups = #[[$GROUPS_1]]>
 // CHECK:         ktdp.inter_tile_reduce({{.*}}) consumer_tiles_per_group = #[[$PROD_4]],{{.*}}: <(tensor<16xf32>), groups = #[[$GROUPS_1]]>
 tt.func @groups_partition_single_axis(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor<16xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<16xf32>)
          identities(%id : tensor<16xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -332,7 +332,7 @@ tt.func @groups_partition_single_axis(%p: tensor<16xf32>, %id: tensor<16xf32>) -
 // CHECK:         ktdp.inter_tile_produce producer_tiles_per_group = #[[$PROD_2]] -> <(tensor<8xf32>), groups = #[[$GROUPS_2]]>
 // CHECK:         ktdp.inter_tile_reduce({{.*}}) consumer_tiles_per_group = #[[$PROD_2]],{{.*}}: <(tensor<8xf32>), groups = #[[$GROUPS_2]]>
 tt.func @groups_partition_multi_group(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -352,7 +352,7 @@ tt.func @groups_partition_multi_group(%p: tensor<8xf32>, %id: tensor<8xf32>) -> 
 // CHECK:         ktdp.inter_tile_reduce(%[[F]])
 // CHECK-NOT:     ktdp.inter_tile_reduce(%[[F]])
 tt.func @future_single_use(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "x" mode = "all_reduce" combiner = "add"
@@ -364,7 +364,7 @@ tt.func @future_single_use(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf3
 
 // -----
 
-// No-op: module without tt.inter_tile_reduce passes through unchanged.
+// No-op: module without tts.inter_tile_reduce passes through unchanged.
 
 // CHECK-LABEL: tt.func @no_op
 // CHECK-NOT:     ktdp.inter_tile_produce
@@ -387,11 +387,11 @@ tt.func @no_op(%a: tensor<16xf32>) -> tensor<16xf32> {
 // CHECK:       #[[$GROUPS_16:.*]] = affine_set<(d0) : (d0 >= 0, -d0 + 15 >= 0)>
 // CHECK:       #[[$PICK0_16:.*]] = affine_set<(d0)[s0] : (d0 - s0 * 2 == 0)>
 // CHECK-LABEL: tt.func @groups_16_two_digit_labels
-// CHECK-NOT:     tt.inter_tile_reduce
+// CHECK-NOT:     tts.inter_tile_reduce
 // CHECK:         ktdp.inter_tile_produce producer_tiles_per_group = #[[$PROD_16]] -> <(tensor<16xf32>), groups = #[[$GROUPS_16]]>
 // CHECK:         ktdp.inter_tile_reduce({{.*}}) consumer_tiles_per_group = #[[$PICK0_16]],
 tt.func @groups_16_two_digit_labels(%p: tensor<16xf32>, %id: tensor<16xf32>) -> tensor<16xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<16xf32>)
          identities(%id : tensor<16xf32>)
          axis = "k" mode = "reduce_to_one" combiner = "add"
@@ -423,10 +423,10 @@ tt.func @groups_16_two_digit_labels(%p: tensor<16xf32>, %id: tensor<16xf32>) -> 
 // CHECK:       #[[$PROD_P:.*]] = affine_set<(d0)[s0] : (d0 - s0 * 2 >= 0, -d0 + s0 * 2 + 1 >= 0)>
 // CHECK:       #[[$GROUPS_P:.*]] = affine_set<(d0) : (d0 >= 0, -d0 + 2 >= 0)>
 // CHECK-LABEL: tt.func @groups_labels_not_ascending
-// CHECK-NOT:     tt.inter_tile_reduce
+// CHECK-NOT:     tts.inter_tile_reduce
 // CHECK:         ktdp.inter_tile_produce producer_tiles_per_group = #[[$PROD_P]] -> <(tensor<8xf32>), groups = #[[$GROUPS_P]]>
 tt.func @groups_labels_not_ascending(%p: tensor<8xf32>, %id: tensor<8xf32>) -> tensor<8xf32> {
-  %0 = tt.inter_tile_reduce
+  %0 = tts.inter_tile_reduce
          partials(%p : tensor<8xf32>)
          identities(%id : tensor<8xf32>)
          axis = "k" mode = "all_reduce" combiner = "add"

@@ -24,7 +24,7 @@ splitk (reduce_to_one, f32):
   handles arbitrary M for the fixed grid.
 
 No stick-layout variant: LowerInterTile refuses a kernel carrying both a layout
-marker and a ``tt.inter_tile_reduce``. The layout pass cannot carry a physical
+marker and a ``tts.inter_tile_reduce``. The layout pass cannot carry a physical
 type through the produce/reduce pair either, which communicates through a
 ``!ktdp.tile_future`` whose tensor types are nested inside the type.
 
@@ -86,7 +86,7 @@ def run_element_sum(inputs: dict, BLOCK_M: int, BLOCK_N: int, NUM_N_TILES: int, 
 
     If the ``tl.inter_tile`` API or the fixture grid changes this oracle must
     be updated to match.  The exact KTIR structure (affine sets, combiner op)
-    is pinned by ``Conversion/TritonToKTIR/lower-inter-tile.mlir``, so a lowering
+    is pinned by ``Conversion/TritonToKTIR/LowerInterTile/basic.mlir``, so a lowering
     regression surfaces there before this oracle becomes the only signal.
     """
     x = inputs["x_ptr"]
