@@ -61,7 +61,9 @@ representation.
 ## Staged intrinsics with a software fallback
 
 ```
-kernel API  →  tts.spyre_op  →  (fallback body, pure KTIR)  →  LowerSpyreOps  →  spyreop.*
+                              ┌─ _make_ktir:       dissolve tts.spyre_op → plain fallback ops (cached, generic)
+kernel API  →  tts.spyre_op  ─┤
+                              └─ _make_spyrecode:  LowerSpyreOps (hint match) → spyreop.*
 ```
 
 ### 1. `@tl.spyre_intrinsic`: a decorator over a real fallback implementation
@@ -103,16 +105,67 @@ inline the fallback body into the caller. It emits one TTIR op,
 ```
 
 This single op is what makes the generic/Spyre-specific split work in
-practice: `_make_ktir` can simply treat the region as the op's real
-content (nothing about `tts.spyre_op` itself, or the ops inside its
-region, is Spyre-specific), while `_make_spyrecode` has a stable,
-hint-tagged anchor to pattern-match and replace with the real
-`spyreop.*` op. Nothing about an unknown or future intrinsic
-needs its own TTIR op — one generic staging op serves all of them, the
-same economy-of-surface-area the earlier direct-emission design wanted,
-just moved one level later.
+practice: the ops inside its region are plain `linalg`/`arith`/`math`,
+nothing Spyre-specific, and `_make_spyrecode` has a stable, hint-tagged
+anchor to pattern-match and replace with the real `spyreop.*` op. Making
+`_make_ktir`'s own cached output equally generic takes one more step,
+though — the staging op itself still needs to be gone from that artifact,
+not just its contents — covered next. Nothing about an unknown or future
+intrinsic needs its own TTIR op either way: one generic staging op serves
+all of them, the same economy-of-surface-area the earlier direct-emission
+design wanted, just moved one level later.
 
-### 3. `ExpandSpyreOps`: splitting composite intrinsics
+### 3. Dissolving `tts.spyre_op` before `_make_ktir` caches its output (open design item)
+
+Keeping `_make_ktir`'s artifact free of `spyreop.*` is not enough on its
+own: if `tts.spyre_op` itself survives into that cached artifact, the
+artifact still contains a custom, newly-introduced op type that nothing
+outside this proposal knows how to interpret — including `ktir_cpu`,
+which would then need special-cased support for `tts.spyre_op`
+specifically rather than genuinely consuming plain KTIR. That reintroduces,
+one level up, the same problem staging exists to avoid.
+
+So `_make_ktir`'s pipeline needs an explicit step — called
+`DissolveSpyreOpStaging` here as a placeholder name, not a committed one
+— that runs before the artifact is cached and replaces each remaining
+`tts.spyre_op` with the contents of its own region: the region's ops are
+spliced in directly where the staging op was, its `tts.yield` operand is
+wired to the staging op's result, and the hint attribute and the
+`tts.spyre_op`/`tts.yield` wrapper are both dropped entirely. After this
+step, nothing in the cached artifact names `tts.spyre_op` at all — only
+the plain `linalg`/`arith`/`math` ops the fallback body was written in,
+which is what makes the artifact genuinely generic rather than merely
+free of `spyreop.*`.
+
+This step does not exist today, in any form, and this proposal does not
+yet have a concrete design for it. The real `_make_ktir` pipeline
+(`LowerDescriptorMemory`, `LowerScalarLoad`, `LowerTTSMarkers`,
+`LowerComputeOps`, `LowerInterTile`, `ConvertFunctions`, `DistributeWork`,
+`Canonicalizer`) has nothing that performs this dissolution today, so it
+is recorded here as new, required work the staged design depends on — not
+an implementation detail to fill in later without affecting the design.
+
+It also raises an ordering question the staged design has to answer, not
+just implement: `_make_spyrecode`'s `LowerSpyreOps` needs the hint to pick
+the right `spyreop.*` op, but if `_make_ktir`'s own pipeline already
+dissolves that hint away before caching, `_make_spyrecode` cannot simply
+consume the cached artifact and expect the hint to still be there. This
+proposal does not yet pick between the two ways to resolve that:
+
+- `_make_spyrecode` operates on a form of the IR captured before
+  dissolution runs, kept separate from the cached, `ktir_cpu`-facing
+  artifact; or
+- the dissolution step itself leaves behind a discardable, non-structural
+  marker on the spliced-in ops that only `LowerSpyreOps` reads (and then
+  removes), so the cached artifact stays clean for every other consumer
+  while `LowerSpyreOps` can still recover which hint applied to which ops.
+
+Either is workable, but the choice affects both passes' design, so it is
+called out here as something this proposal still needs to settle, not
+something implicit in "the artifact is generic and `LowerSpyreOps`
+matches on the hint" as stated above.
+
+### 4. `ExpandSpyreOps`: splitting composite intrinsics
 
 A composite like `layernorm` doesn't lower to one `spyreop.*` op; it
 expands, during lowering, into a short internal sequence
@@ -124,7 +177,7 @@ each with its own hint and its own slice of the fallback body, so that
 needing a single pattern that understands the whole composite's internal
 protocol at once.
 
-### 4. `LowerSpyreOps`: hint-based matching, alongside its existing job
+### 5. `LowerSpyreOps`: hint-based matching, alongside its existing job
 
 `LowerSpyreOps` already exists and already rewrites `math.sqrt` →
 `spyreop.sqrt` by ordinary pattern matching, in `_make_spyrecode`. This
@@ -146,7 +199,7 @@ unaffected by any of the above:
 | `tl.exp(x)` | `math.exp` | `spyreop.exp` |
 | `tl.sqrt(x)` | `math.sqrt` | `spyreop.sqrt` |
 | `tl.rsqrt(x)` | `math.rsqrt` | `spyreop.rsqrt` |
-| `x / y` | `arith.divf` | `spyreop.realdiv` |
+| `x / y` | `arith.divf` | `spyreop.realdiv` (or `spyreop.reciprocal` when the numerator is a constant `1.0` — see *Reciprocal*, below) |
 | `x + y`, `x * y` (int32/int64, inside elementwise compute) | `arith.addi`/`arith.muli` | `spyreop.addi32toi32` / `addi64toi64` / `muli32toi32` |
 | `tl.where(cond, x, y)` | `arith.cmpf` + `arith.select` | `spyreop.compare` + `spyreop.select`, via pattern recognition (PR #215) — see below |
 
@@ -234,12 +287,16 @@ def my_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
 `tl.exp(x)` traces to `math.exp`, which `LowerSpyreOps`'s existing
 structural matching turns into `spyreop.exp` in `_make_spyrecode` — no
 `tts.spyre_op` involved at any point. `spyre.spyre_gelu(x)` traces to
-`tts.spyre_op {hint = "gelu"}` wrapping the fallback body;
-`_make_ktir`'s artifact keeps that fallback body (so `ktir_cpu` can run
-it), and `_make_spyrecode`'s extended `LowerSpyreOps` replaces the whole
-staging op with `spyreop.gelu`. Both calls end up fully lowered by the
-time `_make_spyrecode` is done; the difference is invisible from the
-kernel author's side and only matters to how the compiler gets there.
+`tts.spyre_op {hint = "gelu"}` wrapping the fallback body. `_make_ktir`'s
+pipeline dissolves that staging op before caching its artifact (see
+*Dissolving `tts.spyre_op`*, above), so what `ktir_cpu` actually runs is
+the fallback body's own ops, spliced in directly with no `tts.spyre_op`
+wrapper left behind. `_make_spyrecode`'s extended `LowerSpyreOps`
+instead replaces the whole staging op — hint, region, and all — with
+`spyreop.gelu`, ahead of whatever point dissolution would otherwise erase
+the hint it needs. Both calls end up fully lowered by the time
+`_make_spyrecode` is done; the difference is invisible from the kernel
+author's side and only matters to how the compiler gets there.
 
 ## Initial operation set
 
@@ -298,24 +355,57 @@ the multi-op decomposition happens entirely inside pattern-based lowering,
 with nothing staged and nothing added to the frontend surface.
 
 
-## Reciprocal: explicit only, never inferred
+## Reciprocal: an existing automatic rewrite, plus an explicit intrinsic
 
-`spyre_reciprocal(x)` is the only way to reach the dedicated hardware
-reciprocal instruction. `1 / x` continues to lower to `spyreop.realdiv`,
-unconditionally, with **no** compiler pattern that rewrites a
-`1.0`-numerator division into `reciprocal`.
+`LowerSpyreOps` already contains a rewrite, independent of this proposal,
+that recognizes a constant-`1.0` numerator in `arith.divf` and rewrites it
+to `spyreop.reciprocal` rather than `spyreop.realdiv`, unconditionally —
+this is existing `_make_spyrecode` behavior today, not something this
+proposal introduces or should describe as absent:
 
-This is a deliberate choice, not an oversight: `1 / x` and `reciprocal(x)`
-are not guaranteed to be the same operation. A hardware reciprocal
-instruction may trade numerical exactness for speed in a way ordinary
-division does not — notably, `spyre_reciprocal`'s own software fallback
-(ordinary division, for `ktir_cpu`'s purposes) is therefore **not** a
+```cpp
+// arith.divf has two targets rather than one: a numerator of constant 1
+// becomes the unary spyreop.reciprocal and everything else the binary
+// spyreop.realdiv.
+```
+
+So `1 / x`, written literally, already lowers to `spyreop.reciprocal`
+today, with no `@tl.spyre_intrinsic` involved at all.
+
+That existing rewrite covers the common case where a kernel author
+happens to write division by the literal constant one. It is not a
+substitute for keeping an explicit `spyre_reciprocal(x)` intrinsic in the
+initial operation set, for two reasons:
+
+- **Not every call site is reachable as a literal `1.0`-numerator
+  division.** Wherever the numerator is an expression rather than the
+  literal constant `1.0` — even one provably equal to one by other means
+  — the existing pattern match doesn't fire, and the kernel falls back to
+  `spyreop.realdiv` whether or not the author actually wanted the
+  dedicated reciprocal instruction.
+- **An explicit call states intent directly**, independent of how the
+  division happens to be spelled, giving `LowerSpyreOps` an unambiguous
+  signal rather than inferring intent from a specific numerator shape.
+
+The two paths are expected to coexist: `1 / x` continues to be caught by
+the existing `arith.divf` rewrite exactly as it is today, and
+`spyre_reciprocal(x)` remains available as a direct, staged intrinsic
+(fallback: ordinary division, for `ktir_cpu`) for a kernel author who
+wants to request the dedicated instruction explicitly rather than relying
+on how a division happens to be written. Both are expected to compile to
+the same `spyreop.reciprocal` op; this proposal does not change the
+existing `arith.divf` → `spyreop.reciprocal` rewrite, and does not propose
+removing it in favor of the explicit intrinsic.
+
+The numeric-divergence note from the original framing still applies to
+the explicit intrinsic's fallback, unchanged by this revision: a hardware
+reciprocal instruction may trade numerical exactness for speed in a way
+ordinary division does not, so `spyre_reciprocal`'s own software fallback
+(ordinary division, for `ktir_cpu`'s purposes) is **not** necessarily a
 numerically exact stand-in for what `spyreop.reciprocal` actually computes
-on real hardware; the two are expected to diverge slightly, by design, and
-that divergence is an accepted property of this op specifically, not a
-fallback-fidelity bug. Silently substituting one for the other — inferring
-the faster, less exact op from an author's use of the exact one, or vice
-versa — removes a choice that belongs to whoever is writing the kernel.
+on real hardware — the two are expected to diverge slightly, by design.
+What changes here is only the claim that `1 / x` never reaches
+`reciprocal` without going through the intrinsic; it already does.
 
 ## LayerNorm: one composite operation, not three primitives
 
@@ -489,6 +579,11 @@ the transparent path.
 
 ## Summary of open questions
 
+- **Dissolving `tts.spyre_op` before `_make_ktir` caches its output.** No
+  pass does this today, and this proposal does not yet have a concrete
+  design for it, nor a resolution to the ordering question it raises
+  against `_make_spyrecode`'s hint-based matching — see *Dissolving
+  `tts.spyre_op` before `_make_ktir` caches its output*, above.
 - **DF16 frontend support.** How a Spyre-native 16-bit type interacts with
   intrinsic signatures, fallback bodies, and `ktir_cpu`'s numerics —
   unresolved, see above.
