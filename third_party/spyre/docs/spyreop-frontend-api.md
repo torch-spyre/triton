@@ -1,385 +1,532 @@
-# tl.spyre_op: A Generic Triton Frontend Interface for SpyreOps
+# `@tl.spyre_intrinsic`: A Staged Frontend Interface for SpyreOps
 
-This proposal introduces a single, string-dispatched Triton frontend entry
-point,
+This proposal introduces a frontend mechanism for exposing Spyre-only
+compute intrinsics — the SpyreOp dialect ops that have no portable meaning
+in ordinary Triton — to kernel authors, staged through a software-fallback
+TTIR representation rather than emitted directly:
 
 ```python
-tl.spyre_op(op_name, *args, **attrs)
+spyre_gelu(x)       # a backend-authored wrapper, decorated with @tl.spyre_intrinsic
 ```
 
-as the mechanism for exposing Spyre-only compute intrinsics — the SpyreOp
-dialect ops that have no portable meaning in ordinary Triton — to kernel
-authors. Operations that already have a natural Triton spelling (`tl.exp`,
+Operations that already have a natural Triton spelling (`tl.exp`,
 `tl.sqrt`, arithmetic operators, ...) are unaffected: the compiler continues
 to lower them to their SpyreOp equivalents internally, with no frontend
-change. `tl.spyre_op` covers everything else: activation functions with no
-existing Triton name, address-generation intrinsics, Element Arrangement
-(EA) rearrangement, and composite fused operations such as `layernorm` that
-must not leak their internal representation into kernel code.
+change. This mechanism covers everything else: activation functions with no
+existing Triton name, address-generation intrinsics, and composite fused
+operations such as `layernorm` that must not leak their internal
+representation into kernel code.
 
 
+## KTIR must stay backend-independent
 
+KTIR is not a Spyre-specific representation. It is the common lowering
+target `_make_ktir` produces for *any* backend built on it, and its
+abstractions — `linalg`, `arith`, `math`, and friends — are defined with no
+knowledge of Spyre at all. `spyreop.*` is exactly the opposite: a dialect
+that exists only to name Spyre-hardware-specific operations, and it
+belongs exclusively to the Spyre-specific half of the pipeline —
+`_make_spyrecode` and the `LowerSpyreOps` pass that already runs there
+today for `math.sqrt` and friends.
 
-## The problem
+`_make_ktir`'s job, by construction, is to produce generic KTIR. Letting a
+`spyreop.*` op appear in its output — the direct-emission design this
+proposal previously recommended — breaks that separation: it puts a
+Spyre-only op into a representation that is supposed to mean the same
+thing regardless of backend, for any intrinsic that has no pre-existing
+portable spelling. `tl.sqrt` happens not to raise this problem, because
+`math.sqrt` is already a generic, backend-agnostic op in its own right.
+`spyreop.gelu` does: there is no generic KTIR op that already means
+"GELU," so a direct-emission design would have no choice but to put a
+Spyre-specific op directly into `_make_ktir`'s otherwise-generic output.
+That is an architectural layering violation, not a style preference, and
+it is the reason this proposal now adopts a staged design: **every new
+intrinsic needs a generic KTIR representation it can trace to that isn't
+`spyreop.*` itself**, so that `_make_ktir`'s output stays Spyre-agnostic
+regardless of which intrinsics a kernel happens to call.
 
-The SpyreOp dialect already has more ops than the frontend can name one at
-a time without constant churn. Some of its ops overlap cleanly with
-existing Triton semantics (`sqrt`, `exp`, `rsqrt`, integer add/mul,
-division) and are already lowered to automatically. Others — activation
-functions with no existing Triton spelling, address-generation intrinsics,
-and fused multi-op sequences that depend on arrangement tricks — have
-nothing to attach to. Minting a dedicated `@builtin` function for each of
-these ties every new SpyreOp to a new frontend PR, and the set of these
-ops is expected to keep growing as address-generation, data-layout, and
-fused operations are added.
+A useful consequence of keeping `_make_ktir`'s output generic falls out of
+this for free: because the artifact never contains `spyreop.*`, it also
+happens to be exactly what `ktir_cpu` — the numerical interpreter the test
+suite runs against, which has no `spyreop` support — needs in order to
+execute it directly and verify the kernel's numerics on the CPU. That is a
+real and valuable benefit of this design, but it is a consequence of
+keeping KTIR backend-independent, not the reason for doing so: the
+staging design would still be the right one even for a hypothetical
+backend with no CPU interpreter at all, because the underlying problem —
+a Spyre-only op leaking into a representation that is supposed to be
+generic — has nothing to do with who else happens to consume that
+representation.
 
-`tl.spyre_op` exists to give that growing set exactly one place to land,
-without requiring a new Python entry point for each addition.
+## Staged intrinsics with a software fallback
 
-## What already works, unchanged
+```
+kernel API  →  tts.spyre_op  →  (fallback body, pure KTIR)  →  LowerSpyreOps  →  spyreop.*
+```
 
-Where a portable, backend-agnostic Triton spelling already exists for the
-underlying math, kernel authors keep using it, and the compiler decides
-internally whether to fuse it into the corresponding SpyreOp. This
-proposal does not touch this path.
+### 1. `@tl.spyre_intrinsic`: a decorator over a real fallback implementation
+
+```python
+@tl.spyre_intrinsic("gelu")
+def spyre_gelu(x):
+    return 0.5 * x * (1.0 + tl.math.tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
+```
+
+The decorated function's body is not a stub or a docstring — it is a
+working implementation of the op, expressed in ordinary Triton/TTIR
+operations, and it is what actually runs when `ktir_cpu` executes the
+op numerically. `tl.spyre_op(op_name, *args, **attrs)` still exists
+underneath the decorator as the low-level builtin that records the
+intrinsic's name and operands, but it is internal plumbing now, not a
+user-facing entry point — a kernel author calls `spyre_gelu(x)`, never
+`tl.spyre_op("gelu", x)` directly.
+
+### 2. `tts.spyre_op`: the TTIR staging op
+
+Tracing a call to a `@tl.spyre_intrinsic`-decorated function does not
+inline the fallback body into the caller. It emits one TTIR op,
+`tts.spyre_op`, carrying:
+
+- a **hint** attribute naming the intrinsic (`"gelu"`), used later purely
+  for matching, and
+- a **nested region** holding the fallback body, traced under ordinary
+  semantics — so the region by itself is just `linalg`/`arith`/`math`,
+  with nothing Spyre-specific in it.
+
+```mlir
+%r = tts.spyre_op {hint = "gelu"} (%x) ({
+  ^bb0(%arg: tensor<...xf32>):
+    // fallback body: the traced form of spyre_gelu's Python source
+    ...
+    tts.yield %result : tensor<...xf32>
+}) : (tensor<...xf32>) -> tensor<...xf32>
+```
+
+This single op is what makes the generic/Spyre-specific split work in
+practice: `_make_ktir` can simply treat the region as the op's real
+content (nothing about `tts.spyre_op` itself, or the ops inside its
+region, is Spyre-specific), while `_make_spyrecode` has a stable,
+hint-tagged anchor to pattern-match and replace with the real
+`spyreop.*` op. Nothing about an unknown or future intrinsic
+needs its own TTIR op — one generic staging op serves all of them, the
+same economy-of-surface-area the earlier direct-emission design wanted,
+just moved one level later.
+
+### 3. `ExpandSpyreOps`: splitting composite intrinsics
+
+A composite like `layernorm` doesn't lower to one `spyreop.*` op; it
+expands, during lowering, into a short internal sequence
+(`EXX2`, a scale op, a norm op — see *LayerNorm*, below). `ExpandSpyreOps`
+runs between tracing and `LowerSpyreOps` and splits one
+`tts.spyre_op {hint = "layernorm"}` into several smaller `tts.spyre_op`s,
+each with its own hint and its own slice of the fallback body, so that
+`LowerSpyreOps` can replace each sub-step independently rather than
+needing a single pattern that understands the whole composite's internal
+protocol at once.
+
+### 4. `LowerSpyreOps`: hint-based matching, alongside its existing job
+
+`LowerSpyreOps` already exists and already rewrites `math.sqrt` →
+`spyreop.sqrt` by ordinary pattern matching, in `_make_spyrecode`. This
+proposal extends it with a second matching mode: given a `tts.spyre_op`,
+look up its hint, discard the fallback region, and emit the `spyreop.*`
+op the hint names. The existing structural pattern matching
+(`math.sqrt` → `spyreop.sqrt`, and friends) is unaffected and keeps
+running in the same pass — this adds a second rule set, not a
+replacement.
+
+## Preserving the existing Triton path
+
+`tl.exp`, `tl.sqrt`, `tl.rsqrt`, `tl.where`, and the arithmetic operators
+keep working exactly as they do today, through their existing route,
+unaffected by any of the above:
 
 | Triton source | TTIR | Spyre lowering |
 |---|---|---|
-| `tl.exp(x)` | `math.exp` | `spyreop.exp` (F16/F32 only) |
+| `tl.exp(x)` | `math.exp` | `spyreop.exp` |
 | `tl.sqrt(x)` | `math.sqrt` | `spyreop.sqrt` |
 | `tl.rsqrt(x)` | `math.rsqrt` | `spyreop.rsqrt` |
 | `x / y` | `arith.divf` | `spyreop.realdiv` |
 | `x + y`, `x * y` (int32/int64, inside elementwise compute) | `arith.addi`/`arith.muli` | `spyreop.addi32toi32` / `addi64toi64` / `muli32toi32` |
+| `tl.where(cond, x, y)` | `arith.cmpf` + `arith.select` | `spyreop.compare` + `spyreop.select`, via pattern recognition (PR #215) — see below |
 
+None of these ever produce a `tts.spyre_op` — they trace straight to
+`math.*`/`arith.*`, which is already a valid, portable fallback in its own
+right, and `LowerSpyreOps`'s existing structural matching handles them in
+`_make_spyrecode` exactly as it does today. **`@tl.spyre_intrinsic` is not
+a replacement for these APIs** and this proposal does not recommend
+migrating them onto it. The staged path exists for the cases the
+transparent path cannot cover:
 
-The rule for what belongs in this table rather than behind `tl.spyre_op`:
-**does this op already have, or naturally deserve, a spelling that makes
-sense on every backend?** If yes, it stays here, regardless of how it
+- **Spyre-only operations** with no portable meaning at all (`addi32toi32`,
+  `idx32toaddr`).
+- **Operations with no standard Triton spelling**, even where the
+  underlying math could in principle be written out by hand (`gelu`,
+  `reciprocal`).
+- **Composite operations** that must not leak an internal, unnamed
+  representation into kernel code (`layernorm`).
+
+The rule for which bucket an op falls into is that if it
+already has, or naturally deserves, a spelling that makes sense on every
+backend, it stays on the transparent path above, regardless of how it
 happens to be implemented on Spyre.
 
-## The proposal
+## Who writes `@tl.spyre_intrinsic` functions?
 
-### 1. A single generic entry point
+**Spyre backend/compiler developers, not kernel authors.** A fallback
+body is not an arbitrary convenience implementation — it is what
+`ktir_cpu` treats as ground truth for the op during `_make_ktir`, so it
+must be numerically faithful to the real `spyreop.*` op's defined
+semantics. Getting that right requires exactly the dialect-level knowledge
+(what the op computes, what its edge cases are) that only someone
+implementing or maintaining the SpyreOp dialect reliably has. These
+functions are shipped as part of Spyre's own frontend library, in the same
+spirit the current registry's arity/dtype table was backend-maintained
+rather than something each kernel wrote per-call:
 
 ```python
-@core.builtin
-def spyre_op(op_name: tl.constexpr, *args, **attrs) -> tensor:
+# illustrative — exact module path not fixed by this proposal
+# triton/language/extra/spyre/intrinsics.py
+
+import triton.language as tl
+
+@tl.spyre_intrinsic("gelu")
+def spyre_gelu(x):
+    ...
+
+@tl.spyre_intrinsic("layernorm")
+def spyre_layernorm(x, weight, bias, eps: tl.constexpr, axis: tl.constexpr):
     ...
 ```
 
-`op_name` is an ordinary Python string literal. Like any non-tensor
-argument to a Triton function, it is a compile-time constant by
-construction — Triton specializes on it the same way it specializes on a
-`tl.constexpr` shape argument, so there is nothing to opt into and nothing
-extra for the caller to annotate.
+exported as, illustratively, `triton.language.extra.spyre`, providing
+`spyre_gelu`, `spyre_layernorm`, and the rest of the initial operation set
+below. Nothing in the decorator mechanism technically prevents a kernel
+author from writing their own `@tl.spyre_intrinsic`-decorated function,
+but doing so correctly requires knowing the exact hint string
+`LowerSpyreOps` matches on and the real op's semantics — implementation-
+internal knowledge, in the same way hand-constructing `spyreop.*` TTIR
+today is possible but not intended. The expectation is a closed,
+backend-maintained set, not an open one.
 
-`*args` are the operation's tensor/scalar SSA operands. `**attrs` are its
-compile-time parameters — the same role `base_address`/`stride` already
-play on `Spyre_Idx32ToAddr`, or `beta`/`threshold` on `Spyre_Softplus`.
+## What kernel authors actually write
 
-### 2. A registry, not a bare string match
-
-`spyre_op` is not a raw dispatch on an unchecked string. Each supported
-`op_name` has an entry in an internal table naming its operand arity and
-dtypes, its required attributes and their types, and its result-type rule:
+A kernel author imports the pre-built wrappers and calls them like any
+other `tl.*` function — no decorator, no hint string, no awareness that a
+staging op exists underneath:
 
 ```python
-_SPYRE_OP_REGISTRY: dict[str, SpyreOpSpec] = {
-    "gelu":        SpyreOpSpec(arity=1, dtypes=(fp16)),
-    "silu":        SpyreOpSpec(arity=1, dtypes=(fp16, fp32)),
-    "reciprocal":  SpyreOpSpec(arity=1, dtypes=(fp16, fp32)),
-    "softplus":    SpyreOpSpec(arity=1, dtypes=(fp16),
-                                attrs={"beta": ScalarAttr(f32),
-                                       "threshold": ScalarAttr(f32)}),
-    "idx32toaddr": SpyreOpSpec(arity=1, dtypes=(i32,),
-                                attrs={"base": ConstexprAttr(i32),
-                                       "stride": ConstexprAttr(i32)}),
-    "addi32toi32": SpyreOpSpec(arity=2, dtypes=(i32,)),
-    "addi64toi64": SpyreOpSpec(arity=2, dtypes=(i64,)),
-    "muli32toi32": SpyreOpSpec(arity=2, dtypes=(i32,)),
-    "ea_reorder":  SpyreOpSpec(arity=1,
-                                attrs={"target_ea": EnumAttr(
-                                    "standard", "dl16_to_fp32",
-                                    "fp32_to_dl16")}),
-    "layernorm":   SpyreOpSpec(arity=3, dtypes=(fp16, fp32),
-                                attrs={"eps": ScalarAttr(f32),
-                                       "axis": ConstexprAttr(i32)}),
-}
+import triton
+import triton.language as tl
+from triton.language.extra import spyre   # illustrative import
+
+@triton.jit
+def my_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs, mask=offs < N)
+
+    y1 = tl.exp(x)             # existing Triton spelling — untouched
+    y2 = spyre.spyre_gelu(x)   # Spyre-only op, no tl.gelu exists
+
+    tl.store(out_ptr + offs, y1 + y2, mask=offs < N)
 ```
 
-An unknown `op_name` raises at trace time with a suggestion against the
-registry's keys, before any IR is emitted. A wrong arity, dtype, or missing
-attribute raises with the same specificity a dedicated function's own
-argument checking would give. Adding a new op is one registry row, plus the
-dialect op itself if it doesn't already exist — never a new `@builtin`,
-export, docstring location, or conversion pattern.
-
-### 3. Lowering: direct emission, no TTIR staging op
-
-A validated call traces straight to the `spyreop.*` op the registry names:
-
-```mlir
-%r = spyreop.gelu %x : tensor<...xf16>
-```
-
-No intermediate TTIR-level op is introduced. Every `spyre_op` entry already
-has a concrete, fully-typed target — the `spyreop.*` op the SpyreOp dialect
-defines for it, with its own ODS-generated arity, dtype constraints, and
-attributes — and the registry's arity/dtype/attribute check *is* that
-contract, checked once, at the one place (trace time) an author would see
-a mistake soonest. A staging op such as `tt.spyre_intrinsic {kind = "..."}
-(...)`, converted to `spyreop.*` by a table-driven conversion pattern, was
-considered and rejected: it would restate the same contract a second time
-without anything keeping the two copies in sync beyond code review, and add
-a lowering pass whose only job is to unwrap something the frontend already
-validated. Adding a new entry now touches only the Python registry and, if
-it doesn't exist yet, the SpyreOp dialect — nothing on the TTIR/KTIR
-conversion-pass side, because there is no conversion left to write.
-
-This does mean a traced module can now contain `spyreop.*` ops before any
-KTIR lowering pass has run — something no other path through the frontend
-does today; `tl.sqrt` and friends only ever produce `math.sqrt`, and it's
-`LowerSpyreOps.cpp`, a lowering pass, that later rewrites it to
-`spyreop.sqrt`. That is acceptable here specifically because `tl.spyre_op`
-is already Spyre-only — it does not exist on any other backend's build
-(the same guard `tl.spyre_pin` and `tl.spyre_tensor_layout` already use),
-so a module that calls it was never going to lower anywhere else. Direct
-emission does not make an otherwise-portable module non-portable; it just
-makes the non-portability visible one stage earlier, at the same point the
-call itself already committed to it.
+`tl.exp(x)` traces to `math.exp`, which `LowerSpyreOps`'s existing
+structural matching turns into `spyreop.exp` in `_make_spyrecode` — no
+`tts.spyre_op` involved at any point. `spyre.spyre_gelu(x)` traces to
+`tts.spyre_op {hint = "gelu"}` wrapping the fallback body;
+`_make_ktir`'s artifact keeps that fallback body (so `ktir_cpu` can run
+it), and `_make_spyrecode`'s extended `LowerSpyreOps` replaces the whole
+staging op with `spyreop.gelu`. Both calls end up fully lowered by the
+time `_make_spyrecode` is done; the difference is invisible from the
+kernel author's side and only matters to how the compiler gets there.
 
 ## Initial operation set
 
-| `op_name` | Args | Attrs | Notes |
-|---|---|---|---|
-| `"gelu"` | `x` | — | F16/DF16 only |
-| `"silu"` | `x` | — | F16/DF16/F32 |
-| `"softplus"` | `x` | `beta`, `threshold` (`constexpr[f32]`) | F16/DF16 only |
-| `"reciprocal"` | `x` | — | see below — deliberately never inferred from `1 / x` |
-| `"idx32toaddr"` | `index` | `base`, `stride` (`constexpr[i32]`) | address-generation intrinsic |
-| `"addi32toi32"` | `a, b` | — | explicit address-arithmetic add; see below |
-| `"addi64toi64"` | `a, b` | — | 64-bit form |
-| `"muli32toi32"` | `a, b` | — | explicit address-arithmetic multiply; see below |
-| `"ea_reorder"` | `x` | `target_ea` (`constexpr` enum) | see *Element Arrangement operations* |
-| `"layernorm"` | `x, weight, bias` | `eps`, `axis` | see *LayerNorm* |
+| Frontend API | Fallback | Generated `tts.spyre_op` | Final lowering | Composite/Simple | Notes |
+|---|---|---|---|---|---|
+| `spyre_gelu(x)` | GELU approximation, standard Triton ops (`tanh`, arithmetic) | `tts.spyre_op<"gelu">` | `spyreop.gelu` | Simple | F16/DF16 only |
+| `spyre_silu(x)` | `x * sigmoid(x)`, standard ops | `tts.spyre_op<"silu">` | `spyreop.silu` | Simple | F16/DF16/F32 |
+| `spyre_softplus(x, beta, threshold)` | `log1p(exp(beta * x)) / beta`, with the linear fallback above `threshold`, standard ops | `tts.spyre_op<"softplus">` | `spyreop.softplus` | Simple | F16/DF16 only |
+| `spyre_reciprocal(x)` | `1.0 / x`, ordinary division | `tts.spyre_op<"reciprocal">` | `spyreop.reciprocal` | Simple | fallback is **exact**; real op trades exactness for speed — see below |
+| `spyre_idx32toaddr(index, base, stride)` | `base + stride * index`, ordinary integer arithmetic | `tts.spyre_op<"idx32toaddr">` | `spyreop.idx32toaddr` | Simple | address-generation intrinsic |
+| `spyre_addi32toi32(a, b)` / `addi64toi64` | ordinary `a + b` | `tts.spyre_op<"addi32toi32">` (etc.) | `spyreop.addi32toi32` (etc.) | Simple | explicit address-arithmetic add; see below |
+| `spyre_muli32toi32(a, b)` | ordinary `a * b` | `tts.spyre_op<"muli32toi32">` | `spyreop.muli32toi32` | Simple | explicit address-arithmetic multiply; see below |
+| `spyre_layernorm(x, weight, bias, eps, axis)` | expands via `ExpandSpyreOps`; see *LayerNorm* | `tts.spyre_op<"layernorm">` → split into per-step `tts.spyre_op`s | `EXX2` + scale + norm sequence | Composite | see *LayerNorm* |
 
-**On `addi32toi32`/`muli32toi32` appearing here despite `+`/`*` already
-being transparent above:** these are two different call sites for the same
-underlying hardware op, not a duplication. Ordinary tensor `+`/`*` inside
-elementwise compute is already covered by the transparent path — that path
-deliberately fires only inside elementwise compute, precisely so it never
-misclassifies hand-written index or address arithmetic elsewhere in a
-kernel as something to fuse. That exclusion should stay. It does mean a
-kernel author computing an address by hand (feeding `idx32toaddr`, for
+`tl.where` is deliberately absent from this table: compare/select is not a
+`@tl.spyre_intrinsic` and produces no `tts.spyre_op` at all. It stays on
+the standard Triton API surface — see *Preserving the existing Triton
+path*, below, and the dedicated discussion after this table.
+
+**On `spyre_addi32toi32`/`spyre_muli32toi32` appearing here despite `+`/`*`
+already being transparent above:** these are two different call sites for
+the same underlying hardware op, not a duplication. Ordinary tensor `+`/`*`
+inside elementwise compute is already covered by the transparent path —
+that path deliberately fires only inside elementwise compute, precisely so
+it never misclassifies hand-written index or address arithmetic elsewhere
+in a kernel as something to fuse. That exclusion should stay. It does mean
+a kernel author computing an address by hand (feeding `idx32toaddr`, for
 example) has no transparent route to the hardware add/multiply there —
-which is exactly the gap `tl.spyre_op("addi32toi32", a, b)` fills: an
-explicit request for the intrinsic in a context the transparent path is
+which is exactly the gap `spyre_addi32toi32(a, b)` fills: an explicit
+request for the intrinsic in a context the transparent path is
 deliberately blind to.
+
+**`tl.where`: standard API, Spyre-specific lowering underneath.** A kernel
+author writes ordinary `tl.where(cond, x, y)` — no intrinsic, no hint, no
+import beyond standard Triton — exactly as they would on any other
+backend:
+
+```
+tl.where(cond, x, y)
+  →  arith.cmpf + arith.select     (ordinary TTIR, unchanged)
+  →  compare/select pattern recognition
+  →  spyreop.compare + spyreop.select
+```
+
+A compiler pass structurally recognizes the resulting `cmpf`/`select` pair
+and rewrites it directly to `spyreop.compare` + `spyreop.select`, as
+described in PR #215. This decomposition is similar in spirit to
+`layernorm`'s: one frontend-visible operation lowers to more than one
+`spyreop.*` op. The difference is where that operation lives. `layernorm`
+has no portable Triton spelling at all, so it needs a dedicated
+`@tl.spyre_intrinsic` wrapper and the staged `tts.spyre_op`/
+`ExpandSpyreOps` machinery described above. `tl.where` already has a
+portable, backend-agnostic Triton spelling — it belongs on the transparent
+path in *Preserving the existing Triton path*, not in the table above, and
+the multi-op decomposition happens entirely inside pattern-based lowering,
+with nothing staged and nothing added to the frontend surface.
+
 
 ## Reciprocal: explicit only, never inferred
 
-`tl.spyre_op("reciprocal", x)` is the only way to reach the dedicated
-hardware reciprocal instruction. `1 / x` continues to lower to
-`spyreop.realdiv`, unconditionally, with **no** compiler pattern that
-rewrites a `1.0`-numerator division into `reciprocal`.
+`spyre_reciprocal(x)` is the only way to reach the dedicated hardware
+reciprocal instruction. `1 / x` continues to lower to `spyreop.realdiv`,
+unconditionally, with **no** compiler pattern that rewrites a
+`1.0`-numerator division into `reciprocal`.
 
 This is a deliberate choice, not an oversight: `1 / x` and `reciprocal(x)`
 are not guaranteed to be the same operation. A hardware reciprocal
 instruction may trade numerical exactness for speed in a way ordinary
-division does not. Silently substituting one for the other — inferring the
-faster, less exact op from an author's use of the exact one, or vice versa
-— removes a choice that belongs to whoever is writing the kernel. Requiring
-an explicit call for one of the two options is the same shape as EA's own
-"reject, never insert" policy: an operation with different guarantees is
-never silently substituted for the one the author actually wrote.
-
-## Element Arrangement: rearrangement is one generic operation
-
-This proposal's role here is narrow: give EA's rearrangement concept
-**a frontend surface**, not a design. The actual set of representation
-states, which transitions between them are legal, and what op(s) a
-transition ultimately lowers to are owned by `element-arrangement.md` and
-whatever implementation work follows from it — this document does not
-re-derive or override any of that. What it adds is the one thing
-`element-arrangement.md` does not itself need to specify: how a kernel
-author asks for a rearrangement from Triton source.
-
-Whatever internal structure EA's own design eventually settles on,
-changing a value's representation is, by that design's own policy,
-explicit and kernel-author-driven — never something the compiler inserts
-on its own. That is exactly the shape `tl.spyre_op` is for: a single,
-parameterized, explicit request rather than one op name per
-representation-changing transition, so that a new representation EA later
-defines is a registry-enum addition, not a new frontend op:
-
-```python
-y = tl.spyre_op("ea_reorder", x, target_ea="standard")
-```
-
-Two different things are being named here, and they should not share a
-word. `target_ea`'s values (`standard`, `dl16_to_fp32`, `fp32_to_dl16`,
-...) name **representation states** — each one describes the physical
-shape a value's representation currently has, borrowing the name of
-whichever precision conversion produces that shape as a side effect. The
-operation itself is not one of those states; it is the request to move a
-value from whatever state it is currently typed as into the state named by
-`target_ea`. Calling that operation `ea_convert` would collide with a
-word EA already owns: **conversion**, in EA's own vocabulary, means the
-dtype-changing precision-conversion op that changing representation rides
-along with. This operation does not change dtype — it only changes how a
-value's data is physically arranged — so naming it after what it does
-rather than after "conversion" keeps the two apart: `ea_reorder`.
-
-`target_ea` is validated at trace time against EA's own (append-only)
-set of representation states. Lowering maps `("ea_reorder", target_ea)`
-to whichever op the dialect eventually defines for that transition — this
-proposal does not itself define that op, since EA's own design notes that
-the target dialect has no arrangement attribute today; `ea_reorder` is the
-frontend-facing name that op will attach to once it exists.
-
-**What `ea_reorder` deliberately does not cover.** `EXX2` produces an
-internal representation with no stable, frontend-facing name today — and
-whether it ever gets one through `ea_reorder`'s `target_ea` enum, or is
-handled by some other mechanism EA's own design settles on, is not this
-proposal's call to make. What is this proposal's call: until such a name
-exists and a kernel author has an actual reason to request it directly,
-`EXX2`'s representation gets no `tl.spyre_op` entry of its own —
-general-purpose (a bare `"ea_reorder"` target) or dedicated (a standalone
-`"exx2_fused"`-style op). It stays entirely inside the `layernorm`
-composite described next. A kernel author reasoning about `EXX2` directly,
-rather than through a composite that hides it, is exactly the leak this
-proposal exists to prevent. If a case for naming it directly ever appears,
-that is the point to revisit this — not before.
+division does not — notably, `spyre_reciprocal`'s own software fallback
+(ordinary division, for `ktir_cpu`'s purposes) is therefore **not** a
+numerically exact stand-in for what `spyreop.reciprocal` actually computes
+on real hardware; the two are expected to diverge slightly, by design, and
+that divergence is an accepted property of this op specifically, not a
+fallback-fidelity bug. Silently substituting one for the other — inferring
+the faster, less exact op from an author's use of the exact one, or vice
+versa — removes a choice that belongs to whoever is writing the kernel.
 
 ## LayerNorm: one composite operation, not three primitives
 
 ```python
-y = tl.spyre_op("layernorm", x, weight, bias, eps=1e-5, axis=-1)
+y = spyre_layernorm(x, weight, bias, eps=1e-5, axis=-1)
 ```
 
 `x` is the input tensor; `weight`/`bias` match the shape of the normalized
 axis; `eps` is a scalar constant; `axis` defaults to the innermost
-dimension, which is also the only dimension EA's arrangement machinery
-currently covers. The result has the same shape and dtype as `x`. Nothing
-about `EXX2` or an intermediate pair value appears in this signature.
+dimension. The result has the same shape and dtype as `x`. Nothing about
+`EXX2` or an intermediate pair value appears in this signature.
+
+Staged, this traces to one `tts.spyre_op {hint = "layernorm"}`.
+`ExpandSpyreOps` then splits it into a short sequence of smaller
+`tts.spyre_op`s — one hinted `exx2_fused`, one `layernormscale_fused`, one
+`layernormnorm` — each carrying its own slice of the fallback body, so
+`_make_ktir`'s artifact still contains nothing but portable KTIR across
+all of them. `LowerSpyreOps` then replaces each of those independently
+with its real op during `_make_spyrecode`:
+
+```
+spyre_layernorm(...)
+  → tts.spyre_op<"layernorm">
+  → ExpandSpyreOps
+  → tts.spyre_op<"exx2_fused">, tts.spyre_op<"layernormscale_fused">, tts.spyre_op<"layernormnorm">
+  → LowerSpyreOps
+  → EXX2, layernorm_scale, layernorm_norm (spyreop.*)
+```
 
 ### Why one operation, not `exx2`, `layernorm_scale`, `layernorm_norm`
 
 The usual usability argument applies — three ops with a fixed required call
 order and a pair-value hand-off between them are easy to misuse — but the
 governing reason is narrower: **`EXX2`'s internal representation has no
-stable, frontend-facing name.** Whatever `layernorm_scale` and
-`layernorm_norm` pass between themselves today has nothing a kernel author
-could name, assert, or convert on their own, and no `ea_reorder` target the
-way an ordinary representation state does. If it cannot be named, it must
-not be exposed — a kernel author with no way to reason about it in the
-frontend cannot be handed a value that carries it.
-`layernorm` as a single semantic operation is the consequence of that, not
-a separate usability decision layered on top of it: the frontend presents
-LayerNorm as one operation precisely *because* its internal pair
-representation has nowhere else to go. Decomposition into `EXX2`,
-`layernorm_scale`, `layernorm_norm`, or whatever future SpyreOps replace
-them, happens entirely during lowering, behind a dedicated expansion pass —
-not as a Python-level macro that would instantiate the pair value directly
-in TTIR, where every generic pass downstream could see it.
+stable, frontend-facing name.** Whatever `layernormscale_fused` and
+`layernormnorm` pass between themselves has nothing a kernel author could
+name, assert, or convert on their own. If it cannot be named, it must not
+be exposed — a kernel author with no way to reason about it in the
+frontend cannot be handed a value that carries it. `spyre_layernorm` as a
+single frontend intrinsic is the consequence of that, not a separate
+usability decision layered on top of it: the expansion into `EXX2` and its
+companions happens entirely inside `ExpandSpyreOps` and `LowerSpyreOps`,
+never as something the kernel author's own traced IR exposes.
 
 ### Limitation: this also hides data movement
 
 Hiding the compute sequence has a cost the compute-only framing above does
 not mention: it also hides *where the intermediate values live* between
-the three internal steps. `lx-placement.md` gives kernel authors a way to
-pin a value to on-chip scratchpad rather than pay two off-chip DMAs for an
+the internal steps. `lx-placement.md` gives kernel authors a way to pin a
+value to on-chip scratchpad rather than pay two off-chip DMAs for an
 intermediate that never needed to leave the chip. A hand-written
 `exx2_fused` → `layernormscale_fused` → `layernormnorm` sequence could use
-that mechanism directly on its own intermediates. An opaque `"layernorm"`
-composite cannot — there is no intermediate value in the kernel author's
-own IR to pin. Whatever placement decision gets made for the internal
+that mechanism directly on its own intermediates — and under the staged
+model, those intermediates do exist as real values between
+`ExpandSpyreOps`'s output ops, just not ones the kernel author's own
+source ever names. Whatever placement decision gets made for the internal
 `EXX2` pair and the scale intermediate is made entirely by the lowering
-pass, with no lever exposed to the author who might know their kernel's
+passes, with no lever exposed to the author who might know their kernel's
 memory pressure better than a general-purpose pass would.
 
-This is also, directly, EA's own second open question: whether the
-verified layernorm target's fused pair genuinely needs to reach memory
-packed, or whether "bracket closure" could keep every buffer standard (and,
-by extension, on-chip) by construction. This proposal does not resolve
-that question — it inherits it. Until it is resolved, the composite's
-internal placement behavior is a lowering-pass implementation detail, and
-should be documented as one rather than assumed to be optimal.
+This is also an open question in its own right: whether the fused pair
+genuinely needs to reach memory packed, or whether some other
+representational discipline could keep every buffer on-chip by
+construction. This proposal does not resolve that question — it inherits
+it. Until it is resolved, the composite's internal placement behavior is a
+lowering-pass implementation detail, and should be documented as one
+rather than assumed to be optimal.
 
 Two ways to soften this later, without giving up the opacity that makes the
 composite safe to expose in the first place:
 
-- A coarse placement **hint**, not a pin — e.g. `tl.spyre_op("layernorm",
-  ..., scratch_hint=True)` — that asks the lowering pass to prefer on-chip
-  placement for its internal intermediates without naming which value that
-  applies to. This preserves `EXX2`'s invisibility while still giving the
-  author one lever.
+- A coarse placement **hint**, not a pin — e.g. `spyre_layernorm(...,
+  scratch_hint=True)` — that asks the lowering passes to prefer on-chip
+  placement for their internal intermediates without naming which value
+  that applies to. This preserves `EXX2`'s invisibility while still giving
+  the author one lever.
 - Accepting the limitation for now, and revisiting only if a real
-  performance problem is observed — the lowering pass can hardcode whatever
-  placement the verified layernorm target already relies on, and this
-  proposal takes no position on whether that placement is currently
+  performance problem is observed — the lowering passes can hardcode
+  whatever placement the verified layernorm target already relies on, and
+  this proposal takes no position on whether that placement is currently
   correct.
 
 ## Other composite candidates
 
-A composite `tl.spyre_op` entry is warranted when there is something to
-hide: a fixed multi-step protocol with an easy-to-violate call order, or an
+A composite intrinsic is warranted when there is something to hide: a
+fixed multi-step protocol with an easy-to-violate call order, or an
 internal representation (like `EXX2`) that has nowhere else to be exposed.
 It is not warranted merely because several ops happen to run in sequence.
 
 - **Softmax.** Its usual decomposition — row-max reduce, subtract, `exp`,
   sum-reduce, divide — is made entirely of ops already covered by the
   transparent path above. There is no hidden internal representation
-  analogous to `EXX2` in ordinary softmax; the representation change a
-  precision conversion introduces mid-kernel is already the exact case
-  EA's own per-op table and pin-based assertions are built to handle. A
-  composite `"softmax"` entry would add an abstraction with nothing behind
-  it to hide. Any scheduling win across its sub-ops belongs in a backend
-  fusion pass that recognizes the pattern structurally, not in a new
-  registry entry.
+  analogous to `EXX2` in ordinary softmax, so there is nothing a composite
+  entry would need to hide. A composite `spyre_softmax` would add an
+  abstraction with nothing behind it to hide. Any scheduling win across its
+  sub-ops belongs in a backend fusion pass that recognizes the pattern
+  structurally — the same kind of pass that already turns `tl.where` into
+  `spyreop.compare` + `spyreop.select` — not in a new intrinsic.
 - **Activation functions.** `gelu`, `silu`, `softplus` are each already a
   single dialect op — there is no sequence to hide, so each is a plain
   entry in the initial operation set above, not a composite.
-- **Future EA-driven fused ops.** The same test applies to anything added
-  later: does this operation need to hide an internal representation trick
-  to keep the frontend consistent with what EA actually represents, or is
-  it just several already-transparent ops placed next to each other?
-  The former earns a composite, opaque-until-lowering entry, following the
+- **Future fused ops.** The same test applies to anything added later:
+  does this operation need to hide an internal representation trick to
+  keep the frontend from leaking something backend-internal, or is it
+  just several already-transparent ops placed next to each other? The
+  former earns a composite, `ExpandSpyreOps`-driven entry, following the
   `layernorm` treatment above, including its placement-visibility
   limitation. The latter should stay decomposed.
 
-## Open questions
+## Open question: a frontend-visible DF16 type
 
-1. **Placement visibility for composite ops.** `layernorm`'s internal
-   `EXX2`/scale intermediates have no author-visible pin today. Whether a
-   coarse `scratch_hint`-style lever is worth adding, or whether this
-   should simply wait on EA's own open question about whether `EXX2`'s
-   pair needs to reach memory packed at all, is unresolved here.
-2. **`ea_reorder`'s eventual target op.** This proposal names the frontend
-   entry point but does not define the KTIR-level op it should lower to,
-   since none exists yet in the target dialect. The lowering table entry
-   for `ea_reorder` is a placeholder until that op is designed.
-3. **Whether a second consumer of an `EXX2`-like internal representation
-   ever appears.** If one does, the position taken here — that such a
-   representation gets no general-purpose `tl.spyre_op` entry — should be
-   revisited rather than assumed to still hold.
+Separately, Spyre is considering introducing a frontend-visible,
+Spyre-native 16-bit datatype (`DF16`) rather than treating everything as
+`FP16`. This proposal does not resolve how that interacts with the staged
+intrinsic design, but it raises several questions worth naming now:
+
+- Should kernel authors be able to pass a `DF16` tensor into a
+  `@tl.spyre_intrinsic`-wrapped call directly, or only after an explicit
+  conversion to a type the fallback already handles?
+- A fallback body is ordinary Triton source. If `DF16` isn't a type most
+  standard Triton ops (the ones a fallback body is built from) know how to
+  operate on natively, does every fallback that needs to support `DF16`
+  acquire a type-specific branch, or does `DF16` route through a
+  conversion before reaching the fallback at all — and if so, is that
+  conversion itself expressible without a `spyreop.*` op appearing in
+  `_make_ktir`'s artifact?
+- Does `ktir_cpu` need its own `DF16` numerics to execute a fallback body
+  faithfully, or does the fallback's `DF16` handling necessarily degrade to
+  an approximation (e.g. widen to `FP32`, compute, narrow back) purely for
+  the software path, distinct from what the real hardware op does?
+- How does `DF16` interact with the dtype checking a `@tl.spyre_intrinsic`
+  function's own signature currently provides — does it need to be named
+  explicitly in every relevant wrapper's type annotations, or does it need
+  a broader frontend-level typing mechanism this proposal doesn't yet
+  have?
+
+None of these are resolved here; they are recorded as follow-up design
+work the staged model will need to account for once `DF16` is real.
+
+## Open question: long-term SpyreOp granularity
+
+This proposal assumes today's SpyreOp dialect shape: a handful of large,
+dedicated ops (`gelu`, `layernorm`, `softplus`, ...) each covering
+substantial functionality. A future redesign might instead express more of
+that functionality as compositions of smaller primitives (`exp`, `log`,
+`add`, `mul`, `rsqrt`, ...), closer to how `softmax` is already handled on
+the transparent path.
+
+- **Potential advantage:** fewer dedicated dialect ops to design, verify,
+  and maintain; more reuse of primitives that already have fallbacks and
+  lowering.
+- **Potential drawback:** some of today's dedicated ops exist specifically
+  because their internal representation (`EXX2`) must not be expressed in
+  terms of primitives a kernel author's own fallback body could end up
+  constructing by accident — granularity and representation-hiding pull in
+  opposite directions, and that tension doesn't disappear just because the
+  primitives are smaller.
+- **Impact on `@tl.spyre_intrinsic`:** a wrapper's fallback body is written
+  against today's dialect shape implicitly, by being numerically faithful
+  to today's op. If the backend later re-expresses `gelu` as a composition
+  of primitives, the existing `spyre_gelu` wrapper and its hint keep
+  working unchanged as long as `LowerSpyreOps` is updated to emit the new
+  composition instead of the old single op — the frontend-facing contract
+  (name, arity, fallback) does not need to change for this to happen
+  underneath it.
+- **Open question:** should that frontend-facing stability be treated as a
+  guarantee of this design going forward, or only as something that
+  happens to hold today? This proposal does not take a position, but notes
+  that the hint-based matching in `LowerSpyreOps` is exactly what would
+  need to be re-pointed, not anything in the frontend's own surface.
+
+## Summary of open questions
+
+- **DF16 frontend support.** How a Spyre-native 16-bit type interacts with
+  intrinsic signatures, fallback bodies, and `ktir_cpu`'s numerics —
+  unresolved, see above.
+- **Long-term SpyreOp granularity.** Whether today's large, dedicated
+  SpyreOps remain the right shape, or get decomposed into smaller
+  primitives later, and what that implies for frontend stability — see
+  above.
+- **Composite-op placement visibility.** `layernorm`'s internal `EXX2`/
+  scale intermediates have no author-visible pin today. Whether a coarse
+  `scratch_hint`-style lever is worth adding, or whether this should wait
+  on a resolution to the packed-vs-on-chip question for the fused pair, is
+  unresolved — see *LayerNorm*, above.
+- **Ownership of frontend intrinsic libraries.** This proposal expects
+  `@tl.spyre_intrinsic` wrappers to be backend-maintained and shipped as a
+  library kernel authors import, not something they write themselves — but
+  the exact module location, versioning, and review process for that
+  library is not specified here and needs an owner.
+- **Whether a second consumer of an `EXX2`-like internal representation
+  ever appears.** If one does, the position taken here — that such a
+  representation gets no general-purpose intrinsic of its own, only the
+  `layernorm` composite — should be revisited rather than assumed to still
+  hold.
 
 ## Related discussions
 
-This proposal sits alongside several other in-flight designs rather than
-inside any of them.
-
-- **[`element-arrangement.md`](element-arrangement.md) — Element
-  Arrangement.** Owns EA's representation-state model and its "reject,
-  never insert" policy (both summarized, not restated, in *Background*
-  below), and will own the KTIR-level op `ea_reorder` (*Element
-  Arrangement: rearrangement is one generic operation*, above) eventually
-  lowers to. This document adds only a frontend entry point for that op;
-  it takes no position on EA's own open questions.
-- **`LowerSpyreOps.cpp` — SpyreOp lowering.**
-  The existing pass that rewrites transparent-path ops (`math.sqrt`, ...)
-  to their `spyreop.*` equivalents after they trace to ordinary TTIR.
-  `tl.spyre_op`'s direct-emission design (*Lowering*, below) deliberately
-  bypasses this pass: a `spyre_op` call already names its `spyreop.*`
-  target at trace time, so there is nothing left for a lowering pass to
-  rewrite for it.
+- **PR #212 — `@tl.spyre_intrinsic` and the staged design.** This document
+  adopts the design direction from that PR's "Implementation Think-through"
+  discussion in full: the KTIR-backend-independence motivation, the
+  `tts.spyre_op` staging op, `ExpandSpyreOps`, and `LowerSpyreOps`'s
+  hint-based matching are that proposal's content, organized here as a
+  frontend-facing RFC.
+- **PR #215 — `tl.where` compare/select pattern recognition.** Owns the
+  pattern detection that turns `tl.where`'s `cmpf`/`select` pair into
+  `spyreop.compare` + `spyreop.select` automatically, referenced above
+  under *Preserving the existing Triton path* and *Other composite
+  candidates*. This document depends on that pass existing for `tl.where`,
+  but does not define it.
+- **`LowerSpyreOps.cpp` — existing SpyreOp lowering.** The pass this
+  proposal extends with hint-based matching, alongside its existing
+  structural pattern matching (`math.sqrt` → `spyreop.sqrt`, and friends),
+  which is unaffected.
