@@ -115,11 +115,9 @@ Current upstream touch points:
 | `setup.py` | Default `TRITON_BACKENDS=spyre`; auto TTIR-only/Proton; resolve LLVM via `setup_mlir.py`; Spyre-only package discovery; `spyre-test` extra; `--recursive` submodule init |
 | `CMakeLists.txt` | Guard GPU dialect / blob logic behind the TTIR-only build |
 | `python/src/main.cc` | Register empty `gluon_ir` / `linear_layout` pybind modules so `import triton` works in TTIR-only builds |
-| `python/src/ir.cc` | `create_inter_tile_reduce` / `create_spyre_tensor_layout` op builders on `TritonOpBuilder` |
 | `python/triton/experimental/gluon/__init__.py`, `.../language/__init__.py` | Guard GPU-only arch shim imports absent from a Spyre-only wheel |
 | `include/triton/Dialect/Triton/IR/Dialect.h`, `lib/Target/LLVMIR/LLVMDIUtils.cpp` | Source compatibility with the Spyre LLVM pin |
-| `include/triton/Dialect/Triton/IR/TritonOps.td` | `TT_SpyreTensorLayoutOp`, `TT_InterTileReduceOp` |
-| `lib/Dialect/Triton/IR/Ops.cpp` | `SpyreTensorLayoutOp::verify()`, plus `#ifdef TRITON_BUILD_TTIR_ONLY` guards |
+| `lib/Dialect/Triton/IR/Ops.cpp` | `#ifdef TRITON_BUILD_TTIR_ONLY` guards |
 | `python/triton/language/target_info.py` | Runtime frontend backend guards: `is_spyre()` predicate + `requires_backend()` decorator |
 | `python/triton/language/core.py`, `.../__init__.py` | `tl.inter_tile`, `tl.spyre_tensor_layout`, `tl.wk_slice_coord`, and their `__all__` entries |
 | `python/triton/language/semantic.py` | Emission for those three |
