@@ -18,6 +18,8 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 
 #define GET_OP_CLASSES
 #include "Dialect/TTS/IR/Ops.cpp.inc"
@@ -117,4 +119,172 @@ LogicalResult PinOp::verify() {
   return success();
 }
 
+
+//===----------------------------------------------------------------------===//
+// tts.make_distributed_descriptor
+//===----------------------------------------------------------------------===//
+
+LogicalResult readWorkSliceTable(
+    ArrayAttr table, SmallVectorImpl<WorkSliceEntry> &entries,
+    llvm::MapVector<StringRef, int64_t> &sliceCounts,
+    llvm::function_ref<InFlightDiagnostic()> emitError) {
+  if (table.empty())
+    return emitError() << "work_slices must not be empty: a view is composed "
+                          "from at least one partition";
+
+  SmallVector<StringRef> refKeys;
+  for (auto [i, attr] : llvm::enumerate(table)) {
+    auto dict = dyn_cast<DictionaryAttr>(attr);
+    if (!dict)
+      return emitError() << "work_slices[" << i
+                         << "] must be a dictionary of dimension key to slice "
+                            "index";
+
+    WorkSliceEntry entry;
+    for (NamedAttribute named : dict) {
+      auto idx = dyn_cast<IntegerAttr>(named.getValue());
+      if (!idx || !idx.getType().isSignlessInteger(64))
+        return emitError() << "work_slices[" << i << "]['"
+                           << named.getName().strref()
+                           << "'] must be an i64 slice index";
+      if (idx.getInt() < 0)
+        return emitError() << "work_slices[" << i << "]['"
+                           << named.getName().strref()
+                           << "'] is negative: " << idx.getInt();
+      entry.emplace_back(named.getName().strref(), idx.getInt());
+    }
+
+    // Same key SET in every entry, checked as a sorted sequence because a
+    // DictionaryAttr is already sorted by name -- so equality of the two
+    // sequences is equality of the sets, with no set to build.
+    SmallVector<StringRef> keys;
+    for (auto &[key, _] : entry)
+      keys.push_back(key);
+    if (i == 0) {
+      refKeys = keys;
+    } else if (keys != refKeys) {
+      auto diag = emitError() << "work_slices[" << i << "] has keys [";
+      llvm::interleaveComma(keys, diag);
+      diag << "], expected [";
+      llvm::interleaveComma(refKeys, diag);
+      return diag << "]: every entry describes the same grid, so the keys must "
+                     "be identical";
+    }
+
+    for (auto &[key, index] : entry) {
+      auto it = sliceCounts.find(key);
+      if (it == sliceCounts.end())
+        sliceCounts.insert({key, index + 1});
+      else
+        it->second = std::max(it->second, index + 1);
+    }
+    entries.push_back(std::move(entry));
+  }
+  return success();
+}
+
+LogicalResult MakeDistributedDescriptorOp::verify() {
+  auto tensorTy = cast<RankedTensorType>(getPartial().getType());
+  unsigned rank = tensorTy.getRank();
+
+  // (1) The partition table, through the shared reader.
+  SmallVector<WorkSliceEntry> entries;
+  llvm::MapVector<StringRef, int64_t> sliceCounts;
+  auto emitError = [&]() { return this->emitOpError(); };
+  if (failed(readWorkSliceTable(getWorkSlices(), entries, sliceCounts,
+                                emitError)))
+    return failure();
+
+  // (2) `axes` is per TENSOR DIMENSION, so its length is the share's rank and
+  // not the number of keys: a dimension the work was not divided on still needs
+  // an entry, spelled "", or the mapping would be positional against a shorter
+  // list and silently shift.
+  ArrayAttr axes = getAxes();
+  if (axes.size() != rank)
+    return emitOpError() << "axes has " << axes.size() << " entries for a rank-"
+                         << rank
+                         << " share: one per tensor dimension, with \"\" for a "
+                            "dimension the work was not divided on";
+
+  llvm::SmallDenseSet<StringRef> named;
+  for (auto [d, attr] : llvm::enumerate(axes)) {
+    auto key = dyn_cast<StringAttr>(attr);
+    if (!key)
+      return emitOpError() << "axes[" << d << "] must be a string";
+    if (key.getValue().empty())
+      continue;
+    if (!sliceCounts.contains(key.getValue()))
+      return emitOpError() << "axes[" << d << "] names '" << key.getValue()
+                           << "', which no work_slices entry carries";
+    // (3) One dimension per key. Two dimensions divided along one key would ask
+    // for a single slice index to pick a region in both, which is a projection
+    // the table cannot express.
+    if (!named.insert(key.getValue()).second)
+      return emitOpError() << "axes names '" << key.getValue()
+                           << "' twice: a partition key divides one dimension";
+  }
+
+  // (4) Every key must reach a dimension. A key the table carries and `axes`
+  // does not name divides nothing, so the regions it distinguishes are equal --
+  // which makes partitions collide rather than merely wasting a key.
+  for (auto &[key, count] : sliceCounts) {
+    (void)count;
+    if (!named.contains(key))
+      return emitOpError() << "work_slices carries key '" << key
+                           << "', which axes does not name, so it divides no "
+                              "dimension";
+  }
+
+  // (5) The result's block shape is what one `.load()` takes, so it is
+  // `block_shape`, over the share's element type.
+  ArrayRef<int64_t> blockShape = getBlockShape();
+  auto blockTy = getResult().getType().getBlockType();
+  if (blockShape.size() != blockTy.getRank())
+    return emitOpError() << "block_shape has " << blockShape.size()
+                         << " entries but the result descriptor's block type is "
+                            "rank "
+                         << blockTy.getRank();
+  if (blockShape != blockTy.getShape())
+    return emitOpError() << "block_shape does not match the result "
+                            "descriptor's block shape";
+  if (blockTy.getElementType() != tensorTy.getElementType())
+    return emitOpError() << "the result descriptor's element type "
+                         << blockTy.getElementType()
+                         << " does not match the share's "
+                         << tensorTy.getElementType();
+
+  // (6) `block_shape` is the extent of one ACCESS, bounded by the COMPOSED extent
+  // and not by the share's. Those differ, and admitting the difference is the
+  // point: a share is one slice, so the compose grows it by the slice count, and
+  // an access may legitimately take
+  //
+  //   less than a share   a relayout, reading the region I end up holding;
+  //   exactly a share     the common case, one region per load;
+  //   more than a share   a gather, spanning several partitions -- and at the
+  //                       limit an all-reduce, taking the whole composed axis so
+  //                       that a fold over it reduces across every core.
+  //
+  // Nothing else bounds it. Triton relates `block_shape` only to the descriptor's
+  // own block type, never to the share; and `ktdp.construct_access_tile`'s
+  // verifier checks ranks and maps but not extents against the view it is taken
+  // on. So an access past the composed domain would verify everywhere and address
+  // memory no partition holds, which makes this the only place to refuse it.
+  //
+  // Every dimension, not only the divided ones: an undivided dimension composes
+  // to itself, so a block larger than the share there is out of bounds too.
+  for (auto [d, attr] : llvm::enumerate(axes)) {
+    auto key = cast<StringAttr>(attr).getValue();
+    int64_t composed = tensorTy.getDimSize(d);
+    if (!key.empty())
+      composed *= sliceCounts.find(key)->second;
+    if (blockShape[d] > composed)
+      return emitOpError() << "block_shape[" << d << "] is " << blockShape[d]
+                           << ", larger than the composed extent " << composed
+                           << " on that dimension (the share's "
+                           << tensorTy.getDimSize(d) << " times "
+                           << (composed / tensorTy.getDimSize(d)) << " slices)";
+  }
+
+  return success();
+}
 } // namespace mlir::triton::tts

@@ -31,10 +31,23 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // tt.reduce/broadcast/expand_dims/dot -> linalg + tensor, and a dead-op sweep.
   pm.addPass(createLowerComputeOpsPass());
 
-  // tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery. After
-  // LowerComputeOps, because the partials it consumes have to be linalg/tensor
-  // by then.
-  pm.addPass(createLowerInterTilePass());
+  // Inter-tile communication, both kinds. tt.inter_tile_reduce ->
+  // ktdp.inter_tile_produce + delivery, and tts.make_distributed_descriptor ->
+  // one memory view per partition plus the compose, with the reads through it.
+  // After LowerComputeOps, because the partials a reduce consumes have to be
+  // linalg/tensor by then; before the layout pass, which has no propagation
+  // pattern for a !ktdp.tile_future and so must not be reached with one live.
+  //
+  // BEFORE LowerTTSMarkers, which is this stage's last pass now, so the compose
+  // reads a share's placement off the `tts.pin` MARKER OP -- the marker is still
+  // standing here, and the attribute does not exist yet.
+  //
+  // That ordering is also what keeps the share alive rather than merely readable.
+  // Erasing the compose removes the share's only other use, so from here until
+  // MaterializePinnedBuffers honours it in `spyrecode` the marker is the only thing
+  // holding the value against this stage's closing DCE. See LowerTTSMarkers'
+  // contract for why that pass runs after the canonicalize.
+  pm.addPass(createLowerInterTilePass(options.grid));
 
   // tt.func/tt.return -> func.func/func.return, !tt.ptr -> index. Last of the
   // conversions, because every memory pass above consumes !tt.ptr arguments
@@ -73,15 +86,15 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   //
   // That is not hypothetical. A relayout's share is consumed by the compose, which
   // consumes it by erasing the marker; with the conversion done early, the share's
-  // producer is dead by the time this stage's canonicalize runs, and the pin is gone
-  // before anything could honour it. Running here instead means the marker holds the
-  // value through the DCE and the attribute is written when nothing left in this
-  // stage deletes anything.
+  // producer is dead by the time this stage's canonicalize runs, and the pin never
+  // reaches MaterializePinnedBuffers. Running here instead means the marker holds
+  // the value through the DCE and the attribute is written when nothing left in
+  // this stage deletes anything.
   //
   // Nothing in this stage reads the attributes, which is what makes the move free:
-  // every consumer is in `spyrecode` -- RewriteDescriptorLayoutGeneric and
-  // FoldDataMovementGenerics today, and the pin's own consumer when it lands, at the
-  // head of that stage -- so no DCE runs between the write and the honouring.
+  // every consumer -- MaterializePinnedBuffers, RewriteDescriptorLayoutGeneric,
+  // FoldDataMovementGenerics -- is in `spyrecode`, and MaterializePinnedBuffers is
+  // that stage's first pass, so no DCE runs between the write and the honouring.
   //
   // Markers must not cross into the artifact, and do not: this is the last pass, so
   // what leaves the stage is attributes. An op from a dialect a consumer does not
@@ -91,6 +104,25 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
 
 void mlir::triton::spyre::buildSpyrecodePipeline(
     OpPassManager &pm, const SpyrecodePipelineOptions &options) {
+  // FIRST, ahead of NormalizeForDevice as well as of the shaping prefix. Each
+  // tts.pin attribute -> the buffer it asked for, plus the store and loads that
+  // route the value through it. The carrier is the op PRODUCING the pinned value,
+  // and every pass below this one that replaces such an op -- NormalizeForDevice,
+  // DropReductionInitFill, ConvertElementwiseToLinalg, LinalgGeneralizeNamedOps --
+  // would take the annotation with it in silence, so this runs before any of them
+  // rather than merely before the layout pass.
+  //
+  // In this stage and not the one above, on the FIRST half of Pipeline.h's rule: a
+  // pin exists because the scheduler admits one compute per local schedule, which
+  // is a fact about dbo-opt rather than about the IR, and a kernel that stops at
+  // `ktir` needs no buffer built. Its one numeric rule is a device fact too, which
+  // is why it arrives here as a caller's option.
+  {
+    ktdp::MaterializePinnedBuffersOptions pinOptions;
+    pinOptions.lxCapacityBytes = options.lxCapacityBytes;
+    pm.addPass(ktdp::createMaterializePinnedBuffers(pinOptions));
+  }
+
   // Ahead of everything else in the stage, and not part of what follows:
   // upstream ops this tree emits legally but the toolchain below will not take
   // become ones it will. A pattern host, so a future case is a pattern there

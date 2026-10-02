@@ -64,6 +64,13 @@ struct SpyrecodeCLIOptions
       *this, "base-addresses",
       llvm::cl::desc("The addresses to bind, as element indices, positionally. "
                      "Read only with bind-base-addresses")};
+  Option<int64_t> lxCapacityBytes{
+      *this, "lx-capacity-bytes",
+      llvm::cl::desc("Bytes of LX scratchpad a tl.spyre_pin may reach, per core. "
+                     "0 does not check -- there is no default, because the size "
+                     "is the device description's and the budget is the "
+                     "caller's"),
+      llvm::cl::init(0)};
 };
 
 } // namespace
@@ -93,6 +100,7 @@ void mlir::triton::spyre::registerPipelines() {
         options.bindBaseAddresses = cli.bindBaseAddresses;
         options.baseAddresses.assign(cli.baseAddresses.begin(),
                                      cli.baseAddresses.end());
+        options.lxCapacityBytes = cli.lxCapacityBytes;
         buildSpyrecodePipeline(pm, options);
       });
 }
