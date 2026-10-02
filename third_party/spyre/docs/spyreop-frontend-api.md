@@ -17,6 +17,48 @@ existing Triton name, address-generation intrinsics, and composite fused
 operations such as `layernorm` that must not leak their internal
 representation into kernel code.
 
+## Explicit intrinsics are authoritative; generic code is the compiler's to optimize
+
+One rule governs when a `spyreop.*` op may appear in place of what a
+kernel author actually wrote, and it applies uniformly to every mechanism
+described below:
+
+- **An explicit request for a SpyreOp is always honored.** If a kernel
+  author calls one of the `spyre_*` functions in the initial operation set
+  below — `spyre_gelu(x)`, `spyre_reciprocal(x)`, `spyre_exp(x)`, and the
+  rest — that request compiles to exactly the named op. The compiler does
+  not second-guess it, substitute a different op it considers more
+  efficient, or silently decline it. Asking for a specific instruction is a
+  choice that belongs to whoever is writing the kernel, and lowering must
+  respect it unconditionally. This holds regardless of *how* the request
+  gets to the SpyreOp — most of the operation set is staged through
+  `@tl.spyre_intrinsic` and `tts.spyre_op` because there's a real
+  fallback/real-op distinction to carry across `_make_ktir`, but a few
+  entries (`spyre_exp`, `spyre_sqrt`, `spyre_rsqrt`) are plain aliases over
+  an already-generic op with no such distinction to stage — see the note
+  under *Initial operation set*, below. Either way, the explicit call is
+  the one guarantee that doesn't depend on the compiler recognizing
+  anything.
+- **Generic Triton code carries no such guarantee, in either direction.**
+  If a kernel author writes ordinary code — arithmetic, `tl.exp`,
+  `tl.where`, a plain `1 / x` — with no explicit SpyreOp request anywhere
+  in it, the compiler is free to lower it to a SpyreOp whenever doing so is
+  recognizably the efficient implementation on Spyre hardware, with no
+  change required to what the author wrote. This is permission, not an
+  obligation: it holds only where a lowering pass actually recognizes the
+  pattern, and nothing here commits every generic op to a SpyreOp mapping
+  or requires a kernel author to track which ones currently are.
+
+Everything in this document is one side of that rule or the other.
+`LowerSpyreOps`'s existing structural matching (`math.sqrt` →
+`spyreop.sqrt`, `1 / x` → `spyreop.reciprocal`, and friends) and the
+`tl.where` compare/select pattern recognition (PR #215) are the compiler
+exercising its freedom over generic code — see *Preserving the existing
+Triton path* and *Reciprocal*, below. The staged `@tl.spyre_intrinsic`
+mechanism is the other side: it exists for ops with no generic Triton
+spelling at all for the compiler to opportunistically recognize, where the
+only way to reach the SpyreOp is to ask for it directly — and, per the
+first bullet above, that request is never overridden once made.
 
 ## KTIR must stay backend-independent
 
@@ -192,7 +234,12 @@ replacement.
 
 `tl.exp`, `tl.sqrt`, `tl.rsqrt`, `tl.where`, and the arithmetic operators
 keep working exactly as they do today, through their existing route,
-unaffected by any of the above:
+unaffected by any of the above. None of this is an explicit SpyreOp
+request, so none of it is required to lower to one — the table below is
+the compiler exercising the second half of the rule in *Explicit
+intrinsics are authoritative; generic code is the compiler's to optimize*,
+above: recognizing an efficient Spyre lowering for ordinary code without
+asking the kernel author to change anything:
 
 | Triton source | TTIR | Spyre lowering |
 |---|---|---|
@@ -222,7 +269,13 @@ transparent path cannot cover:
 The rule for which bucket an op falls into is that if it
 already has, or naturally deserves, a spelling that makes sense on every
 backend, it stays on the transparent path above, regardless of how it
-happens to be implemented on Spyre.
+happens to be implemented on Spyre — generic code the compiler is free to
+lower efficiently, per *Explicit intrinsics are authoritative; generic
+code is the compiler's to optimize*, above. The staged intrinsics in this
+table exist precisely where that's not available: there is no generic
+spelling for the compiler to opportunistically recognize in the first
+place, so reaching the SpyreOp requires an explicit request — one that,
+once made, is never overridden.
 
 ## Who writes `@tl.spyre_intrinsic` functions?
 
@@ -254,7 +307,11 @@ def spyre_layernorm(x, weight, bias, eps: tl.constexpr, axis: tl.constexpr):
 
 exported as, illustratively, `triton.language.extra.spyre`, providing
 `spyre_gelu`, `spyre_layernorm`, and the rest of the initial operation set
-below. Nothing in the decorator mechanism technically prevents a kernel
+below. (`spyre_exp`, `spyre_sqrt`, and `spyre_rsqrt` ship from the same
+library for discoverability, but aren't `@tl.spyre_intrinsic`-decorated at
+all — they're plain wrappers over `tl.exp`/`tl.sqrt`/`tl.rsqrt`, with no
+fallback body to maintain; see the note under *Initial operation set*.)
+Nothing in the decorator mechanism technically prevents a kernel
 author from writing their own `@tl.spyre_intrinsic`-decorated function,
 but doing so correctly requires knowing the exact hint string
 `LowerSpyreOps` matches on and the real op's semantics — implementation-
@@ -302,6 +359,9 @@ author's side and only matters to how the compiler gets there.
 
 | Frontend API | Fallback | Generated `tts.spyre_op` | Final lowering | Composite/Simple | Notes |
 |---|---|---|---|---|---|
+| `spyre_exp(x)` | identical to `tl.exp(x)` — no distinct fallback | none — traces straight to `math.exp`, same as the generic call | `spyreop.exp`, via existing structural matching | Simple | explicit alias over an already-generic op; see note below |
+| `spyre_sqrt(x)` | identical to `tl.sqrt(x)` | none — traces straight to `math.sqrt` | `spyreop.sqrt`, via existing structural matching | Simple | explicit alias; see note below |
+| `spyre_rsqrt(x)` | identical to `tl.rsqrt(x)` | none — traces straight to `math.rsqrt` | `spyreop.rsqrt`, via existing structural matching | Simple | explicit alias; see note below |
 | `spyre_gelu(x)` | GELU approximation, standard Triton ops (`tanh`, arithmetic) | `tts.spyre_op<"gelu">` | `spyreop.gelu` | Simple | F16/DF16 only |
 | `spyre_silu(x)` | `x * sigmoid(x)`, standard ops | `tts.spyre_op<"silu">` | `spyreop.silu` | Simple | F16/DF16/F32 |
 | `spyre_softplus(x, beta, threshold)` | `log1p(exp(beta * x)) / beta`, with the linear fallback above `threshold`, standard ops | `tts.spyre_op<"softplus">` | `spyreop.softplus` | Simple | F16/DF16 only |
@@ -310,6 +370,25 @@ author's side and only matters to how the compiler gets there.
 | `spyre_addi32toi32(a, b)` / `addi64toi64` | ordinary `a + b` | `tts.spyre_op<"addi32toi32">` (etc.) | `spyreop.addi32toi32` (etc.) | Simple | explicit address-arithmetic add; see below |
 | `spyre_muli32toi32(a, b)` | ordinary `a * b` | `tts.spyre_op<"muli32toi32">` | `spyreop.muli32toi32` | Simple | explicit address-arithmetic multiply; see below |
 | `spyre_layernorm(x, weight, bias, eps, axis)` | expands via `ExpandSpyreOps`; see *LayerNorm* | `tts.spyre_op<"layernorm">` → split into per-step `tts.spyre_op`s | `EXX2` + scale + norm sequence | Composite | see *LayerNorm* |
+
+**`spyre_exp`/`spyre_sqrt`/`spyre_rsqrt`: explicit aliases over an
+already-generic op, not staged intrinsics.** These three don't need
+`@tl.spyre_intrinsic`'s staging machinery at all, unlike every other row
+in this table. `math.exp`/`math.sqrt`/`math.rsqrt` are already fully
+generic, portable KTIR ops, and `LowerSpyreOps`'s existing structural
+matching already converts every supported scalar occurrence
+unconditionally — there is no separate software-fallback-versus-real-op
+split to stage, because the fallback and the real lowering path are the
+same op. So `spyre_exp(x)` traces to exactly the same `math.exp` a plain
+`tl.exp(x)` would: no `tts.spyre_op` wrapper, no hint, nothing for
+`LowerSpyreOps`'s hint-based matching to do. The two spellings are
+otherwise interchangeable — the compiler already performs this lowering
+automatically either way, per *Preserving the existing Triton path*,
+below. Calling the explicit form exists only so a kernel author can state
+the choice directly, pinning it under the explicit-request guarantee in
+*Explicit intrinsics are authoritative; generic code is the compiler's to
+optimize*, above, rather than because the compiler needs a different
+mechanism to guarantee the same outcome.
 
 `tl.where` is deliberately absent from this table: compare/select is not a
 `@tl.spyre_intrinsic` and produces no `tts.spyre_op` at all. It stays on
@@ -356,6 +435,13 @@ with nothing staged and nothing added to the frontend surface.
 
 
 ## Reciprocal: an existing automatic rewrite, plus an explicit intrinsic
+
+This is the governing rule from *Explicit intrinsics are authoritative;
+generic code is the compiler's to optimize*, above, in miniature: a plain
+`1 / x` is generic code, so the compiler is free to recognize it as the
+efficient Spyre lowering and already does; `spyre_reciprocal(x)` is an
+explicit request, so it is always honored, independent of whatever the
+generic path happens to catch.
 
 `LowerSpyreOps` already contains a rewrite, independent of this proposal,
 that recognizes a constant-`1.0` numerator in `arith.divf` and rewrites it
@@ -500,10 +586,13 @@ It is not warranted merely because several ops happen to run in sequence.
   transparent path above. There is no hidden internal representation
   analogous to `EXX2` in ordinary softmax, so there is nothing a composite
   entry would need to hide. A composite `spyre_softmax` would add an
-  abstraction with nothing behind it to hide. Any scheduling win across its
-  sub-ops belongs in a backend fusion pass that recognizes the pattern
-  structurally — the same kind of pass that already turns `tl.where` into
-  `spyreop.compare` + `spyreop.select` — not in a new intrinsic.
+  abstraction with nothing behind it to hide. It is generic code with no
+  explicit SpyreOp request anywhere in it, so under the rule in *Explicit
+  intrinsics are authoritative; generic code is the compiler's to
+  optimize*, any scheduling win across its sub-ops is the compiler's to
+  take if it can recognize the pattern — a backend fusion pass, the same
+  kind of pass that already turns `tl.where` into `spyreop.compare` +
+  `spyreop.select` — not a reason to add a new intrinsic.
 - **Activation functions.** `gelu`, `silu`, `softplus` are each already a
   single dialect op — there is no sequence to hide, so each is a plain
   entry in the initial operation set above, not a composite.
