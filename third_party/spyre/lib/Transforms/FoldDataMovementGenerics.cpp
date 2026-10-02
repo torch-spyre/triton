@@ -182,8 +182,7 @@
 // generic -> generic only, so a named producer or consumer blocks it whatever the
 // control function says. Before rewrite_descriptor_layout_generic, which must see
 // the folded maps so that no data-movement generic is left for it to linearize,
-// and which is also the pass whose scope the gate above predicts. Nothing is owed
-// to lower_inter_tile, which runs in the `ktir` stage a whole stage earlier.
+// and which is also the pass whose scope the gate above predicts.
 //
 //===----------------------------------------------------------------------===//
 
