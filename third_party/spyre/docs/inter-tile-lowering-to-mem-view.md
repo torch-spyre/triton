@@ -12,9 +12,9 @@ expresses an inter-tile communication** (§2), and **how that expression lowers 
 view** (§3). The view itself is the target, not the subject — where the design would
 change it, §8 says so.
 
-It is **one lowering target, not the whole subject**. `LowerInterTile` gains a second mode
-and the existing `tts.inter_tile_reduce` path stays exactly as it is; §11 says what that
-path is and why it is not the design.
+It is **one lowering target, not the whole subject**. The cross-tile reduction it
+replaces, `tl.inter_tile`, has been removed; §11 says what that surface was and why it is
+not the design.
 
 The communication in question is a **scratchpad relayout**: a tensor moving between
 two ownership arrangements while it stays resident in the scratchpad. Both sides are
@@ -63,7 +63,7 @@ changed, and the composed domain is a true statement of where data lives.
 
 A **work slice table** is a list of dicts. Each dict holds one grid coordinate: one key
 per dimension the work was divided along, mapping to a slice index on it. Every element
-carries the same keys. It is what `tl.inter_tile` already accepts as `work_slices`.
+carries the same keys. It is what `tl.wk_slice_coord` reads as `work_slices`.
 
 The same kind of list appears in **two roles**, and they differ in length:
 
@@ -261,8 +261,9 @@ slice width           512 / 8 = 64 on out; x is whole
 
 ### Where the phases live
 
-`LowerInterTile` gains a second mode. The existing path — `tts.inter_tile_reduce` to
-`ktdp.inter_tile_produce` plus a delivery op — is not removed. §11.
+In the `ktir` stage, after `LowerComputeOps` has turned the share into linalg/tensor
+values. That is the slot the removed `LowerInterTile` pass held (§11); nothing else in the
+stage lowers inter-tile communication.
 
 ## 4. The pull model
 
@@ -337,7 +338,7 @@ holders — where each holder writes and reads its own copy locally.
 ## 6. Why the partition list stays a table
 
 What the measured patterns rule out is deriving ownership from **axis counts** — an axis
-name and a slice count, which is the form `tl.inter_tile`'s `axis` parameter has. Ownership
+name and a slice count, which is the form the removed `tl.inter_tile`'s `axis` parameter took. Ownership
 is frequently strided rather than contiguous. In the measured records the cores feeding one
 destination region sit two apart (cores 0 and 2, then 4 and 6, and so on), or eight apart
 (0, 8, 16 and 24), or are drawn only from the even-numbered cores. No axis count reproduces
@@ -560,19 +561,21 @@ The lowering should refuse, rather than guess:
   as well as associativity, and a custom region can supply neither. With no order to
   promise, the lowering should say so rather than quietly pick one.
 
-## 11. `tl.inter_tile`, the alternative
+## 11. `tl.inter_tile`, the removed alternative
 
-`tl.inter_tile(x, axis, combiner, mode, work_slices=...)` is the shipped surface: one named
-collective call, a `mode` enum, one work-slice table, and a tensor result.
+`tl.inter_tile(x, axis, combiner, mode, work_slices=...)` was the earlier surface: one
+named collective call, a `mode` enum, one work-slice table, and a tensor result. It
+authored a `tts.inter_tile_reduce` op, which a `LowerInterTile` pass expanded into a
+`ktdp.inter_tile_produce` plus a delivery op. The builtin, the op and the pass have been
+removed; the `ktdp` ops are KTIR's and remain, and `tl.wk_slice_coord`, which reads the
+same work-slice table, stays.
 
-**What lowers today.** `all_reduce` and `reduce_to_one`. `reduce_scatter` and `broadcast`
-are accepted by the Python surface and rejected by the pass
-([`LowerInterTile.cpp:340-346`](../lib/Conversion/TritonToKTIR/LowerInterTile.cpp)), as are
-custom combiner regions (`:356`), non-contiguous groups (`:180-183`) and non-uniform `pick0`
-layouts for `reduce_to_one` (`:253-255`).
+**What it lowered.** `all_reduce` and `reduce_to_one`. `reduce_scatter` and `broadcast`
+were accepted by the Python surface and rejected by the pass, as were custom combiner
+regions, non-contiguous groups and non-uniform `pick0` layouts for `reduce_to_one`.
 
-**Its advantage.** It names the collective, so nothing has to be recognized: `mode` maps
-directly onto the produce/delivery pair, and the K-split matmul reduce ring is validated
+**Its advantage.** It named the collective, so nothing had to be recognized: `mode` mapped
+directly onto the produce/delivery pair, and the K-split matmul reduce ring was validated
 through it at `SENCORES` 4 and 8.
 
 **Why it is not the design.** Naming buys less than it appears to, because provenance
@@ -580,8 +583,9 @@ already identifies the fold (§7) and does so without committing to one lowering
 picks the delivery pair, where provenance leaves ring, tree and direct transfer all
 available. And naming does not scale to the copy family: gather, scatter, all-to-all,
 relocation and broadcast would each need a mode, where a descriptor needs none. Two of the
-four modes already declared do not lower.
+four modes it declared did not lower.
 
-**Why it stays anyway.** Sequencing, not design. It works and is validated; the descriptor
-path lowers not at all. Retire it when the descriptor path passes the same tests — not
-before, and without extending it in the meantime.
+**Why it was removed before the descriptor path.** Keeping it meant keeping a second
+lowering for inter-tile communication in the slot the descriptor path needs, and a second
+op in the `tts` dialect that the descriptor path does not build on. The K-split ring it
+validated has no Triton-level surface until the descriptor path lowers a reduction (§7).

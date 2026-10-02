@@ -2,9 +2,6 @@
 //
 // One verifier, and it delegates rather than restates. See the note on
 // `tts::verifyTensorLayoutArrays` for why the rules have a single owner.
-// `tts.inter_tile_reduce` declares none: its declarative assembly format is all
-// that is checked at parse time, and its semantic rules are checked by
-// LowerInterTile, which is where the diagnostics for them live.
 //
 //===----------------------------------------------------------------------===//
 
