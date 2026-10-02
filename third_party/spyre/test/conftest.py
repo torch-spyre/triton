@@ -419,8 +419,8 @@ class VariantFactory:
 
     Hooks are ordinary methods, found by name. Nothing here inspects a
     callable's parameters to guess whether it is a factory: an oracle may
-    legitimately declare ``**kwargs`` (``inter_tile_reduce``'s
-    ``run_element_sum``), so inspection would call it with no ``inputs``.
+    legitimately declare ``**kwargs``, so inspection would call it with no
+    ``inputs``.
     """
 
     def signature(self, **combo):

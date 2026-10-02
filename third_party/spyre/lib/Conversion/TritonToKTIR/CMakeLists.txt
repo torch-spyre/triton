@@ -17,7 +17,6 @@ add_triton_library(TritonToKTIR
   LowerScalarLoad.cpp
   LowerComputeOps.cpp
   ConvertFunctions.cpp
-  LowerInterTile.cpp
   DistributeWork.cpp
   # Helpers used only by the files above; declared in ConversionUtils.h, which
   # stays out of include/ for that reason.
@@ -25,10 +24,10 @@ add_triton_library(TritonToKTIR
 
   DEPENDS
   TritonToKTIRIncGen
-  # LowerDescriptorMemory.cpp, LowerScalarLoad.cpp and LowerInterTile.cpp include
-  # the tts dialect's generated op declarations through Dialect/TTS/IR/Dialect.h,
-  # so a clean parallel build must not rely on the link edge to order that
-  # tablegen ahead of them.
+  # LowerDescriptorMemory.cpp and LowerScalarLoad.cpp include the tts dialect's
+  # generated op declarations through Dialect/TTS/IR/Dialect.h, so a clean
+  # parallel build must not rely on the link edge to order that tablegen ahead of
+  # them.
   TTSIncGen
 
   LINK_LIBS PUBLIC
@@ -36,8 +35,7 @@ add_triton_library(TritonToKTIR
   SpyreUtils
   # For the tts op classes: two of these passes name tts.tensor_layout in their
   # conversion target's legal set so the marker survives to lower-tts-markers
-  # (neither reads it and neither writes the attribute), and LowerInterTile
-  # matches tts.inter_tile_reduce as its source op.
+  # (neither reads it and neither writes the attribute).
   TTSIR
   KTIR::KtdpDialect
   TritonIR

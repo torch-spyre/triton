@@ -3783,43 +3783,6 @@ def builtin_min(*args, propagate_nan=_NOTHING, _semantic=None):
 # --- START --- added for spyre
 @builtin
 @requires_backend("spyre")
-def inter_tile(x, axis, combiner, mode, *, work_slices, dep_work_slices=None,
-               scatter_dimension=None, _semantic=None):
-    """(Spyre only) Cross-tile reduction over the given work-slice axis.
-
-    Lowers to a ``tts.inter_tile_reduce`` op carrying the work-slice metadata
-    as op attributes.  The ``LowerInterTile`` pass expands it into a
-    ``ktdp.inter_tile_produce`` + delivery op pair.
-
-    Args:
-        x:                 The per-tile partial tensor to reduce.
-        axis:              Work-slice dim name to reduce over (e.g. ``"in"``).
-        combiner:          Shorthand ``"add"`` / ``"max"`` / ``"mul"`` or ``""``
-                           for a custom reducer region (not yet supported from
-                           Python; use the MLIR layer directly).
-        mode:              One of ``"all_reduce"``, ``"reduce_to_one"``,
-                           ``"reduce_scatter"``, ``"broadcast"``.
-        work_slices:       ``tl.constexpr`` list of per-tile slice-index dicts
-                           with identical keys — ``coreIdToWkSlice``.
-                           ``[{dim: label}, ...]`` indexed by tile id; tiles
-                           with the same entry are in the same group.
-                           ``W`` (``numWkSlicesPerDim``) is derived:
-                           ``W[beta] = max(C[t][beta] for all t) + 1``.
-        dep_work_slices:   Optional ``tl.constexpr`` dict for per-tile
-                           dependencies (``depWkSlices``).
-        scatter_dimension: Required when ``mode = "reduce_scatter"``; the i64
-                           scatter dimension.
-
-    Only valid on the ``spyre`` backend — raises on any other target.
-    """
-    return _semantic.inter_tile(x, axis, combiner, mode,
-                                work_slices=work_slices,
-                                dep_work_slices=dep_work_slices,
-                                scatter_dimension=scatter_dimension)
-
-
-@builtin
-@requires_backend("spyre")
 def wk_slice_coord(work_slices, axis, _semantic=None):
     """(Spyre only) Runtime slice coordinate of the current tile on ``axis``.
 
@@ -3827,18 +3790,18 @@ def wk_slice_coord(work_slices, axis, _semantic=None):
     — the same kind of runtime value ``tl.program_id`` produces (it is **not** a
     ``constexpr``).  ``work_slices`` and ``axis`` are ``constexpr``; the per-axis
     column ``[ws[axis] for ws in work_slices]`` is known at compile time and is
-    materialized into the TTIR as a small constant table, then indexed by
-    ``tl.program_id(0)`` at runtime.
+    materialized into the TTIR as a chain of scalar selects on
+    ``tl.program_id(0)``.
 
-    This lets an inter-tile kernel recover its own slice coordinate (e.g. for a
-    ``reduce_to_one`` store guard or a descriptor offset) directly from the
-    ``work_slices`` topology, instead of hand-coding the radix
+    This lets a kernel recover its own slice coordinate (e.g. for a store guard
+    or a descriptor offset) directly from the ``work_slices`` topology, instead
+    of hand-coding the radix
     (``pid % NUM_IN_TILES``) which must otherwise be kept in sync with
     ``work_slices`` by convention.  See spec E4.
 
     Args:
-        work_slices: ``tl.constexpr`` list of per-tile slice-index dicts —
-                     the same value passed to :func:`inter_tile`.
+        work_slices: ``tl.constexpr`` list of per-tile slice-index dicts with
+                     identical keys, indexed by tile id.
         axis:        ``tl.constexpr`` work-slice dim name to look up (e.g.
                      ``"in"``).  Must be a key in every ``work_slices`` entry.
 

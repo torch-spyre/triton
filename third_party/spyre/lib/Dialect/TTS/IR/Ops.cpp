@@ -1,8 +1,7 @@
 //===- Ops.cpp - The tts dialect's ops ------------------------------------===//
 //
-// Three ops. `tensor_layout`'s verifier delegates rather than restates -- see
-// the note on `tts::verifyTensorLayoutArrays` for why the rules have a single
-// owner.
+// Two ops. `tensor_layout`'s verifier delegates rather than restates -- see the
+// note on `tts::verifyTensorLayoutArrays` for why the rules have a single owner.
 //
 // `pin`'s rules are its own, and what is left of them after ODS is small: the
 // offset is an attribute, so its spelling is a type constraint the generated
@@ -10,10 +9,6 @@
 // stays here is the memory space, which no type constraint can check against
 // ktdp's enum. What deliberately does NOT stay is any rule about the operand's
 // provenance -- see the note in `PinOp::verify`.
-//
-// `inter_tile_reduce` declares no verifier: its declarative assembly format is
-// all that is checked at parse time, and its semantic rules are checked by
-// LowerInterTile, which is where the diagnostics for them live.
 //
 //===----------------------------------------------------------------------===//
 

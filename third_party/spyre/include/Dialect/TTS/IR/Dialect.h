@@ -7,8 +7,7 @@
 // What it publishes is one layout contract in two spellings — the
 // `tts.tensor_layout` *op*, which a kernel authors on a `!tt.tensordesc`, and
 // the `tts.tensor_layout` *attribute*, which the lowered IR carries on the
-// memory view — and the one structural checker both are enforced by. Plus
-// `tts.inter_tile_reduce`, the authoring form of a cross-tile combination.
+// memory view — and the one structural checker both are enforced by.
 //
 // And one placement marker, `tts.pin`, in the same two spellings: the op, which
 // a kernel authors on a value, and the `tts.pin` attribute, which the lowered IR

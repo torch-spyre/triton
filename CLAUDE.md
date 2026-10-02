@@ -119,8 +119,8 @@ Current upstream touch points:
 | `include/triton/Dialect/Triton/IR/Dialect.h`, `lib/Target/LLVMIR/LLVMDIUtils.cpp` | Source compatibility with the Spyre LLVM pin |
 | `lib/Dialect/Triton/IR/Ops.cpp` | `#ifdef TRITON_BUILD_TTIR_ONLY` guards |
 | `python/triton/language/target_info.py` | Runtime frontend backend guards: `is_spyre()` predicate + `requires_backend()` decorator |
-| `python/triton/language/core.py`, `.../__init__.py` | `tl.inter_tile`, `tl.spyre_tensor_layout`, `tl.wk_slice_coord`, and their `__all__` entries |
-| `python/triton/language/semantic.py` | Emission for those three |
+| `python/triton/language/core.py`, `.../__init__.py` | `tl.spyre_tensor_layout`, `tl.wk_slice_coord`, and their `__all__` entries |
+| `python/triton/language/semantic.py` | Emission for those two |
 | `python/triton/knobs.py` | `knobs.spyre`, beside `knobs.nvidia` / `knobs.amd` |
 | `python/triton/backends/compiler.py`, `python/triton/runtime/jit.py` | `compile_time_launch_options` hook, returning `{}` for every other backend, and its call site |
 

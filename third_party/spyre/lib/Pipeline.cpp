@@ -31,16 +31,10 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   // tt.reduce/broadcast/expand_dims/dot -> linalg + tensor, and a dead-op sweep.
   pm.addPass(createLowerComputeOpsPass());
 
-  // tts.inter_tile_reduce -> ktdp.inter_tile_produce + delivery. After
-  // LowerComputeOps, because the partials it consumes have to be linalg/tensor
-  // by then.
-  pm.addPass(createLowerInterTilePass());
-
   // tt.func/tt.return -> func.func/func.return, !tt.ptr -> index. Last of the
   // conversions, because every memory pass above consumes !tt.ptr arguments
-  // through getBasePtrAsIndex, and because LowerInterTile reads work-slice
-  // function attributes this rewrites. metadata["name"] and the base-address
-  // inference read the module before the pipeline for the same reason.
+  // through getBasePtrAsIndex. metadata["name"] and the base-address inference
+  // read the module before the pipeline for the same reason.
   pm.addPass(createConvertFunctionsPass());
 
   // tt.get_program_id -> ktdp.get_compute_tile_id, tt.get_num_programs folded
