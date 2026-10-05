@@ -13,9 +13,11 @@ Operations that already have a natural Triton spelling (`tl.exp`,
 `tl.sqrt`, arithmetic operators, ...) are unaffected: the compiler continues
 to lower them to their SpyreOp equivalents internally, with no frontend
 change. This mechanism covers everything else: activation functions with no
-existing Triton name, address-generation intrinsics, and composite fused
+existing Triton name, address-generation intrinsics, composite fused
 operations such as `layernorm` that must not leak their internal
-representation into kernel code.
+representation into kernel code, and operations like `topk` whose real
+implementation depends on inter-core communication that has no
+representation in a Triton kernel at all.
 
 ## Explicit intrinsics are authoritative; generic code is the compiler's to optimize
 
@@ -370,6 +372,7 @@ author's side and only matters to how the compiler gets there.
 | `spyre_addi32toi32(a, b)` / `addi64toi64` | ordinary `a + b` | `tts.spyre_op<"addi32toi32">` (etc.) | `spyreop.addi32toi32` (etc.) | Simple | explicit address-arithmetic add; see below |
 | `spyre_muli32toi32(a, b)` | ordinary `a * b` | `tts.spyre_op<"muli32toi32">` | `spyreop.muli32toi32` | Simple | explicit address-arithmetic multiply; see below |
 | `spyre_layernorm(x, weight, bias, eps, axis)` | expands via `ExpandSpyreOps`; see *LayerNorm* | `tts.spyre_op<"layernorm">` → split into per-step `tts.spyre_op`s | `EXX2` + scale + norm sequence | Composite | see *LayerNorm* |
+| `spyre_topk(x, k, axis)` | generic top-k along `axis` (e.g. sort-and-slice or repeated argmax-and-mask), standard ops, no inter-core communication | `tts.spyre_op<"topk">` | `spyreop.topk`, realized via SFP-ring inter-core communication at device-codegen time | Simple\* | hardware-constrained on `k`; see *TopK*, below |
 
 **`spyre_exp`/`spyre_sqrt`/`spyre_rsqrt`: explicit aliases over an
 already-generic op, not staged intrinsics.** These three don't need
@@ -574,6 +577,177 @@ composite safe to expose in the first place:
   this proposal takes no position on whether that placement is currently
   correct.
 
+## TopK: hidden SFP-ring inter-core communication
+
+```python
+values, indices = spyre_topk(x, k, axis)
+```
+
+TopK is different in kind from every other entry in the initial operation
+set, not just in degree. Every other intrinsic — even `layernorm` — is a
+single-core computation: whatever it hides (`EXX2`, an internal
+representation) still lives entirely inside one core's own data and
+instructions. Spyre's real TopK implementation is not single-core at all:
+it is realized through **SFP-ring inter-core communication**, in which
+participating cores exchange partial top-k candidates around a ring to
+combine their local results into a globally correct top-k.
+
+Nothing about SFP-ring communication is representable in a Triton kernel
+today — there is no `tl.*` construct, no TTIR op, and no KTIR abstraction
+for "a value traveling between cores around a ring." Introducing one would
+be a substantial undertaking in its own right (a new dialect-level
+concept, new scheduling and placement implications, likely new KTDP
+primitives), and this proposal deliberately leaves it **out of scope**.
+`spyre_topk` is staged precisely so that this proposal doesn't have to
+resolve that: the ring protocol is entirely a `_make_spyrecode`/
+device-codegen-time concern, invisible above the single `spyreop.topk` op
+itself. A kernel author calls `spyre_topk(x, k, axis)` and never sees, or
+needs to see, that cores are communicating at all.
+
+**This is a restriction on one specific communication mechanism, not on
+inter-core communication in general.** It would be easy to read the above
+as "Spyre Triton kernels can't express inter-core communication," which is
+not what this section is saying. Cores already communicate with each
+other through LX/HBM today — reading and writing shared tensor data across
+cores is an ordinary part of the existing programming model, not something
+this proposal touches. What's specifically out of scope is the **SFP-ring**
+mechanism `spyreop.topk` happens to use internally: that one mechanism has
+no Triton-level abstraction and isn't getting one here. A future operation
+built on a different inter-core mechanism — or even a future, lower-level
+exposure of SFP-ring itself — is not precluded by anything in this
+document; it simply isn't what `spyre_topk` does, and `spyre_topk` doesn't
+need it to be exposed in order to work.
+
+This also differs from LayerNorm's hiding in kind, not just reuse of the
+same idea. LayerNorm hides an internal *representation* (`EXX2`) across
+several TTIR-visible sub-ops that `ExpandSpyreOps` produces and
+`LowerSpyreOps` replaces independently — the hiding happens at the TTIR
+decomposition layer. TopK hides an internal *communication protocol* one
+level below even the final `spyreop.topk` op: nothing about the ring shows
+up as a decomposed `tts.spyre_op` at all, because there is nothing at the
+TTIR level to decompose — the ring is realized entirely inside this one
+op's device-side implementation. `spyre_topk` therefore needs the same
+staging treatment as any intrinsic with no portable Triton spelling, but
+not `ExpandSpyreOps`'s splitting.
+
+That also strains the *Composite/Simple* column in the table above:
+`spyre_topk` lowers to a single `spyreop.*` op, so it reads as "Simple" by
+this document's existing definition (no `ExpandSpyreOps` splitting) — but
+unlike every other Simple entry, it still hides something that must not
+leak into kernel code, the same justification that earns `layernorm` its
+"Composite" label. This proposal records that tension here rather than
+quietly stretching one of the two existing labels to cover it; a future
+revision of this table may need a third category for "single op, but
+still something to hide beneath it."
+
+### Hardware constraints on `k`
+
+TopK's real implementation is subject to hardware limits that have no
+analogue in the fallback and no natural expression in today's frontend:
+
+- Each core can perform up to **4 local sorts**.
+- With **32 cores**, the maximum supported `k` is **128** — consistent
+  with (though this proposal does not assert any more general formula
+  than) 32 cores × 4 local sorts each.
+- Valid `k` values depend on **both** the requested `k` and the number of
+  participating cores, not on `k` alone — the same `k` that's valid with
+  32 cores participating may not be valid with fewer.
+
+Because these are hardware constraints, not soft tuning advice, a
+`spyre_topk` call with an infeasible `(k, num_cores)` pairing must fail
+loudly rather than silently generating code that computes a wrong result
+or fails only at the device level.
+
+### Proposed validation strategy
+
+This proposal takes a position rather than leaving validation entirely
+open, in two layers:
+
+1. **`k` is required to be a compile-time constant.** `spyre_topk`'s
+   signature takes `k` as a `tl.constexpr`, not a runtime value. Nothing
+   about a hardware-feasibility check is possible otherwise — a `k` that
+   can vary at runtime can't be checked once at compile time, and would
+   push this entire question to a device-time failure, which is exactly
+   what this proposal wants to avoid.
+2. **The authoritative check is a verifier with access to the resolved
+   participating core count, not a frontend-only assertion.** `k` alone
+   is not enough to validate — the constraint is on the pair `(k,
+   num_cores)` — and `spyre_topk`'s own trace-time call site does not
+   necessarily know the final core allocation (that may only be resolved
+   once scheduling/placement has run). So the primary check belongs on
+   `spyreop.topk` itself (or on `tts.spyre_op {hint = "topk"}`, before
+   dissolution — see *Dissolving `tts.spyre_op`*, above): a verifier that
+   runs once core count is resolved, reads both `k` and the resolved
+   `num_cores` off the op, and rejects any combination outside the
+   documented limits (today: ≤4 local sorts/core, ≤128 total at 32 cores)
+   with `mlir::emitError`, failing the pass pipeline rather than
+   proceeding.
+
+   A **frontend-side assertion in `spyre_topk` itself** is still worth
+   adding alongside the verifier, as an early, best-effort check: reject
+   any `k` above the largest value feasible under *any* core count the
+   target hardware supports (today, `k > 128`) immediately at trace time,
+   before core allocation is even attempted. This catches the most common
+   mistake — a `k` that's never going to work regardless of scheduling —
+   with a kernel-level Python traceback instead of a pass-level MLIR
+   diagnostic, without pretending the frontend can fully validate the pair
+   on its own.
+
+Either diagnostic names the actual numbers involved — the requested `k`,
+the resolved or assumed `num_cores`, and the limit that was violated — not
+a generic "unsupported `topk` configuration." A kernel author should be
+able to fix the call from the error message alone, without needing to
+understand the ring protocol that makes the limit exist.
+
+This resolves *where* the check lives and *what* it checks; it does not
+by itself answer whether a kernel author should ever need to state
+`num_cores` explicitly, which is the next open question.
+
+### Open questions this proposal does not resolve
+
+- **Should core-count-dependent limits on `k` be part of `spyre_topk`'s
+  own frontend API contract** — e.g. an explicit `num_cores` or
+  `max_k`-style argument the kernel author must supply — or should the
+  frontend stay silent about core count and rely entirely on the verifier
+  above, which reads the resolved count rather than asking for it? The
+  validation strategy above is written to work either way, but defaults
+  toward the latter (no explicit argument) since core count is normally a
+  scheduling decision, not something a kernel author chooses directly.
+- **How much SFP-ring behavior should be observable at all, even just as
+  documentation or diagnostic text, versus staying a pure implementation
+  detail?** The verifier's diagnostic above is deliberately framed in
+  terms of `k` and core count, not ring mechanics — but a kernel author
+  who wants to understand *why* the limit is 4 local sorts per core, for
+  instance, needs that explained somewhere. What the error message is
+  allowed to say, versus what belongs only in this document or in
+  backend-internal comments, is part of this question.
+
+### Software fallback divergence
+
+If `spyre_topk`'s software fallback (for `ktir_cpu`) implements top-k with
+an ordinary sequential algorithm — sort-and-slice, or repeated
+argmax-and-mask — with no ring communication at all, that fallback can be
+a numerically valid top-k while still being structurally nothing like the
+real ring-based hardware execution. This is the same class of
+fallback/real-op divergence this document already accepts for
+`reciprocal`, but it is worth naming on its own for TopK, for two reasons
+specific to it:
+
+- **Tie-breaking and ordering may not match.** Where the input has
+  repeated values at the `k`-th-largest boundary, which particular
+  elements (and indices, since `spyre_topk` returns indices — an
+  ordering-sensitive result, unlike `reciprocal`'s single scalar) get
+  selected can legitimately differ between an arbitrary sequential
+  tie-break and whatever the ring protocol's own tie-break happens to
+  produce.
+- **The fallback cannot exercise the hardware constraints above at all.**
+  A sequential software implementation has no notion of "32 cores" or "4
+  local sorts," so it will happily compute a top-k for a `k` the real
+  hardware op could never support. The fallback succeeding is therefore
+  no signal that a given `(k, num_cores)` pairing is actually feasible —
+  the validation discussed above has to be enforced independently of the
+  fallback, not inferred from it.
+
 ## Other composite candidates
 
 A composite intrinsic is warranted when there is something to hide: a
@@ -695,6 +869,18 @@ the transparent path.
   representation gets no general-purpose intrinsic of its own, only the
   `layernorm` composite — should be revisited rather than assumed to still
   hold.
+- **Whether core-count-dependent limits on `k` belong in `spyre_topk`'s
+  frontend API contract** (an explicit `num_cores`/`max_k` argument) or
+  stay implicit, resolved by the verifier proposed in *TopK*, above, which
+  that proposal defaults toward without closing off the alternative.
+- **How much SFP-ring behavior should be observable, even just in
+  diagnostic text**, without exposing the ring protocol itself — see
+  *TopK*, above.
+- **TopK's software fallback has no notion of hardware feasibility.** A
+  fallback that succeeds is not evidence that a given `(k, num_cores)`
+  pairing is valid on real hardware, and its tie-breaking on repeated
+  values at the `k`-th-largest boundary is not guaranteed to match the
+  ring protocol's — see *TopK*, above.
 
 ## Related discussions
 
