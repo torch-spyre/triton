@@ -49,6 +49,7 @@
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -58,8 +59,11 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/IntervalMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MathExtras.h"
+
+#include <optional>
 
 using namespace mlir;
 
@@ -101,6 +105,101 @@ struct ByteRange {
 };
 
 //===----------------------------------------------------------------------===//
+// The layout a pin's buffer inherits
+//===----------------------------------------------------------------------===//
+
+/// A coordinate map, in the three parallel arrays `tts.tensor_layout` spells one
+/// as. Copied rather than borrowed, because the search below projects one and
+/// compares two.
+struct Layout {
+  SmallVector<int64_t> src, op, arg;
+
+  bool operator==(const Layout &other) const {
+    return src == other.src && op == other.op && arg == other.arg;
+  }
+
+  DictionaryAttr toAttr(Builder &b) const {
+    return b.getDictionaryAttr(
+        {b.getNamedAttr(TTSDialect::kPhysSrcName, b.getDenseI64ArrayAttr(src)),
+         b.getNamedAttr(TTSDialect::kPhysOpName, b.getDenseI64ArrayAttr(op)),
+         b.getNamedAttr(TTSDialect::kPhysArgName,
+                        b.getDenseI64ArrayAttr(arg))});
+  }
+};
+
+/// The layout the view behind `access` states, carried onto the dims of the tensor
+/// the search started from.
+///
+/// `toStart[d]` is the starting tensor's dim that this access's logical dim `d`
+/// carries, or -1 when it carries none -- which is how a dim-dropping op is walked
+/// through. The carry is a DROP by `src`: a physical dim names exactly one logical
+/// dim, so removing the entries of a dim that survives into nothing leaves a
+/// coordinate map over the dims that do, with the survivors renumbered.
+///
+/// `out` stays empty, with success, when there is nothing to read or nothing sound
+/// to carry: `access` is not a load or a store, the view behind it carries no
+/// layout, the carry would have to drop a dim that was stick-SPLIT rather than named
+/// whole, or it leaves no entry at all (a full reduction, whose rank-0 result no
+/// layout describes).
+/// Failure means the annotation is there and malformed, and a diagnostic has been
+/// emitted -- through the dialect's own checker, so this pass states none of those
+/// rules itself.
+static LogicalResult layoutThrough(Operation *access, ArrayRef<int64_t> toStart,
+                                   std::optional<Layout> &out) {
+  Operation *view = mlir::triton::ktdp::viewBehindAccess(access);
+  if (!view)
+    return success();
+  Attribute attr = view->getAttr(TTSDialect::kTensorLayoutAttrName);
+  if (!attr)
+    return success();
+
+  auto anchor = [&]() { return view->emitError(); };
+  ArrayRef<int64_t> src, op, arg;
+  if (failed(mlir::triton::tts::readTensorLayoutArrays(attr, src, op, arg,
+                                                       anchor)))
+    return failure();
+
+  Layout carried;
+  for (auto [s, o, a] : llvm::zip_equal(src, op, arg)) {
+    if (s < 0 || s >= (int64_t)toStart.size() || toStart[s] < 0) {
+      // A dropped dim is only droppable while it was named WHOLE. Dropping a dim
+      // that was stick-SPLIT would leave a map with no stick structure over it,
+      // and that is not what the result of such a reduction wants: reducing away
+      // a split dim destroys the stick structure, so the output is re-stuck by a
+      // splat instead -- `phys_op [identity, splat]` over one `phys_src`, which
+      // replicates the surviving dim across a stick's lanes. See
+      // RewriteDescriptorLayoutGeneric/rebuild-reduction.mlir, case 2.
+      //
+      // A splat is not something a carry can produce: nothing upstream states the
+      // width it would broadcast over. So this is where the walk stops rather than
+      // where it guesses -- and the layout for such a buffer can still arrive from
+      // the other direction, where a store of the re-stuck result states it.
+      if (o != (int64_t)mlir::triton::tts::CoordOp::Identity) {
+        out.reset();
+        return success();
+      }
+      continue;
+    }
+    carried.src.push_back(toStart[s]);
+    carried.op.push_back(o);
+    carried.arg.push_back(a);
+  }
+  if (carried.src.empty())
+    return success();
+
+  // The carried map is checked rather than trusted. A drop by `src` cannot break
+  // the pairing rules -- a split's two halves name the same logical dim, so they
+  // leave together or stay together -- but this says so instead of arguing it, and
+  // it is also what checks the renumbering against the pinned value's own rank.
+  if (failed(mlir::triton::tts::verifyTensorLayoutArrays(
+          carried.src, carried.op, carried.arg, toStart.size(), anchor)))
+    return failure();
+
+  out = std::move(carried);
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Reading the annotation
 //===----------------------------------------------------------------------===//
 
@@ -119,6 +218,11 @@ struct Pin {
   /// The single result the annotation is about, and the value to be stored.
   Value value;
   RankedTensorType type;
+  /// What the buffer's view is annotated with, from `LayoutSearch`. Absent when no
+  /// neighbour states one, which leaves the buffer logical -- the same thing an
+  /// unannotated descriptor leaves behind, and the author's responsibility in the
+  /// same way.
+  std::optional<Layout> layout;
   /// Filled by `checkOffset`, which is also where it is checked.
   ByteRange range;
 };
@@ -219,6 +323,166 @@ static LogicalResult readPin(Operation *op, Pin &pin) {
 }
 
 //===----------------------------------------------------------------------===//
+// Deciding that layout
+//===----------------------------------------------------------------------===//
+
+/// The search for the layout a pin's buffer carries, out from the pinned value to
+/// the nearest annotated access.
+///
+/// A pin's buffer is a memory view like any other and should leave `spyrecode`
+/// physical; what is particular about it is only that the AUTHOR cannot annotate
+/// it, since it is the compiler's buffer. So the compiler decides it, the way a
+/// `linalg.generic` has its domain decided: from what is next to it.
+///
+/// Both directions, and they are not symmetric. Backward -- towards the value's
+/// producers -- may pass through an op that DROPS dims, because the layout found
+/// upstream describes a superset of this tensor's dims and the surplus entries can
+/// be dropped. Forward may not: a layout found downstream of a dim-dropping op
+/// describes fewer dims than the pinned value has, and the missing entries cannot
+/// be invented. So forward steps only where the shape is unchanged.
+struct LayoutSearch {
+  const Pin &pin;
+
+  /// Each distinct layout found, with the access that stated it, so that a
+  /// disagreement can name both sides.
+  SmallVector<std::pair<Layout, Operation *>> found;
+  /// One set per direction. Shared, they would let one walk's visit suppress the
+  /// other's, which loses a candidate rather than merely repeating work.
+  SmallPtrSet<Operation *, 8> seenBack, seenFwd;
+
+  LogicalResult run() {
+    SmallVector<int64_t> identity;
+    identity.reserve(pin.type.getRank());
+    for (int64_t d = 0, e = pin.type.getRank(); d < e; ++d)
+      identity.push_back(d);
+    if (failed(backward(pin.value, identity)))
+      return failure();
+    return forward(pin.value);
+  }
+
+  /// The layout to use, or nullopt when nothing stated one. Refuses a
+  /// disagreement rather than choosing: a buffer has one layout, and its extent is
+  /// what the author's offset is denominated in, so picking a side would make the
+  /// footprint depend on which neighbour the walk reached first.
+  LogicalResult decide(std::optional<Layout> &out) {
+    if (found.empty())
+      return success();
+    if (found.size() > 1) {
+      InFlightDiagnostic diag =
+          pin.op->emitError()
+          << "a pinned value's neighbours state different layouts, so the "
+             "layout of its buffer is not determined";
+      for (auto &[layout, access] : found)
+        diag.attachNote(access->getLoc()) << "one of them is stated here";
+      return failure();
+    }
+    out = found.front().first;
+    return success();
+  }
+
+private:
+  void note(Layout layout, Operation *access) {
+    for (auto &[seen, by] : found)
+      if (seen == layout)
+        return;
+    found.push_back({std::move(layout), access});
+  }
+
+  LogicalResult backward(Value v, ArrayRef<int64_t> toPin) {
+    Operation *def = v.getDefiningOp();
+    if (!def || !seenBack.insert(def).second)
+      return success();
+
+    // A `ktdp.load` is where a branch ends, found or not: it is the one op that
+    // reaches a view, so there is nothing further back to ask.
+    if (isa<mlir::ktdp::LoadOp>(def)) {
+      std::optional<Layout> layout;
+      if (failed(layoutThrough(def, toPin, layout)))
+        return failure();
+      if (layout)
+        note(std::move(*layout), def);
+      return success();
+    }
+
+    // A REDUCTION is walked THROUGH rather than stopped at. It states which dims
+    // it removes, so its input's layout is a layout for this tensor once the
+    // removed dims' entries are dropped -- which is what `toPin` carries.
+    if (auto reduce = dyn_cast<linalg::ReduceOp>(def)) {
+      ArrayRef<int64_t> dropped = reduce.getDimensions();
+      for (Value in : reduce.getDpsInputs()) {
+        auto inTy = dyn_cast<RankedTensorType>(in.getType());
+        if (!inTy)
+          continue;
+        SmallVector<int64_t> toPinIn(inTy.getRank(), -1);
+        int64_t surviving = 0;
+        for (int64_t d = 0, e = inTy.getRank(); d < e; ++d) {
+          if (llvm::is_contained(dropped, d))
+            continue;
+          if (surviving < (int64_t)toPin.size())
+            toPinIn[d] = toPin[surviving];
+          ++surviving;
+        }
+        if (failed(backward(in, toPinIn)))
+          return failure();
+      }
+      return success();
+    }
+
+    // Anything else: the operands whose shape is this tensor's, which is the hop
+    // that needs no carry. An operand of a different shape with no stated
+    // correspondence ends the branch, because guessing one is how a layout would
+    // come to describe the wrong dims.
+    auto vTy = dyn_cast<RankedTensorType>(v.getType());
+    if (!vTy)
+      return success();
+    for (Value operand : def->getOperands()) {
+      auto oTy = dyn_cast<RankedTensorType>(operand.getType());
+      if (oTy && oTy.getShape() == vTy.getShape())
+        if (failed(backward(operand, toPin)))
+          return failure();
+    }
+    return success();
+  }
+
+  LogicalResult forward(Value v) {
+    auto vTy = dyn_cast<RankedTensorType>(v.getType());
+    if (!vTy)
+      return success();
+    SmallVector<int64_t> identity;
+    identity.reserve(vTy.getRank());
+    for (int64_t d = 0, e = vTy.getRank(); d < e; ++d)
+      identity.push_back(d);
+
+    for (OpOperand &use : v.getUses()) {
+      Operation *user = use.getOwner();
+
+      // A `ktdp.store` of this value is an end, the mirror of the load above. Only
+      // of THIS value: a store's other operand is its access tile.
+      if (auto store = dyn_cast<mlir::ktdp::StoreOp>(user)) {
+        if (store.getDataTile() != v)
+          continue;
+        std::optional<Layout> layout;
+        if (failed(layoutThrough(store, identity, layout)))
+          return failure();
+        if (layout)
+          note(std::move(*layout), store);
+        continue;
+      }
+
+      if (!seenFwd.insert(user).second)
+        continue;
+      for (Value result : user->getResults()) {
+        auto rTy = dyn_cast<RankedTensorType>(result.getType());
+        if (rTy && rTy.getShape() == vTy.getShape())
+          if (failed(forward(result)))
+            return failure();
+      }
+    }
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Building the buffer
 //===----------------------------------------------------------------------===//
 
@@ -305,14 +569,37 @@ struct MaterializePinnedBuffersPass
     // elsewhere. An unchecked product wraps to a small range that passes both the
     // capacity and the overlap test and then builds a view at that offset with no
     // diagnostic, which is the one failure mode here that is silent.
+    // The element count the buffer OCCUPIES, which is the physical one once it
+    // carries a layout. A stick-tiled extent is rounded up to a whole stick, so a
+    // buffer can hold more elements than its logical shape has -- and measuring the
+    // logical count would under-report the range, which is silent twice over: two
+    // pins an author packed as disjoint would pass the overlap test, and a pin past
+    // the budget would pass the capacity test.
+    int64_t elements = pin.type.getNumElements();
+    if (pin.layout) {
+      SmallVector<int64_t> physSizes;
+      if (!mlir::triton::tts::applyCoordMap(pin.type.getShape(),
+                                            pin.layout->src, pin.layout->op,
+                                            pin.layout->arg, physSizes))
+        return op->emitError()
+               << "a pinned value has no static physical extents under the "
+                  "layout its buffer takes from a neighbour";
+      elements = 1;
+      for (int64_t extent : physSizes)
+        if (llvm::MulOverflow(elements, extent, elements))
+          return op->emitError()
+                 << "a pinned value's physical element count is not "
+                    "representable";
+    }
+
     int64_t size = 0;
     if (llvm::MulOverflow(pin.offset, elemBytes, pin.range.lo) ||
-        llvm::MulOverflow(pin.type.getNumElements(), elemBytes, size) ||
+        llvm::MulOverflow(elements, elemBytes, size) ||
         llvm::AddOverflow(pin.range.lo, size, pin.range.hi))
       return op->emitError()
              << "pinned range is not representable: offset " << pin.offset
-             << " of " << pin.type.getNumElements() << " elements at "
-             << elemBytes << " bytes each";
+             << " of " << elements << " elements at " << elemBytes
+             << " bytes each";
 
     if (capacity > 0 && pin.range.hi > capacity)
       return op->emitError()
@@ -377,6 +664,17 @@ struct MaterializePinnedBuffersPass
         builder, loc, offset, shape, strides, /*dynSizes=*/{},
         /*dynStrides=*/{}, pin.type.getElementType(), pin.space);
 
+    // The layout a neighbour stated, if one did, and this is the whole of how the
+    // buffer becomes physical: annotated, it is stick-tiled by
+    // RewriteDescriptorLayoutGeneric like any other annotated view, which then
+    // finds it from the producing compute and restates that compute to match. The
+    // view is built LOGICAL either way -- that pass is where logical becomes
+    // physical, and it is below this one.
+    if (pin.layout)
+      if (Operation *viewOp = memView.getDefiningOp())
+        viewOp->setAttr(TTSDialect::kTensorLayoutAttrName,
+                        pin.layout->toAttr(builder));
+
     Value storeTile = buildWholeTile(builder, loc, memView, shape);
     mlir::ktdp::StoreOp::create(builder, loc, pin.value, storeTile);
 
@@ -440,6 +738,11 @@ struct MaterializePinnedBuffersPass
         return signalPassFailure();
       // Before the numbers: the mode makes the pin unsupported whatever they are.
       if (failed(checkBindMode(pin)))
+        return signalPassFailure();
+      // And before them for a second reason: what the buffer's layout turns out to
+      // be is what its extent is measured in.
+      LayoutSearch search{pin};
+      if (failed(search.run()) || failed(search.decide(pin.layout)))
         return signalPassFailure();
       if (failed(checkOffset(pin)))
         return signalPassFailure();

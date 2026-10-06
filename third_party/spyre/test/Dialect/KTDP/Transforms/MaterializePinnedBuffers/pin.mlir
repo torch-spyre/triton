@@ -171,6 +171,64 @@ tt.func @linalg_carrier(%x: tensor<4x64xf32>) -> tensor<4xf32> {
 }
 
 // -----
+// A layout carried BACKWARD THROUGH A REDUCTION, which is the one hop the search
+// makes that is not shape-preserving. The source is `[4, 128]` fp16 stick-tiled on
+// dim 1 at the 64-element stick, so its physical form is `[2, 4, 64]`; the reduction
+// removes dim 0, and the `[128]` result keeps the split, renumbered onto its one
+// surviving dim -- physical `[2, 64]`.
+//
+// The reduction is OFF the stick axis, which is what makes the carry sound: the dim
+// being dropped was named WHOLE, by an identity entry, so removing it leaves the
+// stick structure of the dim that survives untouched. Reducing ON the stick axis is
+// the next case, and is refused.
+//
+// Backward and not forward, and the asymmetry is the point: a layout found upstream
+// of a dim-dropping op describes a SUPERSET of this tensor's dims, and the surplus
+// entries can be dropped, where one found downstream describes fewer and the missing
+// entries cannot be invented.
+// CHECK-LABEL: tt.func @layout_through_a_reduction
+// CHECK: ktdp.construct_memory_view {{.*}}memory_space = #ktdp.memory_space<ct_local>
+// CHECK-SAME: tts.tensor_layout = {phys_arg = array<i64: 64, 64>, phys_op = array<i64: 1, 2>, phys_src = array<i64: 0, 0>}
+// CHECK-NOT: tts.pin
+tt.func @layout_through_a_reduction(%src: index) -> tensor<128xf16> {
+  %c0 = arith.constant 0 : index
+  %v = ktdp.construct_memory_view %src, sizes: [4, 128], strides: [128, 1] {coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 127 >= 0)>, memory_space = #ktdp.memory_space<global>, tts.tensor_layout = {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>}} : memref<4x128xf16>
+  %t = ktdp.construct_access_tile %v[%c0, %c0] {access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 127 >= 0)>} : memref<4x128xf16> -> !ktdp.access_tile<4x128xindex>
+  %x = ktdp.load %t : <4x128xindex> -> tensor<4x128xf16>
+  %init = tensor.empty() : tensor<128xf16>
+  %r = linalg.reduce { arith.addf } ins(%x : tensor<4x128xf16>) outs(%init : tensor<128xf16>) dimensions = [0]
+      {tts.pin = {memory_space = "ct_local", offset = 0 : i32}}
+  tt.return %r : tensor<128xf16>
+}
+
+// -----
+// The SAME shape reducing ON the stick axis, where the carry is REFUSED and the
+// buffer stays logical. Reducing away a split dim destroys the stick structure, so
+// the result of such a reduction is re-stuck by a splat -- `phys_op
+// [identity, splat]` over one `phys_src`, replicating the surviving dim across a
+// stick's lanes (RewriteDescriptorLayoutGeneric/rebuild-reduction.mlir, case 2).
+//
+// A splat is not something a carry can produce, because nothing upstream states the
+// width it would broadcast over. Dropping the split dim's two entries would leave a
+// map with no stick structure at all, which is a layout this result does not want --
+// so the walk stops instead of inventing one, and a layout for this buffer can still
+// arrive from a store of the re-stuck result.
+// CHECK-LABEL: tt.func @layout_not_carried_off_a_split
+// CHECK: ktdp.construct_memory_view {{.*}}memory_space = #ktdp.memory_space<ct_local>
+// CHECK-NOT: tts.tensor_layout
+// CHECK-NOT: tts.pin
+tt.func @layout_not_carried_off_a_split(%src: index) -> tensor<4xf16> {
+  %c0 = arith.constant 0 : index
+  %v = ktdp.construct_memory_view %src, sizes: [4, 128], strides: [128, 1] {coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 127 >= 0)>, memory_space = #ktdp.memory_space<global>, tts.tensor_layout = {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>}} : memref<4x128xf16>
+  %t = ktdp.construct_access_tile %v[%c0, %c0] {access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 127 >= 0)>} : memref<4x128xf16> -> !ktdp.access_tile<4x128xindex>
+  %x = ktdp.load %t : <4x128xindex> -> tensor<4x128xf16>
+  %init = tensor.empty() : tensor<4xf16>
+  %r = linalg.reduce { arith.addf } ins(%x : tensor<4x128xf16>) outs(%init : tensor<4xf16>) dimensions = [1]
+      {tts.pin = {memory_space = "ct_local", offset = 0 : i32}}
+  tt.return %r : tensor<4xf16>
+}
+
+// -----
 // IDEMPOTENCY, which Passes.td claims as a property and nothing drove. The pass
 // removes the annotation once it has honoured it, so a module that has already been
 // through it has no request left and running it again changes nothing. That is what

@@ -152,6 +152,36 @@ tt.func @sub_byte_element(%a: tensor<4x64xf16>, %b: tensor<4x64xf16>) {
 }
 
 // -----
+// Two neighbours stating DIFFERENT layouts, which is the one refusal the layout
+// search has. A buffer has one layout and nothing picks between two, so this is
+// rejected rather than resolved -- and the reason it cannot be resolved by falling
+// back to the logical form is that a buffer's extent is what the author's offset is
+// denominated in, so a third answer would make their footprint depend on which
+// neighbour the walk happened to reach.
+//
+// Hand-written because it needs two annotated views and the pinned value between
+// them: the source is stick-tiled on dim 1 at the 64-element stick, the destination
+// is untiled -- every dim named whole -- and no layout is a layout for both.
+//
+// The error is on the pin's CARRIER and each note on the access that stated a
+// layout, which is what lets an author see the two sides rather than be told the
+// answer is ambiguous.
+tt.func @neighbours_disagree(%src: index, %dst: index) {
+  %c0 = arith.constant 0 : index
+  %a = ktdp.construct_memory_view %src, sizes: [4, 64], strides: [64, 1] {coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.memory_space<global>, tts.tensor_layout = {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>}} : memref<4x64xf16>
+  %ta = ktdp.construct_access_tile %a[%c0, %c0] {access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 63 >= 0)>} : memref<4x64xf16> -> !ktdp.access_tile<4x64xindex>
+  // expected-note @+1 {{one of them is stated here}}
+  %x = ktdp.load %ta : <4x64xindex> -> tensor<4x64xf16>
+  // expected-error @+1 {{a pinned value's neighbours state different layouts, so the layout of its buffer is not determined}}
+  %e = math.exp %x {tts.pin = {memory_space = "ct_local", offset = 0 : i32}} : tensor<4x64xf16>
+  %b = ktdp.construct_memory_view %dst, sizes: [4, 64], strides: [64, 1] {coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.memory_space<global>, tts.tensor_layout = {phys_arg = array<i64: 0, 0>, phys_op = array<i64: 0, 0>, phys_src = array<i64: 0, 1>}} : memref<4x64xf16>
+  %tb = ktdp.construct_access_tile %b[%c0, %c0] {access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 63 >= 0)>} : memref<4x64xf16> -> !ktdp.access_tile<4x64xindex>
+  // expected-note @+1 {{one of them is stated here}}
+  ktdp.store %e, %tb : tensor<4x64xf16>, <4x64xindex>
+  tt.return
+}
+
+// -----
 // A `tts.pin` that is not a DICTIONARY at all. `LowerTTSMarkers` writes one, so this
 // is only reachable by hand -- which is exactly what this file is, and why readPin
 // diagnoses it instead of asserting.
