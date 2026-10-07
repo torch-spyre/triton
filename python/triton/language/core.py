@@ -3887,14 +3887,14 @@ def spyre_pin(v, memory_space, offset=None, _semantic=None):
     and for the scratchpad, where in it. It lowers to a ``tts.pin`` marker, which
     ``LowerTTSMarkers`` turns into an attribute on the op producing the value.
 
-    That attribute is where it stops TODAY: the request reaches the ``ktir``
-    artifact and nothing in the backend yet builds the buffer it asks for. A pin is
-    therefore a no-op on the generated code until the pass that honours it lands,
-    which is the follow-up to this one.
+    The ``ktir`` artifact carries that attribute and nothing more; the buffer it
+    asks for is built at the head of the ``spyrecode`` stage, by
+    ``MaterializePinnedBuffers``, as a memory view in the named space plus a store
+    of the value and a load per use.
 
-    Once honoured, pinning also SPLITS the producer from its consumers, since the
-    value then reaches them through memory — which is what makes a pin the way to
-    stop two pointwise ops fusing into one compute.
+    Pinning therefore also SPLITS the producer from its consumers, since the value
+    reaches them through memory — which is what makes a pin the way to stop two
+    pointwise ops fusing into one compute.
 
     Args:
         v:            The value to place, and it must be one an OP IN THE KERNEL
@@ -3938,4 +3938,56 @@ def spyre_pin(v, memory_space, offset=None, _semantic=None):
     Only valid on the ``spyre`` backend — raises on any other target.
     """
     return _semantic.spyre_pin(v, memory_space, offset)
+
+
+@builtin
+def make_distributed_descriptor(partial, work_slices, axes, block_shape,
+                                _semantic=None):
+    """(Spyre only) Compose every instance's share of a tensor into one descriptor.
+
+    Each instance passes ITS OWN share and gets back a descriptor over the whole
+    tensor. Reading it at an offset of the instance's choosing is the
+    redistribution, and the offsets differing per instance is what makes it one::
+
+        share = ...                                   # produced on-chip
+        tl.spyre_pin(share, "ct_local", offset=0)     # where my share lives
+        whole = tl.make_distributed_descriptor(
+            share, work_slices=SRC, axes=[None, "n"], block_shape=[64, 64])
+        mine  = whole.load([0, my_offset])            # my region under the new division
+        tl.spyre_pin(mine, "ct_local", offset=DEST)   # where the received tile lands
+
+    Both pins are load-bearing. The first is what gives a partition an offset at
+    all — nothing else supplies one. The second is the landing a received tile
+    needs before a compute unit can read it.
+
+    ``.load()`` on the result is a TRANSFER, syntactically identical to a local
+    descriptor read; and the call itself is an implicit barrier over the instances
+    that reach it, so the participant set must not depend on data.
+
+    Args:
+        partial:     This instance's share, a value. It must be pinned.
+        work_slices: The PARTITION table — one entry per region the view is
+                     composed from, NOT one per tile — as a ``tl.constexpr`` list
+                     of dicts mapping a dimension key to a slice index, every
+                     entry carrying the same keys. Written the way
+                     :func:`inter_tile`'s ``work_slices`` is. The slice count
+                     along a key is one more than the largest index appearing
+                     under it, and is deliberately not written down.
+        axes:        One entry per tensor dimension, naming the partition key that
+                     dimension is divided along, or ``None`` for a dimension the
+                     work was not divided on.
+        block_shape: The extent of one ``.load()``, bounded by the COMPOSED extent
+                     rather than by the share's — so it may be larger than the
+                     share. Less is a relayout reading the region this instance
+                     ends up holding; exactly a share is one region per load; more
+                     is a gather across partitions, and the whole composed axis is
+                     what makes a fold over it an all-reduce.
+
+    There is no destination table: the destination arrangement is the offset each
+    instance passes to ``.load()``.
+
+    Only valid on the ``spyre`` backend — raises on any other target.
+    """
+    return _semantic.make_distributed_descriptor(partial, work_slices, axes,
+                                                 block_shape)
 # --- END --- added for spyre
