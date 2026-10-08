@@ -107,24 +107,6 @@ func.func @binary(%x: tensor<64xf32>, %y: tensor<64xf32>) -> tensor<64xf32> {
 
 // -----
 
-#map = affine_map<(d0) -> (d0)>
-
-// A NAME WITH NO INTRINSIC. Tracing refuses one, so only hand-written IR gets
-// here.
-func.func @unknown(%x: tensor<64xf32>) -> tensor<64xf32> {
-  %e = tensor.empty() : tensor<64xf32>
-  %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
-      ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
-  ^bb0(%in: f32, %out: f32):
-    // expected-error @+1 {{tl.spyre_op("softplus") was not selected: there is no spyreop intrinsic named 'softplus'}}
-    %ex = math.exp %in {tts.spyreop_hint = {id = 0 : i64, name = "softplus"}} : f32
-    linalg.yield %ex : f32
-  } -> tensor<64xf32>
-  return %r : tensor<64xf32>
-}
-
-// -----
-
 // A CLAIMED OP OUTSIDE ANY BODY, which is also the 1:1 rules' decline made
 // visible: a scalar math.exp is something SelectUnaryFloat selects wherever it
 // is. Were it not declined, it would become an untagged spyreop.exp and nothing

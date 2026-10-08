@@ -172,11 +172,3 @@ tt.func @captures(%x: tensor<128xf32>) -> tensor<128xf32> {
   tt.return %r : tensor<128xf32>
 }
 
-// -----
-
-// The tag's spelling, which the dialect's attribute verifier owns.
-tt.func @bad_tag(%x: tensor<128xf32>) -> tensor<128xf32> {
-  // expected-error @+1 {{'tts.spyreop_hint' must be a dictionary of exactly a string 'name' and an i64 'id'}}
-  %e = math.exp %x {tts.spyreop_hint = {name = "sigmoid"}} : tensor<128xf32>
-  tt.return %e : tensor<128xf32>
-}

@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/TTS/IR/Dialect.h"
+#include "Dialect/TTS/IR/Intrinsics.h"
 
 #include "ktir/Dialect/KTDP/KTDP.h"
 
@@ -377,9 +378,12 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
   // `tts.spyreop_hint` is written by one pass, LowerTTSMarkers, and READ by two
   // in `spyrecode` -- FuseComputeAndDataMovement groups bodies by equality of
   // the whole hint, and LowerSpyreOps selects the intrinsic its `name` names. So
-  // its spelling is checked here, which is what lets getSpyreopHint hand those
-  // readers a dictionary they need not re-check: on hand-written IR this is the
-  // one place a malformed hint is caught before a reader takes it for absent.
+  // what one op can show is checked here, which is what lets getSpyreopHint hand
+  // those readers a dictionary they need not re-check: exactly the two fields,
+  // each of its type, a `name` in the intrinsic table, and an op that is not a
+  // constant, which LowerTTSMarkers never hints. Nothing about other ops -- an
+  // `id` being unique, a call site being whole -- is checkable from one op;
+  // FuseComputeAndDataMovement checks those once its fusion is done.
   if (name == kSpyreopHintAttrName) {
     auto hint = dyn_cast<DictionaryAttr>(attribute.getValue());
     auto intrinsic =
@@ -392,6 +396,13 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
              << "' must be a dictionary of exactly a string '"
              << kSpyreopHintNameKey << "' and an i64 '" << kSpyreopHintIdKey
              << "', got " << attribute.getValue();
+    if (!lookupSpyreopIntrinsic(intrinsic.getValue()))
+      return op->emitError("'")
+             << kSpyreopHintAttrName << "' names no spyreop intrinsic: "
+             << intrinsic;
+    if (op->hasTrait<OpTrait::ConstantLike>())
+      return op->emitError("'")
+             << kSpyreopHintAttrName << "' is not set on a constant";
     return success();
   }
 
