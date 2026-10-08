@@ -115,6 +115,21 @@ def _raises(kernel, op, dtype, match):
     assert match in str(exc.value)
 
 
+@triton.jit
+def _constant_request(out_ptr, N: tl.constexpr, OP: tl.constexpr):
+    out_desc = tl.make_tensor_descriptor(out_ptr, shape=[N], strides=[1], block_shape=[N])
+    out_desc.store([0], tl.spyre_op(OP, tl.full([N], 1.0, tl.float32)))
+
+
+def test_constant_operand_is_refused(register, tmp_path, capfd):
+    register("test_mock")(func1)
+    ttir = compile_to_ttir(_constant_request, {"out_ptr": "*fp32", "N": "constexpr", "OP": "constexpr"},
+                           {"N": 128, "OP": "test_mock"})
+    with pytest.raises(Exception):
+        _ktir(ttir, tmp_path)
+    assert 'tl.spyre_op("test_mock"): operand 0 is a constant' in capfd.readouterr().err
+
+
 def test_unregistered_name_is_refused():
     _raises(_request, "softplus", "fp16", "tl.spyre_op: no intrinsic named 'softplus'; the Spyre backend registers")
 

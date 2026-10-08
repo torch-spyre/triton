@@ -53,6 +53,7 @@
 #include "ktir/Dialect/KTDP/KTDP.h"
 
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
@@ -348,7 +349,15 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 /// Ids start above any already in the module, so IR that already carries hints
 /// -- written by hand, or lowered once already -- does not collide with the
 /// ones written here.
-static void inlineSpyreOpCallSites(ModuleOp module) {
+///
+/// A call site with a constant operand is refused, before anything is inlined.
+/// Every op of its body then reads only constants, so the first folding driver
+/// in `spyrecode` folds the whole call site to one constant and no intrinsic is
+/// selected. The check is here rather than at trace time because this pass runs
+/// after the `ktir` stage's canonicalize: an operand that only folds to a
+/// constant there (`tl.full` traces to a `tt.splat` of a scalar) is a constant
+/// by now.
+static LogicalResult inlineSpyreOpCallSites(ModuleOp module) {
   using mlir::triton::tts::SpyreOpOp;
   using mlir::triton::tts::TTSDialect;
 
@@ -363,6 +372,14 @@ static void inlineSpyreOpCallSites(ModuleOp module) {
   // since the op's verifier admits only elementwise ops there.
   SmallVector<SpyreOpOp> callSites;
   module.walk([&](SpyreOpOp op) { callSites.push_back(op); });
+
+  for (SpyreOpOp callSite : callSites)
+    for (auto [i, operand] : llvm::enumerate(callSite.getInputs()))
+      if (matchPattern(operand, m_Constant()))
+        return callSite.emitError()
+               << "tl.spyre_op(\"" << callSite.getName() << "\"): operand " << i
+               << " is a constant, so the call site would fold to a constant "
+                  "and no intrinsic would be selected";
 
   Builder builder(module.getContext());
   for (SpyreOpOp callSite : callSites) {
@@ -390,6 +407,7 @@ static void inlineSpyreOpCallSites(ModuleOp module) {
     callSite->replaceAllUsesWith(yield->getOperands());
     callSite->erase();
   }
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -407,10 +425,10 @@ struct LowerTTSMarkersPass
     // FIRST, ahead of the markers. A pin may name a call site's result, and
     // the op producing that value exists only once the body is inlined -- run
     // after, the pin would land on the call site and be erased with it. Not a
-    // marker, so not the driver's: see inlineSpyreOpCallSites. Cannot fail,
-    // since the op's verifier has already held the body to the shape inlining
-    // needs.
-    inlineSpyreOpCallSites(getOperation());
+    // marker, so not the driver's: see inlineSpyreOpCallSites, which refuses
+    // a call site with a constant operand.
+    if (failed(inlineSpyreOpCallSites(getOperation())))
+      return signalPassFailure();
 
     // One statement per marker kind, and the three things a marker brings: its
     // op type, its attribute name, and the resolve/build pair above.

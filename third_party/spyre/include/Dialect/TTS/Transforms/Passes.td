@@ -45,7 +45,10 @@ def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
           inlined but the constants carries the `tts.spyreop_hint` ATTRIBUTE,
           `{name = <name>, id = <i64>}`, with an id unique to that
           tts.spyre_op in the module. Runs before the markers, so a pin naming
-          a request's result lands on the inlined op producing it.
+          a request's result lands on the inlined op producing it. A
+          tts.spyre_op with a constant operand is an error: its body would
+          fold to a constant in `spyrecode` and no intrinsic would be
+          selected.
 
         tts.spyre_op is not a marker -- it names no value and holds a body --
         so it is not one of the driver's kinds below; it has a function of its
