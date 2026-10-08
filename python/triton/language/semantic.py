@@ -2126,8 +2126,8 @@ class TritonSemantic(Generic[TensorTy]):
             if not isinstance(a, tl.tensor) or not a.type.is_block():
                 raise ValueError(f"tl.spyre_op({name!r}): operand {i} must be a "
                                  f"tensor, got {a!r}")
-            # Restated from the intrinsic's operand constraints, so the refusal is
-            # at the kernel line; LowerSpyreOps refuses the same request later.
+            # The C++ intrinsic table's dtypes, which the tts.spyre_op verifier
+            # also checks; checked here so the refusal is at the kernel line.
             if a.type.scalar.name not in entry.dtypes:
                 raise ValueError(f"tl.spyre_op({name!r}): the intrinsic takes "
                                  f"{list(entry.dtypes)}, not {a.type.scalar.name}")

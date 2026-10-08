@@ -113,6 +113,7 @@
 #include "Transforms/Passes.h"
 
 #include "Dialect/TTS/IR/Dialect.h"
+#include "Dialect/TTS/IR/Intrinsics.h"
 #include "ktir/Dialect/SpyreOp/SpyreOp.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
@@ -558,39 +559,6 @@ struct SelectArithMulI : public OpRewritePattern<arith::MulIOp> {
 // A request to one: a body hinted `tts.spyreop_hint` -> the intrinsic it names
 //===----------------------------------------------------------------------===//
 
-/// The intrinsics a request may name, and the element types each accepts --
-/// SpyreOp.td's operand constraints, restricted to the builtin types this tree
-/// produces (DF16 is spyreop's own type and nothing upstream of here makes one):
-/// all take f16, and `takesF32` says whether f32 too. Every one is unary with
-/// SameOperandsAndResultType, which is the shape the rule matches.
-struct SpyreopIntrinsic {
-  StringLiteral name;
-  bool takesF32;
-  Value (*build)(OpBuilder &, Location, Value);
-};
-
-template <typename Intrinsic>
-Value buildUnaryIntrinsic(OpBuilder &builder, Location loc, Value operand) {
-  return Intrinsic::create(builder, loc, operand.getType(), operand);
-}
-
-constexpr SpyreopIntrinsic kSpyreopIntrinsics[] = {
-    {"gelu", /*takesF32=*/false, buildUnaryIntrinsic<spyreop::GeLU>},
-    {"silu", /*takesF32=*/true, buildUnaryIntrinsic<spyreop::SiLU>},
-    {"sigmoid", /*takesF32=*/true, buildUnaryIntrinsic<spyreop::Sigmoid>},
-};
-
-const SpyreopIntrinsic *lookupIntrinsic(StringRef name) {
-  for (const SpyreopIntrinsic &entry : kSpyreopIntrinsics)
-    if (entry.name == name)
-      return &entry;
-  return nullptr;
-}
-
-bool takesType(const SpyreopIntrinsic &entry, Type type) {
-  return isa<Float16Type>(type) || (entry.takesF32 && isa<Float32Type>(type));
-}
-
 /// Where each request's hinted ops are, counted once before the greedy driver
 /// runs: how many generic bodies hold ops of the request, and whether any of
 /// its ops is outside a body altogether.
@@ -642,7 +610,7 @@ CallSiteSpreads spreadOfCallSites(ModuleOp module) {
 /// What the request rule needs from a body it can replace.
 struct CallSiteMatch {
   DictionaryAttr hint;
-  const SpyreopIntrinsic *intrinsic = nullptr;
+  const triton::tts::SpyreopIntrinsic *intrinsic = nullptr;
   BlockArgument input;
   Value result;
   SmallVector<Operation *> members;
@@ -733,12 +701,13 @@ FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic,
           "), and spyreop." + name.str() + " has one type for both";
     return failure();
   }
-  const SpyreopIntrinsic *intrinsic = lookupIntrinsic(name);
+  const triton::tts::SpyreopIntrinsic *intrinsic =
+      triton::tts::lookupSpyreopIntrinsic(name);
   if (!intrinsic) {
     why = "there is no spyreop intrinsic named '" + name.str() + "'";
     return failure();
   }
-  if (!takesType(*intrinsic, match.input.getType())) {
+  if (!intrinsic->takesElementType(match.input.getType())) {
     std::string type;
     llvm::raw_string_ostream os(type);
     os << match.input.getType();
@@ -782,7 +751,8 @@ struct SelectCallSite : public OpRewritePattern<linalg::GenericOp> {
     auto yield = cast<linalg::YieldOp>(generic.getBlock()->getTerminator());
     rewriter.setInsertionPoint(yield);
     Value selected =
-        match->intrinsic->build(rewriter, match->result.getLoc(), match->input);
+        match->intrinsic->build(rewriter, match->result.getLoc(), match->input)
+            ->getResult(0);
     rewriter.modifyOpInPlace(yield, [&] { yield->setOperand(0, selected); });
     // Reverse program order, so each op's users are gone before it is.
     for (Operation *op : llvm::reverse(match->members))

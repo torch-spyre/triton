@@ -109,6 +109,27 @@ def test_wrong_arity_is_refused():
     _raises(two_operands, "silu", "fp32", "tl.spyre_op('silu'): takes 1 tensor operand(s), got 2")
 
 
+def test_intrinsic_table_names_are_unique():
+    # The C++ table is checked where it is defined; this pins that what the
+    # frontend reads from it has one entry per name.
+    from triton._C.libtriton import spyre
+    names = [entry["name"] for entry in spyre.intrinsics.table()]
+    assert len(names) == len(set(names))
+
+
+def test_fallback_names_are_the_table_names():
+    from triton.backends.spyre import intrinsics
+    intrinsics._check_names(intrinsics.FALLBACKS, intrinsics._read_table())
+    with pytest.raises(RuntimeError, match="the C\\+\\+ intrinsic table names"):
+        intrinsics._check_names({**intrinsics.FALLBACKS, "softplus": None}, intrinsics._read_table())
+
+
+def test_a_fallback_name_given_twice_is_refused():
+    from triton.backends.spyre import intrinsics
+    with pytest.raises(ValueError, match="intrinsic 'gelu' has two fallbacks"):
+        intrinsics._by_name(("gelu", None), ("gelu", None))
+
+
 @pytest.mark.parametrize("backend", ["cuda", "hip", None])
 def test_raises_off_backend(monkeypatch, backend):
     # The guard fires before the builtin touches ``_semantic`` or its operands.
