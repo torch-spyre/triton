@@ -131,7 +131,8 @@ def TTS_PinOp : TTS_Op<"pin", []> {
 }
 
 def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
-    IsolatedFromAbove, SingleBlock, RecursiveMemoryEffects]> {
+    IsolatedFromAbove, SingleBlockImplicitTerminator<"SpyreOpYieldOp">,
+    RecursiveMemoryEffects]> {
   let summary = "Request one spyreop intrinsic, carrying its fallback body";
 
   let description = [{
@@ -190,6 +191,9 @@ def TTS_SpyreOpYieldOp : TTS_Op<"spyreop_yield", [
   let summary = "Terminate a tts.spyre_op body, yielding its results";
 
   let arguments = (ins Variadic<AnyRankedTensor>:$values);
+
+  // The no-operand builder SingleBlockImplicitTerminator requires.
+  let builders = [OpBuilder<(ins), [{ /* no values */ }]>];
 
   let assemblyFormat = "($values^ `:` type($values))? attr-dict";
 }

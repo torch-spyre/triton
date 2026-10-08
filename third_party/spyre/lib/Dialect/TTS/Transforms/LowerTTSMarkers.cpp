@@ -334,10 +334,8 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 ///      one helper inlined twice, say -- stay two after both land in one
 ///      function;
 ///   2. set `{name = name, id = id}` on every op of the body but its
-///      constants, nested ops included, since a reduction's combiner becomes
-///      the body a later pass reads. Terminators are not hinted: the call
-///      site's own is about to go, and a nested one is structure that every
-///      rewrite keeps, so a hint on it would outlive the call site it named;
+///      constants and its terminator, which is about to go. The op's verifier
+///      has held every one of them to be elementwise, so none has a region;
 ///   3. replace each block argument by its operand and move the body's ops in
 ///      front of the call site;
 ///   4. replace each result by its yielded value and erase the call site, whose
@@ -361,9 +359,8 @@ static void inlineSpyreOpCallSites(ModuleOp module) {
         nextId = std::max(nextId, id.getInt() + 1);
   });
 
-  // Collect first: the rewrite erases. Post-order, so a call site nested in
-  // another's body is inlined into the outer body first, and its ops then take
-  // the outer call site's hint when that body is inlined in turn.
+  // Collect first: the rewrite erases. None is nested in another's body,
+  // since the op's verifier admits only elementwise ops there.
   SmallVector<SpyreOpOp> callSites;
   module.walk([&](SpyreOpOp op) { callSites.push_back(op); });
 
@@ -379,11 +376,8 @@ static void inlineSpyreOpCallSites(ModuleOp module) {
     Block &body = callSite.getBody().front();
     Operation *yield = body.getTerminator();
     for (Operation &op : body.without_terminator())
-      op.walk([&](Operation *nested) {
-        if (!nested->hasTrait<OpTrait::IsTerminator>() &&
-            !nested->hasTrait<OpTrait::ConstantLike>())
-          nested->setAttr(TTSDialect::kSpyreopHintAttrName, hint);
-      });
+      if (!op.hasTrait<OpTrait::ConstantLike>())
+        op.setAttr(TTSDialect::kSpyreopHintAttrName, hint);
 
     for (auto [arg, operand] :
          llvm::zip_equal(body.getArguments(), callSite.getInputs()))

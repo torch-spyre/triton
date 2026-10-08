@@ -7,8 +7,7 @@
 //   1. the body's ops move in front of the request, block arguments replaced
 //      by the operands;
 //   2. every moved op but a constant carries
-//      `tts.spyreop_hint = {name = <name>, id = <id>}`, ops nested in a moved
-//      op's region included;
+//      `tts.spyreop_hint = {name = <name>, id = <id>}`;
 //   3. the request's results are replaced by the yielded values;
 //   4. the request and its terminator are gone.
 
@@ -62,28 +61,6 @@ func.func @two_requests(%x: tensor<64xf32>) -> tensor<64xf32> {
     tts.spyreop_yield %e : tensor<64xf32>
   }
   return %r1 : tensor<64xf32>
-}
-
-// -----
-
-// Ops nested in a moved op's region are tagged too: a reduction's combiner is
-// the body a later pass reads once the reduction is a generic. Terminators are
-// not, since every rewrite keeps them and the tag would outlive its request.
-// CHECK-LABEL: func.func @nested(
-// CHECK:         linalg.reduce {{.*}} {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}}
-// CHECK:           arith.addf {{.*}} {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}}
-// CHECK:           linalg.yield %{{.*}} : f16
-func.func @nested(%x: tensor<4x64xf16>, %init: tensor<4xf16>) -> tensor<4xf16> {
-  %r = tts.spyre_op "gelu" (%x, %init) : (tensor<4x64xf16>, tensor<4xf16>) -> tensor<4xf16> {
-  ^bb0(%a: tensor<4x64xf16>, %i: tensor<4xf16>):
-    %s = linalg.reduce ins(%a : tensor<4x64xf16>) outs(%i : tensor<4xf16>) dimensions = [1]
-      (%in: f16, %acc: f16) {
-        %t = arith.addf %in, %acc : f16
-        linalg.yield %t : f16
-      }
-    tts.spyreop_yield %s : tensor<4xf16>
-  }
-  return %r : tensor<4xf16>
 }
 
 // -----
