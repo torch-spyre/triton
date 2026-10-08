@@ -29,8 +29,7 @@ import pytest
 import triton
 import triton.language as tl
 
-# The module the frontend reaches through SpyreBackend's codegen hook, as
-# compile_to_ttir imports that backend.
+# The module compile_to_ttir's SpyreBackend reads its fallbacks from.
 from backend import intrinsics
 from utils import compile_to_ttir, make_ktir_mod
 
@@ -63,39 +62,29 @@ def _spyrecode(mod):
 
 
 @pytest.fixture
-def spyre_intrinsic(monkeypatch):
-    """The registration decorator, over a copy of the fallback table that is put
-    back afterwards, so a test's registrations do not reach the next test."""
+def register(monkeypatch):
+    """``spyre_intrinsic``, over a throw-away copy of the fallback table, so a
+    test's registrations are gone when it ends."""
     monkeypatch.setattr(intrinsics, "FALLBACKS", dict(intrinsics.FALLBACKS))
     return intrinsics.spyre_intrinsic
 
 
-def _bind_func1(spyre_intrinsic):
-
-    @spyre_intrinsic("test_mock")
-    @triton.jit
-    def func1(x):
-        xf = x.to(tl.float32)
-        return (xf * xf + xf).to(x.dtype)
-
-    return func1
+@triton.jit
+def func1(x):
+    xf = x.to(tl.float32)
+    return (xf * xf + xf).to(x.dtype)
 
 
-def _bind_func2(spyre_intrinsic):
-
-    @spyre_intrinsic("test_mock")
-    @triton.jit
-    def func2(x):
-        xf = x.to(tl.float32)
-        return (tl.exp(xf) - 1.0).to(x.dtype)
-
-    return func2
+@triton.jit
+def func2(x):
+    xf = x.to(tl.float32)
+    return (tl.exp(xf) - 1.0).to(x.dtype)
 
 
-@pytest.mark.parametrize("bind", [_bind_func1, _bind_func2], ids=["func1", "func2"])
+@pytest.mark.parametrize("fallback", [func1, func2], ids=["func1", "func2"])
 @pytest.mark.parametrize("dtype", ["fp16", "fp32"])
-def test_call_site_reaches_one_intrinsic(spyre_intrinsic, bind, dtype, tmp_path):
-    bind(spyre_intrinsic)
+def test_call_site_reaches_one_intrinsic(register, fallback, dtype, tmp_path):
+    register("test_mock")(fallback)
     ttir = _trace(_request, "test_mock", dtype)
     # The call site, verified, holding the fallback as a call the `ttir` stage
     # inlines.
@@ -135,13 +124,13 @@ def test_test_mock_without_a_fallback_is_refused():
     _raises(_request, "test_mock", "fp32", "tl.spyre_op: no fallback is registered for 'test_mock'")
 
 
-def test_dtype_the_intrinsic_does_not_take_is_refused(spyre_intrinsic):
-    _bind_func1(spyre_intrinsic)
+def test_dtype_the_intrinsic_does_not_take_is_refused(register):
+    register("test_mock")(func1)
     _raises(_request, "test_mock", "bf16", "tl.spyre_op('test_mock'): the intrinsic takes ['fp16', 'fp32'], not bf16")
 
 
-def test_wrong_arity_is_refused(spyre_intrinsic):
-    _bind_func1(spyre_intrinsic)
+def test_wrong_arity_is_refused(register):
+    register("test_mock")(func1)
 
     @triton.jit
     def two_operands(x_ptr, out_ptr, N: tl.constexpr, OP: tl.constexpr):
@@ -153,9 +142,9 @@ def test_wrong_arity_is_refused(spyre_intrinsic):
     _raises(two_operands, "test_mock", "fp32", "tl.spyre_op('test_mock'): takes 1 tensor operand(s), got 2")
 
 
-def test_fallback_returning_other_types_is_refused(spyre_intrinsic):
+def test_fallback_returning_other_types_is_refused(register):
 
-    @spyre_intrinsic("test_mock")
+    @register("test_mock")
     @triton.jit
     def widens(x):
         return x.to(tl.float32)
@@ -179,15 +168,15 @@ def test_every_table_name_has_one_fallback():
         intrinsics._check_names(missing, table)
 
 
-def test_a_name_the_table_does_not_define_is_refused(spyre_intrinsic):
+def test_a_name_the_table_does_not_define_is_refused(register):
     with pytest.raises(ValueError, match="'softplus' is not in the C\\+\\+ intrinsic table"):
-        spyre_intrinsic("softplus")(lambda x: x)
+        register("softplus")(func1)
 
 
-def test_a_second_fallback_for_one_name_is_refused(spyre_intrinsic):
-    _bind_func1(spyre_intrinsic)
+def test_a_second_fallback_for_one_name_is_refused(register):
+    register("test_mock")(func1)
     with pytest.raises(ValueError, match="intrinsic 'test_mock' has two fallbacks"):
-        _bind_func2(spyre_intrinsic)
+        register("test_mock")(func2)
 
 
 @pytest.mark.parametrize("backend", ["cuda", "hip", None])
