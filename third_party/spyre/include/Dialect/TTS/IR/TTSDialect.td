@@ -130,7 +130,8 @@ def TTS_Dialect : Dialect {
     /// pass that rebuilds a `linalg.generic` drops the generic's own
     /// attributes. FuseComputeAndDataMovement fuses two generics whose bodies
     /// carry one call site, and LowerSpyreOps replaces the body the call site
-    /// became with the intrinsic `name` names.
+    /// became with the intrinsic `name` names. What is checked about it, and
+    /// where, is stated once, in `tts.spyre_op`'s description.
     ///
     /// Builtin-valued like the two above, so the `ktir` artifact carrying it
     /// parses in a consumer that does not load this dialect.
