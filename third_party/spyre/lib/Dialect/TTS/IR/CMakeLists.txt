@@ -25,4 +25,9 @@ add_triton_library(TTSIR
   KTIR::KtdpDialect
   TritonIR
   MLIRIR
+  # tts.spyre_op: the verifier's memory-effect and call questions, and the
+  # DialectInlinerInterface that lets the `ttir` stage inline into its body.
+  MLIRSideEffectInterfaces
+  MLIRCallInterfaces
+  MLIRTransformUtils
 )

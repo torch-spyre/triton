@@ -20,6 +20,13 @@
 // Two markers, two resolution functions and two attribute builders, which is
 // what the shape below was for.
 //
+// And one op that is NOT a marker: `tts.spyre_op` names no value and has a body,
+// so it does not fit the driver's resolve-and-move shape and has a function of
+// its own, lowerSpyreOps. Its lowering inlines the body in place and leaves the
+// request as the `tts.hint` tag on every op inlined -- an attribute on the ops
+// rather than on one subject, which is the same rule (the op goes, a builtin
+// attribute stays) applied to a request that is about a computation.
+//
 // A pinned BLOCK ARGUMENT is therefore refused HERE, and this is the only place it
 // can be. It is a value like any other and the op admits one, but it has no defining
 // op, so there is nothing for the attribute to live on -- a function argument
@@ -315,6 +322,79 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 }
 
 //===----------------------------------------------------------------------===//
+// tts.spyre_op
+//===----------------------------------------------------------------------===//
+
+/// Inline every `tts.spyre_op` in `module` in place, tagging each inlined op.
+///
+/// Per op, in this order:
+///
+///   1. pick the request's `group`: one per op, so two requests for the same
+///      intrinsic -- one helper inlined twice, say -- stay two after both land
+///      in one function;
+///   2. tag every op of the body with `{hint = name, group = id}`, nested ops
+///      included, since a reduction's combiner becomes the body a later pass
+///      reads. Terminators are not tagged: the request's own is about to go,
+///      and a nested one is structure that every rewrite keeps, so a tag on it
+///      would outlive the request it named;
+///   3. replace each block argument by its operand and move the body's ops in
+///      front of the request;
+///   4. replace each result by its yielded value and erase the request, whose
+///      terminator goes with it.
+///
+/// Constants are tagged with the rest. The canonicalizer may hoist one out of a
+/// body or merge it with an equal untagged one, so a reader treats a constant as
+/// neutral rather than as a member it can count.
+///
+/// Group ids start above any already in the module, so IR that already carries
+/// tags -- written by hand, or lowered once already -- does not collide with the
+/// ones written here.
+static void lowerSpyreOps(ModuleOp module) {
+  using mlir::triton::tts::SpyreOpOp;
+  using mlir::triton::tts::TTSDialect;
+
+  int64_t nextGroup = 0;
+  module.walk([&](Operation *op) {
+    if (DictionaryAttr tag = mlir::triton::tts::getHintTag(op))
+      if (auto group = tag.getAs<IntegerAttr>(TTSDialect::kGroupName))
+        nextGroup = std::max(nextGroup, group.getInt() + 1);
+  });
+
+  // Collect first: the rewrite erases. Post-order, so a request nested in
+  // another's body is inlined into the outer body first, and its ops then take
+  // the outer request's tag when that body is inlined in turn.
+  SmallVector<SpyreOpOp> requests;
+  module.walk([&](SpyreOpOp op) { requests.push_back(op); });
+
+  Builder builder(module.getContext());
+  for (SpyreOpOp request : requests) {
+    DictionaryAttr tag = builder.getDictionaryAttr({
+        builder.getNamedAttr(TTSDialect::kHintName, request.getNameAttr()),
+        builder.getNamedAttr(TTSDialect::kGroupName,
+                             builder.getI64IntegerAttr(nextGroup++)),
+    });
+
+    Block &body = request.getBody().front();
+    Operation *yield = body.getTerminator();
+    for (Operation &op : body.without_terminator())
+      op.walk([&](Operation *nested) {
+        if (!nested->hasTrait<OpTrait::IsTerminator>())
+          nested->setAttr(TTSDialect::kHintAttrName, tag);
+      });
+
+    for (auto [arg, operand] :
+         llvm::zip_equal(body.getArguments(), request.getInputs()))
+      arg.replaceAllUsesWith(operand);
+    Block *parent = request->getBlock();
+    parent->getOperations().splice(request->getIterator(), body.getOperations(),
+                                   body.begin(), yield->getIterator());
+
+    request->replaceAllUsesWith(yield->getOperands());
+    request->erase();
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
 
@@ -325,6 +405,13 @@ struct LowerTTSMarkersPass
     using mlir::triton::tts::PinOp;
     using mlir::triton::tts::TensorLayoutOp;
     using mlir::triton::tts::TTSDialect;
+
+    // FIRST, ahead of the markers. A pin may name a request's result, and
+    // the op producing that value exists only once the body is inlined -- run
+    // after, the pin would land on the request and be erased with it. Not a
+    // marker, so not the driver's: see lowerSpyreOps. Cannot fail, since the
+    // op's verifier has already held the body to the shape inlining needs.
+    lowerSpyreOps(getOperation());
 
     // One statement per marker kind, and the three things a marker brings: its
     // op type, its attribute name, and the resolve/build pair above.

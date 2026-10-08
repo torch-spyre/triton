@@ -88,7 +88,7 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
 
 void init_triton_spyre_ir_builders(py::module &&m) {
   // Op builders for the `tts` dialect, called from the Triton frontend --
-  // tl.spyre_tensor_layout and tl.spyre_pin, through
+  // tl.spyre_tensor_layout, tl.spyre_pin and tl.spyre_op, through
   // triton.language.semantic.
   //
   // The frontend reaches this as `from triton._C.libtriton import spyre`, lazily
@@ -165,6 +165,35 @@ void init_triton_spyre_ir_builders(py::module &&m) {
       },
       py::arg("builder"), py::arg("value"), py::arg("memory_space"),
       py::arg("offset") = py::none());
+
+  // tl.spyre_op. The op is built EMPTY and returned, and the frontend then
+  // traces the registered fallback into its region -- the shape `create_reduce`
+  // has, since a region belongs to an op and so the op has to exist first. That
+  // is also why the result types are an argument rather than read off the body:
+  // the registry declares them, and the region verifier holds the yield to them.
+  //
+  // `name` is not checked here. Which names exist is the registry's, in the
+  // backend's Python, and semantic.py refuses an unknown one before this runs.
+  m.def(
+      "create_spyre_op",
+      [](TritonOpBuilder &self, const std::string &name,
+         std::vector<mlir::Value> &inputs,
+         std::vector<mlir::Type> &resultTypes) -> mlir::OpState {
+        // LOAD, not register -- see create_tensor_layout above.
+        self.getContext()->loadDialect<mlir::triton::tts::TTSDialect>();
+        return self.create<mlir::triton::tts::SpyreOpOp>(
+            mlir::TypeRange(resultTypes),
+            self.getBuilder().getStringAttr(name), mlir::ValueRange(inputs));
+      },
+      py::arg("builder"), py::arg("name"), py::arg("inputs"),
+      py::arg("result_types"));
+  m.def(
+      "create_spyre_op_yield",
+      [](TritonOpBuilder &self, std::vector<mlir::Value> &values) -> void {
+        self.create<mlir::triton::tts::SpyreOpYieldOp>(
+            mlir::ValueRange(values));
+      },
+      py::arg("builder"), py::arg("values"));
 }
 
 /// One `tts.tensor_layout` marker, reduced to what a footprint is computed from.

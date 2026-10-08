@@ -34,6 +34,24 @@
 // two generics until this pass joins them -- but that is a consequence, not the
 // reason: the `i1` has to go regardless of whether any rule wanted the pair.
 //
+// And one clause that is a REQUEST rather than a property of the IR:
+//
+//   ONE BODY PER INTRINSIC REQUEST   fuse a producer into its consumer when
+//            both bodies carry the same `tts.hint` tag, i.e. both hold ops
+//            LowerTTSMarkers inlined out of one `tts.spyre_op`. Each tensor op
+//            of the request's fallback arrives in a generic of its own, and
+//            LowerSpyreOps replaces a request only as one whole body. See
+//            isSameHintGroup.
+//
+// Here and not in a pass of its own ahead of LowerSpyreOps, because that
+// position is after RewriteDescriptorLayoutGeneric, which physicalizes only the
+// generics one hop off an annotated load or store: the request's FIRST generic
+// then iterates the physical space while its result stays logical, behind a
+// linearizing result map, and elementwise fusion requires a producer's result
+// map to be a permutation -- so the group can no longer become one body. Fused
+// here, the group is one generic before the layout rewrite and is physicalized
+// whole.
+//
 // The first half is the bulk of this file. Three parts, separable on purpose --
 //
 //   resultToSourceMap    given one shape op, the map from its RESULT
@@ -320,6 +338,48 @@ bool isUnrepresentableIntermediate(OpOperand *fusedOperand) {
              << fusedOperand->getOwner()->getLoc()
              << ": no spyreop op has that type, so it must not cross a generic "
                 "boundary\n");
+  return true;
+}
+
+/// The THIRD clause: the producer and the consumer hold ops of one intrinsic
+/// request. The tag is on the BODY ops and not on the generics, because every
+/// pass that rebuilds a generic -- this pass's own fusion among them -- drops the
+/// generic's attributes and keeps the body's; see `kHintAttrName`.
+///
+/// A body's tag is the one its tagged ops share, and a constant does not count:
+/// the canonicalizer hoists and merges constants without regard to tags, so a
+/// constant says nothing about which request a body belongs to. A body whose
+/// ops carry two tags has none, and fuses with neither request.
+///
+/// Not gated on hasOneUse, like the other two: a producer of a request read by
+/// two consumers of the same request is fused into each, which duplicates part
+/// of the fallback inside the one body LowerSpyreOps then replaces whole.
+DictionaryAttr hintGroupOf(Operation *op) {
+  auto generic = dyn_cast_or_null<linalg::GenericOp>(op);
+  if (!generic)
+    return {};
+  DictionaryAttr found;
+  bool mixed = false;
+  generic.getBlock()->walk([&](Operation *bodyOp) {
+    if (bodyOp->hasTrait<OpTrait::ConstantLike>())
+      return;
+    DictionaryAttr tag = triton::tts::getHintTag(bodyOp);
+    if (!tag)
+      return;
+    if (found && found != tag)
+      mixed = true;
+    found = tag;
+  });
+  return mixed ? DictionaryAttr() : found;
+}
+
+bool isSameHintGroup(OpOperand *fusedOperand) {
+  DictionaryAttr producer = hintGroupOf(fusedOperand->get().getDefiningOp());
+  if (!producer || producer != hintGroupOf(fusedOperand->getOwner()))
+    return false;
+  LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] fusing within intrinsic request "
+                          << producer << " into "
+                          << fusedOperand->getOwner()->getLoc() << "\n");
   return true;
 }
 
@@ -870,13 +930,14 @@ struct FuseComputeAndDataMovementPass
 
     RewritePatternSet patterns(ctx);
     // Upstream does the map composition; the control function decides which
-    // fusions are allowed to happen at all. TWO clauses, and they are
-    // independent reasons rather than one policy split in half -- see THE
-    // FUSION POLICY HAS TWO CLAUSES in the header.
+    // fusions are allowed to happen at all. THREE clauses, and they are
+    // independent reasons rather than one policy split up -- the two halves
+    // the pass is named for, and the intrinsic request; see the header.
     linalg::ControlFusionFn fuseWhatMustNotSurvive =
         [](OpOperand *fusedOperand) {
           return isPureDataMovement(fusedOperand->get().getDefiningOp()) ||
-                 isUnrepresentableIntermediate(fusedOperand);
+                 isUnrepresentableIntermediate(fusedOperand) ||
+                 isSameHintGroup(fusedOperand);
         };
     linalg::populateElementwiseOpsFusionPatterns(patterns,
                                                  fuseWhatMustNotSurvive);

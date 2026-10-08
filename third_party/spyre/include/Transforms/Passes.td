@@ -168,6 +168,20 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
                                           unless the cmpf is a zero test the
                                           select performs itself
 
+        Rules, a REQUEST to one — a linalg.generic body whose ops, constants
+        aside, all carry one `tts.hint` tag, read one `ins` block argument and
+        yield one value, i.e. the whole fallback of one `tl.spyre_op`:
+        - hint "gelu"    (f16)          → spyreop.gelu
+        - hint "silu"    (f16 or f32)   → spyreop.silu
+        - hint "sigmoid" (f16 or f32)   → spyreop.sigmoid
+        The body is replaced whole, casts included, by the intrinsic applied to
+        the block argument; the type it reads must be the type it yields.
+
+        A TAGGED OP IS CLAIMED. Every 1:1 and group rule declines an op carrying
+        `tts.hint`, so a request's `math.exp` is never selected alone as
+        spyreop.exp. That is what keeps the rules unordered: the request rule is
+        rooted on the generic, the others never touch its members.
+
         NO NaN REACHES A COMPUTE BODY. Every rule assumes it. Under it, each
         unordered cmpf predicate computes what its ordered counterpart does
         (`une` as `one`, `ueq` as `oeq`, ...), so both spellings select the same
@@ -186,15 +200,26 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         `spyreop.compare`, an `arith.select` would make it a compare feeding a
         `spyreop.select`, two ops and still one indivisible choice.
 
-        EVERYTHING UNMATCHED FLOWS THROUGH, WITH ONE EXCEPTION. There is no
+        EVERYTHING UNMATCHED FLOWS THROUGH, WITH TWO EXCEPTIONS. There is no
         conversion target: an op with no device form reaches the backend, which is
         the component that knows what it can take, and it refuses there. So this
         pass has no notion of an unsupported input — it selects what it can and
         leaves the rest as it found it. That is a change from when it was a
         dialect conversion, where an unsupported float width was reported here.
 
-        The exception is an `i1`, and it is a different kind of thing rather than
-        a carve-out. Flows-through is about a CAPABILITY gap: an f64 math.sqrt is
+        The first exception is a REQUEST left unselected: any op other than a
+        constant still carrying `tts.hint` after the rewrite is an error naming
+        the intrinsic and why. The author asked for it by name, so passing the
+        fallback through would ignore the request without saying so. The causes
+        it names: the request split over two bodies (a fusion that did not
+        happen), a body also holding ops outside the request (a fold that merged
+        one in), a body reading two values or yielding two, a type the intrinsic
+        does not take (gelu at f32), and a request that reads one type and
+        yields another. A constant's tag is dropped instead: constants are
+        hoisted and merged without regard to tags, so the rule never reads them.
+
+        The second exception is an `i1`, and it is a different kind of thing
+        rather than a carve-out. Flows-through is about a CAPABILITY gap: an f64 math.sqrt is
         valid IR that a future device or a future rule may do. An `i1` in a
         compute body is UNREPRESENTABLE — no spyreop intrinsic produces or
         consumes that type, so no rule anyone could add would ever remove it. That
@@ -241,7 +266,9 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         body for the same reason. A contract between adjacent passes rather than
         an accident — and the reciprocal reads its numerator THROUGH the body, so
         for that rule the dependency is about whether it FIRES, never about
-        whether it is correct.
+        whether it is correct. Its `tts.hint` clause is the same contract for requests: each
+        tensor op of a fallback arrives in its own generic, and that pass fuses
+        the ones of one request into one body.
 
         WHAT IS NOT SELECTED, and what each costs. None is a diagnostic, per
         EVERYTHING UNMATCHED FLOWS THROUGH above.
@@ -382,8 +409,18 @@ def FuseComputeAndDataMovement
           `tt.broadcast`'s lowering puts in front of the broadcast generic;
           a unit-dim expand `[4] → [4,1]` gives `(d0, d1) → (d0)`, the one
           `tt.expand_dims` leaves behind where no collapse cancelled it.
-        - Anything else is left alone. Two computes never merge, and a compute
-          already carrying a shape change never merges with a downstream compute.
+        - A linalg.generic PRODUCER feeding a linalg.generic consumer, both of
+          whose bodies carry the same `tts.hint` tag → fused. The tag means both
+          hold ops LowerTTSMarkers inlined from one `tts.spyre_op`, and
+          [LowerSpyreOps] replaces a request only as ONE body. Constants do not
+          count toward a body's tag, and a body carrying two tags has none.
+          Here rather than in a pass after RewriteDescriptorLayoutGeneric: that
+          pass physicalizes only the generics one hop off an annotated load or
+          store, leaving the request's first generic with a linearizing result
+          map, which elementwise fusion cannot fuse through.
+        - Anything else is left alone. Two computes of different requests, or of
+          none, never merge, and a compute already carrying a shape change never
+          merges with a downstream compute.
         - A coordinate restatement whose composed map LINEARIZES — a collapse
           fusing two non-unit dims, an expand splitting into two — is not
           absorbed. `tensor.reshape` and `tensor.concat` have no result-to-source

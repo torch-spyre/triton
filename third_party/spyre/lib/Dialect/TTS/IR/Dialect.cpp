@@ -13,20 +13,49 @@
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Transforms/InliningUtils.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include "Dialect/TTS/IR/Dialect.cpp.inc"
 
 namespace mlir::triton::tts {
 
+namespace {
+
+/// Admits inlining INTO a `tts.spyre_op` body. Tracing reaches the registered
+/// fallback through a `tt.call` inside that body, and the `ttir` stage's
+/// inliner asks the dialect of the region's parent op whether a callee's body
+/// may land there; with no answer it keeps the call. Whether each inlined op
+/// may move is still asked of that op's own dialect.
+struct TTSInlinerInterface : public DialectInlinerInterface {
+  using DialectInlinerInterface::DialectInlinerInterface;
+
+  bool isLegalToInline(Region *dest, Region *src, bool wouldBeCloned,
+                       IRMapping &valueMapping) const final {
+    return isa<SpyreOpOp>(dest->getParentOp());
+  }
+};
+
+} // namespace
+
 void TTSDialect::initialize() {
-  // One op and nothing else: no types, no attribute types. Most of what the
-  // dialect is for is the attribute NAME and the verifier hook that name routes
-  // to, neither of which is registered here.
+  // Ops and nothing else: no types, no attribute types. Most of what the
+  // dialect is for is the attribute NAMES and the verifier hook those names
+  // route to, neither of which is registered here.
   addOperations<
 #define GET_OP_LIST
 #include "Dialect/TTS/IR/Ops.cpp.inc"
       >();
+  addInterfaces<TTSInlinerInterface>();
+}
+
+DictionaryAttr getHintTag(Operation *op) {
+  return dyn_cast_or_null<DictionaryAttr>(
+      op->getDiscardableAttr(TTSDialect::kHintAttrName));
+}
+
+StringRef getHintName(DictionaryAttr tag) {
+  return tag.getAs<StringAttr>(TTSDialect::kHintName).getValue();
 }
 
 std::optional<CoordOp> symbolizeCoordOp(int64_t code) {
@@ -344,6 +373,25 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
   // exactly that reason. That reader belongs with that consumer.
   if (name == kPinAttrName)
     return success();
+
+  // `tts.hint` is written by one pass, LowerTTSMarkers, and READ by two in
+  // `spyrecode` -- FuseComputeAndDataMovement groups bodies by equality of the
+  // whole tag, and LowerSpyreOps selects the intrinsic its `hint` names. So its
+  // spelling is checked here, which is what lets getHintTag hand those readers a
+  // dictionary they need not re-check: on hand-written IR this is the one place
+  // a malformed tag is caught before a reader takes it for "untagged".
+  if (name == kHintAttrName) {
+    auto tag = dyn_cast<DictionaryAttr>(attribute.getValue());
+    auto hint = tag ? tag.getAs<StringAttr>(kHintName) : StringAttr();
+    auto group = tag ? tag.getAs<IntegerAttr>(kGroupName) : IntegerAttr();
+    if (!tag || tag.size() != 2 || !hint || !group ||
+        !group.getType().isInteger(64))
+      return op->emitError("'")
+             << kHintAttrName << "' must be a dictionary of exactly a string '"
+             << kHintName << "' and an i64 '" << kGroupName << "', got "
+             << attribute.getValue();
+    return success();
+  }
 
   return op->emitError("attribute '")
          << name << "' is not one the tts dialect defines";

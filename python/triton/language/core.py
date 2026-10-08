@@ -3903,4 +3903,40 @@ def spyre_pin(v, memory_space, offset=None, _semantic=None):
     Only valid on the ``spyre`` backend — raises on any other target.
     """
     return _semantic.spyre_pin(v, memory_space, offset)
+
+
+@builtin
+@requires_backend("spyre")
+def spyre_op(name, *args, _semantic=None, _generator=None):
+    """(Spyre only) Compute ``args`` with the spyreop intrinsic ``name``.
+
+    ``tl.spyre_op("gelu", x)`` asks that ``gelu(x)`` be done by the device's own
+    instruction for it. What is traced is the backend's FALLBACK for that name --
+    the same computation in plain ``tl`` ops -- inside a ``tts.spyre_op``, so the
+    request means one thing at every stage: the ``ktir`` artifact holds the
+    fallback, which any KTIR reader runs, and the ``spyrecode`` stage replaces it
+    with the intrinsic.
+
+    The request is explicit, so it is never dropped silently: a request the
+    backend cannot select is a compile error naming the intrinsic, not the
+    fallback in its place.
+
+    Args:
+        name: A ``constexpr`` string naming a registered intrinsic. The Spyre
+              backend registers ``"gelu"`` (fp16), ``"silu"`` and ``"sigmoid"``
+              (fp16, fp32); any other name, or any other dtype, is refused here.
+              Kernel authors cannot register names.
+        args: The operands, tensors, as many as the intrinsic takes -- one for
+              each of the three above. The result has the operand's type.
+
+    Only valid on the ``spyre`` backend — raises on any other target.
+    """
+    name = _unwrap_if_constexpr(name)
+    if not isinstance(name, str):
+        raise ValueError(f"tl.spyre_op: name must be a constexpr string, got {name!r}")
+
+    def call_fallback(fn, fn_args):
+        return _generator.call_JitFunction(fn, fn_args, kwargs={})
+
+    return _semantic.spyre_op(name, args, call_fallback)
 # --- END --- added for spyre

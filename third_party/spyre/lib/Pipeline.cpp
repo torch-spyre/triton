@@ -49,7 +49,10 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   pm.addPass(mlir::createCanonicalizerPass());
 
   // LAST, and after that canonicalize rather than before it. Each tts marker op's
-  // annotation -> an attribute on the op the marked value resolved to.
+  // annotation -> an attribute on the op the marked value resolved to, and each
+  // tts.spyre_op -> its fallback body inlined, every op tagged `tts.hint`. The
+  // body's tt ops were lowered in place by LowerComputeOps, above, so what is
+  // inlined is already this stage's output dialects.
   //
   // Bounded below by two passes, one per marker. LowerDescriptorMemory, because a
   // tts.tensor_layout lands on the memory view that pass builds, reached through
@@ -178,6 +181,10 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // Every coordinate change becomes an `indexing_maps` entry on the generic that
   // consumes it, so nothing whose only effect is to re-index survives.
   //
+  // It also fuses the generics holding one `tl.spyre_op` request's fallback into
+  // one body, which LowerSpyreOps needs, and which has to happen on this side of
+  // the layout pass: see the clause in that pass's header.
+  //
   // Both neighbours fix the position. It must follow the three passes above,
   // which are what make every compute a linalg.generic: the fusion it drives
   // matches generic -> generic, so a named producer or consumer blocks it whatever
@@ -215,8 +222,9 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
 
   // Instruction selection: the arith and math ops in each compute body become the
   // spyreop intrinsics that do the same thing. One pass for all of it -- the
-  // one-op-to-one rules and the group rules share a pattern set, each rooted on
-  // a different op.
+  // one-op-to-one rules, the group rules and the request rule share a pattern
+  // set, each rooted on a different op, and the others decline an op a request
+  // claims, so no order between them is declared.
   //
   // Needs every compute to be a linalg.generic, which the passes above make it: a
   // group rule's SCOPE is the generic body, and the 1:1 rules leave a tensor-typed
@@ -227,10 +235,15 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // tensor-level op a body of its own, so a group spanning two tensor ops is two
   // generics until something fuses them -- that pass's `i1` clause is what does,
   // and the compare rule fires only because of it. The reciprocal is the softer
-  // case: it reads its numerator through the body, so it fires either way.
+  // case: it reads its numerator through the body, so it fires either way. A
+  // `tl.spyre_op` request is the hard case: it is selected only as one whole
+  // body, which that pass's `tts.hint` clause makes it -- before the layout
+  // rewrite, since after it the request's first generic keeps a linearizing
+  // result map that fusion cannot fuse through.
   //
-  // Nothing is reported here. An op with no device form flows through to dbo-opt,
-  // which is the component that knows what it can take.
+  // An op with no device form is not reported here; it flows through to dbo-opt,
+  // which is the component that knows what it can take. What is reported is an
+  // explicit request left unselected, and an `i1` no rule can remove.
   pm.addPass(createLowerSpyreOpsPass());
 
   if (options.bindBaseAddresses) {

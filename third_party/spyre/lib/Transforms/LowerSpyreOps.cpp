@@ -18,20 +18,31 @@
 //   a GROUP to one  a compare and a cast -> spyreop.compare. The group is what
 //                   is selectable: no member of it could have been selected
 //                   alone.
+//   a REQUEST       a body whose ops all carry one `tts.hint` tag -> the
+//                   spyreop intrinsic the tag names, replacing the whole body.
+//                   The author asked for that intrinsic with `tl.spyre_op`, and
+//                   the body is its fallback; see SelectRequest.
 //
 // They share one greedy pattern set, and no two rules are rooted on the same
 // op, so no rule has to win over another and no order is declared anywhere.
+// The request rule is rooted on the generic, and the other rules DECLINE an op
+// carrying a tag: the tag says the op is already claimed, as part of its
+// request. So a request's `math.exp` is never selected as `spyreop.exp` on its
+// own, whichever rule the driver happens to try first.
 // Splitting these across two passes is what an earlier shape did, and it
 // bought a standing question -- which pass claims this op -- for nothing.
 //
-// EVERYTHING UNMATCHED FLOWS THROUGH, WITH ONE EXCEPTION. There is no
+// EVERYTHING UNMATCHED FLOWS THROUGH, WITH TWO EXCEPTIONS. There is no
 // conversion target: an op with no device form reaches the backend, which is
 // the component that actually knows what it can take, and it refuses there. So
 // this pass has no notion of an illegal input -- it selects what it can and
 // leaves the rest exactly as it found it. A type or a predicate this file does
 // not handle is a silent pass-through by design; see WHAT IS NOT SELECTED below
-// for the list and what each one costs. The exception is an `i1` left inside a
-// compute body, which rejectSurvivingBooleans reports.
+// for the list and what each one costs. The exceptions are an `i1` left inside
+// a compute body, which rejectSurvivingBooleans reports, and an intrinsic
+// request that was not selected, which rejectUnselectedRequests reports: the
+// author asked for the intrinsic by name, so running the fallback instead would
+// ignore the request without saying so.
 //
 // WHAT THIS PASS RELIES ON ITS PREDECESSOR FOR. A rule matches ops in ONE body,
 // and ConvertElementwiseToLinalg gives every tensor-level op a body of its own
@@ -101,6 +112,7 @@
 
 #include "Transforms/Passes.h"
 
+#include "Dialect/TTS/IR/Dialect.h"
 #include "ktir/Dialect/SpyreOp/SpyreOp.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
@@ -114,10 +126,13 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <optional>
+#include <string>
 
 #define DEBUG_TYPE "lower-spyre-ops"
 
@@ -220,6 +235,12 @@ spyrePredicateFor(arith::CmpFPredicate p) {
   }
 }
 
+/// Whether `op` belongs to an intrinsic request, which the request rule
+/// selects as a whole body. Every other rule declines such an op.
+bool isClaimedByRequest(Operation *op) {
+  return static_cast<bool>(triton::tts::getHintTag(op));
+}
+
 void traceDecline(Operation *root, const llvm::Twine &why) {
   LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << root->getName() << " at "
                           << root->getLoc() << ": no group match (" << why
@@ -237,7 +258,7 @@ void traceMatch(Operation *root, const llvm::Twine &what) {
 /// predicate support remains the caller's responsibility.
 arith::CmpFOp matchComparedInput(Operation *consumer, Value input) {
   auto generic = dyn_cast<linalg::GenericOp>(consumer->getParentOp());
-  if (!generic)
+  if (!generic || isClaimedByRequest(consumer))
     return nullptr;
   Type resultType = consumer->getResult(0).getType();
   if (!isSpyreOpScalarType(resultType)) {
@@ -247,6 +268,10 @@ arith::CmpFOp matchComparedInput(Operation *consumer, Value input) {
   auto cmp = resolveThroughBody(generic, input).getDefiningOp<arith::CmpFOp>();
   if (!cmp) {
     traceDecline(consumer, "operand is not an arith.cmpf");
+    return nullptr;
+  }
+  if (isClaimedByRequest(cmp)) {
+    traceDecline(consumer, "the arith.cmpf belongs to an intrinsic request");
     return nullptr;
   }
   // Device comparison and selection require identical input and result types.
@@ -274,7 +299,7 @@ struct SelectUnaryFloat : public OpRewritePattern<Source> {
 
   LogicalResult matchAndRewrite(Source op,
                                 PatternRewriter &rewriter) const override {
-    if (!isSpyreOpScalarType(op.getType()))
+    if (isClaimedByRequest(op) || !isSpyreOpScalarType(op.getType()))
       return failure();
     rewriter.template replaceOpWithNewOp<Target>(op, op.getType(),
                                                  op.getOperand());
@@ -297,7 +322,7 @@ struct SelectArithDivF : public OpRewritePattern<arith::DivFOp> {
 
   LogicalResult matchAndRewrite(arith::DivFOp op,
                                 PatternRewriter &rewriter) const override {
-    if (!isSpyreOpScalarType(op.getType()))
+    if (isClaimedByRequest(op) || !isSpyreOpScalarType(op.getType()))
       return failure();
 
     Value numerator = op.getLhs();
@@ -497,7 +522,7 @@ struct SelectArithAddI : public OpRewritePattern<arith::AddIOp> {
 
   LogicalResult matchAndRewrite(arith::AddIOp op,
                                 PatternRewriter &rewriter) const override {
-    if (!isInsideLinalgGeneric(op))
+    if (isClaimedByRequest(op) || !isInsideLinalgGeneric(op))
       return failure();
     unsigned width = getScalarIntBitWidth(op.getType());
     if (width == 32)
@@ -519,13 +544,294 @@ struct SelectArithMulI : public OpRewritePattern<arith::MulIOp> {
 
   LogicalResult matchAndRewrite(arith::MulIOp op,
                                 PatternRewriter &rewriter) const override {
-    if (!isInsideLinalgGeneric(op) || getScalarIntBitWidth(op.getType()) != 32)
+    if (isClaimedByRequest(op) || !isInsideLinalgGeneric(op) ||
+        getScalarIntBitWidth(op.getType()) != 32)
       return failure();
     rewriter.replaceOpWithNewOp<spyreop::MulI32ToI32>(op, op.getType(),
                                                       op.getLhs(), op.getRhs());
     return success();
   }
 };
+
+//===----------------------------------------------------------------------===//
+// A request to one: a body tagged `tts.hint` -> the intrinsic it names
+//===----------------------------------------------------------------------===//
+
+/// The intrinsics a request may name, and the element types each accepts --
+/// SpyreOp.td's operand constraints, restricted to the builtin types this tree
+/// produces (DF16 is spyreop's own type and nothing upstream of here makes one):
+/// all take f16, and `takesF32` says whether f32 too. Every one is unary with
+/// SameOperandsAndResultType, which is the shape the rule matches.
+struct RequestedIntrinsic {
+  StringLiteral name;
+  bool takesF32;
+  Value (*build)(OpBuilder &, Location, Value);
+};
+
+template <typename Intrinsic>
+Value buildUnaryIntrinsic(OpBuilder &builder, Location loc, Value operand) {
+  return Intrinsic::create(builder, loc, operand.getType(), operand);
+}
+
+constexpr RequestedIntrinsic kRequestedIntrinsics[] = {
+    {"gelu", /*takesF32=*/false, buildUnaryIntrinsic<spyreop::GeLU>},
+    {"silu", /*takesF32=*/true, buildUnaryIntrinsic<spyreop::SiLU>},
+    {"sigmoid", /*takesF32=*/true, buildUnaryIntrinsic<spyreop::Sigmoid>},
+};
+
+const RequestedIntrinsic *lookupRequested(StringRef name) {
+  for (const RequestedIntrinsic &entry : kRequestedIntrinsics)
+    if (entry.name == name)
+      return &entry;
+  return nullptr;
+}
+
+bool takesType(const RequestedIntrinsic &entry, Type type) {
+  return isa<Float16Type>(type) || (entry.takesF32 && isa<Float32Type>(type));
+}
+
+/// Where each request's tagged ops are, counted once before the greedy driver
+/// runs: how many generic bodies hold ops of the request, and whether any of
+/// its ops is outside a body altogether.
+///
+/// This is what lets the rule tell a request that is one body from a request
+/// SPLIT across two -- each half of which, seen alone, also reads one value and
+/// yields one, and would be replaced by the whole intrinsic. Counted rather
+/// than held as pointers, because the unused-operand cleanup in the same
+/// fixpoint rebuilds a generic it trims, and a count of one survives that.
+struct RequestPlacement {
+  unsigned bodies = 0;
+  bool outsideBody = false;
+};
+using RequestPlacements = llvm::DenseMap<DictionaryAttr, RequestPlacement>;
+
+/// The ops of `generic`'s body a request rule counts: everything but the
+/// terminator and constants. A constant is neutral -- the canonicalizer hoists
+/// and merges constants without regard to tags, and fusion folds a splat
+/// operand into a fresh untagged scalar -- so whether one carries the tag says
+/// nothing about the request.
+SmallVector<Operation *> requestMembers(linalg::GenericOp generic) {
+  SmallVector<Operation *> members;
+  generic.getBlock()->walk([&](Operation *op) {
+    if (!isa<linalg::YieldOp>(op) && !op->hasTrait<OpTrait::ConstantLike>())
+      members.push_back(op);
+  });
+  return members;
+}
+
+RequestPlacements placeRequests(ModuleOp module) {
+  RequestPlacements placements;
+  module.walk([&](linalg::GenericOp generic) {
+    llvm::SmallSetVector<DictionaryAttr, 2> tags;
+    for (Operation *op : requestMembers(generic))
+      if (DictionaryAttr tag = triton::tts::getHintTag(op))
+        tags.insert(tag);
+    for (DictionaryAttr tag : tags)
+      ++placements[tag].bodies;
+  });
+  module.walk([&](Operation *op) {
+    DictionaryAttr tag = triton::tts::getHintTag(op);
+    if (tag && !op->hasTrait<OpTrait::ConstantLike>() &&
+        !op->getParentOfType<linalg::GenericOp>())
+      placements[tag].outsideBody = true;
+  });
+  return placements;
+}
+
+/// What the request rule needs from a body it can replace.
+struct RequestMatch {
+  DictionaryAttr tag;
+  const RequestedIntrinsic *intrinsic = nullptr;
+  BlockArgument input;
+  Value result;
+  SmallVector<Operation *> members;
+};
+
+/// Whether `generic`'s body is exactly one request, whole. On a decline,
+/// `why` says which condition failed, phrased for a diagnostic, and the result
+/// is failure; a body with no tagged op at all is not a request, and fails
+/// with `why` empty.
+///
+/// The conditions, in the order asked:
+///   - every member carries the same tag: one request, and nothing else;
+///   - no other body and no op outside a body carries it: the request is here
+///     whole, not split by a fusion that did not happen;
+///   - the members read exactly one block argument, an `ins` one, constants
+///     aside, and the body yields one value a member produced: the intrinsic
+///     is unary;
+///   - an intrinsic of that name takes that type, and the type is the yielded
+///     one, since every intrinsic here has the same operand and result type.
+FailureOr<RequestMatch> matchRequest(linalg::GenericOp generic,
+                                     const RequestPlacements &placements,
+                                     std::string &why) {
+  why.clear();
+  RequestMatch match;
+  match.members = requestMembers(generic);
+  for (Operation *op : match.members)
+    if ((match.tag = triton::tts::getHintTag(op)))
+      break;
+  if (!match.tag)
+    return failure();
+
+  StringRef name = triton::tts::getHintName(match.tag);
+  for (Operation *op : match.members) {
+    DictionaryAttr tag = triton::tts::getHintTag(op);
+    if (tag == match.tag)
+      continue;
+    why = tag ? "its body also holds ops of another request, " +
+                    triton::tts::getHintName(tag).str()
+              : "its body also holds '" + op->getName().getStringRef().str() +
+                    "', which is not part of the request";
+    return failure();
+  }
+
+  auto placement = placements.lookup(match.tag);
+  if (placement.bodies != 1 || placement.outsideBody) {
+    why = "the request's ops are spread over " +
+          std::to_string(placement.bodies) + " compute bodies" +
+          (placement.outsideBody ? " and outside any body" : "") +
+          ", and the intrinsic can replace only one whole body";
+    return failure();
+  }
+
+  // The values the request reads. A block argument whose `ins` operand is a
+  // constant is a constant the fusion did not fold into the body, and is
+  // neutral like one.
+  llvm::SmallSetVector<BlockArgument, 2> read;
+  for (Operation *op : match.members)
+    for (Value v : op->getOperands()) {
+      auto arg = dyn_cast<BlockArgument>(v);
+      if (!arg || arg.getOwner() != generic.getBlock())
+        continue;
+      Operation *def = resolveThroughBody(generic, arg).getDefiningOp();
+      if (def && def->hasTrait<OpTrait::ConstantLike>())
+        continue;
+      read.insert(arg);
+    }
+  auto yield = cast<linalg::YieldOp>(generic.getBlock()->getTerminator());
+  if (read.size() != 1 ||
+      !generic.isDpsInput(generic.getMatchingOpOperand(read.front()))) {
+    why = "the body reads " + std::to_string(read.size()) +
+          " block arguments, and the intrinsic takes one input";
+    return failure();
+  }
+  if (yield->getNumOperands() != 1 || !yield->getOperand(0).getDefiningOp() ||
+      !llvm::is_contained(match.members,
+                          yield->getOperand(0).getDefiningOp())) {
+    why = "the body does not yield exactly one value the request computed";
+    return failure();
+  }
+  match.input = read.front();
+  match.result = yield->getOperand(0);
+
+  if (match.input.getType() != match.result.getType()) {
+    std::string types;
+    llvm::raw_string_ostream os(types);
+    os << match.input.getType() << " in, " << match.result.getType() << " out";
+    why = "the request takes and yields different types (" + types +
+          "), and spyreop." + name.str() + " has one type for both";
+    return failure();
+  }
+  const RequestedIntrinsic *intrinsic = lookupRequested(name);
+  if (!intrinsic) {
+    why = "there is no spyreop intrinsic named '" + name.str() + "'";
+    return failure();
+  }
+  if (!takesType(*intrinsic, match.input.getType())) {
+    std::string type;
+    llvm::raw_string_ostream os(type);
+    os << match.input.getType();
+    why = "spyreop." + name.str() + " does not take " + type;
+    return failure();
+  }
+  match.intrinsic = intrinsic;
+  return match;
+}
+
+/// Replaces a body that is one whole intrinsic request with that intrinsic.
+///
+/// Rooted on the generic and not on a member, because the request is the BODY:
+/// which op the fallback happens to end in says nothing, and a rule rooted on
+/// one member would have to search the rest. What the members computed --
+/// the fallback, casts included -- is discarded whole, and the body becomes the
+/// intrinsic applied to its input. The input's unused siblings, a captured
+/// constant among them, then go to the unused-operand cleanup in the same
+/// fixpoint.
+///
+/// Declines are not reported here: what is left tagged after the fixpoint is
+/// reported by rejectUnselectedRequests, which asks matchRequest again for the
+/// reason, so the diagnosis and the rule cannot disagree.
+struct SelectRequest : public OpRewritePattern<linalg::GenericOp> {
+  SelectRequest(MLIRContext *ctx, const RequestPlacements &placements)
+      : OpRewritePattern(ctx), placements(placements) {}
+
+  LogicalResult matchAndRewrite(linalg::GenericOp generic,
+                                PatternRewriter &rewriter) const override {
+    std::string why;
+    FailureOr<RequestMatch> match = matchRequest(generic, placements, why);
+    if (failed(match)) {
+      if (!why.empty())
+        traceDecline(generic, why);
+      return failure();
+    }
+    StringRef name = triton::tts::getHintName(match->tag);
+    traceMatch(generic, "body is intrinsic request " +
+                            llvm::Twine(name) + " -> spyreop." + name);
+
+    auto yield = cast<linalg::YieldOp>(generic.getBlock()->getTerminator());
+    rewriter.setInsertionPoint(yield);
+    Value selected =
+        match->intrinsic->build(rewriter, match->result.getLoc(), match->input);
+    rewriter.modifyOpInPlace(yield, [&] { yield->setOperand(0, selected); });
+    // Reverse program order, so each op's users are gone before it is.
+    for (Operation *op : llvm::reverse(match->members))
+      rewriter.eraseOp(op);
+    return success();
+  }
+
+  const RequestPlacements &placements;
+};
+
+/// Reports every intrinsic request selection left in place, once per request,
+/// naming the intrinsic and why. The author asked for it by name, so running
+/// its fallback instead would ignore that request without saying so.
+///
+/// Whatever the cause, it is reported the same way, and two causes deserve
+/// naming because nothing at the kernel line shows them: the request was split
+/// across two bodies, because a fusion did not happen; or an op of it was
+/// folded into an op outside it, which leaves a body holding both.
+///
+/// Constants are not requests: a tagged one left behind is untagged here, since
+/// the tag on a constant was never what the rule read.
+LogicalResult rejectUnselectedRequests(ModuleOp module) {
+  RequestPlacements placements = placeRequests(module);
+  llvm::DenseMap<DictionaryAttr, Operation *> firstSeen;
+  SmallVector<DictionaryAttr> order;
+  module.walk([&](Operation *op) {
+    DictionaryAttr tag = triton::tts::getHintTag(op);
+    if (!tag)
+      return;
+    if (op->hasTrait<OpTrait::ConstantLike>()) {
+      op->removeDiscardableAttr(triton::tts::TTSDialect::kHintAttrName);
+      return;
+    }
+    if (firstSeen.try_emplace(tag, op).second)
+      order.push_back(tag);
+  });
+
+  for (DictionaryAttr tag : order) {
+    Operation *op = firstSeen.lookup(tag);
+    std::string why = "an op of it is outside any compute body";
+    if (auto generic = op->getParentOfType<linalg::GenericOp>())
+      if (succeeded(matchRequest(generic, placements, why)))
+        why = "the rewrite did not reach a fixpoint";
+    mlir::emitError(op->getLoc())
+        << "lower-spyre-ops: tl.spyre_op(\"" << triton::tts::getHintName(tag)
+        << "\") was not selected: " << why
+        << ". The request is explicit, so its fallback is not used instead";
+  }
+  return success(order.empty());
+}
 
 //===----------------------------------------------------------------------===//
 // After selection: an i1 left in a compute body
@@ -612,9 +918,14 @@ struct LowerSpyreOpsPass
     ModuleOp module = getOperation();
     MLIRContext *ctx = &getContext();
 
+    // Where each request is, before anything is rewritten; see
+    // RequestPlacement for why this is asked once rather than per match.
+    RequestPlacements placements = placeRequests(module);
+
     RewritePatternSet patterns(ctx);
-    // One line per rule, group rules and 1:1 rules in one set, each rooted on
-    // a different op. See ONE PASS FOR ALL SELECTION in the header.
+    // One line per rule, request, group and 1:1 rules in one set, each rooted
+    // on a different op. See ONE PASS FOR ALL SELECTION in the header.
+    patterns.add<SelectRequest>(ctx, placements);
     patterns.add<SelectCompare, SelectWhere>(ctx);
     patterns.add<SelectArithDivF, SelectArithAddI, SelectArithMulI>(ctx);
     patterns.add<SelectUnaryFloat<math::SqrtOp, spyreop::Sqrt>,
@@ -636,10 +947,13 @@ struct LowerSpyreOpsPass
       return;
     }
 
-    // The one thing this pass does report. Not a selection failure -- see
-    // rejectSurvivingBooleans on why an unrepresentable TYPE is a different
-    // kind of thing from an op the device happens not to do.
-    if (failed(rejectSurvivingBooleans(module)))
+    // The two things this pass does report. A request not selected is the
+    // author's explicit ask going unanswered. An `i1` is not a selection
+    // failure at all -- see rejectSurvivingBooleans on why an unrepresentable
+    // TYPE is a different kind of thing from an op the device happens not to
+    // do. Both are asked, so one run reports both.
+    bool requestsFailed = failed(rejectUnselectedRequests(module));
+    if (failed(rejectSurvivingBooleans(module)) || requestsFailed)
       signalPassFailure();
   }
 };

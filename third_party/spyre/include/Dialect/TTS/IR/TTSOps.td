@@ -2,6 +2,7 @@
 #define TTS_OPS
 
 include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 include "Dialect/TTS/IR/TTSDialect.td"
 // For TT_TensorDescType. This is the one direction the dependency may point:
 // `tts` names a Triton type, Triton names nothing of ours. TritonTypes.td
@@ -127,6 +128,70 @@ def TTS_PinOp : TTS_Op<"pin", []> {
 
   let assemblyFormat = "$value attr-dict `:` type($value)";
   let hasVerifier = 1;
+}
+
+def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
+    IsolatedFromAbove, SingleBlock, RecursiveMemoryEffects]> {
+  let summary = "Request one spyreop intrinsic, carrying its fallback body";
+
+  let description = [{
+    `tts.spyre_op` is the **authoring** spelling of `tl.spyre_op(name, *args)`:
+    a request that the computation be done by the spyreop intrinsic `name`. The
+    region holds that computation's FALLBACK -- the backend's registered
+    `@triton.jit` body for `name`, traced at the operands' types -- so the op
+    means the same thing whether or not the intrinsic is ever selected.
+
+    The block arguments are the operands, one for one and of the same types, and
+    the body ends in `tts.spyreop_yield`, whose operands are the results.
+
+    RESULT TYPES ARE DECLARED, not inferred from the body. The op is created
+    before its region is traced -- a region belongs to an op -- so the frontend
+    takes the result types from the registry entry for `name` and refuses a
+    fallback whose returned types differ, at the kernel line. The verifier states
+    the same rule over the IR: the yielded types are the result types.
+
+    `IsolatedFromAbove`, so the body reads nothing but its block arguments: a
+    value the kernel computed outside reaches the fallback only as an operand,
+    and a constant the canonicalizer folds stays inside. No memory op may appear
+    in the body -- the region is a computation on values, and the intrinsic it
+    stands for reads and writes no memory. The one op admitted without that
+    check is a call: tracing reaches the registered fallback through a `tt.call`,
+    which the `ttir` stage's inliner replaces with the callee's body.
+
+    Like the marker ops this is consumed before any artifact is written:
+    `LowerTTSMarkers` inlines the body in place and tags every op it inlined
+    with the `tts.hint` attribute, so the `ktir` artifact is the fallback alone,
+    in dialects any consumer loads. See `kHintAttrName` for what the tag
+    carries and who reads it.
+
+    Example:
+    ```mlir
+      %y = tts.spyre_op "sigmoid" (%x) : (tensor<128xf32>) -> tensor<128xf32> {
+      ^bb0(%a: tensor<128xf32>):
+        ...
+        tts.spyreop_yield %r : tensor<128xf32>
+      }
+    ```
+  }];
+
+  let arguments = (ins StrAttr:$name, Variadic<AnyRankedTensor>:$inputs);
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = [{
+    $name `(` $inputs `)` attr-dict `:` functional-type($inputs, $results)
+    $body
+  }];
+  let hasRegionVerifier = 1;
+}
+
+def TTS_SpyreOpYieldOp : TTS_Op<"spyreop_yield", [
+    Pure, Terminator, HasParent<"SpyreOpOp">]> {
+  let summary = "Terminate a tts.spyre_op body, yielding its results";
+
+  let arguments = (ins Variadic<AnyRankedTensor>:$values);
+
+  let assemblyFormat = "($values^ `:` type($values))? attr-dict";
 }
 
 #endif // TTS_OPS
