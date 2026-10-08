@@ -442,7 +442,7 @@ void init_triton_spyre_intrinsics(py::module &&m) {
   // The intrinsic table, one dict per entry, in the frontend's terms: an
   // element type is a Triton dtype name, and `result_operands[i]` is the
   // operand whose type result `i` has. backend/intrinsics.py pairs each name
-  // with its fallback.
+  // with its fallback, and admits a `test_only` one only under the test knob.
   m.def("table", []() -> py::list {
     py::list entries;
     for (const mlir::triton::tts::SpyreopIntrinsic &entry :
@@ -458,6 +458,7 @@ void init_triton_spyre_intrinsics(py::module &&m) {
       d["dtypes"] = py::tuple(dtypes);
       d["result_operands"] = std::vector<unsigned>(
           entry.resultTypeOperands.begin(), entry.resultTypeOperands.end());
+      d["test_only"] = entry.testOnly;
       entries.append(d);
     }
     return entries;
