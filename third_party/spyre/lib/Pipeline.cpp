@@ -50,7 +50,7 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
 
   // LAST, and after that canonicalize rather than before it. Each tts marker op's
   // annotation -> an attribute on the op the marked value resolved to, and each
-  // tts.spyre_op -> its fallback body inlined, every op tagged `tts.hint`. The
+  // tts.spyre_op -> its fallback body inlined, every op tagged `tts.spyreop_hint`. The
   // body's tt ops were lowered in place by LowerComputeOps, above, so what is
   // inlined is already this stage's output dialects.
   //
@@ -237,7 +237,7 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // and the compare rule fires only because of it. The reciprocal is the softer
   // case: it reads its numerator through the body, so it fires either way. A
   // `tl.spyre_op` request is the hard case: it is selected only as one whole
-  // body, which that pass's `tts.hint` clause makes it -- before the layout
+  // body, which that pass's `tts.spyreop_hint` clause makes it -- before the layout
   // rewrite, since after it the request's first generic keeps a linearizing
   // result map that fusion cannot fuse through.
   //

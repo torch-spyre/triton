@@ -17,15 +17,15 @@ func.func @split(%x: tensor<64xf32>) -> tensor<64xf32> {
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
     // expected-error @+1 {{tl.spyre_op("sigmoid") was not selected: the request's ops are spread over 2 compute bodies}}
-    %n = arith.negf %in {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
-    %ex = math.exp %n {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
+    %n = arith.negf %in {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    %ex = math.exp %n {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
     linalg.yield %ex : f32
   } -> tensor<64xf32>
   %b = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%a : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
-    %d = arith.addf %in, %one {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
-    %q = arith.divf %one, %d {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
+    %d = arith.addf %in, %one {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    %q = arith.divf %one, %d {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
     linalg.yield %q : f32
   } -> tensor<64xf32>
   return %b : tensor<64xf32>
@@ -43,8 +43,8 @@ func.func @gelu_f32(%x: tensor<64xf32>) -> tensor<64xf32> {
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
     // expected-error @+1 {{tl.spyre_op("gelu") was not selected: spyreop.gelu does not take f32}}
-    %er = math.erf %in {tts.hint = {group = 0 : i64, hint = "gelu"}} : f32
-    %m = arith.mulf %er, %half {tts.hint = {group = 0 : i64, hint = "gelu"}} : f32
+    %er = math.erf %in {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}} : f32
+    %m = arith.mulf %er, %half {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}} : f32
     linalg.yield %m : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
@@ -62,8 +62,8 @@ func.func @type_mismatch(%x: tensor<64xf16>) -> tensor<64xf32> {
       ins(%x : tensor<64xf16>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f16, %out: f32):
     // expected-error @+1 {{tl.spyre_op("sigmoid") was not selected: the request takes and yields different types (f16 in, f32 out)}}
-    %xf = arith.extf %in {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f16 to f32
-    %ex = math.exp %xf {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
+    %xf = arith.extf %in {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f16 to f32
+    %ex = math.exp %xf {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
     linalg.yield %ex : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
@@ -81,7 +81,7 @@ func.func @partial(%x: tensor<64xf32>) -> tensor<64xf32> {
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
     // expected-error @+1 {{tl.spyre_op("silu") was not selected: its body also holds 'arith.mulf', which is not part of the request}}
-    %ex = math.exp %in {tts.hint = {group = 0 : i64, hint = "silu"}} : f32
+    %ex = math.exp %in {tts.spyreop_hint = {id = 0 : i64, name = "silu"}} : f32
     %m = arith.mulf %ex, %ex : f32
     linalg.yield %m : f32
   } -> tensor<64xf32>
@@ -99,7 +99,7 @@ func.func @binary(%x: tensor<64xf32>, %y: tensor<64xf32>) -> tensor<64xf32> {
       ins(%x, %y : tensor<64xf32>, tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%a: f32, %b: f32, %out: f32):
     // expected-error @+1 {{tl.spyre_op("sigmoid") was not selected: the body reads 2 block arguments, and the intrinsic takes one input}}
-    %s = arith.addf %a, %b {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
+    %s = arith.addf %a, %b {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
     linalg.yield %s : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
@@ -117,7 +117,7 @@ func.func @unknown(%x: tensor<64xf32>) -> tensor<64xf32> {
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
     // expected-error @+1 {{tl.spyre_op("softplus") was not selected: there is no spyreop intrinsic named 'softplus'}}
-    %ex = math.exp %in {tts.hint = {group = 0 : i64, hint = "softplus"}} : f32
+    %ex = math.exp %in {tts.spyreop_hint = {id = 0 : i64, name = "softplus"}} : f32
     linalg.yield %ex : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
@@ -131,6 +131,6 @@ func.func @unknown(%x: tensor<64xf32>) -> tensor<64xf32> {
 // would be reported.
 func.func @outside_body(%x: f32) -> f32 {
   // expected-error @+1 {{tl.spyre_op("sigmoid") was not selected: an op of it is outside any compute body}}
-  %e = math.exp %x {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
+  %e = math.exp %x {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
   return %e : f32
 }

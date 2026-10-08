@@ -6,7 +6,7 @@ intrinsic ``name``. The kernel author writes only the name; what is traced is th
 FALLBACK registered here -- the same computation in plain ``tl`` ops -- inside a
 ``tts.spyre_op`` region. So a request means the same thing at every stage:
 
-* the ``ktir`` artifact holds the fallback, inlined and tagged ``tts.hint``, which
+* the ``ktir`` artifact holds the fallback, inlined and tagged ``tts.spyreop_hint``, which
   any KTIR reader runs as written;
 * the ``spyrecode`` stage replaces the fallback, whole, with the intrinsic.
 

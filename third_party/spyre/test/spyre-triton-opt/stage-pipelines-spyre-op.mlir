@@ -56,9 +56,9 @@ module {
 //
 // KTIR-LABEL:   func.func @gelu(
 // KTIR:           %[[X:.*]] = ktdp.load
-// KTIR:           arith.extf %[[X]] {tts.hint = {group = 0 : i64, hint = "gelu"}}
-// KTIR:           math.erf {{.*}} {tts.hint = {group = 0 : i64, hint = "gelu"}}
-// KTIR:           %[[G:.*]] = arith.truncf {{.*}} {tts.hint = {group = 0 : i64, hint = "gelu"}}
+// KTIR:           arith.extf %[[X]] {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}}
+// KTIR:           math.erf {{.*}} {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}}
+// KTIR:           %[[G:.*]] = arith.truncf {{.*}} {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}}
 // KTIR:           ktdp.store %[[G]]
 // KTIR-NOT:       tts.spyre_op
 // KTIR-NOT:       tts.spyreop_yield
@@ -74,7 +74,7 @@ module {
 // PHYS-NEXT:        %[[R:.*]] = spyreop.gelu %[[A]] : f16
 // PHYS-NEXT:        linalg.yield %[[R]] : f16
 // PHYS:           ktdp.store %[[G]]
-// PHYS-NOT:       tts.hint
+// PHYS-NOT:       tts.spyreop_hint
 // PHYS-NOT:       math.
 
 // -----
@@ -112,12 +112,12 @@ module {
   }
 }
 
-// Two requests, two groups -- even though the canonicalizer is free to merge
-// their equal constants, which is why a constant never counts toward a group.
+// Two call sites, two ids -- even though the canonicalizer is free to merge
+// their equal constants, which is why a constant never counts toward a call site.
 //
 // KTIR-LABEL:   func.func @sigmoid_silu(
-// KTIR:           math.exp {{.*}} {tts.hint = {group = 0 : i64, hint = "sigmoid"}}
-// KTIR:           math.exp {{.*}} {tts.hint = {group = 1 : i64, hint = "silu"}}
+// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}
+// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {id = 1 : i64, name = "silu"}}
 
 // Two bodies, one intrinsic each, the second reading the first.
 //
@@ -131,5 +131,5 @@ module {
 // PHYS-NEXT:        %[[Q:.*]] = spyreop.silu %[[B]] : f32
 // PHYS-NEXT:        linalg.yield %[[Q]] : f32
 // PHYS:           ktdp.store %[[Y]]
-// PHYS-NOT:       tts.hint
+// PHYS-NOT:       tts.spyreop_hint
 // PHYS-NOT:       math.

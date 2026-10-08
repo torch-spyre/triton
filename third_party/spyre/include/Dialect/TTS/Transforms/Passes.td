@@ -42,8 +42,8 @@ def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
           the pinned value. The marker is erased.
         - tts.spyre_op (op) → its body, inlined in place: block arguments
           replaced by the operands, results by the yielded values. Every op
-          inlined, nested ones included, carries the `tts.hint` ATTRIBUTE,
-          `{hint = <name>, group = <i64>}`, with a group unique to that
+          inlined, nested ones included, carries the `tts.spyreop_hint` ATTRIBUTE,
+          `{name = <name>, id = <i64>}`, with an id unique to that
           tts.spyre_op in the module. Runs before the markers, so a pin naming
           a request's result lands on the inlined op producing it.
 

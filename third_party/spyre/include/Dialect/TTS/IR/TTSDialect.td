@@ -48,7 +48,7 @@ def TTS_Dialect : Dialect {
     The third op, `tts.spyre_op`, is a request for one spyreop intrinsic and
     holds a body rather than naming a value, so it is not a marker; it is bound
     by the same rule all the same. `LowerTTSMarkers` inlines the body and leaves
-    the request as the `tts.hint` attribute on every op it inlined.
+    the request as the `tts.spyreop_hint` attribute on every op it inlined.
   }];
 
   let extraClassDeclaration = [{
@@ -115,31 +115,31 @@ def TTS_Dialect : Dialect {
     static constexpr ::llvm::StringLiteral kMemorySpaceName = "memory_space";
     static constexpr ::llvm::StringLiteral kOffsetName = "offset";
 
-    /// Which `tts.spyre_op` an op was inlined from, as a `DictionaryAttr` on
-    /// EVERY op `LowerTTSMarkers` inlined out of that op's body, nested ops
-    /// included:
+    /// Which `tts.spyre_op` call site an op was inlined from, as a
+    /// `DictionaryAttr` on every op `LowerTTSMarkers` inlined out of that op's
+    /// body:
     ///
-    ///   hint  : the intrinsic requested, the op's `name`, as a string
-    ///   group : an `i64` unique per `tts.spyre_op` in the module, so two
-    ///           requests for the same intrinsic stay distinguishable after
-    ///           both are inlined into one function
+    ///   name : the intrinsic the call site names, the op's `name`, as a string
+    ///   id   : an `i64` unique per `tts.spyre_op` in the module, so two call
+    ///          sites of the same intrinsic stay distinguishable after both are
+    ///          inlined into one function
     ///
     /// On the ops and not on what they become: ConvertElementwiseToLinalg
     /// writes a tensor op's attributes onto the scalar op it puts in the body,
     /// and fusion and the layout rewrite clone body ops whole, while every
     /// pass that rebuilds a `linalg.generic` drops the generic's own
     /// attributes. FuseComputeAndDataMovement fuses two generics whose bodies
-    /// carry one tag, and LowerSpyreOps replaces the body the group became
-    /// with the intrinsic `hint` names -- or reports the group, since the
-    /// request is explicit and a silent fallback would ignore it.
+    /// carry one call site, and LowerSpyreOps replaces the body the call site
+    /// became with the intrinsic `name` names.
     ///
     /// Builtin-valued like the two above, so the `ktir` artifact carrying it
     /// parses in a consumer that does not load this dialect.
-    static constexpr ::llvm::StringLiteral kHintAttrName = "tts.hint";
+    static constexpr ::llvm::StringLiteral kSpyreopHintAttrName =
+        "tts.spyreop_hint";
 
     /// The two entry names of that dictionary.
-    static constexpr ::llvm::StringLiteral kHintName = "hint";
-    static constexpr ::llvm::StringLiteral kGroupName = "group";
+    static constexpr ::llvm::StringLiteral kSpyreopHintNameKey = "name";
+    static constexpr ::llvm::StringLiteral kSpyreopHintIdKey = "id";
   }];
 
   let hasOperationAttrVerify = 1;

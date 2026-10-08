@@ -5,7 +5,7 @@ Three stages, one claim each:
 
 * tracing builds a ``tts.spyre_op`` holding the registered fallback;
 * the ``ktir`` artifact holds that fallback alone, inlined and tagged
-  ``tts.hint`` -- no ``tts`` op, which a KTIR reader could not parse;
+  ``tts.spyreop_hint`` -- no ``tts`` op, which a KTIR reader could not parse;
 * the ``spyrecode`` pipeline replaces the tagged body with exactly one
   ``spyreop.<name>``, and no tag is left for dbo-opt.
 
@@ -66,7 +66,7 @@ def test_request_reaches_one_intrinsic(op, dtype, tmp_path):
     mod = _ktir(ttir, tmp_path)
     ktir = str(mod)
     assert "tts.spyre_op" not in ktir and "tts.spyreop_yield" not in ktir
-    assert f'tts.hint = {{group = 0 : i64, hint = "{op}"}}' in ktir
+    assert f'tts.spyreop_hint = {{id = 0 : i64, name = "{op}"}}' in ktir
     assert "tt.call" not in ktir
 
     spyrecode = _spyrecode(mod)
@@ -74,7 +74,7 @@ def test_request_reaches_one_intrinsic(op, dtype, tmp_path):
     assert spyrecode.count(f"spyreop.{op} ") == 1
     assert f"spyreop.{op} %" in spyrecode and f": {elem}" in spyrecode
     # The fallback went whole, casts included, and so did every tag.
-    assert "tts.hint" not in spyrecode
+    assert "tts.spyreop_hint" not in spyrecode
     assert "math." not in spyrecode
     assert "arith.extf" not in spyrecode and "arith.truncf" not in spyrecode
 

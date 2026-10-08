@@ -49,13 +49,13 @@ void TTSDialect::initialize() {
   addInterfaces<TTSInlinerInterface>();
 }
 
-DictionaryAttr getHintTag(Operation *op) {
+DictionaryAttr getSpyreopHint(Operation *op) {
   return dyn_cast_or_null<DictionaryAttr>(
-      op->getDiscardableAttr(TTSDialect::kHintAttrName));
+      op->getDiscardableAttr(TTSDialect::kSpyreopHintAttrName));
 }
 
-StringRef getHintName(DictionaryAttr tag) {
-  return tag.getAs<StringAttr>(TTSDialect::kHintName).getValue();
+StringRef getSpyreopHintName(DictionaryAttr hint) {
+  return hint.getAs<StringAttr>(TTSDialect::kSpyreopHintNameKey).getValue();
 }
 
 std::optional<CoordOp> symbolizeCoordOp(int64_t code) {
@@ -374,22 +374,24 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
   if (name == kPinAttrName)
     return success();
 
-  // `tts.hint` is written by one pass, LowerTTSMarkers, and READ by two in
-  // `spyrecode` -- FuseComputeAndDataMovement groups bodies by equality of the
-  // whole tag, and LowerSpyreOps selects the intrinsic its `hint` names. So its
-  // spelling is checked here, which is what lets getHintTag hand those readers a
-  // dictionary they need not re-check: on hand-written IR this is the one place
-  // a malformed tag is caught before a reader takes it for "untagged".
-  if (name == kHintAttrName) {
-    auto tag = dyn_cast<DictionaryAttr>(attribute.getValue());
-    auto hint = tag ? tag.getAs<StringAttr>(kHintName) : StringAttr();
-    auto group = tag ? tag.getAs<IntegerAttr>(kGroupName) : IntegerAttr();
-    if (!tag || tag.size() != 2 || !hint || !group ||
-        !group.getType().isInteger(64))
+  // `tts.spyreop_hint` is written by one pass, LowerTTSMarkers, and READ by two
+  // in `spyrecode` -- FuseComputeAndDataMovement groups bodies by equality of
+  // the whole hint, and LowerSpyreOps selects the intrinsic its `name` names. So
+  // its spelling is checked here, which is what lets getSpyreopHint hand those
+  // readers a dictionary they need not re-check: on hand-written IR this is the
+  // one place a malformed hint is caught before a reader takes it for absent.
+  if (name == kSpyreopHintAttrName) {
+    auto hint = dyn_cast<DictionaryAttr>(attribute.getValue());
+    auto intrinsic =
+        hint ? hint.getAs<StringAttr>(kSpyreopHintNameKey) : StringAttr();
+    auto id = hint ? hint.getAs<IntegerAttr>(kSpyreopHintIdKey) : IntegerAttr();
+    if (!hint || hint.size() != 2 || !intrinsic || !id ||
+        !id.getType().isInteger(64))
       return op->emitError("'")
-             << kHintAttrName << "' must be a dictionary of exactly a string '"
-             << kHintName << "' and an i64 '" << kGroupName << "', got "
-             << attribute.getValue();
+             << kSpyreopHintAttrName
+             << "' must be a dictionary of exactly a string '"
+             << kSpyreopHintNameKey << "' and an i64 '" << kSpyreopHintIdKey
+             << "', got " << attribute.getValue();
     return success();
   }
 

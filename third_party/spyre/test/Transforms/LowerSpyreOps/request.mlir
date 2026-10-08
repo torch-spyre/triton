@@ -1,7 +1,7 @@
 // RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | FileCheck %s
 
 // THE REQUEST RULE: a compute body whose ops, constants aside, all carry one
-// `tts.hint` tag is one `tl.spyre_op` request's whole fallback, and becomes the
+// `tts.spyreop_hint` tag is one `tl.spyre_op` request's whole fallback, and becomes the
 // intrinsic the tag names applied to the body's input.
 //
 // Each body below is the fallback the backend registers for that intrinsic, as
@@ -22,7 +22,7 @@
 // CHECK-NEXT:    ^bb0(%[[IN:.*]]: f16, %{{.*}}: f16):
 // CHECK-NEXT:      %[[R:.*]] = spyreop.gelu %[[IN]] : f16
 // CHECK-NEXT:      linalg.yield %[[R]] : f16
-// CHECK-NOT:     tts.hint
+// CHECK-NOT:     tts.spyreop_hint
 func.func @gelu_f16(%x: tensor<64xf16>) -> tensor<64xf16> {
   %half = arith.constant 5.000000e-01 : f32
   %one = arith.constant 1.000000e+00 : f32
@@ -31,13 +31,13 @@ func.func @gelu_f16(%x: tensor<64xf16>) -> tensor<64xf16> {
   %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%x : tensor<64xf16>) outs(%e : tensor<64xf16>) {
   ^bb0(%in: f16, %out: f16):
-    %xf = arith.extf %in {tts.hint = {group = 0 : i64, hint = "gelu"}} : f16 to f32
-    %h = arith.mulf %xf, %half {tts.hint = {group = 0 : i64, hint = "gelu"}} : f32
-    %s = arith.mulf %xf, %rsqrt2 {tts.hint = {group = 0 : i64, hint = "gelu"}} : f32
-    %er = math.erf %s {tts.hint = {group = 0 : i64, hint = "gelu"}} : f32
-    %p = arith.addf %er, %one {tts.hint = {group = 0 : i64, hint = "gelu"}} : f32
-    %m = arith.mulf %h, %p {tts.hint = {group = 0 : i64, hint = "gelu"}} : f32
-    %t = arith.truncf %m {tts.hint = {group = 0 : i64, hint = "gelu"}} : f32 to f16
+    %xf = arith.extf %in {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}} : f16 to f32
+    %h = arith.mulf %xf, %half {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}} : f32
+    %s = arith.mulf %xf, %rsqrt2 {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}} : f32
+    %er = math.erf %s {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}} : f32
+    %p = arith.addf %er, %one {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}} : f32
+    %m = arith.mulf %h, %p {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}} : f32
+    %t = arith.truncf %m {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}} : f32 to f16
     linalg.yield %t : f16
   } -> tensor<64xf16>
   return %r : tensor<64xf16>
@@ -59,10 +59,10 @@ func.func @silu_f32(%x: tensor<64xf32>) -> tensor<64xf32> {
   %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
-    %n = arith.negf %in {tts.hint = {group = 4 : i64, hint = "silu"}} : f32
-    %ex = math.exp %n {tts.hint = {group = 4 : i64, hint = "silu"}} : f32
-    %d = arith.addf %ex, %one {tts.hint = {group = 4 : i64, hint = "silu"}} : f32
-    %q = arith.divf %in, %d {tts.hint = {group = 4 : i64, hint = "silu"}} : f32
+    %n = arith.negf %in {tts.spyreop_hint = {id = 4 : i64, name = "silu"}} : f32
+    %ex = math.exp %n {tts.spyreop_hint = {id = 4 : i64, name = "silu"}} : f32
+    %d = arith.addf %ex, %one {tts.spyreop_hint = {id = 4 : i64, name = "silu"}} : f32
+    %q = arith.divf %in, %d {tts.spyreop_hint = {id = 4 : i64, name = "silu"}} : f32
     linalg.yield %q : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
@@ -82,13 +82,13 @@ func.func @silu_f16(%x: tensor<64xf16>) -> tensor<64xf16> {
   %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%x : tensor<64xf16>) outs(%e : tensor<64xf16>) {
   ^bb0(%in: f16, %out: f16):
-    %xf = arith.extf %in {tts.hint = {group = 0 : i64, hint = "silu"}} : f16 to f32
-    %n = arith.negf %xf {tts.hint = {group = 0 : i64, hint = "silu"}} : f32
-    %ex = math.exp %n {tts.hint = {group = 0 : i64, hint = "silu"}} : f32
-    %d = arith.addf %ex, %one {tts.hint = {group = 0 : i64, hint = "silu"}} : f32
-    %xf2 = arith.extf %in {tts.hint = {group = 0 : i64, hint = "silu"}} : f16 to f32
-    %q = arith.divf %xf2, %d {tts.hint = {group = 0 : i64, hint = "silu"}} : f32
-    %t = arith.truncf %q {tts.hint = {group = 0 : i64, hint = "silu"}} : f32 to f16
+    %xf = arith.extf %in {tts.spyreop_hint = {id = 0 : i64, name = "silu"}} : f16 to f32
+    %n = arith.negf %xf {tts.spyreop_hint = {id = 0 : i64, name = "silu"}} : f32
+    %ex = math.exp %n {tts.spyreop_hint = {id = 0 : i64, name = "silu"}} : f32
+    %d = arith.addf %ex, %one {tts.spyreop_hint = {id = 0 : i64, name = "silu"}} : f32
+    %xf2 = arith.extf %in {tts.spyreop_hint = {id = 0 : i64, name = "silu"}} : f16 to f32
+    %q = arith.divf %xf2, %d {tts.spyreop_hint = {id = 0 : i64, name = "silu"}} : f32
+    %t = arith.truncf %q {tts.spyreop_hint = {id = 0 : i64, name = "silu"}} : f32 to f16
     linalg.yield %t : f16
   } -> tensor<64xf16>
   return %r : tensor<64xf16>
@@ -111,10 +111,10 @@ func.func @sigmoid_f32(%x: tensor<64xf32>) -> tensor<64xf32> {
   %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
-    %n = arith.negf %in {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
-    %ex = math.exp %n {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
-    %d = arith.addf %ex, %one {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
-    %q = arith.divf %one, %d {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
+    %n = arith.negf %in {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    %ex = math.exp %n {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    %d = arith.addf %ex, %one {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    %q = arith.divf %one, %d {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
     linalg.yield %q : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
@@ -135,19 +135,19 @@ func.func @sigmoid_f32(%x: tensor<64xf32>) -> tensor<64xf32> {
 // CHECK-NEXT:    ^bb0(%[[IN:.*]]: f16, %{{.*}}: f16):
 // CHECK-NEXT:      %[[R:.*]] = spyreop.sigmoid %[[IN]] : f16
 // CHECK-NEXT:      linalg.yield %[[R]] : f16
-// CHECK-NOT:     tts.hint
+// CHECK-NOT:     tts.spyreop_hint
 func.func @sigmoid_f16_splat_operand(%x: tensor<64xf16>) -> (tensor<64xf16>, tensor<64xf32>) {
-  %one = arith.constant {tts.hint = {group = 0 : i64, hint = "sigmoid"}} dense<1.0> : tensor<64xf32>
+  %one = arith.constant {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} dense<1.0> : tensor<64xf32>
   %e = tensor.empty() : tensor<64xf16>
   %r = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel"]}
       ins(%x, %one : tensor<64xf16>, tensor<64xf32>) outs(%e : tensor<64xf16>) {
   ^bb0(%in: f16, %c: f32, %out: f16):
-    %xf = arith.extf %in {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f16 to f32
-    %n = arith.negf %xf {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
-    %ex = math.exp %n {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
-    %d = arith.addf %ex, %c {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
-    %q = arith.divf %c, %d {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32
-    %t = arith.truncf %q {tts.hint = {group = 0 : i64, hint = "sigmoid"}} : f32 to f16
+    %xf = arith.extf %in {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f16 to f32
+    %n = arith.negf %xf {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    %ex = math.exp %n {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    %d = arith.addf %ex, %c {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    %q = arith.divf %c, %d {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    %t = arith.truncf %q {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32 to f16
     linalg.yield %t : f16
   } -> tensor<64xf16>
   return %r, %one : tensor<64xf16>, tensor<64xf32>

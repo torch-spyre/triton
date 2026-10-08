@@ -160,8 +160,8 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
 
     Like the marker ops this is consumed before any artifact is written:
     `LowerTTSMarkers` inlines the body in place and tags every op it inlined
-    with the `tts.hint` attribute, so the `ktir` artifact is the fallback alone,
-    in dialects any consumer loads. See `kHintAttrName` for what the tag
+    with the `tts.spyreop_hint` attribute, so the `ktir` artifact is the fallback alone,
+    in dialects any consumer loads. See `kSpyreopHintAttrName` for what the tag
     carries and who reads it.
 
     Example:

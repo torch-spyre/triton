@@ -169,16 +169,16 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
                                           select performs itself
 
         Rules, a REQUEST to one — a linalg.generic body whose ops, constants
-        aside, all carry one `tts.hint` tag, read one `ins` block argument and
+        aside, all carry one `tts.spyreop_hint` tag, read one `ins` block argument and
         yield one value, i.e. the whole fallback of one `tl.spyre_op`:
-        - hint "gelu"    (f16)          → spyreop.gelu
-        - hint "silu"    (f16 or f32)   → spyreop.silu
-        - hint "sigmoid" (f16 or f32)   → spyreop.sigmoid
+        - name "gelu"    (f16)          → spyreop.gelu
+        - name "silu"    (f16 or f32)   → spyreop.silu
+        - name "sigmoid" (f16 or f32)   → spyreop.sigmoid
         The body is replaced whole, casts included, by the intrinsic applied to
         the block argument; the type it reads must be the type it yields.
 
         A TAGGED OP IS CLAIMED. Every 1:1 and group rule declines an op carrying
-        `tts.hint`, so a request's `math.exp` is never selected alone as
+        `tts.spyreop_hint`, so a request's `math.exp` is never selected alone as
         spyreop.exp. That is what keeps the rules unordered: the request rule is
         rooted on the generic, the others never touch its members.
 
@@ -208,7 +208,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         dialect conversion, where an unsupported float width was reported here.
 
         The first exception is a REQUEST left unselected: any op other than a
-        constant still carrying `tts.hint` after the rewrite is an error naming
+        constant still carrying `tts.spyreop_hint` after the rewrite is an error naming
         the intrinsic and why. The author asked for it by name, so passing the
         fallback through would ignore the request without saying so. The causes
         it names: the request split over two bodies (a fusion that did not
@@ -266,7 +266,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         body for the same reason. A contract between adjacent passes rather than
         an accident — and the reciprocal reads its numerator THROUGH the body, so
         for that rule the dependency is about whether it FIRES, never about
-        whether it is correct. Its `tts.hint` clause is the same contract for requests: each
+        whether it is correct. Its `tts.spyreop_hint` clause is the same contract for requests: each
         tensor op of a fallback arrives in its own generic, and that pass fuses
         the ones of one request into one body.
 
@@ -410,7 +410,7 @@ def FuseComputeAndDataMovement
           a unit-dim expand `[4] → [4,1]` gives `(d0, d1) → (d0)`, the one
           `tt.expand_dims` leaves behind where no collapse cancelled it.
         - A linalg.generic PRODUCER feeding a linalg.generic consumer, both of
-          whose bodies carry the same `tts.hint` tag → fused. The tag means both
+          whose bodies carry the same `tts.spyreop_hint` tag → fused. The tag means both
           hold ops LowerTTSMarkers inlined from one `tts.spyre_op`, and
           [LowerSpyreOps] replaces a request only as ONE body. Constants do not
           count toward a body's tag, and a body carrying two tags has none.

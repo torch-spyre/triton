@@ -36,20 +36,20 @@
 //
 // And one clause that is a REQUEST rather than a property of the IR:
 //
-//   ONE BODY PER INTRINSIC REQUEST   fuse a producer into its consumer when
-//            both bodies carry the same `tts.hint` tag, i.e. both hold ops
+//   ONE BODY PER CALL SITE   fuse a producer into its consumer when both
+//            bodies carry the same `tts.spyreop_hint`, i.e. both hold ops
 //            LowerTTSMarkers inlined out of one `tts.spyre_op`. Each tensor op
-//            of the request's fallback arrives in a generic of its own, and
-//            LowerSpyreOps replaces a request only as one whole body. See
-//            isSameHintGroup.
+//            of the call site's fallback arrives in a generic of its own, and
+//            LowerSpyreOps replaces a call site only as one whole body. See
+//            producerAndConsumerShareCallSite.
 //
 // Here and not in a pass of its own ahead of LowerSpyreOps, because that
 // position is after RewriteDescriptorLayoutGeneric, which physicalizes only the
-// generics one hop off an annotated load or store: the request's FIRST generic
+// generics one hop off an annotated load or store: the call site's FIRST generic
 // then iterates the physical space while its result stays logical, behind a
 // linearizing result map, and elementwise fusion requires a producer's result
-// map to be a permutation -- so the group can no longer become one body. Fused
-// here, the group is one generic before the layout rewrite and is physicalized
+// map to be a permutation -- so its generics can no longer become one body. Fused
+// here, the call site is one generic before the layout rewrite and is physicalized
 // whole.
 //
 // The first half is the bulk of this file. Three parts, separable on purpose --
@@ -341,20 +341,21 @@ bool isUnrepresentableIntermediate(OpOperand *fusedOperand) {
   return true;
 }
 
-/// The THIRD clause: the producer and the consumer hold ops of one intrinsic
-/// request. The tag is on the BODY ops and not on the generics, because every
-/// pass that rebuilds a generic -- this pass's own fusion among them -- drops the
-/// generic's attributes and keeps the body's; see `kHintAttrName`.
+/// The `tl.spyre_op` call site whose ops `op`'s body holds: the one
+/// `tts.spyreop_hint` its hinted ops share, or null when `op` is not a generic,
+/// holds no hinted op, or holds hinted ops of two call sites. With `<silu#0>`
+/// for the hint `{name = "silu", id = 0}`:
 ///
-/// A body's tag is the one its tagged ops share, and a constant does not count:
-/// the canonicalizer hoists and merges constants without regard to tags, so a
-/// constant says nothing about which request a body belongs to. A body whose
-/// ops carry two tags has none, and fuses with neither request.
+///   {exp<silu#0>, addf<silu#0>}   -> silu#0
+///   {exp<silu#0>, cst}            -> silu#0
+///   {exp<silu#0>, mulf<gelu#1>}   -> null
 ///
-/// Not gated on hasOneUse, like the other two: a producer of a request read by
-/// two consumers of the same request is fused into each, which duplicates part
-/// of the fallback inside the one body LowerSpyreOps then replaces whole.
-DictionaryAttr hintGroupOf(Operation *op) {
+/// The hint is on the BODY ops and not on the generics, because every pass that
+/// rebuilds a generic -- this pass's own fusion among them -- drops the generic's
+/// attributes and keeps the body's; see `kSpyreopHintAttrName`. A constant does
+/// not count: the canonicalizer hoists and merges constants without regard to
+/// hints, so a constant says nothing about which call site a body belongs to.
+DictionaryAttr callSiteOfBody(Operation *op) {
   auto generic = dyn_cast_or_null<linalg::GenericOp>(op);
   if (!generic)
     return {};
@@ -363,21 +364,29 @@ DictionaryAttr hintGroupOf(Operation *op) {
   generic.getBlock()->walk([&](Operation *bodyOp) {
     if (bodyOp->hasTrait<OpTrait::ConstantLike>())
       return;
-    DictionaryAttr tag = triton::tts::getHintTag(bodyOp);
-    if (!tag)
+    DictionaryAttr hint = triton::tts::getSpyreopHint(bodyOp);
+    if (!hint)
       return;
-    if (found && found != tag)
+    if (found && found != hint)
       mixed = true;
-    found = tag;
+    found = hint;
   });
   return mixed ? DictionaryAttr() : found;
 }
 
-bool isSameHintGroup(OpOperand *fusedOperand) {
-  DictionaryAttr producer = hintGroupOf(fusedOperand->get().getDefiningOp());
-  if (!producer || producer != hintGroupOf(fusedOperand->getOwner()))
+/// The THIRD clause: whether the producer and the consumer of `fusedOperand`
+/// both hold ops of one call site, by callSiteOfBody. Fusing a producer
+/// `<silu#0>` into a consumer `<silu#0>` -> yes; into `<silu#1>` -> no; into
+/// an unhinted consumer -> no.
+///
+/// Not gated on hasOneUse, like the other two: a producer of a call site read
+/// by two consumers of the same call site is fused into each, which duplicates
+/// part of the fallback inside the one body LowerSpyreOps then replaces whole.
+bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
+  DictionaryAttr producer = callSiteOfBody(fusedOperand->get().getDefiningOp());
+  if (!producer || producer != callSiteOfBody(fusedOperand->getOwner()))
     return false;
-  LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] fusing within intrinsic request "
+  LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] fusing within call site "
                           << producer << " into "
                           << fusedOperand->getOwner()->getLoc() << "\n");
   return true;
@@ -932,12 +941,12 @@ struct FuseComputeAndDataMovementPass
     // Upstream does the map composition; the control function decides which
     // fusions are allowed to happen at all. THREE clauses, and they are
     // independent reasons rather than one policy split up -- the two halves
-    // the pass is named for, and the intrinsic request; see the header.
+    // the pass is named for, and the call site; see the header.
     linalg::ControlFusionFn fuseWhatMustNotSurvive =
         [](OpOperand *fusedOperand) {
           return isPureDataMovement(fusedOperand->get().getDefiningOp()) ||
                  isUnrepresentableIntermediate(fusedOperand) ||
-                 isSameHintGroup(fusedOperand);
+                 producerAndConsumerShareCallSite(fusedOperand);
         };
     linalg::populateElementwiseOpsFusionPatterns(patterns,
                                                  fuseWhatMustNotSurvive);
