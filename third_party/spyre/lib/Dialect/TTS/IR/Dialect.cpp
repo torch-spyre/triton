@@ -8,25 +8,55 @@
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/TTS/IR/Dialect.h"
+#include "Dialect/TTS/IR/Intrinsics.h"
 
 #include "ktir/Dialect/KTDP/KTDP.h"
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Transforms/InliningUtils.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include "Dialect/TTS/IR/Dialect.cpp.inc"
 
 namespace mlir::triton::tts {
 
+namespace {
+
+/// Admits inlining INTO a `tts.spyre_op` body. Tracing reaches the registered
+/// fallback through a `tt.call` inside that body, and the `ttir` stage's
+/// inliner asks the dialect of the region's parent op whether a callee's body
+/// may land there; with no answer it keeps the call. Whether each inlined op
+/// may move is still asked of that op's own dialect.
+struct TTSInlinerInterface : public DialectInlinerInterface {
+  using DialectInlinerInterface::DialectInlinerInterface;
+
+  bool isLegalToInline(Region *dest, Region *src, bool wouldBeCloned,
+                       IRMapping &valueMapping) const final {
+    return isa<SpyreOpOp>(dest->getParentOp());
+  }
+};
+
+} // namespace
+
 void TTSDialect::initialize() {
-  // One op and nothing else: no types, no attribute types. Most of what the
-  // dialect is for is the attribute NAME and the verifier hook that name routes
-  // to, neither of which is registered here.
+  // Ops and nothing else: no types, no attribute types. Most of what the
+  // dialect is for is the attribute NAMES and the verifier hook those names
+  // route to, neither of which is registered here.
   addOperations<
 #define GET_OP_LIST
 #include "Dialect/TTS/IR/Ops.cpp.inc"
       >();
+  addInterfaces<TTSInlinerInterface>();
+}
+
+DictionaryAttr getSpyreopHint(Operation *op) {
+  return dyn_cast_or_null<DictionaryAttr>(
+      op->getDiscardableAttr(TTSDialect::kSpyreopHintAttrName));
+}
+
+StringRef getSpyreopHintName(DictionaryAttr hint) {
+  return hint.getAs<StringAttr>(TTSDialect::kSpyreopHintNameKey).getValue();
 }
 
 std::optional<CoordOp> symbolizeCoordOp(int64_t code) {
@@ -344,6 +374,37 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
   // exactly that reason. That reader belongs with that consumer.
   if (name == kPinAttrName)
     return success();
+
+  // `tts.spyreop_hint` is written by one pass, LowerTTSMarkers, and READ by two
+  // in `spyrecode` -- FuseComputeAndDataMovement groups bodies by equality of
+  // the whole hint, and LowerSpyreOps selects the intrinsic its `name` names. So
+  // what one op can show is checked here, which is what lets getSpyreopHint hand
+  // those readers a dictionary they need not re-check: exactly the two fields,
+  // each of its type, a `name` in the intrinsic table, and an op that is not a
+  // constant, which LowerTTSMarkers never hints. Nothing about other ops -- an
+  // `id` being unique, a call site being whole -- is checkable from one op;
+  // FuseComputeAndDataMovement checks those once its fusion is done.
+  if (name == kSpyreopHintAttrName) {
+    auto hint = dyn_cast<DictionaryAttr>(attribute.getValue());
+    auto intrinsic =
+        hint ? hint.getAs<StringAttr>(kSpyreopHintNameKey) : StringAttr();
+    auto id = hint ? hint.getAs<IntegerAttr>(kSpyreopHintIdKey) : IntegerAttr();
+    if (!hint || hint.size() != 2 || !intrinsic || !id ||
+        !id.getType().isInteger(64))
+      return op->emitError("'")
+             << kSpyreopHintAttrName
+             << "' must be a dictionary of exactly a string '"
+             << kSpyreopHintNameKey << "' and an i64 '" << kSpyreopHintIdKey
+             << "', got " << attribute.getValue();
+    if (!lookupSpyreopIntrinsic(intrinsic.getValue()))
+      return op->emitError("'")
+             << kSpyreopHintAttrName << "' names no spyreop intrinsic: "
+             << intrinsic;
+    if (op->hasTrait<OpTrait::ConstantLike>())
+      return op->emitError("'")
+             << kSpyreopHintAttrName << "' is not set on a constant";
+    return success();
+  }
 
   return op->emitError("attribute '")
          << name << "' is not one the tts dialect defines";

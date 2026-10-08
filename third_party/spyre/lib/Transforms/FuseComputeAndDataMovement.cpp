@@ -34,6 +34,24 @@
 // two generics until this pass joins them -- but that is a consequence, not the
 // reason: the `i1` has to go regardless of whether any rule wanted the pair.
 //
+// And one clause that is a REQUEST rather than a property of the IR:
+//
+//   ONE BODY PER CALL SITE   fuse a producer into its consumer when both
+//            bodies carry the same `tts.spyreop_hint`, i.e. both hold ops
+//            LowerTTSMarkers inlined out of one `tts.spyre_op`. Each tensor op
+//            of the call site's fallback arrives in a generic of its own, and
+//            LowerSpyreOps replaces a call site only as one whole body. See
+//            producerAndConsumerShareCallSite.
+//
+// Here and not in a pass of its own ahead of LowerSpyreOps, because that
+// position is after RewriteDescriptorLayoutGeneric, which physicalizes only the
+// generics one hop off an annotated load or store: the call site's FIRST generic
+// then iterates the physical space while its result stays logical, behind a
+// linearizing result map, and elementwise fusion requires a producer's result
+// map to be a permutation -- so its generics can no longer become one body. Fused
+// here, the call site is one generic before the layout rewrite and is physicalized
+// whole.
+//
 // The first half is the bulk of this file. Three parts, separable on purpose --
 //
 //   resultToSourceMap    given one shape op, the map from its RESULT
@@ -226,6 +244,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -321,6 +341,150 @@ bool isUnrepresentableIntermediate(OpOperand *fusedOperand) {
              << ": no spyreop op has that type, so it must not cross a generic "
                 "boundary\n");
   return true;
+}
+
+/// The `tl.spyre_op` call site whose ops `op`'s body holds: the one
+/// `tts.spyreop_hint` its hinted ops share, or null when `op` is not a generic,
+/// holds no hinted op, or holds hinted ops of two call sites. With `<silu#0>`
+/// for the hint `{name = "silu", id = 0}`:
+///
+///   {exp<silu#0>, addf<silu#0>}   -> silu#0
+///   {exp<silu#0>, cst}            -> silu#0
+///   {exp<silu#0>, mulf<gelu#1>}   -> null
+///
+/// The hint is on the BODY ops and not on the generics, because every pass that
+/// rebuilds a generic -- this pass's own fusion among them -- drops the generic's
+/// attributes and keeps the body's; see `kSpyreopHintAttrName`. A constant does
+/// not count: the canonicalizer hoists and merges constants without regard to
+/// hints, so a constant says nothing about which call site a body belongs to.
+DictionaryAttr callSiteOfBody(Operation *op) {
+  auto generic = dyn_cast_or_null<linalg::GenericOp>(op);
+  if (!generic)
+    return {};
+  DictionaryAttr found;
+  bool mixed = false;
+  generic.getBlock()->walk([&](Operation *bodyOp) {
+    if (bodyOp->hasTrait<OpTrait::ConstantLike>())
+      return;
+    DictionaryAttr hint = triton::tts::getSpyreopHint(bodyOp);
+    if (!hint)
+      return;
+    if (found && found != hint)
+      mixed = true;
+    found = hint;
+  });
+  return mixed ? DictionaryAttr() : found;
+}
+
+/// The THIRD clause: whether the producer and the consumer of `fusedOperand`
+/// both hold ops of one call site, by callSiteOfBody. Fusing a producer
+/// `<silu#0>` into a consumer `<silu#0>` -> yes; into `<silu#1>` -> no; into
+/// an unhinted consumer -> no.
+///
+/// Not gated on hasOneUse, like the other two: a producer of a call site read
+/// by two consumers of the same call site is fused into each, which duplicates
+/// part of the fallback inside the one body LowerSpyreOps then replaces whole.
+bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
+  DictionaryAttr producer = callSiteOfBody(fusedOperand->get().getDefiningOp());
+  if (!producer || producer != callSiteOfBody(fusedOperand->getOwner()))
+    return false;
+  LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] fusing within call site "
+                          << producer << " into "
+                          << fusedOperand->getOwner()->getLoc() << "\n");
+  return true;
+}
+
+/// The post-condition of the third clause, checked once after the fixpoint:
+/// every call site is ONE generic body, holding nothing else.
+///
+///   - each `id` is in exactly one generic body, and on no op outside a body;
+///   - a body holding hinted ops holds no other op but constants: neither the
+///     ops of a second `id`, nor an unhinted op;
+///   - every op of one `id` agrees on `name`.
+///
+/// The `tts.spyre_op` verifier held each body to be elementwise at one shape,
+/// so ConvertElementwiseToLinalg gives every op of it a generic over one
+/// iteration space and the clause fuses them; anything else here is a compiler
+/// bug, and is reported as one rather than as the author's.
+LogicalResult checkCallSitesFused(ModuleOp mod) {
+  using triton::tts::getSpyreopHint;
+  using triton::tts::getSpyreopHintName;
+  using triton::tts::TTSDialect;
+
+  struct CallSite {
+    StringAttr name;
+    Operation *first = nullptr;
+    llvm::SmallSetVector<Operation *, 2> bodies;
+  };
+  llvm::MapVector<int64_t, CallSite> callSites;
+  LogicalResult result = success();
+  auto report = [&](Operation *op, int64_t id, StringRef name) {
+    result = failure();
+    return op->emitError("fuse-compute-and-data-movement: tl.spyre_op(\"")
+           << name << "\") call site " << id
+           << " did not fuse into one compute body, which its verified body "
+              "guarantees -- a compiler bug: ";
+  };
+
+  mod.walk([&](Operation *op) {
+    DictionaryAttr hint = getSpyreopHint(op);
+    if (!hint)
+      return;
+    int64_t id = hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintIdKey).getInt();
+    auto name = hint.getAs<StringAttr>(TTSDialect::kSpyreopHintNameKey);
+    CallSite &site = callSites[id];
+    if (!site.first) {
+      site.first = op;
+      site.name = name;
+    } else if (site.name != name) {
+      report(op, id, site.name.getValue())
+          << "an op of it names '" << name.getValue() << "'";
+      return;
+    }
+    auto generic = dyn_cast<linalg::GenericOp>(op->getParentOp());
+    if (!generic) {
+      report(op, id, name.getValue()) << "'" << op->getName()
+                                      << "' is outside any compute body";
+      return;
+    }
+    site.bodies.insert(generic);
+  });
+
+  for (auto &[id, site] : callSites) {
+    StringRef name = site.name.getValue();
+    if (site.bodies.size() > 1) {
+      InFlightDiagnostic diag = report(site.first, id, name)
+                                << "its ops are spread over "
+                                << site.bodies.size() << " compute bodies";
+      for (Operation *body : site.bodies)
+        diag.attachNote(body->getLoc()) << "a body holding ops of it";
+      continue;
+    }
+    if (site.bodies.empty())
+      continue;
+    auto generic = cast<linalg::GenericOp>(site.bodies.front());
+    for (Operation &op : generic.getBlock()->without_terminator()) {
+      if (op.hasTrait<OpTrait::ConstantLike>())
+        continue;
+      DictionaryAttr hint = getSpyreopHint(&op);
+      if (!hint) {
+        report(&op, id, name) << "its body also holds '" << op.getName()
+                              << "', which is not part of it";
+        break;
+      }
+      int64_t other =
+          hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintIdKey).getInt();
+      if (other != id) {
+        // Reported once per pair, from the lower id.
+        if (other > id)
+          report(&op, id, name)
+              << "its body also holds ops of call site " << other << ", "
+              << getSpyreopHintName(hint);
+        break;
+      }
+    }
+  }
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -870,13 +1034,14 @@ struct FuseComputeAndDataMovementPass
 
     RewritePatternSet patterns(ctx);
     // Upstream does the map composition; the control function decides which
-    // fusions are allowed to happen at all. TWO clauses, and they are
-    // independent reasons rather than one policy split in half -- see THE
-    // FUSION POLICY HAS TWO CLAUSES in the header.
+    // fusions are allowed to happen at all. THREE clauses, and they are
+    // independent reasons rather than one policy split up -- the two halves
+    // the pass is named for, and the call site; see the header.
     linalg::ControlFusionFn fuseWhatMustNotSurvive =
         [](OpOperand *fusedOperand) {
           return isPureDataMovement(fusedOperand->get().getDefiningOp()) ||
-                 isUnrepresentableIntermediate(fusedOperand);
+                 isUnrepresentableIntermediate(fusedOperand) ||
+                 producerAndConsumerShareCallSite(fusedOperand);
         };
     linalg::populateElementwiseOpsFusionPatterns(patterns,
                                                  fuseWhatMustNotSurvive);
@@ -888,8 +1053,10 @@ struct FuseComputeAndDataMovementPass
 
     // After the fixpoint, not during it: what is left is precisely what the
     // absorber declined, so presence is the evidence and no pattern has to
-    // report anything.
+    // report anything. The call sites the third clause fused are checked the
+    // same way.
     LogicalResult gate = rejectOnPhysicalizedPaths(mod, tally);
+    LogicalResult fused = checkCallSitesFused(mod);
 
     LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] done: " << tally.absorbed
                             << " operand(s) absorbed, " << tally.genericsRemoved
@@ -897,7 +1064,7 @@ struct FuseComputeAndDataMovementPass
                             << tally.declined << " operand(s) declined, "
                             << tally.rejected << " op(s) rejected\n");
 
-    if (failed(gate))
+    if (failed(gate) || failed(fused))
       signalPassFailure();
   }
 };

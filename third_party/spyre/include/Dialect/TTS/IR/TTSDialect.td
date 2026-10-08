@@ -44,6 +44,11 @@ def TTS_Dialect : Dialect {
     descriptor became, a pin names a value and lands on the op producing it.
     What does not differ is that the value of either is built out of builtin
     attributes only.
+
+    The third op, `tts.spyre_op`, is a request for one spyreop intrinsic and
+    holds a body rather than naming a value, so it is not a marker; it is bound
+    by the same rule all the same. `LowerTTSMarkers` inlines the body and leaves
+    the request as the `tts.spyreop_hint` attribute on every op it inlined.
   }];
 
   let extraClassDeclaration = [{
@@ -109,6 +114,33 @@ def TTS_Dialect : Dialect {
     /// The two entry names of that dictionary.
     static constexpr ::llvm::StringLiteral kMemorySpaceName = "memory_space";
     static constexpr ::llvm::StringLiteral kOffsetName = "offset";
+
+    /// Which `tts.spyre_op` call site an op was inlined from, as a
+    /// `DictionaryAttr` on every op `LowerTTSMarkers` inlined out of that op's
+    /// body:
+    ///
+    ///   name : the intrinsic the call site names, the op's `name`, as a string
+    ///   id   : an `i64` unique per `tts.spyre_op` in the module, so two call
+    ///          sites of the same intrinsic stay distinguishable after both are
+    ///          inlined into one function
+    ///
+    /// On the ops and not on what they become: ConvertElementwiseToLinalg
+    /// writes a tensor op's attributes onto the scalar op it puts in the body,
+    /// and fusion and the layout rewrite clone body ops whole, while every
+    /// pass that rebuilds a `linalg.generic` drops the generic's own
+    /// attributes. FuseComputeAndDataMovement fuses two generics whose bodies
+    /// carry one call site, and LowerSpyreOps replaces the body the call site
+    /// became with the intrinsic `name` names. What is checked about it, and
+    /// where, is stated once, in `tts.spyre_op`'s description.
+    ///
+    /// Builtin-valued like the two above, so the `ktir` artifact carrying it
+    /// parses in a consumer that does not load this dialect.
+    static constexpr ::llvm::StringLiteral kSpyreopHintAttrName =
+        "tts.spyreop_hint";
+
+    /// The two entry names of that dictionary.
+    static constexpr ::llvm::StringLiteral kSpyreopHintNameKey = "name";
+    static constexpr ::llvm::StringLiteral kSpyreopHintIdKey = "id";
   }];
 
   let hasOperationAttrVerify = 1;

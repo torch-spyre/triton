@@ -1,7 +1,8 @@
 // RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file -verify-diagnostics
 
-// AN i1 LEFT IN A COMPUTE BODY IS REFUSED, and it is the one thing this pass
-// reports.
+// AN i1 LEFT IN A COMPUTE BODY IS REFUSED, and it is one of the two things this
+// pass reports; the other is an intrinsic request left unselected, which
+// request-invalid.mlir covers.
 //
 // Everything else unmatched flows through, because it is a CAPABILITY gap -- an
 // f64 `math.sqrt` is valid IR that a future device or a future rule may do, so the

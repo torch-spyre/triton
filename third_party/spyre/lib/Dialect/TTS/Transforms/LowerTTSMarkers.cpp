@@ -20,6 +20,14 @@
 // Two markers, two resolution functions and two attribute builders, which is
 // what the shape below was for.
 //
+// And one op that is NOT a marker: `tts.spyre_op` names no value and has a body,
+// so it does not fit the driver's resolve-and-move shape and has a function of
+// its own, inlineSpyreOpCallSites. Its lowering inlines the body in place and
+// leaves the call site as the `tts.spyreop_hint` on every op inlined -- an
+// attribute on the ops rather than on one subject, which is the same rule (the op
+// goes, a builtin attribute stays) applied to a call site that is about a
+// computation.
+//
 // A pinned BLOCK ARGUMENT is therefore refused HERE, and this is the only place it
 // can be. It is a value like any other and the op admits one, but it has no defining
 // op, so there is nothing for the attribute to live on -- a function argument
@@ -45,6 +53,7 @@
 #include "ktir/Dialect/KTDP/KTDP.h"
 
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
@@ -315,6 +324,93 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 }
 
 //===----------------------------------------------------------------------===//
+// tts.spyre_op
+//===----------------------------------------------------------------------===//
+
+/// Inline every `tts.spyre_op` in `module` in place, hinting each inlined op.
+///
+/// Per call site, in this order:
+///
+///   1. pick its `id`: one per op, so two call sites of the same intrinsic --
+///      one helper inlined twice, say -- stay two after both land in one
+///      function;
+///   2. set `{name = name, id = id}` on every op of the body but its
+///      constants and its terminator, which is about to go. The op's verifier
+///      has held every one of them to be elementwise, so none has a region;
+///   3. replace each block argument by its operand and move the body's ops in
+///      front of the call site;
+///   4. replace each result by its yielded value and erase the call site, whose
+///      terminator goes with it.
+///
+/// Constants are not hinted. The canonicalizer hoists, merges and folds them
+/// freely, so a constant cannot stay a member of one call site, and every
+/// reader of the hint skips constants.
+///
+/// Ids start above any already in the module, so IR that already carries hints
+/// -- written by hand, or lowered once already -- does not collide with the
+/// ones written here.
+///
+/// A call site with a constant operand is refused, before anything is inlined.
+/// Every op of its body then reads only constants, so the first folding driver
+/// in `spyrecode` folds the whole call site to one constant and no intrinsic is
+/// selected. The check is here rather than at trace time because this pass runs
+/// after the `ktir` stage's canonicalize: an operand that only folds to a
+/// constant there (`tl.full` traces to a `tt.splat` of a scalar) is a constant
+/// by now.
+static LogicalResult inlineSpyreOpCallSites(ModuleOp module) {
+  using mlir::triton::tts::SpyreOpOp;
+  using mlir::triton::tts::TTSDialect;
+
+  int64_t nextId = 0;
+  module.walk([&](Operation *op) {
+    if (DictionaryAttr hint = mlir::triton::tts::getSpyreopHint(op))
+      if (auto id = hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintIdKey))
+        nextId = std::max(nextId, id.getInt() + 1);
+  });
+
+  // Collect first: the rewrite erases. None is nested in another's body,
+  // since the op's verifier admits only elementwise ops there.
+  SmallVector<SpyreOpOp> callSites;
+  module.walk([&](SpyreOpOp op) { callSites.push_back(op); });
+
+  for (SpyreOpOp callSite : callSites)
+    for (auto [i, operand] : llvm::enumerate(callSite.getInputs()))
+      if (matchPattern(operand, m_Constant()))
+        return callSite.emitError()
+               << "tl.spyre_op(\"" << callSite.getName() << "\"): operand " << i
+               << " is a constant, so the call site would fold to a constant "
+                  "and no intrinsic would be selected";
+
+  Builder builder(module.getContext());
+  for (SpyreOpOp callSite : callSites) {
+    DictionaryAttr hint = builder.getDictionaryAttr({
+        builder.getNamedAttr(TTSDialect::kSpyreopHintNameKey,
+                             callSite.getNameAttr()),
+        builder.getNamedAttr(TTSDialect::kSpyreopHintIdKey,
+                             builder.getI64IntegerAttr(nextId++)),
+    });
+
+    Block &body = callSite.getBody().front();
+    Operation *yield = body.getTerminator();
+    for (Operation &op : body.without_terminator())
+      if (!op.hasTrait<OpTrait::ConstantLike>())
+        op.setAttr(TTSDialect::kSpyreopHintAttrName, hint);
+
+    for (auto [arg, operand] :
+         llvm::zip_equal(body.getArguments(), callSite.getInputs()))
+      arg.replaceAllUsesWith(operand);
+    Block *parent = callSite->getBlock();
+    parent->getOperations().splice(callSite->getIterator(),
+                                   body.getOperations(), body.begin(),
+                                   yield->getIterator());
+
+    callSite->replaceAllUsesWith(yield->getOperands());
+    callSite->erase();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
 
@@ -325,6 +421,14 @@ struct LowerTTSMarkersPass
     using mlir::triton::tts::PinOp;
     using mlir::triton::tts::TensorLayoutOp;
     using mlir::triton::tts::TTSDialect;
+
+    // FIRST, ahead of the markers. A pin may name a call site's result, and
+    // the op producing that value exists only once the body is inlined -- run
+    // after, the pin would land on the call site and be erased with it. Not a
+    // marker, so not the driver's: see inlineSpyreOpCallSites, which refuses
+    // a call site with a constant operand.
+    if (failed(inlineSpyreOpCallSites(getOperation())))
+      return signalPassFailure();
 
     // One statement per marker kind, and the three things a marker brings: its
     // op type, its attribute name, and the resolve/build pair above.

@@ -22,7 +22,8 @@ include "mlir/Pass/PassBase.td"
 
 def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
     let summary = "Move each tts marker op's annotation onto the op the marked "
-                  "value resolves to, and erase the marker.";
+                  "value resolves to, and erase the marker; inline each "
+                  "tts.spyre_op, tagging what it inlined.";
     let description = [{
         Input: lowered KTIR (after LowerDescriptorMemory, LowerScalarLoad and
         LowerComputeOps) still carrying `tts` marker ops. A marker is an op with
@@ -39,6 +40,20 @@ def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
         - tts.pin (op) → the `tts.pin` ATTRIBUTE, a dictionary of the op's
           memory_space and its address when it stated one, on the op DEFINING
           the pinned value. The marker is erased.
+        - tts.spyre_op (op) → its body, inlined in place: block arguments
+          replaced by the operands, results by the yielded values. Every op
+          inlined but the constants carries the `tts.spyreop_hint` ATTRIBUTE,
+          `{name = <name>, id = <i64>}`, with an id unique to that
+          tts.spyre_op in the module. Runs before the markers, so a pin naming
+          a request's result lands on the inlined op producing it. A
+          tts.spyre_op with a constant operand is an error: its body would
+          fold to a constant in `spyrecode` and no intrinsic would be
+          selected.
+
+        tts.spyre_op is not a marker -- it names no value and holds a body --
+        so it is not one of the driver's kinds below; it has a function of its
+        own, and the rule it shares with them is only the outcome: the op is
+        gone and a builtin-valued attribute stays.
 
         The pass is one generic driver over any number of marker kinds: resolve
         the marked value to an op, set the attribute, erase the marker, then
@@ -61,7 +76,10 @@ def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
         Both markers stay legal through the passes in between. LowerComputeOps
         converts against an explicit illegal-op list that names no `tts` op, so
         a marker reaching it passes through untouched; LowerScalarLoad is
-        indifferent to markers.
+        indifferent to markers. A tts.spyre_op passes through the same way,
+        and its BODY is converted where it stands: the conversion visits nested
+        ops and no pattern depends on its parent, so the body inlined here is
+        already linalg/tensor/arith/math.
 
         And one UPPER bound, which is why this runs at the very end of the `ktir`
         stage rather than as early as those lower bounds allow: after that
@@ -81,12 +99,13 @@ def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
         runs at the head of that stage, so no DCE runs between the write and the
         honouring.
 
-        Output: no `tts` marker op remains anywhere in the module, which is also
+        Output: no `tts` op remains anywhere in the module, which is also
         what lets the stage's artifact be parsed by a consumer that does not load
         this dialect. The annotations they carried are attributes — the layout on
         a ktdp op, which is the form [RewriteDescriptorLayoutGeneric] reads, and
-        the pin on a compute op, for which no consumer is written yet. IR carrying
-        no marker is returned unchanged.
+        the pin on a compute op, for which no consumer is written yet, and the
+        hint on each op a request inlined, which [FuseComputeAndDataMovement] and
+        [LowerSpyreOps] read. IR carrying no tts op is returned unchanged.
     }];
 
     // No dependentDialects: this pass constructs no op and no dialect

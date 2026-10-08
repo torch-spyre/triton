@@ -13,6 +13,9 @@
 // a kernel authors on a value, and the `tts.pin` attribute, which the lowered IR
 // carries on the op producing that value.
 //
+// And one intrinsic request, `tts.spyre_op`, whose attribute spelling is the
+// `tts.spyreop_hint` tag on every op its body was inlined into.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef TRITON_SPYRE_DIALECT_TTS_IR_DIALECT_H
@@ -37,6 +40,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 
 #include "Dialect/TTS/IR/Dialect.h.inc"
@@ -45,6 +49,16 @@
 #include "Dialect/TTS/IR/Ops.h.inc"
 
 namespace mlir::triton::tts {
+
+/// The `tts.spyreop_hint` `op` carries, or null when it carries none. The
+/// dialect's attribute verifier has already held the value to its spelling --
+/// a dictionary of exactly a string `name` and an i64 `id` -- so a non-null
+/// result has both entries. Two ops come from one call site exactly when their
+/// hints are equal.
+DictionaryAttr getSpyreopHint(Operation *op);
+
+/// The intrinsic a hint returned by getSpyreopHint names.
+StringRef getSpyreopHintName(DictionaryAttr hint);
 
 /// The coordinate op a `tts.tensor_layout`'s `phys_op[k]` names, by the
 /// attribute's own numbering.

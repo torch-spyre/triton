@@ -16,6 +16,7 @@
 # way: Triton names nothing of ours.
 add_triton_library(TTSIR
   Dialect.cpp
+  Intrinsics.cpp
   Ops.cpp
 
   DEPENDS
@@ -23,6 +24,11 @@ add_triton_library(TTSIR
 
   LINK_LIBS PUBLIC
   KTIR::KtdpDialect
+  # The intrinsic table's builders construct spyreop ops.
+  KTIR::SpyreOpDialect
   TritonIR
   MLIRIR
+  MLIRSideEffectInterfaces
+  MLIRCallInterfaces
+  MLIRTransformUtils
 )

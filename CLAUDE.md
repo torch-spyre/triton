@@ -120,6 +120,7 @@ Current upstream touch points:
 | `lib/Dialect/Triton/IR/Ops.cpp` | `#ifdef TRITON_BUILD_TTIR_ONLY` guards |
 | `python/triton/language/target_info.py` | Runtime frontend backend guards: `is_spyre()` predicate + `requires_backend()` decorator |
 | `python/triton/language/core.py`, `.../__init__.py` | `tl.spyre_tensor_layout`, `tl.wk_slice_coord`, and their `__all__` entries |
+| `python/triton/language/core.py`, `.../__init__.py`, `.../semantic.py` | `tl.spyre_op` and its `__all__` entry, and `semantic.spyre_op`, which traces the backend's registered fallback into a `tts.spyre_op` |
 | `python/triton/language/semantic.py` | Emission for those two |
 | `python/triton/knobs.py` | `knobs.spyre`, beside `knobs.nvidia` / `knobs.amd` |
 | `python/triton/backends/compiler.py`, `python/triton/runtime/jit.py` | `compile_time_launch_options` hook, returning `{}` for every other backend, and its call site |

@@ -2106,4 +2106,53 @@ class TritonSemantic(Generic[TensorTy]):
         from triton._C.libtriton import spyre
         spyre.ir_builders.create_pin(self.builder, v.handle, space, off)
         return tl.tensor(None, tl.void)
+
+    def spyre_op(self, name, args, call_fallback):
+        """Emit tts.spyre_op -- a request for the spyreop intrinsic ``name``,
+        holding the backend's registered fallback for it, traced at the operands'
+        types. ``call_fallback(fn, args)`` traces one ``@triton.jit`` call at the
+        current insertion point, which is the code generator's to do."""
+        # The registry is the backend's, reached through the codegen hook the
+        # backend supplies; an unknown name raises there, naming the known ones.
+        lookup = self.builder.codegen_fns.get("spyre_intrinsic")
+        if lookup is None:
+            raise ValueError("tl.spyre_op: this backend registers no intrinsics")
+        entry = lookup(name)
+
+        if len(args) != entry.arity:
+            raise ValueError(f"tl.spyre_op({name!r}): takes {entry.arity} tensor "
+                             f"operand(s), got {len(args)}")
+        for i, a in enumerate(args):
+            if not isinstance(a, tl.tensor) or not a.type.is_block():
+                raise ValueError(f"tl.spyre_op({name!r}): operand {i} must be a "
+                                 f"tensor, got {a!r}")
+            # The C++ intrinsic table's dtypes, which the tts.spyre_op verifier
+            # also checks; checked here so the refusal is at the kernel line.
+            if a.type.scalar.name not in entry.dtypes:
+                raise ValueError(f"tl.spyre_op({name!r}): the intrinsic takes "
+                                 f"{list(entry.dtypes)}, not {a.type.scalar.name}")
+        result_types = entry.result_types([a.type for a in args])
+
+        # Built empty, then traced into: a region belongs to an op, so the op has
+        # to exist first -- and that is why its result types are the registry's.
+        from triton._C.libtriton import spyre
+        op = spyre.ir_builders.create_spyre_op(self.builder, name, [a.handle for a in args],
+                                               [t.to_ir(self.builder) for t in result_types])
+        ip = self.builder.get_insertion_point()
+        try:
+            block = self.builder.create_block_with_parent(op.get_region(0),
+                                                          [a.type.to_ir(self.builder) for a in args])
+            body_args = [tl.tensor(block.arg(i), a.type) for i, a in enumerate(args)]
+            results = call_fallback(entry.fallback, body_args)
+            results = [results] if isinstance(results, tl.tensor) else list(results)
+            got = [r.type for r in results]
+            if got != list(result_types):
+                raise ValueError(f"tl.spyre_op({name!r}): the registered fallback returns "
+                                 f"{got}, but the intrinsic declares {list(result_types)}")
+            spyre.ir_builders.create_spyre_op_yield(self.builder, [r.handle for r in results])
+        finally:
+            self.builder.restore_insertion_point(ip)
+
+        outs = [tl.tensor(op.get_result(i), t) for i, t in enumerate(result_types)]
+        return outs[0] if len(outs) == 1 else tuple(outs)
     # --- END --- added for spyre

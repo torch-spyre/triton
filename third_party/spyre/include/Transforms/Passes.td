@@ -168,6 +168,15 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
                                           unless the cmpf is a zero test the
                                           select performs itself
 
+        A request to one: a body holding exactly one `tl.spyre_op`'s fallback →
+        the intrinsic its hint names. The intrinsics are listed in the intrinsic
+        table, `Dialect/TTS/IR/Intrinsics.cpp`.
+
+        A HINTED OP IS CLAIMED. Every 1:1 and group rule declines an op carrying
+        `tts.spyreop_hint`, so a fallback's `math.exp` is never selected alone as
+        spyreop.exp. That is what keeps the rules unordered: the request rule is
+        rooted on the generic, the others never touch its members.
+
         NO NaN REACHES A COMPUTE BODY. Every rule assumes it. Under it, each
         unordered cmpf predicate computes what its ordered counterpart does
         (`une` as `one`, `ueq` as `oeq`, ...), so both spellings select the same
@@ -186,15 +195,22 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         `spyreop.compare`, an `arith.select` would make it a compare feeding a
         `spyreop.select`, two ops and still one indivisible choice.
 
-        EVERYTHING UNMATCHED FLOWS THROUGH, WITH ONE EXCEPTION. There is no
+        EVERYTHING UNMATCHED FLOWS THROUGH, WITH TWO EXCEPTIONS. There is no
         conversion target: an op with no device form reaches the backend, which is
         the component that knows what it can take, and it refuses there. So this
         pass has no notion of an unsupported input — it selects what it can and
         leaves the rest as it found it. That is a change from when it was a
         dialect conversion, where an unsupported float width was reported here.
 
-        The exception is an `i1`, and it is a different kind of thing rather than
-        a carve-out. Flows-through is about a CAPABILITY gap: an f64 math.sqrt is
+        The first exception is a request left unselected. A `tl.spyre_op` names
+        its intrinsic, so passing the fallback through would drop the request
+        without saying so. Any op that still carries a `tts.spyreop_hint` after
+        the rewrite is an error naming the intrinsic. That a request is one
+        whole body is checked before this pass, by
+        [FuseComputeAndDataMovement].
+
+        The second exception is an `i1`, and it is a different kind of thing
+        rather than a carve-out. Flows-through is about a CAPABILITY gap: an f64 math.sqrt is
         valid IR that a future device or a future rule may do. An `i1` in a
         compute body is UNREPRESENTABLE — no spyreop intrinsic produces or
         consumes that type, so no rule anyone could add would ever remove it. That
@@ -241,7 +257,9 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         body for the same reason. A contract between adjacent passes rather than
         an accident — and the reciprocal reads its numerator THROUGH the body, so
         for that rule the dependency is about whether it FIRES, never about
-        whether it is correct.
+        whether it is correct. Its `tts.spyreop_hint` clause is the same contract
+        for requests: each tensor op of a fallback arrives in its own generic,
+        and that pass fuses the ones of one request into one body.
 
         WHAT IS NOT SELECTED, and what each costs. None is a diagnostic, per
         EVERYTHING UNMATCHED FLOWS THROUGH above.
@@ -276,8 +294,8 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         Ordering: after the passes that make every compute a linalg.generic, and
         after [FuseComputeAndDataMovement] per the contract above.
 
-        Output: the selected ops replaced by their intrinsics. Everything else
-        unchanged.
+        Output: the selected ops replaced by their intrinsics, and no op
+        carrying a `tts.spyreop_hint`. Everything else unchanged.
     }];
 
     let dependentDialects = [
@@ -382,8 +400,18 @@ def FuseComputeAndDataMovement
           `tt.broadcast`'s lowering puts in front of the broadcast generic;
           a unit-dim expand `[4] → [4,1]` gives `(d0, d1) → (d0)`, the one
           `tt.expand_dims` leaves behind where no collapse cancelled it.
-        - Anything else is left alone. Two computes never merge, and a compute
-          already carrying a shape change never merges with a downstream compute.
+        - A linalg.generic PRODUCER feeding a linalg.generic consumer, both of
+          whose bodies carry the same `tts.spyreop_hint` tag → fused. The tag means both
+          hold ops LowerTTSMarkers inlined from one `tts.spyre_op`, and
+          [LowerSpyreOps] replaces a request only as ONE body. Constants carry
+          no hint, and a body carrying two hints has none.
+          Here rather than in a pass after RewriteDescriptorLayoutGeneric: that
+          pass physicalizes only the generics one hop off an annotated load or
+          store, leaving the request's first generic with a linearizing result
+          map, which elementwise fusion cannot fuse through.
+        - Anything else is left alone. Two computes of different requests, or of
+          none, never merge, and a compute already carrying a shape change never
+          merges with a downstream compute.
         - A coordinate restatement whose composed map LINEARIZES — a collapse
           fusing two non-unit dims, an expand splitting into two — is not
           absorbed. `tensor.reshape` and `tensor.concat` have no result-to-source
@@ -522,6 +550,14 @@ def FuseComputeAndDataMovement
         same single compute in its body it had before. On a module with at least
         one annotated memory view, no unabsorbable coordinate restatement is left
         on a path that view physicalizes; the pass fails instead.
+
+        And each `tl.spyre_op` call site is ONE generic body: every op carrying
+        a `tts.spyreop_hint` of one `id` is in the same body, which holds no op
+        but constants besides them, no hinted op is outside a body, and the
+        ops of one `id` agree on `name`. Anything else is an error naming the
+        intrinsic and saying the call site did not fuse. The `tts.spyre_op`
+        verifier held the body to be elementwise at one shape, which is what
+        makes this a compiler bug rather than the author's.
     }];
 
     // No ktdp and no tts, though the gate reads both: dependentDialects is about

@@ -1,6 +1,6 @@
 //===- Ops.cpp - The tts dialect's ops ------------------------------------===//
 //
-// Two ops. `tensor_layout`'s verifier delegates rather than restates -- see the
+// Four ops. `tensor_layout`'s verifier delegates rather than restates -- see the
 // note on `tts::verifyTensorLayoutArrays` for why the rules have a single owner.
 //
 // `pin`'s rules are its own, and what is left of them after ODS is small: the
@@ -10,14 +10,22 @@
 // ktdp's enum. What deliberately does NOT stay is any rule about the operand's
 // provenance -- see the note in `PinOp::verify`.
 //
+// `spyre_op`'s rules are about its name and its body, which is why they are a
+// region verifier: the name is in the intrinsic table and the operands and
+// results are what the table declares, the block's signature is the operands',
+// its terminator yields the results, nothing in it touches memory, and the body
+// is one elementwise computation, so it can fuse into one generic.
+//
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/TTS/IR/Dialect.h"
+#include "Dialect/TTS/IR/Intrinsics.h"
 
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/CallInterfaces.h"
 
 #define GET_OP_CLASSES
 #include "Dialect/TTS/IR/Ops.cpp.inc"
@@ -114,6 +122,115 @@ LogicalResult PinOp::verify() {
   // MaterializePinnedBuffers', which takes it as a pass option. Alignment is not
   // asked anywhere: the offset counts from an allocator-assigned base, and
   // aligning that base is the allocator's rule rather than the author's.
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// tts.spyre_op
+//===----------------------------------------------------------------------===//
+
+LogicalResult SpyreOpOp::verifyRegions() {
+  const SpyreopIntrinsic *intrinsic = lookupSpyreopIntrinsic(getName());
+  if (!intrinsic) {
+    InFlightDiagnostic diag =
+        emitOpError("names no spyreop intrinsic: '") << getName() << "'; the "
+        << "intrinsic table has";
+    for (const SpyreopIntrinsic &entry : getSpyreopIntrinsics())
+      diag << " '" << entry.name << "'";
+    return diag;
+  }
+  if (getInputs().size() != intrinsic->numOperands)
+    return emitOpError("'") << getName() << "' takes "
+                            << intrinsic->numOperands << " operand(s), got "
+                            << getInputs().size();
+  for (auto [i, input] : llvm::enumerate(getInputs())) {
+    Type elementType = getElementTypeOrSelf(input.getType());
+    if (!intrinsic->takesElementType(elementType))
+      return emitOpError("'") << getName() << "' does not take operand " << i
+                              << " of element type " << elementType;
+  }
+  SmallVector<Type> resultTypes =
+      intrinsic->resultTypes(getInputs().getTypes());
+  if (TypeRange(resultTypes) != getResultTypes())
+    return emitOpError("'") << getName() << "' gives results "
+                            << TypeRange(resultTypes) << " for these operands, "
+                            << "but the op declares " << getResultTypes();
+
+  Block &body = getBody().front();
+  if (body.getArgumentTypes() != getInputs().getTypes())
+    return emitOpError("body block arguments must have the operand types, one "
+                       "for one");
+
+  // SingleBlockImplicitTerminator has already held the last op to be a yield.
+  auto yield = cast<SpyreOpYieldOp>(body.getTerminator());
+  if (yield.getValues().getTypes() != getResultTypes())
+    return emitOpError("body yields ")
+           << yield.getValues().getTypes() << " but the op's results are "
+           << getResultTypes();
+
+  // No memory op anywhere in the body, nested regions included. A call is the
+  // one op admitted unasked: tracing reaches the fallback through a `tt.call`,
+  // and what its callee does is IR outside this op, which a verifier must not
+  // read. The `ttir` stage's inliner replaces the call with that body, which is
+  // then held to this rule like any other.
+  Operation *offender = nullptr;
+  body.walk([&](Operation *op) {
+    if (op == yield.getOperation() || isa<CallOpInterface>(op))
+      return WalkResult::advance();
+    // An op with no effect interface at all counts as having effects, so an
+    // op this rule has never heard of is refused rather than admitted.
+    if (isMemoryEffectFree(op))
+      return WalkResult::advance();
+    offender = op;
+    return WalkResult::interrupt();
+  });
+  if (offender) {
+    InFlightDiagnostic diag =
+        emitOpError("body must not access memory: the request names an "
+                    "intrinsic computing on values, and '")
+        << offender->getName() << "' has memory effects";
+    diag.attachNote(offender->getLoc()) << "the op is here";
+    return diag;
+  }
+
+  // Fusable into one generic: every op elementwise, and every value but a
+  // constant at the operands' shape, so ConvertElementwiseToLinalg gives each
+  // op a generic over one iteration space and FuseComputeAndDataMovement can
+  // fuse them into one. A call is admitted for the reason above; its results
+  // are still held to the shape.
+  ArrayRef<int64_t> shape;
+  if (!getInputs().empty())
+    shape = cast<RankedTensorType>(getInputs()[0].getType()).getShape();
+  auto hasShape = [&](Value v) {
+    auto type = dyn_cast<RankedTensorType>(v.getType());
+    return type && type.getShape() == shape;
+  };
+  for (auto [i, input] : llvm::enumerate(getInputs()))
+    if (!hasShape(input))
+      return emitOpError("operand ")
+             << i << " has type " << input.getType()
+             << ", and every operand must have operand 0's shape";
+  for (Operation &op : body.without_terminator()) {
+    if (op.hasTrait<OpTrait::ConstantLike>())
+      continue;
+    if (!isa<CallOpInterface>(op) && !op.hasTrait<OpTrait::Elementwise>()) {
+      InFlightDiagnostic diag =
+          emitOpError("body must be elementwise, so it can fuse into one "
+                      "generic, and '")
+          << op.getName() << "' is not";
+      diag.attachNote(op.getLoc()) << "the op is here";
+      return diag;
+    }
+    for (Value result : op.getResults())
+      if (!hasShape(result)) {
+        InFlightDiagnostic diag =
+            emitOpError("body must keep the operands' shape, so it can fuse "
+                        "into one generic, and '")
+            << op.getName() << "' gives " << result.getType();
+        diag.attachNote(op.getLoc()) << "the op is here";
+        return diag;
+      }
+  }
   return success();
 }
 

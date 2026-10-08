@@ -18,20 +18,31 @@
 //   a GROUP to one  a compare and a cast -> spyreop.compare. The group is what
 //                   is selectable: no member of it could have been selected
 //                   alone.
+//   a REQUEST       a body whose ops all carry one `tts.spyreop_hint` -> the
+//                   spyreop intrinsic the hint names, replacing the whole body.
+//                   The author asked for that intrinsic with `tl.spyre_op`, and
+//                   the body is its fallback; see SelectCallSite.
 //
 // They share one greedy pattern set, and no two rules are rooted on the same
 // op, so no rule has to win over another and no order is declared anywhere.
+// The call-site rule is rooted on the generic, and the other rules DECLINE an
+// op carrying a hint: the hint says the op is already claimed, as part of its
+// call site. So a fallback's `math.exp` is never selected as `spyreop.exp` on
+// its own, whichever rule the driver happens to try first.
 // Splitting these across two passes is what an earlier shape did, and it
 // bought a standing question -- which pass claims this op -- for nothing.
 //
-// EVERYTHING UNMATCHED FLOWS THROUGH, WITH ONE EXCEPTION. There is no
+// EVERYTHING UNMATCHED FLOWS THROUGH, WITH TWO EXCEPTIONS. There is no
 // conversion target: an op with no device form reaches the backend, which is
 // the component that actually knows what it can take, and it refuses there. So
 // this pass has no notion of an illegal input -- it selects what it can and
 // leaves the rest exactly as it found it. A type or a predicate this file does
 // not handle is a silent pass-through by design; see WHAT IS NOT SELECTED below
-// for the list and what each one costs. The exception is an `i1` left inside a
-// compute body, which rejectSurvivingBooleans reports.
+// for the list and what each one costs. The exceptions are an `i1` left inside
+// a compute body, which rejectSurvivingBooleans reports, and a
+// `tts.spyreop_hint` that survives selection, which rejectSurvivingHints
+// reports: the author asked for the intrinsic by name, so running the fallback
+// instead would ignore the request without saying so.
 //
 // WHAT THIS PASS RELIES ON ITS PREDECESSOR FOR. A rule matches ops in ONE body,
 // and ConvertElementwiseToLinalg gives every tensor-level op a body of its own
@@ -101,6 +112,8 @@
 
 #include "Transforms/Passes.h"
 
+#include "Dialect/TTS/IR/Dialect.h"
+#include "Dialect/TTS/IR/Intrinsics.h"
 #include "ktir/Dialect/SpyreOp/SpyreOp.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
@@ -114,10 +127,13 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <optional>
+#include <string>
 
 #define DEBUG_TYPE "lower-spyre-ops"
 
@@ -220,6 +236,13 @@ spyrePredicateFor(arith::CmpFPredicate p) {
   }
 }
 
+/// Whether `op` carries a `tts.spyreop_hint`, i.e. belongs to a `tl.spyre_op`
+/// call site, which the call-site rule selects as a whole body. Every other rule
+/// declines such an op.
+bool hasSpyreopHint(Operation *op) {
+  return static_cast<bool>(triton::tts::getSpyreopHint(op));
+}
+
 void traceDecline(Operation *root, const llvm::Twine &why) {
   LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << root->getName() << " at "
                           << root->getLoc() << ": no group match (" << why
@@ -237,7 +260,7 @@ void traceMatch(Operation *root, const llvm::Twine &what) {
 /// predicate support remains the caller's responsibility.
 arith::CmpFOp matchComparedInput(Operation *consumer, Value input) {
   auto generic = dyn_cast<linalg::GenericOp>(consumer->getParentOp());
-  if (!generic)
+  if (!generic || hasSpyreopHint(consumer))
     return nullptr;
   Type resultType = consumer->getResult(0).getType();
   if (!isSpyreOpScalarType(resultType)) {
@@ -247,6 +270,10 @@ arith::CmpFOp matchComparedInput(Operation *consumer, Value input) {
   auto cmp = resolveThroughBody(generic, input).getDefiningOp<arith::CmpFOp>();
   if (!cmp) {
     traceDecline(consumer, "operand is not an arith.cmpf");
+    return nullptr;
+  }
+  if (hasSpyreopHint(cmp)) {
+    traceDecline(consumer, "the arith.cmpf belongs to a tl.spyre_op call site");
     return nullptr;
   }
   // Device comparison and selection require identical input and result types.
@@ -274,7 +301,7 @@ struct SelectUnaryFloat : public OpRewritePattern<Source> {
 
   LogicalResult matchAndRewrite(Source op,
                                 PatternRewriter &rewriter) const override {
-    if (!isSpyreOpScalarType(op.getType()))
+    if (hasSpyreopHint(op) || !isSpyreOpScalarType(op.getType()))
       return failure();
     rewriter.template replaceOpWithNewOp<Target>(op, op.getType(),
                                                  op.getOperand());
@@ -297,7 +324,7 @@ struct SelectArithDivF : public OpRewritePattern<arith::DivFOp> {
 
   LogicalResult matchAndRewrite(arith::DivFOp op,
                                 PatternRewriter &rewriter) const override {
-    if (!isSpyreOpScalarType(op.getType()))
+    if (hasSpyreopHint(op) || !isSpyreOpScalarType(op.getType()))
       return failure();
 
     Value numerator = op.getLhs();
@@ -497,7 +524,7 @@ struct SelectArithAddI : public OpRewritePattern<arith::AddIOp> {
 
   LogicalResult matchAndRewrite(arith::AddIOp op,
                                 PatternRewriter &rewriter) const override {
-    if (!isInsideLinalgGeneric(op))
+    if (hasSpyreopHint(op) || !isInsideLinalgGeneric(op))
       return failure();
     unsigned width = getScalarIntBitWidth(op.getType());
     if (width == 32)
@@ -519,13 +546,126 @@ struct SelectArithMulI : public OpRewritePattern<arith::MulIOp> {
 
   LogicalResult matchAndRewrite(arith::MulIOp op,
                                 PatternRewriter &rewriter) const override {
-    if (!isInsideLinalgGeneric(op) || getScalarIntBitWidth(op.getType()) != 32)
+    if (hasSpyreopHint(op) || !isInsideLinalgGeneric(op) ||
+        getScalarIntBitWidth(op.getType()) != 32)
       return failure();
     rewriter.replaceOpWithNewOp<spyreop::MulI32ToI32>(op, op.getType(),
                                                       op.getLhs(), op.getRhs());
     return success();
   }
 };
+
+//===----------------------------------------------------------------------===//
+// A request to one: a body hinted `tts.spyreop_hint` -> the intrinsic it names
+//===----------------------------------------------------------------------===//
+
+/// What the call-site rule needs from a body it replaces.
+struct CallSiteMatch {
+  DictionaryAttr hint;
+  const triton::tts::SpyreopIntrinsic *intrinsic = nullptr;
+  BlockArgument input;
+  SmallVector<Operation *> members;
+};
+
+/// Whether `generic`'s body is one call site, and what it reads. Fails on a
+/// body with no hinted op, which is not a call site.
+///
+/// FuseComputeAndDataMovement has already checked that a body holding hinted
+/// ops holds one call site, whole, and nothing else but constants, so what is
+/// left to find is the input: the one `ins` block argument the members read,
+/// a block argument whose `ins` operand is a constant aside, since that is a
+/// constant the fusion did not fold into the body. Unary only: with two inputs,
+/// the block-argument order after fusion says nothing about the call site's
+/// operand order.
+FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic) {
+  CallSiteMatch match;
+  for (Operation &op : generic.getBlock()->without_terminator())
+    if (!op.hasTrait<OpTrait::ConstantLike>())
+      match.members.push_back(&op);
+  for (Operation *op : match.members)
+    if ((match.hint = triton::tts::getSpyreopHint(op)))
+      break;
+  if (!match.hint)
+    return failure();
+  match.intrinsic = triton::tts::lookupSpyreopIntrinsic(
+      triton::tts::getSpyreopHintName(match.hint));
+  if (!match.intrinsic || match.intrinsic->numOperands != 1 ||
+      match.intrinsic->resultTypeOperands.size() != 1)
+    return failure();
+
+  llvm::SmallSetVector<BlockArgument, 2> read;
+  for (Operation *op : match.members)
+    for (Value v : op->getOperands()) {
+      auto arg = dyn_cast<BlockArgument>(v);
+      if (!arg || arg.getOwner() != generic.getBlock())
+        continue;
+      Operation *def = resolveThroughBody(generic, arg).getDefiningOp();
+      if (def && def->hasTrait<OpTrait::ConstantLike>())
+        continue;
+      read.insert(arg);
+    }
+  auto yield = cast<linalg::YieldOp>(generic.getBlock()->getTerminator());
+  if (read.size() != 1 ||
+      !generic.isDpsInput(generic.getMatchingOpOperand(read.front())) ||
+      yield->getNumOperands() != 1)
+    return failure();
+  match.input = read.front();
+  return match;
+}
+
+/// Replaces a body that is one call site with the intrinsic its hint names.
+///
+/// Rooted on the generic and not on a member, because the call site is the
+/// BODY: which op the fallback happens to end in says nothing, and a rule
+/// rooted on one member would have to search the rest. What the members
+/// computed -- the fallback, casts included -- is discarded whole, and the body
+/// becomes the intrinsic applied to its input. The input's unused siblings, a
+/// captured constant among them, then go to the unused-operand cleanup in the
+/// same fixpoint.
+struct SelectCallSite : public OpRewritePattern<linalg::GenericOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp generic,
+                                PatternRewriter &rewriter) const override {
+    FailureOr<CallSiteMatch> match = matchCallSite(generic);
+    if (failed(match))
+      return failure();
+    StringRef name = triton::tts::getSpyreopHintName(match->hint);
+    traceMatch(generic, "body is call site " + llvm::Twine(name) +
+                            " -> spyreop." + name);
+
+    auto yield = cast<linalg::YieldOp>(generic.getBlock()->getTerminator());
+    rewriter.setInsertionPoint(yield);
+    Value selected =
+        match->intrinsic
+            ->build(rewriter, yield->getOperand(0).getLoc(), match->input)
+            ->getResult(0);
+    rewriter.modifyOpInPlace(yield, [&] { yield->setOperand(0, selected); });
+    // Reverse program order, so each op's users are gone before it is.
+    for (Operation *op : llvm::reverse(match->members))
+      rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// Reports every call site selection left in place, once per `id`, naming the
+/// intrinsic: the author asked for it by name, so running its fallback instead
+/// would ignore that request without saying so. After the fixpoint, so it is
+/// the one check that no `tts.spyreop_hint` survives this pass.
+LogicalResult rejectSurvivingHints(ModuleOp module) {
+  llvm::SmallDenseSet<DictionaryAttr> reported;
+  module.walk([&](Operation *op) {
+    DictionaryAttr hint = triton::tts::getSpyreopHint(op);
+    if (!hint || !reported.insert(hint).second)
+      return;
+    mlir::emitError(op->getLoc())
+        << "lower-spyre-ops: tl.spyre_op(\""
+        << triton::tts::getSpyreopHintName(hint)
+        << "\") was not selected. The request is explicit, so its fallback is "
+           "not used instead";
+  });
+  return success(reported.empty());
+}
 
 //===----------------------------------------------------------------------===//
 // After selection: an i1 left in a compute body
@@ -613,8 +753,9 @@ struct LowerSpyreOpsPass
     MLIRContext *ctx = &getContext();
 
     RewritePatternSet patterns(ctx);
-    // One line per rule, group rules and 1:1 rules in one set, each rooted on
-    // a different op. See ONE PASS FOR ALL SELECTION in the header.
+    // One line per rule, call-site, group and 1:1 rules in one set, each rooted
+    // on a different op. See ONE PASS FOR ALL SELECTION in the header.
+    patterns.add<SelectCallSite>(ctx);
     patterns.add<SelectCompare, SelectWhere>(ctx);
     patterns.add<SelectArithDivF, SelectArithAddI, SelectArithMulI>(ctx);
     patterns.add<SelectUnaryFloat<math::SqrtOp, spyreop::Sqrt>,
@@ -636,10 +777,13 @@ struct LowerSpyreOpsPass
       return;
     }
 
-    // The one thing this pass does report. Not a selection failure -- see
-    // rejectSurvivingBooleans on why an unrepresentable TYPE is a different
-    // kind of thing from an op the device happens not to do.
-    if (failed(rejectSurvivingBooleans(module)))
+    // The two things this pass does report. A hint surviving is the author's
+    // explicit ask going unanswered. An `i1` is not a selection
+    // failure at all -- see rejectSurvivingBooleans on why an unrepresentable
+    // TYPE is a different kind of thing from an op the device happens not to
+    // do. Both are asked, so one run reports both.
+    bool hintsSurvived = failed(rejectSurvivingHints(module));
+    if (failed(rejectSurvivingBooleans(module)) || hintsSurvived)
       signalPassFailure();
   }
 };

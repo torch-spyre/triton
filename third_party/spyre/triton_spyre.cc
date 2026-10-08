@@ -15,6 +15,8 @@
 // The one dialect of ours a kernel is authored in, for the op builder below and
 // for the coordinate-map evaluator the descriptor-layout query reads.
 #include "Dialect/TTS/IR/Dialect.h"
+// The spyreop intrinsic table, which the frontend reads through `intrinsics`.
+#include "Dialect/TTS/IR/Intrinsics.h"
 // ktdp's memory-space ENUM, for validating the name tl.spyre_pin was given. The
 // enum only; deliberately not KTDPDialect.h, because this file must not load that
 // dialect -- see the note on create_pin.
@@ -88,7 +90,7 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
 
 void init_triton_spyre_ir_builders(py::module &&m) {
   // Op builders for the `tts` dialect, called from the Triton frontend --
-  // tl.spyre_tensor_layout and tl.spyre_pin, through
+  // tl.spyre_tensor_layout, tl.spyre_pin and tl.spyre_op, through
   // triton.language.semantic.
   //
   // The frontend reaches this as `from triton._C.libtriton import spyre`, lazily
@@ -165,6 +167,35 @@ void init_triton_spyre_ir_builders(py::module &&m) {
       },
       py::arg("builder"), py::arg("value"), py::arg("memory_space"),
       py::arg("offset") = py::none());
+
+  // tl.spyre_op. The op is built EMPTY and returned, and the frontend then
+  // traces the registered fallback into its region -- the shape `create_reduce`
+  // has, since a region belongs to an op and so the op has to exist first. That
+  // is also why the result types are an argument rather than read off the body:
+  // the registry declares them, and the region verifier holds the yield to them.
+  //
+  // `name` is not checked here. Which names exist is the registry's, in the
+  // backend's Python, and semantic.py refuses an unknown one before this runs.
+  m.def(
+      "create_spyre_op",
+      [](TritonOpBuilder &self, const std::string &name,
+         std::vector<mlir::Value> &inputs,
+         std::vector<mlir::Type> &resultTypes) -> mlir::OpState {
+        // LOAD, not register -- see create_tensor_layout above.
+        self.getContext()->loadDialect<mlir::triton::tts::TTSDialect>();
+        return self.create<mlir::triton::tts::SpyreOpOp>(
+            mlir::TypeRange(resultTypes),
+            self.getBuilder().getStringAttr(name), mlir::ValueRange(inputs));
+      },
+      py::arg("builder"), py::arg("name"), py::arg("inputs"),
+      py::arg("result_types"));
+  m.def(
+      "create_spyre_op_yield",
+      [](TritonOpBuilder &self, std::vector<mlir::Value> &values) -> void {
+        self.create<mlir::triton::tts::SpyreOpYieldOp>(
+            mlir::ValueRange(values));
+      },
+      py::arg("builder"), py::arg("values"));
 }
 
 /// One `tts.tensor_layout` marker, reduced to what a footprint is computed from.
@@ -407,6 +438,32 @@ void init_triton_spyre_ir_utils(py::module &&m) {
         });
 }
 
+void init_triton_spyre_intrinsics(py::module &&m) {
+  // The intrinsic table, one dict per entry, in the frontend's terms: an
+  // element type is a Triton dtype name, and `result_operands[i]` is the
+  // operand whose type result `i` has. backend/intrinsics.py pairs each name
+  // with its fallback.
+  m.def("table", []() -> py::list {
+    py::list entries;
+    for (const mlir::triton::tts::SpyreopIntrinsic &entry :
+         mlir::triton::tts::getSpyreopIntrinsics()) {
+      py::list dtypes;
+      if (entry.elementTypes & mlir::triton::tts::kIntrinsicF16)
+        dtypes.append("fp16");
+      if (entry.elementTypes & mlir::triton::tts::kIntrinsicF32)
+        dtypes.append("fp32");
+      py::dict d;
+      d["name"] = entry.name.str();
+      d["num_operands"] = entry.numOperands;
+      d["dtypes"] = py::tuple(dtypes);
+      d["result_operands"] = std::vector<unsigned>(
+          entry.resultTypeOperands.begin(), entry.resultTypeOperands.end());
+      entries.append(d);
+    }
+    return entries;
+  });
+}
+
 void init_triton_spyre(py::module &&m) {
   // Passes submodule
   auto passes = m.def_submodule("passes");
@@ -417,6 +474,7 @@ void init_triton_spyre(py::module &&m) {
   // submodules because the first writes IR and the second only reads it.
   init_triton_spyre_ir_builders(m.def_submodule("ir_builders"));
   init_triton_spyre_ir_utils(m.def_submodule("ir_utils"));
+  init_triton_spyre_intrinsics(m.def_submodule("intrinsics"));
 
   // Dialect registration. Appends to a context Triton has already populated
   // (python/src/ir.cc load_dialects runs first), so this adds only what the
