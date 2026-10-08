@@ -27,17 +27,17 @@ Operation *buildUnary(OpBuilder &builder, Location loc, ValueRange operands) {
 constexpr unsigned kResultIsOperand0[] = {0};
 
 constexpr SpyreopIntrinsic kIntrinsics[] = {
-    {"gelu", 1, kIntrinsicF16, kResultIsOperand0, /*testOnly=*/false,
-     buildUnary<spyreop::GeLU>},
+    {"gelu", 1, kIntrinsicF16, kResultIsOperand0, buildUnary<spyreop::GeLU>},
     {"silu", 1, kIntrinsicF16 | kIntrinsicF32, kResultIsOperand0,
-     /*testOnly=*/false, buildUnary<spyreop::SiLU>},
+     buildUnary<spyreop::SiLU>},
     {"sigmoid", 1, kIntrinsicF16 | kIntrinsicF32, kResultIsOperand0,
-     /*testOnly=*/false, buildUnary<spyreop::Sigmoid>},
-    // A unary intrinsic for test_spyre_op.py, which binds its own fallbacks to
-    // it, so that test names no real intrinsic. Selects an existing spyreop op,
-    // so the spyreop dialect needs nothing for it.
+     buildUnary<spyreop::Sigmoid>},
+    // Reserved for test_spyre_op.py, which registers its own fallbacks for it,
+    // so that test names no real intrinsic. backend/intrinsics.py registers
+    // none, so a kernel naming it is refused for want of one. Selects an
+    // existing spyreop op, so the spyreop dialect needs nothing for it.
     {"test_mock", 1, kIntrinsicF16 | kIntrinsicF32, kResultIsOperand0,
-     /*testOnly=*/true, buildUnary<spyreop::Sigmoid>},
+     buildUnary<spyreop::Sigmoid>},
 };
 
 constexpr bool namesAreUnique() {

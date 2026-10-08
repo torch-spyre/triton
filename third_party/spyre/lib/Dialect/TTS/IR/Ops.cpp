@@ -136,8 +136,7 @@ LogicalResult SpyreOpOp::verifyRegions() {
         emitOpError("names no spyreop intrinsic: '") << getName() << "'; the "
         << "intrinsic table has";
     for (const SpyreopIntrinsic &entry : getSpyreopIntrinsics())
-      if (!entry.testOnly)
-        diag << " '" << entry.name << "'";
+      diag << " '" << entry.name << "'";
     return diag;
   }
   if (getInputs().size() != intrinsic->numOperands)

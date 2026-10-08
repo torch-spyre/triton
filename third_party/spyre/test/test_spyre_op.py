@@ -16,7 +16,8 @@ The last is reproduced with the registered pipeline rather than through the
 ``spyrecode`` stage itself, which shells out to dbo-opt -- CLAUDE.md's
 "Reproducing that module". And the refusals the frontend owns: a name the table
 does not have, a dtype the intrinsic does not take, the wrong arity, a fallback
-returning other types than declared, and ``test_mock`` while the test knob is off.
+returning other types than declared, and ``test_mock`` with no fallback
+registered.
 
 Numerical coverage of the real fallbacks, through ``ktir_cpu``, is the
 ``spyreop`` fixture's.
@@ -27,7 +28,6 @@ import re
 import pytest
 import triton
 import triton.language as tl
-from triton import knobs
 
 # The module the frontend reaches through SpyreBackend's codegen hook, as
 # compile_to_ttir imports that backend.
@@ -64,9 +64,8 @@ def _spyrecode(mod):
 
 @pytest.fixture
 def spyre_intrinsic(monkeypatch):
-    """The registration decorator, with the test knob on and a fallback table
-    this test's bindings are dropped from afterwards."""
-    monkeypatch.setattr(knobs.spyre, "allow_test_intrinsics", True)
+    """The registration decorator, over a copy of the fallback table that is put
+    back afterwards, so a test's registrations do not reach the next test."""
     monkeypatch.setattr(intrinsics, "FALLBACKS", dict(intrinsics.FALLBACKS))
     return intrinsics.spyre_intrinsic
 
@@ -131,13 +130,9 @@ def test_unregistered_name_is_refused():
     _raises(_request, "softplus", "fp16", "tl.spyre_op: no intrinsic named 'softplus'; the Spyre backend registers")
 
 
-def test_test_mock_is_refused_while_the_knob_is_off():
-    assert not knobs.spyre.allow_test_intrinsics
-    _raises(_request, "test_mock", "fp32",
-            "tl.spyre_op: 'test_mock' is a test-only intrinsic, admitted only while "
-            "knobs.spyre.allow_test_intrinsics is set")
-    with pytest.raises(ValueError, match="'test_mock' is a test-only intrinsic"):
-        intrinsics.spyre_intrinsic("test_mock")(lambda x: x)
+def test_test_mock_without_a_fallback_is_refused():
+    assert intrinsics.TEST_MOCK not in intrinsics.FALLBACKS
+    _raises(_request, "test_mock", "fp32", "tl.spyre_op: no fallback is registered for 'test_mock'")
 
 
 def test_dtype_the_intrinsic_does_not_take_is_refused(spyre_intrinsic):

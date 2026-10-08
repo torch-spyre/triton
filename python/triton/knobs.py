@@ -546,11 +546,6 @@ class spyre_knobs(base_knobs):
     # that tree is the only on-disk record of what was actually scheduled; it
     # is packed into the artifact and unpacked beside spyrecode.json.
     dbo_debug: env_bool = env_bool("TRITON_SPYRE_DBO_DEBUG", True)
-
-    # Test-only. Admits the intrinsic table's test-only entries (`test_mock`) in
-    # tl.spyre_op and in the backend's fallback registration; off, both refuse
-    # them, so a kernel cannot name one.
-    allow_test_intrinsics: env_bool = env_bool("TRITON_SPYRE_ALLOW_TEST_INTRINSICS", False)
 # --- END --- added for spyre
 
 class proton_knobs(base_knobs):

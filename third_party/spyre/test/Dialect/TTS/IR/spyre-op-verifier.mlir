@@ -4,7 +4,7 @@
 
 // A name the intrinsic table does not have.
 tt.func @unknown_name(%x: tensor<128xf32>) -> tensor<128xf32> {
-  // expected-error @+1 {{names no spyreop intrinsic: 'softplus'; the intrinsic table has 'gelu' 'silu' 'sigmoid'}}
+  // expected-error @+1 {{names no spyreop intrinsic: 'softplus'; the intrinsic table has 'gelu' 'silu' 'sigmoid' 'test_mock'}}
   %r = tts.spyre_op "softplus" (%x) : (tensor<128xf32>) -> tensor<128xf32> {
   ^bb0(%a: tensor<128xf32>):
     tts.spyreop_yield %a : tensor<128xf32>

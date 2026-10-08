@@ -18,9 +18,9 @@ verifier and ``LowerSpyreOps`` read. This module holds only the fallbacks, each
 registered under its name with ``@spyre_intrinsic(name)``, and checks at import
 that every name in the table has exactly one. The decorator is the backend's: it
 is not exported through ``triton.language``, so kernel authors cannot register
-names. The table's test-only entry, ``test_mock``, has no fallback here: a test
-binds its own through the same decorator, which, like ``tl.spyre_op``, refuses
-that name unless ``knobs.spyre.allow_test_intrinsics`` is set.
+names. The table's reserved entry, ``test_mock``, has no fallback here: a test
+registers its own through the same decorator, and a kernel naming it otherwise
+is refused for want of one.
 
 Every fallback widens to fp32 and narrows back. ``tl.exp`` and ``tl.erf`` are
 fp32-only in the frontend, and the casts cost nothing on the device path, since
@@ -37,7 +37,6 @@ from typing import Callable, Tuple
 
 import triton
 import triton.language as tl
-from triton import knobs
 
 
 def _read_table():
@@ -52,28 +51,22 @@ def _read_table():
 
 _TABLE = _read_table()
 
+#: The table's entry reserved for tests, which register its fallback.
+TEST_MOCK = "test_mock"
+
 #: Name -> fallback, filled by ``spyre_intrinsic``.
 FALLBACKS = {}
 
 
-def _check_test_only(name):
-    """Raise if ``name`` is a test-only entry and the test knob is off."""
-    if _TABLE[name]["test_only"] and not knobs.spyre.allow_test_intrinsics:
-        raise ValueError(f"tl.spyre_op: {name!r} is a test-only intrinsic, admitted only "
-                         f"while knobs.spyre.allow_test_intrinsics is set")
-
-
 def spyre_intrinsic(name):
     """Register the decorated ``@triton.jit`` function as the fallback for the
-    intrinsic ``name``. Raises on a name the C++ table does not define, on a
-    test-only name while the test knob is off, and on a name that already has a
-    fallback."""
+    intrinsic ``name``. Raises on a name the C++ table does not define, and on a
+    name that already has a fallback."""
 
     def register(fallback):
         if name not in _TABLE:
             raise ValueError(f"tl.spyre_op: {name!r} is not in the C++ intrinsic table, "
                              f"which names {', '.join(sorted(_TABLE))}")
-        _check_test_only(name)
         if name in FALLBACKS:
             raise ValueError(f"tl.spyre_op: intrinsic {name!r} has two fallbacks")
         FALLBACKS[name] = fallback
@@ -105,11 +98,10 @@ def sigmoid(x):
 
 
 def _check_names(fallbacks, table):
-    """Raise unless every name in ``table`` but the test-only ones has a fallback
-    in ``fallbacks``, and ``fallbacks`` has no other. ``spyre_intrinsic`` has
-    already refused a second fallback for one name. A test-only name's fallback is
-    the test's, bound while it runs."""
-    wanted = {name for name, entry in table.items() if not entry["test_only"]}
+    """Raise unless every name in ``table`` but ``TEST_MOCK`` has a fallback in
+    ``fallbacks``, and ``fallbacks`` has no other. ``spyre_intrinsic`` has already
+    refused a second fallback for one name."""
+    wanted = set(table) - {TEST_MOCK}
     if set(fallbacks) != wanted:
         raise RuntimeError(f"tl.spyre_op: the fallbacks name {sorted(fallbacks)}, but the C++ "
                            f"intrinsic table names {sorted(wanted)}")
@@ -140,12 +132,10 @@ def lookup(name):
     registered ones when there is none."""
     entry = _TABLE.get(name)
     if entry is None:
-        registered = sorted(n for n, e in _TABLE.items() if not e["test_only"])
         raise ValueError(f"tl.spyre_op: no intrinsic named {name!r}; the Spyre backend "
-                         f"registers {', '.join(registered)}")
-    _check_test_only(name)
+                         f"registers {', '.join(sorted(FALLBACKS))}")
     if name not in FALLBACKS:
-        raise ValueError(f"tl.spyre_op: the test-only intrinsic {name!r} has no fallback bound")
+        raise ValueError(f"tl.spyre_op: no fallback is registered for {name!r}")
     result_operands = list(entry["result_operands"])
     return Intrinsic(
         fallback=FALLBACKS[name],

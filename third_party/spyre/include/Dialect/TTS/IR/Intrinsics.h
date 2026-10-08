@@ -44,10 +44,6 @@ struct SpyreopIntrinsic {
   /// The result rule, one entry per result: result `i` has the type of operand
   /// `resultTypeOperands[i]`. Its size is the result count.
   llvm::ArrayRef<unsigned> resultTypeOperands;
-  /// Reserved for tests: the frontend admits it only while
-  /// `knobs.spyre.allow_test_intrinsics` is set, and binds its fallback per
-  /// test.
-  bool testOnly;
   /// Builds the intrinsic over `operands`, which are scalars of an element
   /// type the entry takes.
   Operation *(*build)(OpBuilder &, Location, ValueRange operands);
