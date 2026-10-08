@@ -168,17 +168,12 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
                                           unless the cmpf is a zero test the
                                           select performs itself
 
-        Rules, a REQUEST to one — a linalg.generic body whose ops, constants
-        aside, all carry one `tts.spyreop_hint` tag, read one `ins` block argument and
-        yield one value, i.e. the whole fallback of one `tl.spyre_op`:
-        - name "gelu"    (f16)          → spyreop.gelu
-        - name "silu"    (f16 or f32)   → spyreop.silu
-        - name "sigmoid" (f16 or f32)   → spyreop.sigmoid
-        The body is replaced whole, casts included, by the intrinsic applied to
-        the block argument; the type it reads must be the type it yields.
+        A request to one: a body holding exactly one `tl.spyre_op`'s fallback →
+        the intrinsic its hint names. The intrinsics are listed in the intrinsic
+        table, `Dialect/TTS/IR/Intrinsics.cpp`.
 
-        A TAGGED OP IS CLAIMED. Every 1:1 and group rule declines an op carrying
-        `tts.spyreop_hint`, so a request's `math.exp` is never selected alone as
+        A HINTED OP IS CLAIMED. Every 1:1 and group rule declines an op carrying
+        `tts.spyreop_hint`, so a fallback's `math.exp` is never selected alone as
         spyreop.exp. That is what keeps the rules unordered: the request rule is
         rooted on the generic, the others never touch its members.
 
@@ -207,15 +202,12 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         leaves the rest as it found it. That is a change from when it was a
         dialect conversion, where an unsupported float width was reported here.
 
-        The first exception is a REQUEST left unselected: any op still carrying
-        `tts.spyreop_hint` after the rewrite is an error naming the intrinsic
-        and why. The author asked for it by name, so passing the
-        fallback through would ignore the request without saying so. The causes
-        it names: the request split over two bodies (a fusion that did not
-        happen), a body also holding ops outside the request (a fold that merged
-        one in), a body reading two values or yielding two, a type the intrinsic
-        does not take (gelu at f32), and a request that reads one type and
-        yields another.
+        The first exception is a request left unselected. A `tl.spyre_op` names
+        its intrinsic, so passing the fallback through would drop the request
+        without saying so. Any op that still carries a `tts.spyreop_hint` after
+        the rewrite is an error naming the intrinsic. That a request is one
+        whole body is checked before this pass, by
+        [FuseComputeAndDataMovement].
 
         The second exception is an `i1`, and it is a different kind of thing
         rather than a carve-out. Flows-through is about a CAPABILITY gap: an f64 math.sqrt is
@@ -265,9 +257,9 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         body for the same reason. A contract between adjacent passes rather than
         an accident — and the reciprocal reads its numerator THROUGH the body, so
         for that rule the dependency is about whether it FIRES, never about
-        whether it is correct. Its `tts.spyreop_hint` clause is the same contract for requests: each
-        tensor op of a fallback arrives in its own generic, and that pass fuses
-        the ones of one request into one body.
+        whether it is correct. Its `tts.spyreop_hint` clause is the same contract
+        for requests: each tensor op of a fallback arrives in its own generic,
+        and that pass fuses the ones of one request into one body.
 
         WHAT IS NOT SELECTED, and what each costs. None is a diagnostic, per
         EVERYTHING UNMATCHED FLOWS THROUGH above.
@@ -302,8 +294,8 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         Ordering: after the passes that make every compute a linalg.generic, and
         after [FuseComputeAndDataMovement] per the contract above.
 
-        Output: the selected ops replaced by their intrinsics. Everything else
-        unchanged.
+        Output: the selected ops replaced by their intrinsics, and no op
+        carrying a `tts.spyreop_hint`. Everything else unchanged.
     }];
 
     let dependentDialects = [

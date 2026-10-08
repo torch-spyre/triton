@@ -1,18 +1,21 @@
 // RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | spyre-triton-opt -split-input-file | FileCheck %s --check-prefix=NOHINT
+
+// NOHINT-NOT: tts.spyreop_hint
 
 // THE REQUEST RULE: a compute body whose ops, constants aside, all carry one
-// `tts.spyreop_hint` tag is one `tl.spyre_op` request's whole fallback, and becomes the
-// intrinsic the tag names applied to the body's input.
+// `tts.spyreop_hint` is one `tl.spyre_op` call site's whole fallback, and becomes the
+// intrinsic the hint names applied to the body's input.
 //
 // Each body below is the fallback the backend registers for that intrinsic, as
 // FuseComputeAndDataMovement leaves it: one generic, its scalar constants
-// captured from above and untagged. The fallback is replaced WHOLE -- the casts
+// captured from above and unhinted. The fallback is replaced WHOLE -- the casts
 // around an f16 request included -- so what survives is the intrinsic at the
 // type the body reads and yields.
 //
 // It also shows the 1:1 rules declining a claimed op: each body holds a
 // `math.exp` or an `arith.divf`, which would otherwise become spyreop.exp or
-// spyreop.realdiv. None is left, untagged or otherwise.
+// spyreop.realdiv. None is left, unhinted or otherwise.
 
 #map = affine_map<(d0) -> (d0)>
 
