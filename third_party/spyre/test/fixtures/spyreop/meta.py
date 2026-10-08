@@ -5,8 +5,8 @@ a deliberate departure from ``fixtures/README.md``'s usual one-folder-
 per-function convention, so that ``LowerSpyreOps.cpp``'s float ops sweep
 together as one fixture instead of living in sibling folders.
 
-Level D only -- no ktir_cpu (Level A/B) variants, and that is deliberate,
-not an oversight:
+The ``LowerSpyreOps.cpp`` op variants are Level D only -- no ktir_cpu
+(Level A/B) variants, and that is deliberate, not an oversight:
 
 ``ktir_cpu`` (the numerical interpreter Level A/B runs against) has no
 ``spyreop`` dialect handler at all -- confirmed by inspecting the installed
@@ -90,8 +90,35 @@ level (that the rewrite fires, and fires only where it should) is what
 level; what this fixture adds on top is that a real Triton kernel, run
 through the full pipeline on real hardware, produces the right numbers.
 
+THE ``tl.spyre_op`` INTRINSICS are the exception to Level D only, and the
+reason is the same two facts read the other way round. ``ktir_cpu`` runs the
+``ktir`` artifact, which holds each intrinsic's registered FALLBACK
+(``backend/intrinsics.py``) inlined as plain arith/math, so a ktir_cpu variant
+checks that fallback against the mathematical definition -- which is a claim
+worth making, since the fallback is what every KTIR reader computes for the
+call site. They never reach ``spyrecode``, the fusion or the selection; those
+are pinned in lit (``Transforms/LowerSpyreOps/request.mlir``,
+``spyre-triton-opt/stage-pipelines-spyre-op.mlir``) and in
+``test_spyre_op.py``. By level:
+
+- Level A, shape: ``intrinsic_2d`` -- the 2D kernel, ``OP`` and ``DTYPE``
+  pinned to sigmoid at fp32.
+- Level B, compute: ``intrinsic`` -- the 1D kernel across the grid, swept over
+  each intrinsic at each dtype it takes: gelu at fp16, silu and sigmoid at fp16
+  and fp32. Any other cell is refused at trace time.
+- Level C, layout: ``intrinsic_2d_stick`` -- the 2D kernel with both
+  descriptors stick-on-N at fp16, swept over the three intrinsics. Numerically
+  this is Level B (``fixtures/README.md``), and is here for the ``ktir``
+  artifact carrying the layout beside the hinted fallback.
+- Level D, device: not implemented. The shape would be the single-tile,
+  loop-free kernel the variants above use, ``compiles_to_binary``, at the
+  dtypes each intrinsic takes -- the one level where the intrinsic itself, and
+  not its fallback, computes the numbers.
+
 See ``fixtures/README.md`` for the field reference and discovery rules.
 """
+
+import math
 
 import numpy as np
 from dataclasses import dataclass
@@ -187,8 +214,44 @@ def make_addmul_inputs(n_elements, DTYPE="i32", **_unused) -> dict:
     return _make_addmul_inputs(n_elements, dtype=DTYPE)
 
 
+def _gelu(x):
+    erf = np.vectorize(math.erf)
+    return 0.5 * x * (1.0 + erf(x / math.sqrt(2.0)))
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+# The tl.spyre_op intrinsics' definitions, which their fallbacks compute.
+_INTRINSIC_OPS = {
+    "gelu": _gelu,
+    "silu": lambda x: x * _sigmoid(x),
+    "sigmoid": _sigmoid,
+}
+
+
+def _make_intrinsic_inputs(shape, *, dtype="fp32") -> dict:
+    """``x`` as a ramp over [-4, 4), the range where all three intrinsics bend,
+    and a zeroed ``output``. Never random."""
+    np_dtype = DTYPE_MAP[dtype]
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    total = int(np.prod(shape))
+    x = np.arange(total, dtype=np.float32) * (8.0 / total) - 4.0
+    return {"x_ptr": x.astype(np_dtype).reshape(shape),
+            "output_ptr": np.zeros(shape, dtype=np_dtype)}
+
+
+def make_intrinsic_inputs(n_elements, DTYPE="fp32", **_unused) -> dict:
+    return _make_intrinsic_inputs(n_elements, dtype=DTYPE)
+
+
+def make_intrinsic_2d_inputs(M, N, DTYPE="fp32", **_unused) -> dict:
+    return _make_intrinsic_inputs((M, N), dtype=DTYPE)
+
+
 # ---------------------------------------------------------------------------
-# Factories -- SpyreOp/SpyreIntOp(VariantFactory)
+# Factories -- SpyreOp/SpyreIntOp/SpyreIntrinsic(VariantFactory)
 #
 # OP determines the oracle in both cases (each variant shares one kernel,
 # one SIGNATURE and one input maker across its OP sweep, so only
@@ -218,6 +281,28 @@ class SpyreIntOp(conftest.VariantFactory):
 
         def oracle(inputs):
             return op(inputs["x_ptr"], inputs["y_ptr"])
+        return oracle
+
+
+@dataclass(frozen=True)
+class SpyreIntrinsic(conftest.VariantFactory):
+    """Factory for the ``tl.spyre_op`` variants: pointer dtypes from ``DTYPE``,
+    and the oracle from ``OP``, computed in fp32 and rounded to the buffer's
+    dtype, which is what each fallback does."""
+
+    rank: int = 1
+
+    def signature(self, DTYPE, **_):
+        sig = dict(_SIG_INTRINSIC if self.rank == 1 else _SIG_INTRINSIC_2D)
+        sig["x_ptr"] = sig["output_ptr"] = f"*{DTYPE}"
+        return sig
+
+    def reference(self, OP, **_):
+        op = _INTRINSIC_OPS[OP]
+
+        def oracle(inputs):
+            x = inputs["x_ptr"]
+            return op(x.astype(np.float32)).astype(x.dtype)
         return oracle
 
 
@@ -256,6 +341,26 @@ _SIG_ADDMUL = {
 }
 
 
+# The tl.spyre_op kernels. The pointer dtypes are SpyreIntrinsic's, per DTYPE.
+_SIG_INTRINSIC = {
+    "x_ptr":      "*fp32",
+    "output_ptr": "*fp32",
+    "n_elements": "i32",
+    "BLOCK_SIZE": "i32",
+}
+
+_SIG_INTRINSIC_2D = {
+    "x_ptr":      "*fp32",
+    "output_ptr": "*fp32",
+    "M":          "i32",
+    "N":          "i32",
+    "BLOCK_M":    "i32",
+    "BLOCK_N":    "i32",
+    "X_LAYOUT":   "constexpr",
+    "OUT_LAYOUT": "constexpr",
+}
+
+
 def _stick_of(dtype: str) -> int:
     return sticksize({"p": f"*{dtype}"}, "p")
 
@@ -264,6 +369,12 @@ def _stick_1d(dtype: str) -> tuple:
     """Labelled 1D stick layout at *dtype*, ``[n]`` -> ``[ceil(n/S), S]``."""
     stick = _stick_of(dtype)
     return ("stick", ((0, "floordiv", stick), (0, "mod", stick)))
+
+
+def _stick_2d_on_n(dtype: str) -> tuple:
+    """Labelled stick-on-N layout at *dtype*, ``[M, N]`` -> ``[ceil(N/S), M, S]``."""
+    stick = _stick_of(dtype)
+    return ("stick", ((1, "floordiv", stick), 0, (1, "mod", stick)))
 
 
 # ---------------------------------------------------------------------------
@@ -395,5 +506,89 @@ VARIANTS = {
         "rtol":         0,
         "atol":         0,
         "extra_checks": None,
+    },
+
+    # -----------------------------------------------------------------------
+    # The tl.spyre_op intrinsics on ktir_cpu, which runs each one's fallback.
+    # See the module docstring for the levels, and for the Level D variant
+    # that is not here.
+    # -----------------------------------------------------------------------
+
+    # Level A -- shape.
+    "intrinsic_2d": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static",
+                 "program-id-1d", "spyre-op"],
+        "summary": (
+            "2D tl.spyre_op over M-tiles distributed across the grid, OP and "
+            "DTYPE pinned to sigmoid at fp32."
+        ),
+        "kernel_fn":    kernel.spyreop_intrinsic_2d,
+        "factory":      SpyreIntrinsic(rank=2),
+        "constexpr":    ["BLOCK_M", "BLOCK_N", "X_LAYOUT", "OUT_LAYOUT", "OP"],
+        "params": {
+            "M": [128], "N": [64], "BLOCK_M": [32], "BLOCK_N": [64],
+            "X_LAYOUT": [None], "OUT_LAYOUT": [None],
+            "OP": ["sigmoid"], "DTYPE": ["fp32"],
+        },
+        "grid":         [4],
+        "inputs":       make_intrinsic_2d_inputs,
+        "output_key":   "output_ptr",
+        "rtol":         1e-5,
+        "atol":         1e-6,
+    },
+
+    # Level B -- compute.
+    "intrinsic": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static",
+                 "program-id-1d", "spyre-op"],
+        "summary": (
+            "1D tl.spyre_op across the grid, swept over each intrinsic at each "
+            "dtype it takes."
+        ),
+        "kernel_fn":    kernel.spyreop_intrinsic_1d,
+        "factory":      SpyreIntrinsic(),
+        "constexpr":    ["BLOCK_SIZE", "OP"],
+        "params": {
+            ("OP", "DTYPE"): [
+                ("gelu", "fp16"),
+                ("silu", "fp16"), ("silu", "fp32"),
+                ("sigmoid", "fp16"), ("sigmoid", "fp32"),
+            ],
+            "n_elements": [4096],
+            "BLOCK_SIZE": [128],
+        },
+        "grid":         [32],
+        "inputs":       make_intrinsic_inputs,
+        "output_key":   "output_ptr",
+        "rtol":         {"fp16": 1e-2, "fp32": 1e-5},
+        "atol":         {"fp16": 2e-3, "fp32": 1e-6},
+    },
+
+    # Level C -- layout.
+    "intrinsic_2d_stick": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static",
+                 "program-id-1d", "spyre-op", "spyre-tensor-layout"],
+        "summary": (
+            "2D tl.spyre_op with x and out stick-on-N at fp16, swept over the "
+            "three intrinsics."
+        ),
+        "kernel_fn":    kernel.spyreop_intrinsic_2d,
+        "factory":      SpyreIntrinsic(rank=2),
+        "constexpr":    ["BLOCK_M", "BLOCK_N", "X_LAYOUT", "OUT_LAYOUT", "OP"],
+        "params": {
+            # fp16 stick = 64, so N = 128 is exactly 2 sticks.
+            "M": [64], "N": [128], "BLOCK_M": [64], "BLOCK_N": [128],
+            "X_LAYOUT": [_stick_2d_on_n("fp16")],
+            "OUT_LAYOUT": [_stick_2d_on_n("fp16")],
+            "OP": ["gelu", "silu", "sigmoid"], "DTYPE": ["fp16"],
+        },
+        "grid":         [1],
+        "inputs":       make_intrinsic_2d_inputs,
+        "output_key":   "output_ptr",
+        "rtol":         1e-2,
+        "atol":         2e-3,
     },
 }
