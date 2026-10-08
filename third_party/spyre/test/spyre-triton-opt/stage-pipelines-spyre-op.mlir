@@ -113,7 +113,7 @@ module {
 }
 
 // Two call sites, two ids -- even though the canonicalizer is free to merge
-// their equal constants, which is why a constant never counts toward a call site.
+// their equal constants, which is why a constant carries no hint.
 //
 // KTIR-LABEL:   func.func @sigmoid_silu(
 // KTIR:           math.exp {{.*}} {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}

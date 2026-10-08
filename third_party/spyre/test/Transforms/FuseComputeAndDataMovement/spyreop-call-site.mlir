@@ -11,8 +11,7 @@
 // the fusion itself.
 
 // The f16 sigmoid fallback, seven tensor ops: one generic, every compute op
-// tagged, the splat constant folded in as an untagged scalar -- a constant does
-// not count toward a body's tag, which is what lets this one fuse at all.
+// hinted, the splat constant folded in as an unhinted scalar.
 // CHECK-LABEL: func.func @one_request(
 // CHECK:         linalg.generic
 // CHECK-NOT:     linalg.generic
@@ -25,7 +24,7 @@
 // CHECK:           linalg.yield
 // CHECK-NOT:     linalg.generic
 func.func @one_request(%x: tensor<64x128xf16>) -> tensor<64x128xf16> {
-  %one = arith.constant {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} dense<1.0> : tensor<64x128xf32>
+  %one = arith.constant dense<1.0> : tensor<64x128xf32>
   %xf = arith.extf %x {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : tensor<64x128xf16> to tensor<64x128xf32>
   %n = arith.negf %xf {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : tensor<64x128xf32>
   %e = math.exp %n {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : tensor<64x128xf32>
@@ -47,7 +46,7 @@ func.func @one_request(%x: tensor<64x128xf16>) -> tensor<64x128xf16> {
 // CHECK:           linalg.yield
 // CHECK-NOT:     linalg.generic
 func.func @multi_use_within_request(%x: tensor<64xf16>) -> tensor<64xf16> {
-  %one = arith.constant {tts.spyreop_hint = {id = 3 : i64, name = "silu"}} dense<1.0> : tensor<64xf32>
+  %one = arith.constant dense<1.0> : tensor<64xf32>
   %xf = arith.extf %x {tts.spyreop_hint = {id = 3 : i64, name = "silu"}} : tensor<64xf16> to tensor<64xf32>
   %n = arith.negf %xf {tts.spyreop_hint = {id = 3 : i64, name = "silu"}} : tensor<64xf32>
   %e = math.exp %n {tts.spyreop_hint = {id = 3 : i64, name = "silu"}} : tensor<64xf32>

@@ -801,9 +801,6 @@ struct SelectCallSite : public OpRewritePattern<linalg::GenericOp> {
 /// naming because nothing at the kernel line shows them: the request was split
 /// across two bodies, because a fusion did not happen; or an op of it was
 /// folded into an op outside it, which leaves a body holding both.
-///
-/// Constants are not requests: a hinted one left behind is unhinted here, since
-/// the hint on a constant was never what the rule read.
 LogicalResult rejectSurvivingHints(ModuleOp module) {
   CallSiteSpreads spreads = spreadOfCallSites(module);
   llvm::DenseMap<DictionaryAttr, Operation *> firstSeen;
@@ -812,10 +809,6 @@ LogicalResult rejectSurvivingHints(ModuleOp module) {
     DictionaryAttr hint = triton::tts::getSpyreopHint(op);
     if (!hint)
       return;
-    if (op->hasTrait<OpTrait::ConstantLike>()) {
-      op->removeDiscardableAttr(triton::tts::TTSDialect::kSpyreopHintAttrName);
-      return;
-    }
     if (firstSeen.try_emplace(hint, op).second)
       order.push_back(hint);
   });

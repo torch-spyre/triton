@@ -333,19 +333,19 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 ///   1. pick its `id`: one per op, so two call sites of the same intrinsic --
 ///      one helper inlined twice, say -- stay two after both land in one
 ///      function;
-///   2. set `{name = name, id = id}` on every op of the body, nested ops
-///      included, since a reduction's combiner becomes the body a later pass
-///      reads. Terminators are not hinted: the call site's own is about to go,
-///      and a nested one is structure that every rewrite keeps, so a hint on it
-///      would outlive the call site it named;
+///   2. set `{name = name, id = id}` on every op of the body but its
+///      constants, nested ops included, since a reduction's combiner becomes
+///      the body a later pass reads. Terminators are not hinted: the call
+///      site's own is about to go, and a nested one is structure that every
+///      rewrite keeps, so a hint on it would outlive the call site it named;
 ///   3. replace each block argument by its operand and move the body's ops in
 ///      front of the call site;
 ///   4. replace each result by its yielded value and erase the call site, whose
 ///      terminator goes with it.
 ///
-/// Constants are hinted with the rest. The canonicalizer may hoist one out of a
-/// body or merge it with an equal unhinted one, so a reader treats a constant as
-/// neutral rather than as a member it can count.
+/// Constants are not hinted. The canonicalizer hoists, merges and folds them
+/// freely, so a constant cannot stay a member of one call site, and every
+/// reader of the hint skips constants.
 ///
 /// Ids start above any already in the module, so IR that already carries hints
 /// -- written by hand, or lowered once already -- does not collide with the
@@ -380,7 +380,8 @@ static void inlineSpyreOpCallSites(ModuleOp module) {
     Operation *yield = body.getTerminator();
     for (Operation &op : body.without_terminator())
       op.walk([&](Operation *nested) {
-        if (!nested->hasTrait<OpTrait::IsTerminator>())
+        if (!nested->hasTrait<OpTrait::IsTerminator>() &&
+            !nested->hasTrait<OpTrait::ConstantLike>())
           nested->setAttr(TTSDialect::kSpyreopHintAttrName, hint);
       });
 

@@ -125,10 +125,9 @@ func.func @sigmoid_f32(%x: tensor<64xf32>) -> tensor<64xf32> {
 #map = affine_map<(d0) -> (d0)>
 
 // sigmoid, f16, with its constant still a splat `ins` operand -- the form
-// before the fusion folds it -- and a tagged constant left above the body. The
-// block argument reading a constant is neutral like the constant, so the body
-// still reads one value; the unused operand is then erased, and the constant
-// above loses its tag rather than carrying it to the backend.
+// before the fusion folds it. The block argument reading a constant is neutral
+// like the constant, so the body still reads one value; the unused operand is
+// then erased.
 // CHECK-LABEL: func.func @sigmoid_f16_splat_operand(
 // CHECK:         arith.constant dense<1.000000e+00> : tensor<64xf32>
 // CHECK:         linalg.generic {{.*}} ins(%{{.*}} : tensor<64xf16>)
@@ -137,7 +136,7 @@ func.func @sigmoid_f32(%x: tensor<64xf32>) -> tensor<64xf32> {
 // CHECK-NEXT:      linalg.yield %[[R]] : f16
 // CHECK-NOT:     tts.spyreop_hint
 func.func @sigmoid_f16_splat_operand(%x: tensor<64xf16>) -> (tensor<64xf16>, tensor<64xf32>) {
-  %one = arith.constant {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} dense<1.0> : tensor<64xf32>
+  %one = arith.constant dense<1.0> : tensor<64xf32>
   %e = tensor.empty() : tensor<64xf16>
   %r = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel"]}
       ins(%x, %one : tensor<64xf16>, tensor<64xf32>) outs(%e : tensor<64xf16>) {

@@ -6,16 +6,17 @@
 //
 //   1. the body's ops move in front of the request, block arguments replaced
 //      by the operands;
-//   2. every moved op carries `tts.spyreop_hint = {name = <name>, id = <id>}`,
-//      constants and ops nested in a moved op's region included;
+//   2. every moved op but a constant carries
+//      `tts.spyreop_hint = {name = <name>, id = <id>}`, ops nested in a moved
+//      op's region included;
 //   3. the request's results are replaced by the yielded values;
 //   4. the request and its terminator are gone.
 
 // One request, the f16 sigmoid fallback as LowerComputeOps leaves it: every op
-// tagged, the constant too, and the store reading the last of them.
+// hinted but the constant, and the return reading the last of them.
 // CHECK-LABEL: func.func @one_request(
 // CHECK-SAME:    %[[X:.*]]: tensor<64xf16>
-// CHECK:         %[[ONE:.*]] = arith.constant {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} dense<1.000000e+00> : tensor<64xf32>
+// CHECK:         %[[ONE:.*]] = arith.constant dense<1.000000e+00> : tensor<64xf32>
 // CHECK:         %[[XF:.*]] = arith.extf %[[X]] {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}
 // CHECK:         %[[N:.*]] = arith.negf %[[XF]] {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}
 // CHECK:         %[[E:.*]] = math.exp %[[N]] {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}

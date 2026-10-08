@@ -207,16 +207,15 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         leaves the rest as it found it. That is a change from when it was a
         dialect conversion, where an unsupported float width was reported here.
 
-        The first exception is a REQUEST left unselected: any op other than a
-        constant still carrying `tts.spyreop_hint` after the rewrite is an error naming
-        the intrinsic and why. The author asked for it by name, so passing the
+        The first exception is a REQUEST left unselected: any op still carrying
+        `tts.spyreop_hint` after the rewrite is an error naming the intrinsic
+        and why. The author asked for it by name, so passing the
         fallback through would ignore the request without saying so. The causes
         it names: the request split over two bodies (a fusion that did not
         happen), a body also holding ops outside the request (a fold that merged
         one in), a body reading two values or yielding two, a type the intrinsic
         does not take (gelu at f32), and a request that reads one type and
-        yields another. A constant's tag is dropped instead: constants are
-        hoisted and merged without regard to tags, so the rule never reads them.
+        yields another.
 
         The second exception is an `i1`, and it is a different kind of thing
         rather than a carve-out. Flows-through is about a CAPABILITY gap: an f64 math.sqrt is
@@ -412,8 +411,8 @@ def FuseComputeAndDataMovement
         - A linalg.generic PRODUCER feeding a linalg.generic consumer, both of
           whose bodies carry the same `tts.spyreop_hint` tag → fused. The tag means both
           hold ops LowerTTSMarkers inlined from one `tts.spyre_op`, and
-          [LowerSpyreOps] replaces a request only as ONE body. Constants do not
-          count toward a body's tag, and a body carrying two tags has none.
+          [LowerSpyreOps] replaces a request only as ONE body. Constants carry
+          no hint, and a body carrying two hints has none.
           Here rather than in a pass after RewriteDescriptorLayoutGeneric: that
           pass physicalizes only the generics one hop off an annotated load or
           store, leaving the request's first generic with a linearizing result
