@@ -558,6 +558,14 @@ def FuseComputeAndDataMovement
         same single compute in its body it had before. On a module with at least
         one annotated memory view, no unabsorbable coordinate restatement is left
         on a path that view physicalizes; the pass fails instead.
+
+        And each `tl.spyre_op` call site is ONE generic body: every op carrying
+        a `tts.spyreop_hint` of one `id` is in the same body, which holds no op
+        but constants besides them, no hinted op is outside a body, and the
+        ops of one `id` agree on `name`. Anything else is an error naming the
+        intrinsic and saying the call site did not fuse. The `tts.spyre_op`
+        verifier held the body to be elementwise at one shape, which is what
+        makes this a compiler bug rather than the author's.
     }];
 
     // No ktdp and no tts, though the gate reads both: dependentDialects is about
