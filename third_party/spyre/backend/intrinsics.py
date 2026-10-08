@@ -14,8 +14,11 @@ The registry is the backend's and not the author's. What each intrinsic takes
 -- its operand count, the dtypes of its operands and its result rule -- is the
 C++ intrinsic table's (``Dialect/TTS/IR/Intrinsics.h``), read here through the
 ``spyre.intrinsics`` pybind module; the same table is what the ``tts.spyre_op``
-verifier and ``LowerSpyreOps`` read. This module holds only the fallbacks, keyed
-by name, and checks at import that their names are the table's.
+verifier and ``LowerSpyreOps`` read. This module holds only the fallbacks, each
+registered under its name with ``@spyre_intrinsic(name)``, and checks at import
+that every name in the table has exactly one. The decorator is the backend's: it
+is not exported through ``triton.language``, so kernel authors cannot register
+names.
 
 Every fallback widens to fp32 and narrows back. ``tl.exp`` and ``tl.erf`` are
 fp32-only in the frontend, and the casts cost nothing on the device path, since
@@ -34,23 +37,71 @@ import triton
 import triton.language as tl
 
 
+def _read_table():
+    """The C++ intrinsic table, as ``{name: entry}``."""
+    from triton._C.libtriton import spyre
+    entries = spyre.intrinsics.table()
+    table = {entry["name"]: entry for entry in entries}
+    if len(table) != len(entries):
+        raise RuntimeError("tl.spyre_op: the C++ intrinsic table names an intrinsic twice")
+    return table
+
+
+_TABLE = _read_table()
+
+#: Name -> fallback, filled by ``spyre_intrinsic``.
+FALLBACKS = {}
+
+
+def spyre_intrinsic(name):
+    """Register the decorated ``@triton.jit`` function as the fallback for the
+    intrinsic ``name``. Raises on a name the C++ table does not define, and on a
+    name that already has a fallback."""
+
+    def register(fallback):
+        if name not in _TABLE:
+            raise ValueError(f"tl.spyre_op: {name!r} is not in the C++ intrinsic table, "
+                             f"which names {', '.join(sorted(_TABLE))}")
+        if name in FALLBACKS:
+            raise ValueError(f"tl.spyre_op: intrinsic {name!r} has two fallbacks")
+        FALLBACKS[name] = fallback
+        return fallback
+
+    return register
+
+
+@spyre_intrinsic("gelu")
 @triton.jit
-def _gelu(x):
+def gelu(x):
     # The exact form, x * CDF(x), which is what spyreop.gelu is documented as.
     xf = x.to(tl.float32)
     return (0.5 * xf * (1.0 + tl.erf(xf * 0.7071067811865476))).to(x.dtype)
 
 
+@spyre_intrinsic("silu")
 @triton.jit
-def _silu(x):
+def silu(x):
     xf = x.to(tl.float32)
     return (xf / (1.0 + tl.exp(-xf))).to(x.dtype)
 
 
+@spyre_intrinsic("sigmoid")
 @triton.jit
-def _sigmoid(x):
+def sigmoid(x):
     xf = x.to(tl.float32)
     return (1.0 / (1.0 + tl.exp(-xf))).to(x.dtype)
+
+
+def _check_names(fallbacks, table):
+    """Raise unless every name in ``table`` has a fallback in ``fallbacks``, and
+    ``fallbacks`` has no other. ``spyre_intrinsic`` has already refused a second
+    fallback for one name."""
+    if set(fallbacks) != set(table):
+        raise RuntimeError(f"tl.spyre_op: the fallbacks name {sorted(fallbacks)}, but the C++ "
+                           f"intrinsic table names {sorted(table)}")
+
+
+_check_names(FALLBACKS, _TABLE)
 
 
 @dataclass(frozen=True)
@@ -68,47 +119,6 @@ class Intrinsic:
     arity: int
     dtypes: Tuple[str, ...]
     result_types: Callable
-
-
-def _by_name(*pairs):
-    """``{name: fallback}`` from ``(name, fallback)`` pairs, refusing a name given
-    twice."""
-    fallbacks = {}
-    for name, fallback in pairs:
-        if name in fallbacks:
-            raise ValueError(f"tl.spyre_op: intrinsic {name!r} has two fallbacks")
-        fallbacks[name] = fallback
-    return fallbacks
-
-
-#: Name -> fallback. The names are the C++ table's, which are spyreop's op
-#: mnemonics.
-FALLBACKS = _by_name(
-    ("gelu", _gelu),
-    ("silu", _silu),
-    ("sigmoid", _sigmoid),
-)
-
-
-def _read_table():
-    """The C++ intrinsic table, as ``{name: entry}``."""
-    from triton._C.libtriton import spyre
-    entries = spyre.intrinsics.table()
-    table = {entry["name"]: entry for entry in entries}
-    if len(table) != len(entries):
-        raise RuntimeError("tl.spyre_op: the C++ intrinsic table names an intrinsic twice")
-    return table
-
-
-def _check_names(fallbacks, table):
-    """Raise unless ``fallbacks`` has exactly the names of ``table``."""
-    if set(fallbacks) != set(table):
-        raise RuntimeError(f"tl.spyre_op: the fallbacks name {sorted(fallbacks)}, but the C++ "
-                           f"intrinsic table names {sorted(table)}")
-
-
-_TABLE = _read_table()
-_check_names(FALLBACKS, _TABLE)
 
 
 def lookup(name):

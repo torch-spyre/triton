@@ -117,17 +117,27 @@ def test_intrinsic_table_names_are_unique():
     assert len(names) == len(set(names))
 
 
-def test_fallback_names_are_the_table_names():
+def test_every_table_name_has_one_fallback():
     from triton.backends.spyre import intrinsics
-    intrinsics._check_names(intrinsics.FALLBACKS, intrinsics._read_table())
+    table = intrinsics._read_table()
+    intrinsics._check_names(intrinsics.FALLBACKS, table)
+    missing = {n: f for n, f in intrinsics.FALLBACKS.items() if n != "gelu"}
     with pytest.raises(RuntimeError, match="the C\\+\\+ intrinsic table names"):
-        intrinsics._check_names({**intrinsics.FALLBACKS, "softplus": None}, intrinsics._read_table())
+        intrinsics._check_names(missing, table)
 
 
-def test_a_fallback_name_given_twice_is_refused():
+def test_a_name_the_table_does_not_define_is_refused(monkeypatch):
     from triton.backends.spyre import intrinsics
+    monkeypatch.setattr(intrinsics, "FALLBACKS", dict(intrinsics.FALLBACKS))
+    with pytest.raises(ValueError, match="'softplus' is not in the C\\+\\+ intrinsic table"):
+        intrinsics.spyre_intrinsic("softplus")(lambda x: x)
+
+
+def test_a_second_fallback_for_one_name_is_refused(monkeypatch):
+    from triton.backends.spyre import intrinsics
+    monkeypatch.setattr(intrinsics, "FALLBACKS", dict(intrinsics.FALLBACKS))
     with pytest.raises(ValueError, match="intrinsic 'gelu' has two fallbacks"):
-        intrinsics._by_name(("gelu", None), ("gelu", None))
+        intrinsics.spyre_intrinsic("gelu")(lambda x: x)
 
 
 @pytest.mark.parametrize("backend", ["cuda", "hip", None])
