@@ -75,4 +75,86 @@ def RewriteDescriptorLayoutGeneric
   ];
 }
 
+def MaterializePinnedBuffers
+    : Pass<"materialize-pinned-buffers", "mlir::ModuleOp"> {
+  let summary = "Give each value carrying a tts.pin annotation a buffer in the "
+                "memory space the annotation names, and route its uses through "
+                "it.";
+  let description = [{
+    Input: KTIR at the head of the `spyrecode` stage, in which some ops carry the
+    `tts.pin` attribute `LowerTTSMarkers` wrote there. A pinned value is a
+    `tensor` produced by an arith/math op, a `linalg` op or a `ktdp.load`.
+
+    Lowering: per annotated op, one `ktdp.construct_memory_view` over the pinned
+    value's own shape at the annotation's offset and in its memory space, then a
+    `ktdp.store` of the value through a whole-buffer access tile, and one access
+    tile + `ktdp.load` per use, each use rewritten to read the buffer. The
+    attribute is removed, so the pass is idempotent and nothing downstream sees a
+    request that has already been honoured.
+
+    Pinning therefore also SPLITS the producer from its consumers, which is what
+    makes a pin the way to stop two pointwise ops fusing into one compute.
+
+    Position: FIRST in `spyrecode`, ahead of NormalizeForDevice,
+    DropReductionInitFill, ConvertElementwiseToLinalg and
+    LinalgGeneralizeNamedOps. Each of those replaces an op that could be a pin's
+    carrier, and a replaced op takes its discardable attributes with it silently.
+    In this stage rather than in `ktir` for the reason Pipeline.h gives: a pin
+    exists because the scheduler admits one compute per local schedule, which is
+    a fact about dbo-opt and not about the IR, and a kernel that stops at `ktir`
+    needs no buffer built at all.
+
+    Placing the intermediates nobody pinned is deliberately not here. That is
+    every compute-to-compute edge, named or not, and it is a different pass's
+    subject; this one does only what an annotation asked for.
+
+    An offset is counted from the base of whatever allocation the scratchpad
+    allocator gives this kernel, and NOT from the start of the scratchpad. That is
+    what decides which numeric rules exist here at all: only the ones that hold for
+    any base, which are two. A range cannot be longer than a whole scratchpad, and
+    two pins of one kernel share one base and so must not overlap.
+
+    ALIGNMENT is therefore not among them, and its absence is a consequence of that
+    reading rather than a relaxation. A stick-aligned offset is neither necessary
+    nor sufficient for a stick-aligned buffer when the base is unknown here;
+    aligning the base it hands out is the allocator's rule, and asserting a stick
+    multiple would ask the author to guarantee something they cannot see either.
+
+    The capacity rule is this pass's rather than the op's because its subject is a
+    fact about the device that this tree does not hold --
+    `SpyreUtils.get_device_properties` states that the LX scratchpad "is sized by
+    the device description and allocated by the scheduler" -- so it arrives as an
+    option. `lx-capacity-bytes` has NO default: a per-kernel budget is the caller's
+    to state, and 0 means the capacity question is not asked rather than that it is
+    answered with a number this pass invented.
+
+    BIND-BASE-ADDRESSES mode cannot carry a pin, and this pass refuses one rather
+    than letting it abort later. That mode's CSE merges a pin's store access tile
+    with its load's -- both are `Pure` over the same view, block and indices -- and
+    dbo-opt's compute-group extraction then aborts with nothing naming the cause
+    (issue #161). Unsupported until #199 removes the mode, at which point the option
+    and the refusal both leave. A pin whose value has no use is exempt: it has one
+    access tile, so there is nothing to merge.
+
+    Output: no `tts.pin` attribute remains. Every value one named is stored to,
+    and read back from, a buffer in the named space.
+  }];
+
+  let options = [
+    Option<"lxCapacityBytes", "lx-capacity-bytes", "int64_t",
+           /*default=*/"0",
+           "Bytes of scratchpad a pin's range may reach, per core. 0 does not "
+           "check. Negative is refused.">,
+    Option<"bindBaseAddresses", "bind-base-addresses", "bool",
+           /*default=*/"false",
+           "The pipeline is baking base addresses, whose CSE merges a pin's "
+           "access tiles (#161). Refuses a pin that has a use.">
+  ];
+
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::ktdp::KtdpDialect"
+  ];
+}
+
 #endif // KTDP_TRANSFORMS_PASSES

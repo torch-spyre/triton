@@ -3852,14 +3852,14 @@ def spyre_pin(v, memory_space, offset=None, _semantic=None):
     and for the scratchpad, where in it. It lowers to a ``tts.pin`` marker, which
     ``LowerTTSMarkers`` turns into an attribute on the op producing the value.
 
-    That attribute is where it stops TODAY: the request reaches the ``ktir``
-    artifact and nothing in the backend yet builds the buffer it asks for. A pin is
-    therefore a no-op on the generated code until the pass that honours it lands,
-    which is the follow-up to this one.
+    The ``ktir`` artifact carries that attribute and nothing more; the buffer it
+    asks for is built at the head of the ``spyrecode`` stage, by
+    ``MaterializePinnedBuffers``, as a memory view in the named space plus a store
+    of the value and a load per use.
 
-    Once honoured, pinning also SPLITS the producer from its consumers, since the
-    value then reaches them through memory — which is what makes a pin the way to
-    stop two pointwise ops fusing into one compute.
+    Pinning therefore also SPLITS the producer from its consumers, since the value
+    reaches them through memory — which is what makes a pin the way to stop two
+    pointwise ops fusing into one compute.
 
     Args:
         v:            The value to place, and it must be one an OP IN THE KERNEL
