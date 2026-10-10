@@ -7,7 +7,9 @@
 //
 // The view is built ONCE and shared by the store and the load, with a fresh access
 // tile per access -- the shape LowerDescriptorMemory uses for a descriptor, which
-// is the one that runs on hardware.
+// is the one that runs on hardware. And it is built where a descriptor's is, at the
+// head of the function and so BEFORE the producer, ahead of both the store's span
+// and the load's. The CHECK-NEXTs pin that position.
 //
 // Note the two spellings of the memory space, which are the point rather than an
 // inconsistency: the ANNOTATION holds the name `"ct_local"`, and the view this pass
@@ -16,10 +18,10 @@
 // the marker op it comes from is built during tracing, where loading ktdp would load
 // `func` and abort the `ttir` stage's Inliner.
 // CHECK-LABEL: tt.func @one_consumer
-// CHECK: %[[E:.*]] = math.exp
+// CHECK-NEXT: %[[OFF:.*]] = arith.constant 4096 : index
+// CHECK-NEXT: %[[V:.*]] = ktdp.construct_memory_view %[[OFF]], sizes: [4, 64], strides: [64, 1] {{.*}}memory_space = #ktdp.memory_space<ct_local>
+// CHECK-NEXT: %[[E:.*]] = math.exp
 // CHECK-NOT: tts.pin
-// CHECK: %[[OFF:.*]] = arith.constant 4096 : index
-// CHECK: %[[V:.*]] = ktdp.construct_memory_view %[[OFF]], sizes: [4, 64], strides: [64, 1] {{.*}}memory_space = #ktdp.memory_space<ct_local>
 // CHECK: %[[ST:.*]] = ktdp.construct_access_tile %[[V]]
 // CHECK: ktdp.store %[[E]], %[[ST]]
 // CHECK: %[[LT:.*]] = ktdp.construct_access_tile %[[V]]
@@ -84,10 +86,11 @@ tt.func @rank_zero(%x: tensor<f16>) -> tensor<f16> {
 // the pass; it is here because it is the shape #207's composition consumes, where
 // a share arrives from memory and is then redistributed.
 // CHECK-LABEL: tt.func @pinned_load_result
+// CHECK: %[[V:.*]] = ktdp.construct_memory_view {{.*}}memory_space = #ktdp.memory_space<ct_local>
 // CHECK: %[[HBM:.*]] = ktdp.load
 // CHECK-NOT: tts.pin
-// CHECK: %[[V:.*]] = ktdp.construct_memory_view {{.*}}memory_space = #ktdp.memory_space<ct_local>
-// CHECK: ktdp.store %[[HBM]]
+// CHECK: %[[ST:.*]] = ktdp.construct_access_tile %[[V]]
+// CHECK: ktdp.store %[[HBM]], %[[ST]]
 tt.func @pinned_load_result(%base: index) -> tensor<4x64xf16> {
   %c0 = arith.constant 0 : index
   %v = ktdp.construct_memory_view %base, sizes: [4, 64], strides: [64, 1] {coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.memory_space<global>} : memref<4x64xf16>
@@ -156,9 +159,9 @@ tt.func @no_pin(%x: tensor<4x64xf16>) -> tensor<4x64xf16> {
 // below it -- replace such an op and would take the annotation with them in silence.
 // Nothing in the pass reads the carrier's identity, which is what this case pins.
 // CHECK-LABEL: tt.func @linalg_carrier
+// CHECK: %[[V:.*]] = ktdp.construct_memory_view {{.*}} : memref<4xf32>
 // CHECK: %[[R:.*]] = linalg.reduce
 // CHECK-NOT: tts.pin
-// CHECK: %[[V:.*]] = ktdp.construct_memory_view {{.*}} : memref<4xf32>
 // CHECK: ktdp.store %[[R]]
 // CHECK: ktdp.load
 // CHECK: math.sqrt
@@ -214,8 +217,10 @@ tt.func @layout_through_a_reduction(%src: index) -> tensor<128xf16> {
 // so the walk stops instead of inventing one, and a layout for this buffer can still
 // arrive from a store of the re-stuck result.
 // CHECK-LABEL: tt.func @layout_not_carried_off_a_split
-// CHECK: ktdp.construct_memory_view {{.*}}memory_space = #ktdp.memory_space<ct_local>
-// CHECK-NOT: tts.tensor_layout
+// The pin's view comes first and the source's annotated view after it, so the
+// absence is checked on the pin view's own line: attributes print sorted, and a
+// layout would sit between `memory_space` and the closing brace.
+// CHECK: ktdp.construct_memory_view {{.*}}memory_space = #ktdp.memory_space<ct_local>} : memref<4xf16>
 // CHECK-NOT: tts.pin
 tt.func @layout_not_carried_off_a_split(%src: index) -> tensor<4xf16> {
   %c0 = arith.constant 0 : index

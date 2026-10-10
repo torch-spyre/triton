@@ -21,6 +21,11 @@
 //     descriptors already violate, so this follows the shape that is known to work
 //     rather than the stricter one that is not.
 //
+//     And like a descriptor's, the view is built at the head of the function,
+//     ahead of every op that uses it, rather than beside the producer: dbo-opt
+//     forms compute groups as spans of the block, and an op shared by two groups
+//     has to precede both spans.
+//
 //   * The buffer is the value's OWN shape, row-major. A pin states no layout --
 //     the buffer is the compiler's, so there is nothing for an author to agree
 //     with -- and the physical type is the producing compute's result type.
@@ -643,25 +648,26 @@ struct MaterializePinnedBuffersPass
     ArrayRef<int64_t> shape = pin.type.getShape();
     Location loc = op->getLoc();
 
-    // Directly after the producer, which is the earliest point the value exists
-    // and therefore dominates every use of it. The annotation carries no position
-    // of its own, so there is no other candidate.
-    OpBuilder builder(op);
-    builder.setInsertionPointAfter(op);
-
     // Collected BEFORE the store is built, because the store is itself a use of
     // the value and must not be rewritten into a read of its own result.
     SmallVector<OpOperand *> uses;
     for (OpOperand &use : pin.value.getUses())
       uses.push_back(&use);
 
-    Value offset = arith::ConstantIndexOp::create(builder, loc, pin.offset);
+    // The view at the head of the function, where a descriptor's view is; the
+    // file header says why. It reads nothing but a constant, so the head
+    // dominates every access to it, inside a loop body included.
+    auto func = op->getParentOfType<FunctionOpInterface>();
+    OpBuilder viewBuilder(op->getContext());
+    viewBuilder.setInsertionPointToStart(&func.getFunctionBody().front());
+
+    Value offset = arith::ConstantIndexOp::create(viewBuilder, loc, pin.offset);
     // Row-major, because a pin states no layout: the buffer is the compiler's, so
     // there is nothing for an author to agree with. `computeStrides` is upstream's
     // suffix product, which is exactly that.
     SmallVector<int64_t> strides = mlir::computeStrides(shape);
     Value memView = mlir::triton::ktdp::buildMemoryView(
-        builder, loc, offset, shape, strides, /*dynSizes=*/{},
+        viewBuilder, loc, offset, shape, strides, /*dynSizes=*/{},
         /*dynStrides=*/{}, pin.type.getElementType(), pin.space);
 
     // The layout a neighbour stated, if one did, and this is the whole of how the
@@ -673,8 +679,13 @@ struct MaterializePinnedBuffersPass
     if (pin.layout)
       if (Operation *viewOp = memView.getDefiningOp())
         viewOp->setAttr(TTSDialect::kTensorLayoutAttrName,
-                        pin.layout->toAttr(builder));
+                        pin.layout->toAttr(viewBuilder));
 
+    // The store directly after the producer, which is the earliest point the
+    // value exists and therefore dominates every use of it. The annotation
+    // carries no position of its own, so there is no other candidate.
+    OpBuilder builder(op);
+    builder.setInsertionPointAfter(op);
     Value storeTile = buildWholeTile(builder, loc, memView, shape);
     mlir::ktdp::StoreOp::create(builder, loc, pin.value, storeTile);
 
