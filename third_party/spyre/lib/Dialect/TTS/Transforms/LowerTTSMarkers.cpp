@@ -20,6 +20,14 @@
 // Two markers, two resolution functions and two attribute builders, which is
 // what the shape below was for.
 //
+// And one op that is NOT a marker: `tts.spyre_intrinsic` names no value and has
+// a body, so it does not fit the driver's resolve-and-move shape and has a
+// function of its own, inlineSpyreIntrinsicCallSites. Its lowering inlines the
+// body in place and leaves the call site as the `tts.spyre_intrinsic` on every
+// op inlined -- an attribute on the ops rather than on one subject, which is
+// the same rule (the op goes, a builtin attribute stays) applied to a call site
+// that is about a computation.
+//
 // A pinned BLOCK ARGUMENT is therefore refused HERE, and this is the only place it
 // can be. It is a value like any other and the op admits one, but it has no defining
 // op, so there is nothing for the attribute to live on -- a function argument
@@ -45,6 +53,7 @@
 #include "ktir/Dialect/KTDP/KTDP.h"
 
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
@@ -315,6 +324,142 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 }
 
 //===----------------------------------------------------------------------===//
+// tts.spyre_intrinsic
+//===----------------------------------------------------------------------===//
+
+/// Inline every `tts.spyre_intrinsic` in `module` in place, hinting each
+/// inlined op.
+///
+/// Per call site, in this order:
+///
+///   1. pick its `id`: one per op, so two call sites of the same intrinsic --
+///      one helper inlined twice, say -- stay two after both land in one
+///      function;
+///   2. set `{target = target, id = id, arity = n}` on every op of the body
+///      but its constants and its terminator, which is about to go, `n` the
+///      call site's operand count -- and on an op with an operand that is a
+///      block argument, `operands` too: per operand of that op, the index of
+///      the block argument it is, which is the index of the call operand it is
+///      about to become, or -1. This is the one point the binding is known
+///      exactly; after ConvertElementwiseToLinalg and fusion, a body's block
+///      arguments are in whatever order its `ins` ended up in. The op's
+///      verifier has held every op to be elementwise, so none has a region;
+///   3. replace each block argument by its operand and move the body's ops in
+///      front of the call site;
+///   4. replace each result by its yielded value and erase the call site, whose
+///      terminator goes with it.
+///
+/// Constants are not hinted. The canonicalizer hoists, merges and folds them
+/// freely, so a constant cannot stay a member of one call site, and every
+/// reader of the hint skips constants.
+///
+/// Ids start above any already in the module, so IR that already carries hints
+/// -- written by hand, or lowered once already -- does not collide with the
+/// ones written here.
+///
+/// A call site with a constant operand is refused, before anything is inlined.
+/// Every op of its body then reads only constants, so the first folding driver
+/// in `spyrecode` folds the whole call site to one constant and no intrinsic is
+/// selected. The check is here rather than at trace time because this pass runs
+/// after the `ktir` stage's canonicalize: an operand that only folds to a
+/// constant there (`tl.full` traces to a `tt.splat` of a scalar) is a constant
+/// by now.
+///
+/// So is a call site whose body holds nothing but constants, for the same
+/// outcome: no op would carry the hint, and the request would vanish without
+/// a diagnostic. The canonicalizes before this pass are what reduce a body to
+/// that -- `x * 1.0` folds to `x` -- and they run inside the region.
+static LogicalResult inlineSpyreIntrinsicCallSites(ModuleOp module) {
+  using mlir::triton::tts::SpyreIntrinsicOp;
+  using mlir::triton::tts::TTSDialect;
+
+  int64_t nextId = 0;
+  module.walk([&](Operation *op) {
+    if (DictionaryAttr hint = mlir::triton::tts::getSpyreIntrinsic(op))
+      if (auto id = hint.getAs<IntegerAttr>(TTSDialect::kSpyreIntrinsicIdKey))
+        nextId = std::max(nextId, id.getInt() + 1);
+  });
+
+  // Collect first: the rewrite erases. None is nested in another's body,
+  // since the op's verifier admits only elementwise ops there.
+  SmallVector<SpyreIntrinsicOp> callSites;
+  module.walk([&](SpyreIntrinsicOp op) { callSites.push_back(op); });
+
+  for (SpyreIntrinsicOp callSite : callSites) {
+    for (auto [i, operand] : llvm::enumerate(callSite.getInputs()))
+      if (matchPattern(operand, m_Constant()))
+        return callSite.emitError()
+               << "tl.spyre_intrinsic(\"" << callSite.getTarget()
+               << "\"): operand " << i
+               << " is a constant, so the call site would fold to a constant "
+                  "and no target would be selected";
+    Block &body = callSite.getBody().front();
+    if (llvm::all_of(body.without_terminator(), [](Operation &op) {
+          return op.hasTrait<OpTrait::ConstantLike>();
+        }))
+      return callSite.emitError()
+             << "tl.spyre_intrinsic(\"" << callSite.getTarget()
+             << "\"): the fallback folded to nothing but constants and its "
+                "operands, so no op is left to carry the request and no "
+                "target would be selected";
+  }
+
+  Builder builder(module.getContext());
+  for (SpyreIntrinsicOp callSite : callSites) {
+    SmallVector<NamedAttribute, 4> common = {
+        builder.getNamedAttr(TTSDialect::kSpyreIntrinsicTargetKey,
+                             callSite.getTargetAttr()),
+        builder.getNamedAttr(TTSDialect::kSpyreIntrinsicIdKey,
+                             builder.getI64IntegerAttr(nextId++)),
+        builder.getNamedAttr(
+            TTSDialect::kSpyreIntrinsicArityKey,
+            builder.getI64IntegerAttr(callSite.getInputs().size())),
+    };
+    DictionaryAttr hint = builder.getDictionaryAttr(common);
+
+    Block &body = callSite.getBody().front();
+    Operation *yield = body.getTerminator();
+    for (Operation &op : body.without_terminator()) {
+      if (op.hasTrait<OpTrait::ConstantLike>())
+        continue;
+      SmallVector<int64_t> operands;
+      bool readsCallOperand = false;
+      for (Value v : op.getOperands()) {
+        auto arg = dyn_cast<BlockArgument>(v);
+        if (arg && arg.getOwner() == &body) {
+          operands.push_back(arg.getArgNumber());
+          readsCallOperand = true;
+        } else {
+          operands.push_back(-1);
+        }
+      }
+      if (!readsCallOperand) {
+        op.setAttr(TTSDialect::kSpyreIntrinsicAttrName, hint);
+        continue;
+      }
+      SmallVector<NamedAttribute, 4> entries(common);
+      entries.push_back(
+          builder.getNamedAttr(TTSDialect::kSpyreIntrinsicOperandsKey,
+                               builder.getDenseI64ArrayAttr(operands)));
+      op.setAttr(TTSDialect::kSpyreIntrinsicAttrName,
+                 builder.getDictionaryAttr(entries));
+    }
+
+    for (auto [arg, operand] :
+         llvm::zip_equal(body.getArguments(), callSite.getInputs()))
+      arg.replaceAllUsesWith(operand);
+    Block *parent = callSite->getBlock();
+    parent->getOperations().splice(callSite->getIterator(),
+                                   body.getOperations(), body.begin(),
+                                   yield->getIterator());
+
+    callSite->replaceAllUsesWith(yield->getOperands());
+    callSite->erase();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
 
@@ -325,6 +470,14 @@ struct LowerTTSMarkersPass
     using mlir::triton::tts::PinOp;
     using mlir::triton::tts::TensorLayoutOp;
     using mlir::triton::tts::TTSDialect;
+
+    // FIRST, ahead of the markers. A pin may name a call site's result, and
+    // the op producing that value exists only once the body is inlined -- run
+    // after, the pin would land on the call site and be erased with it. Not a
+    // marker, so not the driver's: see inlineSpyreIntrinsicCallSites, which
+    // refuses a call site with a constant operand.
+    if (failed(inlineSpyreIntrinsicCallSites(getOperation())))
+      return signalPassFailure();
 
     // One statement per marker kind, and the three things a marker brings: its
     // op type, its attribute name, and the resolve/build pair above.

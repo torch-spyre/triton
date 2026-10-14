@@ -2,6 +2,7 @@
 #define TTS_OPS
 
 include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 include "Dialect/TTS/IR/TTSDialect.td"
 // For TT_TensorDescType. This is the one direction the dependency may point:
 // `tts` names a Triton type, Triton names nothing of ours. TritonTypes.td
@@ -127,6 +128,119 @@ def TTS_PinOp : TTS_Op<"pin", []> {
 
   let assemblyFormat = "$value attr-dict `:` type($value)";
   let hasVerifier = 1;
+}
+
+def TTS_SpyreIntrinsicOp : TTS_Op<"spyre_intrinsic", [
+    IsolatedFromAbove, SingleBlockImplicitTerminator<"SpyreIntrinsicYieldOp">,
+    RecursiveMemoryEffects]> {
+  let summary = "Request one device op, carrying its fallback body";
+
+  let description = [{
+    `tts.spyre_intrinsic` is the **authoring** spelling of
+    `tl.spyre_intrinsic(target, *args)`: a request that the computation be done
+    by the op `target`, by its full name, e.g. `"spyreop.sigmoid"`. The region
+    holds that computation's FALLBACK -- the backend's registered `@triton.jit`
+    body for `target`, traced at the operands' types -- so the op means the same
+    thing whether or not the target is ever selected.
+
+    The block arguments are the operands, one for one and of the same types,
+    and the body ends in `tts.spyre_intrinsic_yield`, whose operands are the
+    results.
+
+    RESULT TYPES ARE DECLARED, not inferred from the body. The op is created
+    before its region is traced -- a region belongs to an op -- so the frontend
+    gives it one result of operand 0's type, for every target, and refuses a
+    fallback whose returned types differ, at the kernel line.
+
+    `IsolatedFromAbove`, so the body reads nothing but its block arguments: a
+    value the kernel computed outside reaches the fallback only as an operand,
+    and a constant the canonicalizer folds stays inside.
+
+    THE CALL SITE IS CHECKED IN FOUR PLACES, by the form it has at the time. It
+    is this op from trace to the end of the `ktir` stage; LowerTTSMarkers then
+    inlines the body in place and sets
+    `tts.spyre_intrinsic = {target, id, arity}` on every op it inlined but the
+    constants, `id` unique to this op in the module and `arity` its operand
+    count, so the `ktir` artifact is the fallback alone, in dialects any
+    consumer loads. An op reading a block
+    argument also gets `operands`, per operand of that op the index of the call
+    operand it is or -1: the call's operand order, which nothing after the
+    inlining can recover. In `spyrecode`, FuseComputeAndDataMovement fuses the
+    hinted ops of one `id` into one body, and LowerSpyreIntrinsicCalls replaces
+    that body with the target, applied to the inputs `operands` binds, in call
+    order.
+
+    WHICH TARGETS EXIST, and what each takes, is the frontend's registration
+    (`backend/intrinsics.py`), not this dialect's: it checks that `target` is a
+    registered op when a fallback is registered, and the operand count, the
+    dtypes and the result type when the call is traced. The IR carries the
+    target by name, so the checks below hold for hand-written IR too, and what
+    is target-specific is checked once more by the target op's own verifier,
+    when LowerSpyreIntrinsicCalls builds it.
+
+      V1  this op's region verifier, while the op exists. What no later pass
+          can change: `target` is a registered op; the block arguments have
+          the operand types and
+          the yield the result types; no op in the body has a memory effect;
+          and the body can fuse into one generic -- every op elementwise or a
+          constant, and every value but a constant at the operands' shape. A
+          `tt.call` is admitted by both of the last two until the `ttir`
+          stage's inliner replaces it with the fallback's body.
+      V2  the `tts.spyre_intrinsic` attribute verifier, on each op at every
+          verification point. What one op shows: a dictionary of a string
+          `target`, an i64 `id`, a positive i64 `arity`, optionally an
+          `operands` array of one entry per operand of the op, each in
+          [-1, arity), and no other key; a `target` that is a registered op;
+          and an op that is not a constant. Nothing about other ops.
+      V3  FuseComputeAndDataMovement, after its fixpoint, over the module:
+          each `id` is in exactly one generic body and on no op outside one,
+          that body holds no other op but constants, and the ops of one `id`
+          agree on `target` and `arity`. V1 is what guarantees the fusion, so a
+          failure here is a compiler bug, reported as one.
+      V4  LowerSpyreIntrinsicCalls: selection, which reads each call
+          operand's input off the members' `operands` -- refusing, by target
+          and call operand, a call operand bound to two different inputs, to
+          none, or to anything but an `ins` block argument -- builds the target
+          and runs its verifier; then one check, that no op still carries a
+          `tts.spyre_intrinsic` attribute. A request left unselected is an
+          error naming the target, since passing the fallback through would
+          drop it silently.
+
+    Constants carry no hint: passes create, merge and fold them freely, so one
+    says nothing about its call site.
+
+    Example:
+    ```mlir
+      %y = tts.spyre_intrinsic "spyreop.sigmoid" (%x)
+          : (tensor<128xf32>) -> tensor<128xf32> {
+      ^bb0(%a: tensor<128xf32>):
+        ...
+        tts.spyre_intrinsic_yield %r : tensor<128xf32>
+      }
+    ```
+  }];
+
+  let arguments = (ins StrAttr:$target, Variadic<AnyRankedTensor>:$inputs);
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = [{
+    $target `(` $inputs `)` attr-dict `:` functional-type($inputs, $results)
+    $body
+  }];
+  let hasRegionVerifier = 1;
+}
+
+def TTS_SpyreIntrinsicYieldOp : TTS_Op<"spyre_intrinsic_yield", [
+    Pure, Terminator, HasParent<"SpyreIntrinsicOp">]> {
+  let summary = "Terminate a tts.spyre_intrinsic body, yielding its results";
+
+  let arguments = (ins Variadic<AnyRankedTensor>:$values);
+
+  // The no-operand builder SingleBlockImplicitTerminator requires.
+  let builders = [OpBuilder<(ins), [{ /* no values */ }]>];
+
+  let assemblyFormat = "($values^ `:` type($values))? attr-dict";
 }
 
 #endif // TTS_OPS

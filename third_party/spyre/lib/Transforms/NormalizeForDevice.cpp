@@ -28,6 +28,8 @@
 
 #include "Transforms/Passes.h"
 
+#include "Dialect/TTS/IR/Dialect.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -47,9 +49,10 @@ namespace {
 // arith.maxnumf -> arith.maximumf, arith.minnumf -> arith.minimumf
 //===----------------------------------------------------------------------===//
 
-/// Replaces `Source` with `Target`, carrying both operands and the fastmath
-/// attribute across. Applies wherever the op appears -- a linalg.generic body, a
-/// linalg.reduce combiner, or plain scalar arithmetic.
+/// Replaces `Source` with `Target`, carrying both operands, the fastmath
+/// attribute and the `tts` attributes across. Applies wherever the op appears
+/// -- a linalg.generic body, a linalg.reduce combiner, or plain scalar
+/// arithmetic.
 ///
 /// Usable for any pair of binary `arith` float ops: the only ODS shape it reads
 /// is two same-typed operands, one result and an optional fastmath attribute.
@@ -59,8 +62,10 @@ struct ReplaceBinaryFloatOp : public OpRewritePattern<Source> {
 
   LogicalResult matchAndRewrite(Source op,
                                 PatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<Target>(op, op.getLhs(), op.getRhs(),
-                                        op.getFastmathAttr());
+    auto replacement = Target::create(rewriter, op.getLoc(), op.getLhs(),
+                                      op.getRhs(), op.getFastmathAttr());
+    mlir::triton::tts::copyTTSAttrs(op, replacement);
+    rewriter.replaceOp(op, replacement);
     return success();
   }
 };

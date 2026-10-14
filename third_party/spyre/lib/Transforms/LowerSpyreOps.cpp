@@ -23,6 +23,8 @@
 // op, so no rule has to win over another and no order is declared anywhere.
 // Splitting these across two passes is what an earlier shape did, and it
 // bought a standing question -- which pass claims this op -- for nothing.
+// LowerSpyreIntrinsicCalls runs first, so no op this pass sees carries a
+// `tts.spyre_intrinsic` attribute.
 //
 // EVERYTHING UNMATCHED FLOWS THROUGH, WITH ONE EXCEPTION. There is no
 // conversion target: an op with no device form reaches the backend, which is

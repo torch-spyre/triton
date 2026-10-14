@@ -91,3 +91,18 @@ func.func @already_normalized_and_integers(%f0: f32, %f1: f32, %i0: i32, %i1: i3
   return %a, %b, %c, %d : f32, f32, i32, i32
 }
 }
+
+// -----
+
+// Test: the `tts` attributes ride along too. A `tl.spyre_intrinsic` fallback using
+// tl.maximum reaches this pass as a hinted arith.maxnumf, and the replacement
+// has to carry the hint, or selection never sees that op as part of the call
+// site.
+module {
+// CHECK-LABEL:   func.func @hinted_maxnumf(
+// CHECK:           arith.maximumf %{{.*}}, %{{.*}} {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, target = "spyreop.sigmoid"}} : tensor<64xf32>
+func.func @hinted_maxnumf(%a: tensor<64xf32>, %b: tensor<64xf32>) -> tensor<64xf32> {
+  %m = arith.maxnumf %a, %b {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, target = "spyreop.sigmoid"}} : tensor<64xf32>
+  return %m : tensor<64xf32>
+}
+}
