@@ -158,6 +158,40 @@ def select_1d_device(
 
 
 @triton.jit
+def select_const_1d_device(
+    mask_ptr,
+    p_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+    C: tl.constexpr,
+):
+    """``out = where(mask != 0, p, C)``: :func:`select_1d_device` with the
+    false branch a compile-time float rather than a loaded tensor."""
+    pid = tl.program_id(0)
+
+    mask_desc = tl.make_tensor_descriptor(
+        mask_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    p_desc = tl.make_tensor_descriptor(
+        p_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(mask_desc, LAYOUT)
+    tl.spyre_tensor_layout(p_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    offset = pid * BLOCK_SIZE
+    mask = mask_desc.load([offset])
+    p = p_desc.load([offset])
+    zero = tl.zeros([BLOCK_SIZE], dtype=mask.dtype)
+    out_desc.store([offset], tl.where(mask != zero, p, C))
+
+
+@triton.jit
 def where_1d_device(
     x_ptr,
     y_ptr,
@@ -213,6 +247,58 @@ def where_1d_device(
 
     # Stage 2: the select, over the mask read back. Reloading is what gives the
     # intermediate a descriptor, and with it a layout.
+    mask = mask_desc.load([offset])
+    p = p_desc.load([offset])
+    q = q_desc.load([offset])
+    zero = tl.zeros([BLOCK_SIZE], dtype=mask.dtype)
+    out_desc.store([offset], tl.where(mask != zero, p, q))
+
+
+@triton.jit
+def where_const_1d_device(
+    x_ptr,
+    p_ptr,
+    q_ptr,
+    mask_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+    OP: tl.constexpr,
+    C: tl.constexpr,
+):
+    """``out = where(x OP C, p, q)``: :func:`where_1d_device` with ``y`` a
+    compile-time float rather than a loaded tensor."""
+    pid = tl.program_id(0)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    p_desc = tl.make_tensor_descriptor(
+        p_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    q_desc = tl.make_tensor_descriptor(
+        q_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    mask_desc = tl.make_tensor_descriptor(
+        mask_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(p_desc, LAYOUT)
+    tl.spyre_tensor_layout(q_desc, LAYOUT)
+    tl.spyre_tensor_layout(mask_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    offset = pid * BLOCK_SIZE
+
+    # Stage 1: the comparison against the constant, stored to its own buffer.
+    x = x_desc.load([offset])
+    mask_desc.store([offset], _compare(x, C, OP).to(x.dtype))
+
+    # Stage 2: the select, over the mask read back.
     mask = mask_desc.load([offset])
     p = p_desc.load([offset])
     q = q_desc.load([offset])
