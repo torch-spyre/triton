@@ -159,8 +159,6 @@ def make_realdiv_inputs(n_elements, DTYPE="fp32", **_unused) -> dict:
     return _make_realdiv_inputs(n_elements, dtype=DTYPE)
 
 
-def _realdiv_reference(inputs):
-    return inputs["x_ptr"] / inputs["y_ptr"]
 
 
 _NUMPY_INT_OPS = {"add": np.add, "mul": np.multiply}
@@ -210,6 +208,20 @@ class SpyreOp(conftest.VariantFactory):
 
 
 @dataclass(frozen=True)
+class SpyreRealdiv(conftest.VariantFactory):
+    """Factory for the realdiv variants: ``x / y``, or ``x / D`` for a float
+    ``D``."""
+
+    def reference(self, D, **_):
+        def oracle(inputs):
+            x = inputs["x_ptr"]
+            if D == "y":
+                return x / inputs["y_ptr"]
+            return x / np.asarray(D, dtype=x.dtype)
+        return oracle
+
+
+@dataclass(frozen=True)
 class SpyreIntOp(conftest.VariantFactory):
     """Factory for the binary int spyreop variant ("addmul")."""
 
@@ -243,6 +255,7 @@ _SIG_REALDIV = {
     "n_elements": "i32",
     "BLOCK_SIZE": "i32",
     "LAYOUT":     "constexpr",
+    "D":          "constexpr",
 }
 
 # addmul is binary and i32, not fp32.
@@ -336,21 +349,36 @@ VARIANTS = {
             "distribution loop, fp32, stick-tiled."
         ),
         "kernel_fn":    kernel.spyreop_realdiv_1d_device,
+        "factory":      SpyreRealdiv(),
         "SIGNATURE":    _SIG_REALDIV,
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT"],
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "D"],
         "params": {
             "n_elements": [128], "BLOCK_SIZE": [128], "DTYPE": ["fp32"],
             "LAYOUT": [_stick_1d("fp32")],
+            "D": ["y"],
         },
         "grid":         [1],
         "parallel":     False,
         "compiles_to_binary": True,
         "inputs":       make_realdiv_inputs,
-        "reference":    _realdiv_reference,
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
         "extra_checks": None,
+    },
+
+    # ``realdiv`` with the denominator a compile-time constant, not a loaded y.
+    "realdiv_const": {
+        "base": "realdiv",
+        "summary": (
+            "1D binary spyreop `out = x / D` over a single tile, `D` a "
+            "compile-time float, no distribution loop, fp32, stick-tiled."
+        ),
+        "params": {
+            "n_elements": [128], "BLOCK_SIZE": [128], "DTYPE": ["fp32"],
+            "LAYOUT": [_stick_1d("fp32")],
+            "D": [10.0],
+        },
     },
 
     # -----------------------------------------------------------------------

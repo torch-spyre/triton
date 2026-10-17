@@ -30,9 +30,9 @@ not fold: it disagrees with "non-zero" on a negative lane, and a mask read back
 from memory cannot be shown non-negative. Written ``> 0`` the kernel still
 compiles, as two intrinsics.
 
-The zero is ``tl.zeros`` at the mask's own dtype rather than a literal ``0.0``.
-A bare Python float is fp32, so comparing an fp16 mask against it widens the
-mask with ``arith.extf`` and compares at fp32.
+The zero is the integer ``0``, which is splatted at the mask's own dtype. A
+float ``0.0`` is fp32, so comparing an fp16 mask against it widens the mask
+with ``arith.extf`` and compares at fp32.
 
 No kernel takes a ``DTYPE`` parameter: the element type is fixed by the pointer
 arguments, and ``meta.py`` sweeps it through the signature.
@@ -153,8 +153,40 @@ def select_1d_device(
     mask = mask_desc.load([offset])
     p = p_desc.load([offset])
     q = q_desc.load([offset])
-    zero = tl.zeros([BLOCK_SIZE], dtype=mask.dtype)
-    out_desc.store([offset], tl.where(mask != zero, p, q))
+    out_desc.store([offset], tl.where(mask != 0, p, q))
+
+
+@triton.jit
+def select_const_1d_device(
+    mask_ptr,
+    p_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+    C: tl.constexpr,
+):
+    """``out = where(mask != 0, p, C)``: :func:`select_1d_device` with the
+    false branch a compile-time float rather than a loaded tensor."""
+    pid = tl.program_id(0)
+
+    mask_desc = tl.make_tensor_descriptor(
+        mask_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    p_desc = tl.make_tensor_descriptor(
+        p_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(mask_desc, LAYOUT)
+    tl.spyre_tensor_layout(p_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    offset = pid * BLOCK_SIZE
+    mask = mask_desc.load([offset])
+    p = p_desc.load([offset])
+    out_desc.store([offset], tl.where(mask != 0, p, C))
 
 
 @triton.jit
@@ -216,8 +248,72 @@ def where_1d_device(
     mask = mask_desc.load([offset])
     p = p_desc.load([offset])
     q = q_desc.load([offset])
-    zero = tl.zeros([BLOCK_SIZE], dtype=mask.dtype)
-    out_desc.store([offset], tl.where(mask != zero, p, q))
+    out_desc.store([offset], tl.where(mask != 0, p, q))
+
+
+@triton.jit
+def where_const_1d_device(
+    x_ptr,
+    p_ptr,
+    q_ptr,
+    mask_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+    OP: tl.constexpr,
+    C: tl.constexpr,
+    T: tl.constexpr,
+    F: tl.constexpr,
+):
+    """``out = where(x OP C, T, F)``: :func:`where_1d_device` with ``y`` a
+    compile-time float rather than a loaded tensor.
+
+    ``T`` is ``"p"`` for the true branch loaded from ``p_ptr``, and ``F`` is
+    ``"q"`` for the false branch loaded from ``q_ptr``; either is otherwise a
+    compile-time float. Both pointers are taken either way, so the signature
+    does not vary with them.
+    """
+    pid = tl.program_id(0)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    p_desc = tl.make_tensor_descriptor(
+        p_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    q_desc = tl.make_tensor_descriptor(
+        q_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    mask_desc = tl.make_tensor_descriptor(
+        mask_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(p_desc, LAYOUT)
+    tl.spyre_tensor_layout(q_desc, LAYOUT)
+    tl.spyre_tensor_layout(mask_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    offset = pid * BLOCK_SIZE
+
+    # Stage 1: the comparison against the constant, stored to its own buffer.
+    x = x_desc.load([offset])
+    mask_desc.store([offset], _compare(x, C, OP).to(x.dtype))
+
+    # Stage 2: the select, over the mask read back.
+    mask = mask_desc.load([offset])
+    if T == "p":
+        true = p_desc.load([offset])
+    else:
+        true = T
+    if F == "q":
+        result = tl.where(mask != 0, true, q_desc.load([offset]))
+    else:
+        result = tl.where(mask != 0, true, F)
+    out_desc.store([offset], result)
 
 
 @triton.jit
@@ -289,5 +385,4 @@ def where_scalar_stick_device(
     mask = mask_desc.load([0, 0])
     p = p_desc.load([0, 0])
     q = q_desc.load([0, 0])
-    zero = tl.zeros([ROWS, STICK], dtype=mask.dtype)
-    out_desc.store([0, 0], tl.where(mask != zero, p, q))
+    out_desc.store([0, 0], tl.where(mask != 0, p, q))
