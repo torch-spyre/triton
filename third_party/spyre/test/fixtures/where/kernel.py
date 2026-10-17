@@ -30,9 +30,9 @@ not fold: it disagrees with "non-zero" on a negative lane, and a mask read back
 from memory cannot be shown non-negative. Written ``> 0`` the kernel still
 compiles, as two intrinsics.
 
-The zero is ``tl.zeros`` at the mask's own dtype rather than a literal ``0.0``.
-A bare Python float is fp32, so comparing an fp16 mask against it widens the
-mask with ``arith.extf`` and compares at fp32.
+The zero is the integer ``0``, which is splatted at the mask's own dtype. A
+float ``0.0`` is fp32, so comparing an fp16 mask against it widens the mask
+with ``arith.extf`` and compares at fp32.
 
 No kernel takes a ``DTYPE`` parameter: the element type is fixed by the pointer
 arguments, and ``meta.py`` sweeps it through the signature.
@@ -153,8 +153,7 @@ def select_1d_device(
     mask = mask_desc.load([offset])
     p = p_desc.load([offset])
     q = q_desc.load([offset])
-    zero = tl.zeros([BLOCK_SIZE], dtype=mask.dtype)
-    out_desc.store([offset], tl.where(mask != zero, p, q))
+    out_desc.store([offset], tl.where(mask != 0, p, q))
 
 
 @triton.jit
@@ -187,8 +186,7 @@ def select_const_1d_device(
     offset = pid * BLOCK_SIZE
     mask = mask_desc.load([offset])
     p = p_desc.load([offset])
-    zero = tl.zeros([BLOCK_SIZE], dtype=mask.dtype)
-    out_desc.store([offset], tl.where(mask != zero, p, C))
+    out_desc.store([offset], tl.where(mask != 0, p, C))
 
 
 @triton.jit
@@ -250,8 +248,7 @@ def where_1d_device(
     mask = mask_desc.load([offset])
     p = p_desc.load([offset])
     q = q_desc.load([offset])
-    zero = tl.zeros([BLOCK_SIZE], dtype=mask.dtype)
-    out_desc.store([offset], tl.where(mask != zero, p, q))
+    out_desc.store([offset], tl.where(mask != 0, p, q))
 
 
 @triton.jit
@@ -307,11 +304,10 @@ def where_const_1d_device(
     # Stage 2: the select, over the mask read back.
     mask = mask_desc.load([offset])
     p = p_desc.load([offset])
-    zero = tl.zeros([BLOCK_SIZE], dtype=mask.dtype)
     if F == "q":
-        result = tl.where(mask != zero, p, q_desc.load([offset]))
+        result = tl.where(mask != 0, p, q_desc.load([offset]))
     else:
-        result = tl.where(mask != zero, p, F)
+        result = tl.where(mask != 0, p, F)
     out_desc.store([offset], result)
 
 
@@ -384,5 +380,4 @@ def where_scalar_stick_device(
     mask = mask_desc.load([0, 0])
     p = p_desc.load([0, 0])
     q = q_desc.load([0, 0])
-    zero = tl.zeros([ROWS, STICK], dtype=mask.dtype)
-    out_desc.store([0, 0], tl.where(mask != zero, p, q))
+    out_desc.store([0, 0], tl.where(mask != 0, p, q))
