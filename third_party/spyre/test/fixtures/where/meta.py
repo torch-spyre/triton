@@ -197,16 +197,17 @@ def make_where_const_inputs(n_elements, C, DTYPE="fp32", **_unused) -> dict:
             "output_ptr": np.zeros(n_elements, dtype=np_dtype)}
 
 
-def make_where_const_oracle(OP, C, F):
+def make_where_const_oracle(OP, C, T, F):
     """-> the ``spilled_const`` oracle for comparison *OP* against *C*, its
-    false branch ``q`` or the constant *F*."""
+    true branch ``p`` or the constant *T*, its false branch ``q`` or the
+    constant *F*."""
     compare = _NUMPY_COMPARISONS[OP]
 
     def run_where_const(inputs) -> np.ndarray:
         x = inputs["x_ptr"]
+        true = inputs["p_ptr"] if T == "p" else np.asarray(T, dtype=x.dtype)
         false = inputs["q_ptr"] if F == "q" else np.asarray(F, dtype=x.dtype)
-        return np.where(compare(x, np.asarray(C, dtype=x.dtype)),
-                        inputs["p_ptr"], false)
+        return np.where(compare(x, np.asarray(C, dtype=x.dtype)), true, false)
     return run_where_const
 
 
@@ -316,14 +317,14 @@ class WhereConst(Where):
 @dataclass(frozen=True)
 class WhereComparingConst(WhereComparing):
     """Factory for ``spilled_const``: ``spilled`` compared against the swept
-    ``C`` rather than a loaded ``y``, its false branch the swept ``F``."""
+    ``C`` rather than a loaded ``y``, its branches the swept ``T`` and ``F``."""
 
     def signature(self, DTYPE, OP, **_):
         return {**super().signature(DTYPE, OP), "C": "constexpr",
-                "F": "constexpr"}
+                "T": "constexpr", "F": "constexpr"}
 
-    def reference(self, OP, C, F, **_):
-        return self.oracle(OP, C, F)
+    def reference(self, OP, C, T, F, **_):
+        return self.oracle(OP, C, T, F)
 
 
 @dataclass(frozen=True)
@@ -527,24 +528,26 @@ VARIANTS = {
     },
 
     # -----------------------------------------------------------------------
-    # ``spilled`` with ``y`` a bare Python float, not a loaded tensor, and the
-    # false branch loaded or a bare Python float too: one distinct from C and
-    # from every value of p and q, or C itself, so that one constant is read by
-    # both the compare and the select.
+    # ``spilled`` with ``y`` a bare Python float, not a loaded tensor, and each
+    # branch loaded or a bare Python float too: one distinct from C and from
+    # every value of p and q, or (false branch) C itself, so that one constant
+    # is read by both the compare and the select.
     # -----------------------------------------------------------------------
     "spilled_const": {
         "base": None,
         "tags": _TAGS,
         "summary": (
-            "1D fp32 where(x OP C, p, F) in one kernel, C a compile-time "
-            "constant and F the loaded q or a constant, the mask spilled to its "
-            "own buffer between compare and select. Sweeps every OP."
+            "1D fp32 where(x OP C, T, F) in one kernel, C a compile-time "
+            "constant, T the loaded p or a constant and F the loaded q or a "
+            "constant, the mask spilled to its own buffer between compare and "
+            "select. Sweeps every OP."
         ),
         "kernel_fn":    kernel.where_const_1d_device,
         "factory":      WhereComparingConst(ptrs=("x_ptr", "p_ptr", "q_ptr",
                                                   "mask_ptr", "output_ptr"),
                                             oracle=make_where_const_oracle),
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "OP", "C", "F"],
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "OP", "C", "T",
+                         "F"],
         "params": {
             ("DTYPE", "LAYOUT"): [
                 ("fp32", _stick_1d("fp32")),
@@ -553,6 +556,7 @@ VARIANTS = {
             "BLOCK_SIZE": [_N_ELEMENTS],
             "OP": _OPS,
             "C": [1.5],
+            "T": ["p", 7.25],
             "F": ["q", -3.75, 1.5],
         },
         "grid":         [1],

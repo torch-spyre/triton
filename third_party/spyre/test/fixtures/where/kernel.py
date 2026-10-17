@@ -263,14 +263,16 @@ def where_const_1d_device(
     LAYOUT: tl.constexpr,
     OP: tl.constexpr,
     C: tl.constexpr,
+    T: tl.constexpr,
     F: tl.constexpr,
 ):
-    """``out = where(x OP C, p, F)``: :func:`where_1d_device` with ``y`` a
+    """``out = where(x OP C, T, F)``: :func:`where_1d_device` with ``y`` a
     compile-time float rather than a loaded tensor.
 
-    ``F`` is ``"q"`` for the false branch loaded from ``q_ptr``, or else a
-    compile-time float. ``q_ptr`` is taken either way, so the signature does
-    not vary with it.
+    ``T`` is ``"p"`` for the true branch loaded from ``p_ptr``, and ``F`` is
+    ``"q"`` for the false branch loaded from ``q_ptr``; either is otherwise a
+    compile-time float. Both pointers are taken either way, so the signature
+    does not vary with them.
     """
     pid = tl.program_id(0)
 
@@ -303,11 +305,14 @@ def where_const_1d_device(
 
     # Stage 2: the select, over the mask read back.
     mask = mask_desc.load([offset])
-    p = p_desc.load([offset])
-    if F == "q":
-        result = tl.where(mask != 0, p, q_desc.load([offset]))
+    if T == "p":
+        true = p_desc.load([offset])
     else:
-        result = tl.where(mask != 0, p, F)
+        true = T
+    if F == "q":
+        result = tl.where(mask != 0, true, q_desc.load([offset]))
+    else:
+        result = tl.where(mask != 0, true, F)
     out_desc.store([offset], result)
 
 
