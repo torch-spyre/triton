@@ -165,6 +165,32 @@ void init_triton_spyre_ir_builders(py::module &&m) {
       },
       py::arg("builder"), py::arg("value"), py::arg("memory_space"),
       py::arg("offset") = py::none());
+
+  // tl.spyre_op. Unlike create_tensor_layout/create_pin, this op has a real
+  // result -- it is a request, not a marker -- so this builder returns a
+  // Value rather than void.
+  //
+  // Deliberately does NOT load ktdp, and could not usefully: `tts.spyre_op`
+  // names its request as a bare string, exactly like `tts.pin`'s
+  // `memory_space` does, and for the same reason given on create_pin above
+  // -- this runs during TRACING, before the `ttir` stage's Inliner, and
+  // loading ktdp here (it depends on `func`) would abort that pass. The
+  // request becomes `ktdp.gelu` only later, in `ConvertSpyreOpToKTDP`,
+  // which runs inside `_make_ktir`'s own pipeline -- a pass, where the pass
+  // manager loads `dependentDialects` for us, which is the one place that
+  // is safe to ask.
+  m.def(
+      "create_spyre_op",
+      [](TritonOpBuilder &self, const std::string &name,
+         mlir::Value &input) -> mlir::Value {
+        self.getContext()->loadDialect<mlir::triton::tts::TTSDialect>();
+
+        auto &builder = self.getBuilder();
+        auto op = self.create<mlir::triton::tts::SpyreOpOp>(
+            input.getType(), builder.getStringAttr(name), input);
+        return op.getResult();
+      },
+      py::arg("builder"), py::arg("name"), py::arg("input"));
 }
 
 /// One `tts.tensor_layout` marker, reduced to what a footprint is computed from.

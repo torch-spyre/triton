@@ -1,0 +1,268 @@
+diff --git a/docs/gap_analysis.md b/docs/gap_analysis.md
+index 61f37f2..5207771 100644
+--- a/docs/gap_analysis.md
++++ b/docs/gap_analysis.md
+@@ -17,6 +17,7 @@
+ | 2b | `ktdp.inter_tile_consume` (broadcast delivery) | ❌ experimental | Same upstream PR. Not implemented. |
+ | 2c | `ktdp.inter_tile_reduce_scatter` | ❌ experimental | Same upstream PR. Not implemented. |
+ | 2d | `producer_dependency_per_consumer` (per-tile sync) | 🟡 experimental | Same upstream PR. Parsed and stored on the delivery op AST; runtime is full-barrier mode (waits for all producers). Per-tile mode unimplemented. |
++| 2e | `ktdp.gelu` (device-neutral compute intrinsic) | ⚠️ **spec conflict** | **New op, not in RFC 0682, and in tension with its own stated separation of concerns** ("Compute ops use standard MLIR dialects (Arith, Math, LinAlg)" — this file's own project rules repeat that line verbatim). Introduced by a cross-repo prototype (`torch-spyre/triton`'s `tl.spyre_op("gelu", x)` → `tts.spyre_op` → `ktdp.gelu`, defined in `ktir-mlir-frontend`'s `KTDP.td` as a `Ktdp_IntrinsicOp`) for representing a Spyre-only hardware intrinsic (`spyreop.gelu`) in a device-neutral way at the KTIR level, so that `_make_ktir`'s cached artifact never contains a Spyre-specific op. This repo's role is only to decompose it (`ktir_cpu/mlir_frontend/parser.py`'s `MLIRFrontendParser.parse_module`, via `--decompose-ktdp-compute` from `ktir-mlir-frontend`) into the tanh-approximation reference implementation in plain `arith`/`math` ops before interpreting — `ktdp.gelu` itself is never executed directly, and no new op handler was added to `ktir_cpu/dialects/registry.py`. Flagged here per this file's own rule ("if the spec does not cover a needed feature, flag it explicitly rather than silently extending the dialect") rather than treated as settled. **Action: if this mechanism is adopted beyond the current prototype, RFC 0682 needs a real amendment defining the `Ktdp_IntrinsicOp` family (`ktdp.gelu` and whatever follows it) and reconciling it with the compute/`ktdp` separation the spec currently states as a hard line, not a soft default.**
+ 
+ ## B. `ktdp` Types & Attributes
+ 
+diff --git a/examples/ktir/gelu.mlir b/examples/ktir/gelu.mlir
+new file mode 100644
+index 0000000..ae054a5
+--- /dev/null
++++ b/examples/ktir/gelu.mlir
+@@ -0,0 +1,50 @@
++// `ktdp.gelu` -- a device-neutral compute intrinsic, not in RFC 0682. See
++// docs/gap_analysis.md row 2e. This fixture exists to exercise this repo's
++// one real role for it: `DecomposeKTDPCompute`
++// (`--decompose-ktdp-compute`, from `ktir-mlir-frontend`) replaces it with
++// the tanh-approximation reference implementation in plain `arith`/`math`
++// before `MLIRFrontendParser` ever hands the module to `walk_module` --
++// `ktdp.gelu` itself has no handler in `ktir_cpu/dialects/registry.py` and
++// is never meant to.
++//
++// Single tile, no distribution loop: load 1x128 from HBM, apply the
++// intrinsic, store back.
++module {
++  func.func @gelu(
++      %in_ptr: index,
++      %out_ptr: index
++  ) attributes {grid = [1]} {
++    %c0 = arith.constant 0 : index
++
++    %in_view = ktdp.construct_memory_view %in_ptr, sizes: [1, 128], strides: [128, 1] {
++      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
++      memory_space = #ktdp.memory_space<global>
++    } : memref<1x128xf16>
++
++    %in_tile = ktdp.construct_access_tile %in_view[%c0, %c0] {
++      access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
++      access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
++    } : memref<1x128xf16> -> !ktdp.access_tile<1x128xindex>
++
++    %in = ktdp.load %in_tile : !ktdp.access_tile<1x128xindex> -> tensor<1x128xf16>
++    %collapsed = tensor.collapse_shape %in [[0, 1]] : tensor<1x128xf16> into tensor<128xf16>
++
++    %y = ktdp.gelu %collapsed : tensor<128xf16>
++
++    %expanded = tensor.expand_shape %y [[0, 1]] output_shape [1, 128] : tensor<128xf16> into tensor<1x128xf16>
++
++    %out_view = ktdp.construct_memory_view %out_ptr, sizes: [1, 128], strides: [128, 1] {
++      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
++      memory_space = #ktdp.memory_space<global>
++    } : memref<1x128xf16>
++
++    %out_tile = ktdp.construct_access_tile %out_view[%c0, %c0] {
++      access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
++      access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
++    } : memref<1x128xf16> -> !ktdp.access_tile<1x128xindex>
++
++    ktdp.store %expanded, %out_tile : tensor<1x128xf16>, !ktdp.access_tile<1x128xindex>
++
++    return
++  }
++}
+diff --git a/ktir_cpu/mlir_frontend/parser.py b/ktir_cpu/mlir_frontend/parser.py
+index 9c4a4bb..505f4aa 100644
+--- a/ktir_cpu/mlir_frontend/parser.py
++++ b/ktir_cpu/mlir_frontend/parser.py
+@@ -41,8 +41,12 @@ try:
+         Module,
+         ShapedType,
+     )
++    from mlir_ktdp._mlir_libs._ktir import register_passes
+     from mlir_ktdp.passmanager import PassManager
+-    from mlir_ktdp.tools import ktdp_context, walk_module
++    from mlir_ktdp.tools import ktdp_context
++    # PassManager.parse resolves pass names (e.g. "decompose-ktdp-compute")
++    # against the CAPI-embedded PassRegistry, which is empty until this runs.
++    register_passes()
+     _HAS_MLIR = True
+ except ImportError:
+     _HAS_MLIR = False
+@@ -801,6 +805,26 @@ def _adapt_tensor_insert_slice(mlir_op, attributes, result_type, operands):
+ # Parser
+ # ---------------------------------------------------------------------------
+ 
++def _walk_operation(operation):
++    """Recursively walk an already-parsed MLIR operation.
++
++    Same traversal as `mlir_ktdp.tools.walk_module`, starting from a live
++    `Operation` instead of re-parsing source text -- see the call site in
++    `parse_module` for why that distinction matters here.
++    """
++    operations = []
++
++    def _walk(op, depth: int) -> None:
++        operations.append((op, depth))
++        for region in op.regions:
++            for block in region.blocks:
++                for child in block.operations:
++                    _walk(child.operation, depth + 1)
++
++    _walk(operation, 0)
++    return operations
++
++
+ class MLIRFrontendParser(KTIRParserBase):
+     """Parse MLIR text into IRModule objects using the MLIR Python bindings.
+ 
+@@ -817,6 +841,17 @@ class MLIRFrontendParser(KTIRParserBase):
+ 
+     _NORMALIZE_PIPELINE = "builtin.module(canonicalize,cse)"
+ 
++    # Decomposes a device-neutral `ktdp.*` compute intrinsic (e.g.
++    # `ktdp.gelu`) into the generic `arith`/`math` reference implementation
++    # this interpreter already knows how to execute. Unconditional, unlike
++    # `_NORMALIZE_PIPELINE` above: canonicalize/CSE are an optional cleanup,
++    # but a `ktdp.gelu` reaching `walk_module` has no handler in
++    # `ktir_cpu/dialects/registry.py` and never will -- `MLIRTypeAdapter`
++    # would raise `NotImplementedError` on it, not run it incorrectly. See
++    # `docs/gap_analysis.md` row 2e: this op is not in RFC 0682, flagged
++    # there rather than silently added to the dialect.
++    _DECOMPOSE_PIPELINE = "builtin.module(decompose-ktdp-compute)"
++
+     def __init__(self, adapter: Optional[MLIRTypeAdapter] = None):
+         if not _HAS_MLIR:
+             raise ImportError(
+@@ -840,15 +875,37 @@ class MLIRFrontendParser(KTIRParserBase):
+             m = Module.parse(mlir_text, ctx)
+             if not m.operation.verify():
+                 raise RuntimeError("MLIR module failed verification after parse")
++
++            # Unconditional, and ahead of the optional normalize step below:
++            # a module containing `ktdp.gelu` (or any future device-neutral
++            # `ktdp.*` compute intrinsic) is not yet in a form this
++            # interpreter can run at all, regardless of whether the caller
++            # asked for cleanup. A module with none is unaffected -- the
++            # pass's one pattern simply does not match.
++            PassManager.parse(self._DECOMPOSE_PIPELINE).run(m.operation)
++            if not m.operation.verify():
++                raise RuntimeError(
++                    "MLIR module failed verification after decompose-ktdp-compute"
++                )
++
+             if normalize:
+                 PassManager.parse(self._NORMALIZE_PIPELINE).run(m.operation)
+                 if not m.operation.verify():
+                     raise RuntimeError(
+                         "MLIR module failed verification after canonicalize"
+                     )
+-                mlir_text = str(m)
+ 
+-        operations = walk_module(mlir_text)
++            # Walk the live module object directly rather than
++            # `walk_module(str(m))`: printing and reparsing is pure overhead
++            # here, and for at least one real fixture
++            # (`examples/triton-ktir/indexed_add.mlir`, a
++            # `ktdp.construct_access_tile` with a 4-d `access_tile_set`) the
++            # printer emits an `affine_set` attribute its own parser then
++            # rejects, so a round trip through text can fail on input the
++            # first parse accepted. `walk_module`'s own text-in contract
++            # doesn't apply once we already hold the parsed operation.
++            operations = _walk_operation(m.operation)
++
+         return self._build_ir_module(operations)
+ 
+     @staticmethod
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 7da757b..f0ed96a 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -90,6 +90,18 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
+             "execute_kwargs": {},
+         },
+     ],
++    "gelu": [
++        {
++            # ktdp.gelu -- not in RFC 0682, see docs/gap_analysis.md row 2e.
++            # Exercises MLIRFrontendParser's unconditional
++            # `--decompose-ktdp-compute` step: the module as written cannot
++            # run at all without it (no handler in ktir_cpu/dialects/registry.py
++            # takes "ktdp.gelu"), so this is a regression anchor for that
++            # pipeline step, not for a new op the interpreter understands.
++            "path": "ktir/gelu.mlir",
++            "execute_kwargs": {},
++        },
++    ],
+     "softmax_kernel_small": [
+         {
+             "path": "latency/softmax_small.mlir",
+diff --git a/tests/mlir_frontend/test_gelu_decompose.py b/tests/mlir_frontend/test_gelu_decompose.py
+new file mode 100644
+index 0000000..99953bd
+--- /dev/null
++++ b/tests/mlir_frontend/test_gelu_decompose.py
+@@ -0,0 +1,68 @@
++"""`ktdp.gelu` decomposition -- MLIR-frontend only.
++
++`ktdp.gelu` is not in RFC 0682 (docs/gap_analysis.md row 2e) and the regex
++parser has no notion of it at all -- there is no decomposition mechanism
++outside the real MLIR pass pipeline, so unlike every other fixture in this
++tree, this one cannot be run through the base `KTIRParser` and is not
++registered as a `TestXxxExecution` base class in `test_examples.py` for an
++Adapt subclass to extend. It is MLIRFrontendParser-only, by construction.
++"""
++
++import numpy as np
++import pytest
++
++from conftest import get_test_params  # noqa: F401 -- re-exported for subpackage tests
++
++try:
++    import mlir_ktdp  # noqa: F401
++except ImportError:
++    pytest.skip("mlir_ktdp not installed", allow_module_level=True)
++
++from ktir_cpu import KTIRInterpreter
++from ktir_cpu.mlir_frontend.parser import MLIRFrontendParser
++
++
++def _tanh_approx_gelu(x: np.ndarray) -> np.ndarray:
++    """The reference `DecomposeKTDPCompute` is checked against -- same
++    formula, independently expressed, so this test does not just restate
++    the pass's own arithmetic back at itself."""
++    xf = x.astype(np.float32)
++    inner = xf + 0.044715 * xf**3
++    return (0.5 * xf * (1.0 + np.tanh(0.7978845608 * inner))).astype(np.float16)
++
++
++class TestGeluDecompose:
++    """End-to-end execution of ktir/gelu.mlir.
++
++    `ktdp.gelu` cannot reach the interpreter's op dispatch
++    (`ktir_cpu/dialects/registry.py`) at all -- `MLIRFrontendParser.parse_module`
++    must have already run `--decompose-ktdp-compute` (unconditionally, before
++    `walk_module`) for this module to execute at all. A `NotImplementedError`
++    from `MLIRTypeAdapter.adapt_op` here would mean that step did not run.
++    """
++
++    def _make_interp(self):
++        return KTIRInterpreter(parser=MLIRFrontendParser())
++
++    @pytest.mark.parametrize("path,func_name,entry", get_test_params("gelu"))
++    def test_gelu(self, path, func_name, entry):
++        interp = self._make_interp()
++        interp.load(path)
++
++        in_ptr, out_ptr = interp.arg_names(func_name)
++        sizes = interp.tensor_input_output_sizes(func_name)
++        shape = tuple(sizes[in_ptr]["shape"])
++
++        src = np.linspace(-3.0, 3.0, num=int(np.prod(shape)), dtype=np.float32)
++        src = src.reshape(shape).astype(np.float16)
++        out = np.zeros(tuple(sizes[out_ptr]["shape"]), dtype=np.float16)
++
++        outputs = interp.execute_function(func_name, **{in_ptr: src, out_ptr: out})
++
++        result = outputs[out_ptr]
++        assert result.shape == tuple(sizes[out_ptr]["shape"])
++        np.testing.assert_allclose(
++            result.astype(np.float32),
++            _tanh_approx_gelu(src).astype(np.float32),
++            rtol=1e-2, atol=1e-2,
++        )

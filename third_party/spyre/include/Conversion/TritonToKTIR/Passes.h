@@ -21,6 +21,7 @@ namespace mlir::triton::spyre {
 #define GEN_PASS_REGISTRATION
 #include "Conversion/TritonToKTIR/Passes.h.inc"
 
+std::unique_ptr<OperationPass<ModuleOp>> createConvertSpyreOpToKTDPPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerDescriptorMemoryPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerScalarLoadPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerComputeOpsPass();

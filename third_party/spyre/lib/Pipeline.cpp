@@ -20,6 +20,12 @@
 
 void mlir::triton::spyre::buildTTIRToKTIRPipeline(
     OpPassManager &pm, const TTIRToKTIRPipelineOptions &options) {
+  // tts.spyre_op "name" -> ktdp.<name>. FIRST: a 1:1 rename with nothing to
+  // stage, so nothing else needs to run before it, and converting
+  // immediately after tracing means every pass below only ever sees
+  // ktdp.<name>, never tts.spyre_op.
+  pm.addPass(createConvertSpyreOpToKTDPPass());
+
   // tt.descriptor_load/store/gather/scatter -> ktdp memory ops.
   pm.addPass(createLowerDescriptorMemoryPass());
 

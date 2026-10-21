@@ -33,8 +33,10 @@ add_triton_library(SpyreTransforms
   # FuseComputeAndDataMovement refuses an unabsorbable re-indexing op only on a
   # path RewriteDescriptorLayoutGeneric will physicalize, and asks that question
   # with that pass's own seed traversals -- hence the ktdp dialect, KTDPUtils
-  # where the shared walks live, and TTSIR for the layout attribute's name.  It
-  # is the only pass here that reaches a ktdp op; the other three still do not.
+  # where the shared walks live, and TTSIR for the layout attribute's name.
+  # LowerSpyreOps reaches a ktdp op too now, for `ktdp.gelu` -- a device-neutral
+  # intrinsic request, selected into `spyreop.gelu` the same way `math.sqrt` is;
+  # the other three passes here still do not reach ktdp at all.
   KTDPUtils
   TTSIR
   KTIR::KtdpDialect
