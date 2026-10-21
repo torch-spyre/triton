@@ -1,0 +1,167 @@
+diff --git a/include/ktir/Dialect/KTDP/CMakeLists.txt b/include/ktir/Dialect/KTDP/CMakeLists.txt
+index 068fc2e..e93db35 100644
+--- a/include/ktir/Dialect/KTDP/CMakeLists.txt
++++ b/include/ktir/Dialect/KTDP/CMakeLists.txt
+@@ -7,3 +7,5 @@ mlir_tablegen(KTDPEnums.cpp.inc -gen-enum-defs)
+ mlir_tablegen(KTDPAttrs.h.inc -gen-attrdef-decls -attrdefs-dialect=ktdp)
+ mlir_tablegen(KTDPAttrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=ktdp)
+ add_ktir_tablegen_target(KTIRKTDPAttrsIncGen)
++
++add_subdirectory(Transforms)
+diff --git a/include/ktir/Dialect/KTDP/KTDP.td b/include/ktir/Dialect/KTDP/KTDP.td
+index dbe0913..5c64c81 100644
+--- a/include/ktir/Dialect/KTDP/KTDP.td
++++ b/include/ktir/Dialect/KTDP/KTDP.td
+@@ -30,6 +30,7 @@ include "mlir/IR/EnumAttr.td"
+ 
+ include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.td"
+ include "mlir/Interfaces/ControlFlowInterfaces.td"
++include "mlir/Interfaces/InferTypeOpInterface.td"
+ include "mlir/Interfaces/SideEffectInterfaces.td"
+ include "mlir/Interfaces/ViewLikeInterface.td"
+ include "mlir/IR/BuiltinAttributes.td"
+@@ -710,4 +711,56 @@ def KTDP_RuntimeArgExtractOp : Ktdp_Op<"runtime_arg_extract", [Pure]> {
+     OpBuilder<(ins "RuntimeArgExtractKind":$kind, "Value":$input)>
+   ];
+ }
++
++//===----------------------------------------------------------------------===//
++// Device-neutral compute intrinsics
++//===----------------------------------------------------------------------===//
++
++// F16, or a vector/tensor container of it -- the same shape `FloatLike`
++// (OpBase.td) gives `AnyFloat`, narrowed to the one width `spyreop.*`
++// intrinsics actually take. Needed, not just convenient: the op is traced
++// as a tensor but must remain the SAME op class once scalarized inside a
++// linalg.generic body (see the note on `ElementwiseMappable.traits`,
++// below), so its type constraint has to admit both forms itself.
++def Ktdp_F16Like : TypeOrValueSemanticsContainer<F16, "f16-or-container-of-f16">;
++
++// Base class for a device-neutral, 1:1 mirror of a `spyreop.*` intrinsic.
++// Such an op names a request for a specific device computation without
++// naming any device: it is traced as a tensor op (unlike `spyreop.*`, which
++// is scalar-only), carries no notion of "this requires Spyre hardware," and
++// is expected to have more than one legitimate lowering -- the real
++// hardware op for a backend that has one, a generic decomposition for a
++// backend (such as ktir_cpu) that does not.
++//
++// `ElementwiseMappable.traits` (OpBase.td: Elementwise, Scalarizable,
++// Vectorizable, Tensorizable) is load-bearing, not decorative, and
++// `Elementwise` alone is not enough: `Scalarizable` is specifically what
++// licenses the upstream `-convert-elementwise-to-linalg` pass to replace a
++// tensor-typed occurrence with a scalar-typed occurrence of this SAME op
++// class, inside a `linalg.generic` body, with no KTDP-specific wrapping
++// pass needed -- exactly the trick `math.sqrt` already relies on (see
++// `Math_Op`'s own base class). Without it, that pass has no license to
++// reuse this op class at scalar type, and the scalarized clone would
++// violate `Ktdp_F16Like` the moment anything re-verifies it.
++class Ktdp_IntrinsicOp<string mnemonic, list<Trait> traits = []> :
++    Ktdp_Op<mnemonic, traits # ElementwiseMappable.traits #
++                      [Pure, SameOperandsAndResultType]> {
++  let arguments = (ins Ktdp_F16Like:$operand);
++  let results = (outs Ktdp_F16Like:$result);
++  let assemblyFormat = "$operand attr-dict `:` type($result)";
++}
++
++def KTDP_GeLUOp : Ktdp_IntrinsicOp<"gelu"> {
++  let summary = "Device-neutral GELU request: x * CDF(x)";
++  let description = [{
++    `ktdp.gelu` is the device-neutral, tensor-level mirror of `spyreop.gelu`
++    (F16-only, matching the real hardware op's own element-type constraint).
++    It names a request for the GELU computation without naming a device:
++    the Spyre backend lowers it directly to `spyreop.gelu` once scalarized;
++    a backend with no `spyreop` support (e.g. ktir_cpu) instead decomposes
++    it into the tanh-approximation reference implementation in plain
++    `arith`/`math` ops. Neither lowering is visible to the other.
++  }];
++}
++
+ #endif // KTDP_OPS_TD
+diff --git a/include/ktir/Dialect/KTDP/KTDPDialect.td b/include/ktir/Dialect/KTDP/KTDPDialect.td
+index 3e0b149..792d722 100644
+--- a/include/ktir/Dialect/KTDP/KTDPDialect.td
++++ b/include/ktir/Dialect/KTDP/KTDPDialect.td
+@@ -28,7 +28,14 @@ def Ktdp_Dialect : Dialect {
+     - Performing explicit load and store operations driven by access tiles.
+ 
+     Compute and control-flow operations are delegated to standard MLIR
+-    dialects (Arith, Math, LinAlg, SCF, Tensor, MemRef, Func).
++    dialects (Arith, Math, LinAlg, SCF, Tensor, MemRef, Func) -- with one
++    deliberate, narrow exception: a handful of `Ktdp_IntrinsicOp`-derived
++    ops (e.g. `ktdp.gelu`) name a device-neutral request for a specific
++    compute intrinsic that has no portable spelling in those dialects at
++    all. They are not general-purpose compute (there is still no `ktdp.add`
++    or `ktdp.mul`); they exist only where a real hardware op (`spyreop.*`)
++    has no generic equivalent, so that KTIR itself can still name the
++    request without naming a backend. See `Ktdp_IntrinsicOp` in KTDP.td.
+   }];
+ 
+   let cppNamespace = "::mlir::ktdp";
+diff --git a/lib/CAPI/Dialect/CMakeLists.txt b/lib/CAPI/Dialect/CMakeLists.txt
+index b8f6b7e..c65b842 100644
+--- a/lib/CAPI/Dialect/CMakeLists.txt
++++ b/lib/CAPI/Dialect/CMakeLists.txt
+@@ -11,6 +11,7 @@ add_ktir_public_c_api_library(KTIRKTDPCAPI
+   LINK_LIBS PUBLIC
+     KTIRKtdpDialect
+     KTIRConvertToKTIR
++    KTIRKTDPTransforms
+ )
+ 
+ add_ktir_public_c_api_library(KTIRSpyreOpCAPI
+diff --git a/lib/CAPI/Dialect/KTDP.cpp b/lib/CAPI/Dialect/KTDP.cpp
+index 1a12893..3fe3820 100644
+--- a/lib/CAPI/Dialect/KTDP.cpp
++++ b/lib/CAPI/Dialect/KTDP.cpp
+@@ -22,6 +22,7 @@
+ #include "ktir/Dialect/KTDP/KTDPAttrs.h"
+ #include "ktir/Dialect/KTDP/KTDPDialect.h"
+ #include "ktir/Dialect/KTDP/KTDPTypes.h"
++#include "ktir/Dialect/KTDP/Transforms/Passes.h"
+ #include "mlir/CAPI/IR.h"
+ #include "mlir/CAPI/Registration.h"
+ #include "mlir/CAPI/Support.h"
+@@ -130,4 +131,12 @@ int32_t mlirKTDPMemorySpaceAttrGetCtId(MlirAttribute attr) {
+   return llvm::cast<mlir::ktdp::MemorySpaceAttr>(unwrap(attr)).getCtId();
+ }
+ 
+-void mlirKTIRRegisterPasses(void) { ktir::registerKTIRConversionPasses(); }
++void mlirKTIRRegisterPasses(void) {
++  ktir::registerKTIRConversionPasses();
++  // `decompose-ktdp-compute`: registered through the same CAPI aggregate
++  // PassRegistry as the conversions above, for the same reason -- the
++  // Python bindings' `PassManager.parse(...)` (what `ktir_cpu`'s
++  // `MLIRFrontendParser` drives) consults this registry, not whatever
++  // registry a direct C++ call from `ktir-opt` would populate.
++  ktir::registerKTDPTransformsPasses();
++}
+diff --git a/lib/Dialect/KTDP/CMakeLists.txt b/lib/Dialect/KTDP/CMakeLists.txt
+index 6aae7fb..2a6a6df 100644
+--- a/lib/Dialect/KTDP/CMakeLists.txt
++++ b/lib/Dialect/KTDP/CMakeLists.txt
+@@ -28,3 +28,5 @@ add_ktir_library(KTIRKtdpDialect
+     MLIRAnalysis
+     MLIRPresburger
+ )
++
++add_subdirectory(Transforms)
+diff --git a/tools/ktir-opt/ktir-opt.cpp b/tools/ktir-opt/ktir-opt.cpp
+index 95a4b75..b9351e7 100644
+--- a/tools/ktir-opt/ktir-opt.cpp
++++ b/tools/ktir-opt/ktir-opt.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "ktir/Conversion/Passes.h"
+ #include "ktir/Dialect/KTDP/KTDPDialect.h"
++#include "ktir/Dialect/KTDP/Transforms/Passes.h"
+ #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
+ 
+ using namespace mlir;
+@@ -17,6 +18,7 @@ using namespace mlir;
+ auto main(int argc, char **argv) -> int {
+   registerAllPasses();
+   ktir::registerKTIRConversionPasses();
++  ktir::registerKTDPTransformsPasses();
+ 
+   DialectRegistry registry;
+   registry.insert<ktdp::KtdpDialect, spyreop::SpyreOpDialect>();
