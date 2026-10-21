@@ -10,6 +10,62 @@ index 61f37f2..5207771 100644
  
  ## B. `ktdp` Types & Attributes
  
+diff --git a/examples/ktir/gelu.mlir b/examples/ktir/gelu.mlir
+new file mode 100644
+index 0000000..ae054a5
+--- /dev/null
++++ b/examples/ktir/gelu.mlir
+@@ -0,0 +1,50 @@
++// `ktdp.gelu` -- a device-neutral compute intrinsic, not in RFC 0682. See
++// docs/gap_analysis.md row 2e. This fixture exists to exercise this repo's
++// one real role for it: `DecomposeKTDPCompute`
++// (`--decompose-ktdp-compute`, from `ktir-mlir-frontend`) replaces it with
++// the tanh-approximation reference implementation in plain `arith`/`math`
++// before `MLIRFrontendParser` ever hands the module to `walk_module` --
++// `ktdp.gelu` itself has no handler in `ktir_cpu/dialects/registry.py` and
++// is never meant to.
++//
++// Single tile, no distribution loop: load 1x128 from HBM, apply the
++// intrinsic, store back.
++module {
++  func.func @gelu(
++      %in_ptr: index,
++      %out_ptr: index
++  ) attributes {grid = [1]} {
++    %c0 = arith.constant 0 : index
++
++    %in_view = ktdp.construct_memory_view %in_ptr, sizes: [1, 128], strides: [128, 1] {
++      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
++      memory_space = #ktdp.memory_space<global>
++    } : memref<1x128xf16>
++
++    %in_tile = ktdp.construct_access_tile %in_view[%c0, %c0] {
++      access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
++      access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
++    } : memref<1x128xf16> -> !ktdp.access_tile<1x128xindex>
++
++    %in = ktdp.load %in_tile : !ktdp.access_tile<1x128xindex> -> tensor<1x128xf16>
++    %collapsed = tensor.collapse_shape %in [[0, 1]] : tensor<1x128xf16> into tensor<128xf16>
++
++    %y = ktdp.gelu %collapsed : tensor<128xf16>
++
++    %expanded = tensor.expand_shape %y [[0, 1]] output_shape [1, 128] : tensor<128xf16> into tensor<1x128xf16>
++
++    %out_view = ktdp.construct_memory_view %out_ptr, sizes: [1, 128], strides: [128, 1] {
++      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
++      memory_space = #ktdp.memory_space<global>
++    } : memref<1x128xf16>
++
++    %out_tile = ktdp.construct_access_tile %out_view[%c0, %c0] {
++      access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
++      access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
++    } : memref<1x128xf16> -> !ktdp.access_tile<1x128xindex>
++
++    ktdp.store %expanded, %out_tile : tensor<1x128xf16>, !ktdp.access_tile<1x128xindex>
++
++    return
++  }
++}
 diff --git a/ktir_cpu/mlir_frontend/parser.py b/ktir_cpu/mlir_frontend/parser.py
 index 9c4a4bb..505f4aa 100644
 --- a/ktir_cpu/mlir_frontend/parser.py
@@ -136,3 +192,77 @@ index 7da757b..f0ed96a 100644
      "softmax_kernel_small": [
          {
              "path": "latency/softmax_small.mlir",
+diff --git a/tests/mlir_frontend/test_gelu_decompose.py b/tests/mlir_frontend/test_gelu_decompose.py
+new file mode 100644
+index 0000000..99953bd
+--- /dev/null
++++ b/tests/mlir_frontend/test_gelu_decompose.py
+@@ -0,0 +1,68 @@
++"""`ktdp.gelu` decomposition -- MLIR-frontend only.
++
++`ktdp.gelu` is not in RFC 0682 (docs/gap_analysis.md row 2e) and the regex
++parser has no notion of it at all -- there is no decomposition mechanism
++outside the real MLIR pass pipeline, so unlike every other fixture in this
++tree, this one cannot be run through the base `KTIRParser` and is not
++registered as a `TestXxxExecution` base class in `test_examples.py` for an
++Adapt subclass to extend. It is MLIRFrontendParser-only, by construction.
++"""
++
++import numpy as np
++import pytest
++
++from conftest import get_test_params  # noqa: F401 -- re-exported for subpackage tests
++
++try:
++    import mlir_ktdp  # noqa: F401
++except ImportError:
++    pytest.skip("mlir_ktdp not installed", allow_module_level=True)
++
++from ktir_cpu import KTIRInterpreter
++from ktir_cpu.mlir_frontend.parser import MLIRFrontendParser
++
++
++def _tanh_approx_gelu(x: np.ndarray) -> np.ndarray:
++    """The reference `DecomposeKTDPCompute` is checked against -- same
++    formula, independently expressed, so this test does not just restate
++    the pass's own arithmetic back at itself."""
++    xf = x.astype(np.float32)
++    inner = xf + 0.044715 * xf**3
++    return (0.5 * xf * (1.0 + np.tanh(0.7978845608 * inner))).astype(np.float16)
++
++
++class TestGeluDecompose:
++    """End-to-end execution of ktir/gelu.mlir.
++
++    `ktdp.gelu` cannot reach the interpreter's op dispatch
++    (`ktir_cpu/dialects/registry.py`) at all -- `MLIRFrontendParser.parse_module`
++    must have already run `--decompose-ktdp-compute` (unconditionally, before
++    `walk_module`) for this module to execute at all. A `NotImplementedError`
++    from `MLIRTypeAdapter.adapt_op` here would mean that step did not run.
++    """
++
++    def _make_interp(self):
++        return KTIRInterpreter(parser=MLIRFrontendParser())
++
++    @pytest.mark.parametrize("path,func_name,entry", get_test_params("gelu"))
++    def test_gelu(self, path, func_name, entry):
++        interp = self._make_interp()
++        interp.load(path)
++
++        in_ptr, out_ptr = interp.arg_names(func_name)
++        sizes = interp.tensor_input_output_sizes(func_name)
++        shape = tuple(sizes[in_ptr]["shape"])
++
++        src = np.linspace(-3.0, 3.0, num=int(np.prod(shape)), dtype=np.float32)
++        src = src.reshape(shape).astype(np.float16)
++        out = np.zeros(tuple(sizes[out_ptr]["shape"]), dtype=np.float16)
++
++        outputs = interp.execute_function(func_name, **{in_ptr: src, out_ptr: out})
++
++        result = outputs[out_ptr]
++        assert result.shape == tuple(sizes[out_ptr]["shape"])
++        np.testing.assert_allclose(
++            result.astype(np.float32),
++            _tanh_approx_gelu(src).astype(np.float32),
++            rtol=1e-2, atol=1e-2,
++        )

@@ -97,6 +97,123 @@ index 3e0b149..792d722 100644
    }];
  
    let cppNamespace = "::mlir::ktdp";
+diff --git a/include/ktir/Dialect/KTDP/Transforms/CMakeLists.txt b/include/ktir/Dialect/KTDP/Transforms/CMakeLists.txt
+new file mode 100644
+index 0000000..b09f42d
+--- /dev/null
++++ b/include/ktir/Dialect/KTDP/Transforms/CMakeLists.txt
+@@ -0,0 +1,3 @@
++set(LLVM_TARGET_DEFINITIONS Passes.td)
++mlir_tablegen(Passes.h.inc -gen-pass-decls -name KTDPTransforms)
++add_ktir_tablegen_target(KTIRKTDPTransformsPassesIncGen)
+diff --git a/include/ktir/Dialect/KTDP/Transforms/Passes.h b/include/ktir/Dialect/KTDP/Transforms/Passes.h
+new file mode 100644
+index 0000000..2cc9f5a
+--- /dev/null
++++ b/include/ktir/Dialect/KTDP/Transforms/Passes.h
+@@ -0,0 +1,36 @@
++//===- Passes.h - KTDP compute-op transform pass registration -*- C++ -*-===//
++//
++// Copyright 2026 The KTIR Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef KTDP_TRANSFORMS_PASSES_H
++#define KTDP_TRANSFORMS_PASSES_H
++
++#include "mlir/Pass/Pass.h"
++
++namespace ktir {
++
++#define GEN_PASS_DECL
++#include "ktir/Dialect/KTDP/Transforms/Passes.h.inc"
++
++// Pull in generated pass registration helpers.
++#define GEN_PASS_REGISTRATION
++#include "ktir/Dialect/KTDP/Transforms/Passes.h.inc"
++#undef GEN_PASS_REGISTRATION
++
++} // namespace ktir
++
++#endif // KTDP_TRANSFORMS_PASSES_H
+diff --git a/include/ktir/Dialect/KTDP/Transforms/Passes.td b/include/ktir/Dialect/KTDP/Transforms/Passes.td
+new file mode 100644
+index 0000000..f92c7e5
+--- /dev/null
++++ b/include/ktir/Dialect/KTDP/Transforms/Passes.td
+@@ -0,0 +1,60 @@
++//===- Passes.td - KTDP compute-op transform pass definitions -*- tablegen -*-===//
++//
++// Copyright 2026 The KTIR Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++//===----------------------------------------------------------------------===//
++//
++// This file defines passes whose subject is the KTDP dialect's own
++// device-neutral compute intrinsics (`Ktdp_IntrinsicOp`-derived ops, e.g.
++// `ktdp.gelu`) -- not its memory/access abstractions, which have no compute
++// to decompose.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef KTDP_TRANSFORMS_PASSES_TD
++#define KTDP_TRANSFORMS_PASSES_TD
++
++include "mlir/Pass/PassBase.td"
++
++def DecomposeKTDPCompute : Pass<"decompose-ktdp-compute", "::mlir::ModuleOp"> {
++  let summary = "Decompose device-neutral KTDP compute intrinsics into "
++                "generic arith/math ops";
++  let description = [{
++    A `Ktdp_IntrinsicOp`-derived op (e.g. `ktdp.gelu`) names a request for a
++    specific compute intrinsic without naming a device. A backend with a real
++    hardware op for it (Spyre) lowers it directly; a backend with none --
++    `ktir_cpu`, today the only such consumer -- instead needs a reference
++    implementation it already knows how to interpret. This pass is that
++    reference: it replaces each KTDP intrinsic with the equivalent `arith`/
++    `math` computation on the same tensor type, so that after it runs, no
++    `Ktdp_IntrinsicOp` survives anywhere in the module.
++
++    `ktdp.gelu` decomposes to the tanh approximation:
++
++      0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x^3)))
++
++    computed directly on the operand's tensor type -- no `linalg`, since the
++    op is still tensor-level when this pass runs (scalarization, where it
++    happens at all, is a later, Spyre-specific concern this pass does not
++    need and does not perform).
++  }];
++
++  let dependentDialects = [
++    "mlir::arith::ArithDialect",
++    "mlir::math::MathDialect"
++  ];
++}
++
++#endif // KTDP_TRANSFORMS_PASSES_TD
 diff --git a/lib/CAPI/Dialect/CMakeLists.txt b/lib/CAPI/Dialect/CMakeLists.txt
 index b8f6b7e..c65b842 100644
 --- a/lib/CAPI/Dialect/CMakeLists.txt
@@ -145,6 +262,222 @@ index 6aae7fb..2a6a6df 100644
  )
 +
 +add_subdirectory(Transforms)
+diff --git a/lib/Dialect/KTDP/Transforms/CMakeLists.txt b/lib/Dialect/KTDP/Transforms/CMakeLists.txt
+new file mode 100644
+index 0000000..c479fbe
+--- /dev/null
++++ b/lib/Dialect/KTDP/Transforms/CMakeLists.txt
+@@ -0,0 +1,23 @@
++add_ktir_library(KTIRKTDPTransforms
++    DecomposeKTDPCompute.cpp
++
++  ADDITIONAL_HEADER_DIRS
++    ${PROJECT_SOURCE_DIR}/include/ktir/Dialect/KTDP/Transforms
++    ${PROJECT_BINARY_DIR}/include/ktir/Dialect/KTDP/Transforms
++
++  GROUP DIALECT
++  EXPORT_NAME KTDPTransforms
++
++  DEPENDS
++    KTIRKTDPTransformsPassesIncGen
++
++  LINK_LIBS PUBLIC
++    KTIRKtdpDialect
++
++  LINK_MLIR_LIBS
++    MLIRPass
++    MLIRTransforms
++    MLIRArithDialect
++    MLIRMathDialect
++    MLIRTransformUtils
++)
+diff --git a/lib/Dialect/KTDP/Transforms/DecomposeKTDPCompute.cpp b/lib/Dialect/KTDP/Transforms/DecomposeKTDPCompute.cpp
+new file mode 100644
+index 0000000..5a9d677
+--- /dev/null
++++ b/lib/Dialect/KTDP/Transforms/DecomposeKTDPCompute.cpp
+@@ -0,0 +1,134 @@
++//===- DecomposeKTDPCompute.cpp - Decompose KTDP compute intrinsics ------===//
++//
++// Copyright 2026 The KTIR Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++//===----------------------------------------------------------------------===//
++//
++// Replaces each `Ktdp_IntrinsicOp`-derived op with the equivalent `arith`/
++// `math` computation on the same tensor type. See the summary in Passes.td
++// for why this exists: a backend with no `spyreop` support (ktir_cpu, today
++// the only one) needs a reference implementation it already knows how to
++// interpret, and this pass is that reference.
++//
++//===----------------------------------------------------------------------===//
++
++#include "ktir/Dialect/KTDP/Transforms/Passes.h"
++
++#include "ktir/Dialect/KTDP/KTDP.h"
++#include "ktir/Dialect/KTDP/KTDPDialect.h"
++
++#include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/Dialect/Math/IR/Math.h"
++#include "mlir/IR/Builders.h"
++#include "mlir/IR/BuiltinTypes.h"
++#include "mlir/IR/PatternMatch.h"
++#include "mlir/Pass/Pass.h"
++#include "llvm/ADT/APFloat.h"
++
++using namespace mlir;
++
++namespace ktir {
++#define GEN_PASS_DEF_DECOMPOSEKTDPCOMPUTE
++#include "ktir/Dialect/KTDP/Transforms/Passes.h.inc"
++} // namespace ktir
++
++namespace {
++
++/// A scalar float constant splatted to `type`, which must be a statically
++/// shaped tensor -- the only shape a `arith.constant` can carry directly, a
++/// dynamically shaped operand would need `tensor.splat` with explicit
++/// dynamic-extent operands instead, which this pass does not build (see the
++/// static-shape check in `DecomposeGeLU`, below).
++Value splatConstant(OpBuilder &builder, Location loc, RankedTensorType type,
++                    double value) {
++  auto elementType = cast<FloatType>(type.getElementType());
++  APFloat apValue(value);
++  bool losesInfo;
++  apValue.convert(elementType.getFloatSemantics(), APFloat::rmNearestTiesToEven,
++                  &losesInfo);
++  return arith::ConstantOp::create(
++      builder, loc, DenseElementsAttr::get(type, llvm::ArrayRef(apValue)));
++}
++
++/// `ktdp.gelu` -> the tanh approximation, in plain `arith`/`math` on the
++/// operand's own tensor type:
++///
++///   0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x^3)))
++///
++/// No `linalg`: the op is still tensor-level when this pass runs (nothing
++/// upstream of it has scalarized anything), and this pass has no reason to
++/// introduce scalarization itself -- that is a later, Spyre-specific
++/// concern (see `LowerSpyreOps`'s `SelectKtdpGeLU` pattern, in the Triton
++/// fork, which relies on the *generic* `-convert-elementwise-to-linalg`
++/// pass instead of a bespoke one). This pass's only job is to leave behind
++/// ops a non-Spyre interpreter already understands.
++///
++/// A direct `IRRewriter` walk, not `applyPatternsGreedily`: the greedy
++/// driver's worklist unconditionally erases any `Pure` op it visits with no
++/// uses (`isOpTriviallyDead`, independent of `GreedyRewriteConfig`'s region-
++/// simplification toggle) -- for a whole-module pass that visits every op
++/// in the IR, not just `ktdp.gelu`. This pass must leave every op it does
++/// not itself decompose untouched.
++LogicalResult decomposeGeLU(ktdp::GeLUOp op, IRRewriter &rewriter) {
++  auto type = dyn_cast<RankedTensorType>(op.getType());
++  if (!type || !type.hasStaticShape())
++    return op.emitError(
++        "decompose-ktdp-compute: only a statically shaped operand is "
++        "supported today");
++
++  Location loc = op.getLoc();
++  Value x = op.getOperand();
++  rewriter.setInsertionPoint(op);
++
++  Value c0 = splatConstant(rewriter, loc, type, 0.044715);
++  Value c1 = splatConstant(rewriter, loc, type, 0.7978845608);
++  Value half = splatConstant(rewriter, loc, type, 0.5);
++  Value one = splatConstant(rewriter, loc, type, 1.0);
++
++  // inner = x + 0.044715 * x^3
++  Value x2 = arith::MulFOp::create(rewriter, loc, x, x);
++  Value x3 = arith::MulFOp::create(rewriter, loc, x2, x);
++  Value cubic = arith::MulFOp::create(rewriter, loc, c0, x3);
++  Value inner = arith::AddFOp::create(rewriter, loc, x, cubic);
++
++  // t = tanh(0.7978845608 * inner)
++  Value scaled = arith::MulFOp::create(rewriter, loc, c1, inner);
++  Value t = math::TanhOp::create(rewriter, loc, scaled);
++
++  // result = 0.5 * x * (1 + t)
++  Value onePlusT = arith::AddFOp::create(rewriter, loc, one, t);
++  Value halfX = arith::MulFOp::create(rewriter, loc, half, x);
++  Value result = arith::MulFOp::create(rewriter, loc, halfX, onePlusT);
++
++  rewriter.replaceOp(op, result);
++  return success();
++}
++
++struct DecomposeKTDPComputePass
++    : public ktir::impl::DecomposeKTDPComputeBase<DecomposeKTDPComputePass> {
++
++  void runOnOperation() override {
++    IRRewriter rewriter(&getContext());
++    auto result = getOperation().walk([&](ktdp::GeLUOp op) {
++      if (failed(decomposeGeLU(op, rewriter)))
++        return WalkResult::interrupt();
++      return WalkResult::advance();
++    });
++    if (result.wasInterrupted())
++      signalPassFailure();
++  }
++};
++
++} // namespace
+diff --git a/test/Dialect/KTDP/Transforms/decompose-gelu.mlir b/test/Dialect/KTDP/Transforms/decompose-gelu.mlir
+new file mode 100644
+index 0000000..eaacb4f
+--- /dev/null
++++ b/test/Dialect/KTDP/Transforms/decompose-gelu.mlir
+@@ -0,0 +1,24 @@
++// RUN: ktir-opt "%s" --decompose-ktdp-compute | FileCheck "%s"
++
++// CHECK-LABEL:   func.func @gelu(
++// CHECK-SAME:                    %[[VAL_0:.*]]: tensor<128xf16>) -> tensor<128xf16> {
++// CHECK:           %[[VAL_1:.*]] = arith.constant dense<{{.*}}> : tensor<128xf16>
++// CHECK:           %[[VAL_2:.*]] = arith.constant dense<{{.*}}> : tensor<128xf16>
++// CHECK:           %[[VAL_3:.*]] = arith.constant dense<{{.*}}> : tensor<128xf16>
++// CHECK:           %[[VAL_4:.*]] = arith.constant dense<{{.*}}> : tensor<128xf16>
++// CHECK:           %[[VAL_5:.*]] = arith.mulf %[[VAL_0]], %[[VAL_0]] : tensor<128xf16>
++// CHECK:           %[[VAL_6:.*]] = arith.mulf %[[VAL_5]], %[[VAL_0]] : tensor<128xf16>
++// CHECK:           %[[VAL_7:.*]] = arith.mulf %[[VAL_1]], %[[VAL_6]] : tensor<128xf16>
++// CHECK:           %[[VAL_8:.*]] = arith.addf %[[VAL_0]], %[[VAL_7]] : tensor<128xf16>
++// CHECK:           %[[VAL_9:.*]] = arith.mulf %[[VAL_2]], %[[VAL_8]] : tensor<128xf16>
++// CHECK:           %[[VAL_10:.*]] = math.tanh %[[VAL_9]] : tensor<128xf16>
++// CHECK:           %[[VAL_11:.*]] = arith.addf %[[VAL_4]], %[[VAL_10]] : tensor<128xf16>
++// CHECK:           %[[VAL_12:.*]] = arith.mulf %[[VAL_3]], %[[VAL_0]] : tensor<128xf16>
++// CHECK:           %[[VAL_13:.*]] = arith.mulf %[[VAL_12]], %[[VAL_11]] : tensor<128xf16>
++// CHECK:           return %[[VAL_13]] : tensor<128xf16>
++// CHECK:         }
++// CHECK-NOT:     ktdp.gelu
++func.func @gelu(%x: tensor<128xf16>) -> tensor<128xf16> {
++  %y = ktdp.gelu %x : tensor<128xf16>
++  return %y : tensor<128xf16>
++}
+diff --git a/test/Dialect/KTDP/gelu-roundtrip.mlir b/test/Dialect/KTDP/gelu-roundtrip.mlir
+new file mode 100644
+index 0000000..ef3a105
+--- /dev/null
++++ b/test/Dialect/KTDP/gelu-roundtrip.mlir
+@@ -0,0 +1,11 @@
++// RUN: ktir-opt "%s" | ktir-opt | FileCheck "%s"
++
++// CHECK-LABEL:   func.func @gelu(
++// CHECK-SAME:                    %[[VAL_0:.*]]: tensor<128xf16>) -> tensor<128xf16> {
++// CHECK:           %[[VAL_1:.*]] = ktdp.gelu %[[VAL_0]] : tensor<128xf16>
++// CHECK:           return %[[VAL_1]] : tensor<128xf16>
++// CHECK:         }
++func.func @gelu(%x: tensor<128xf16>) -> tensor<128xf16> {
++  %y = ktdp.gelu %x : tensor<128xf16>
++  return %y : tensor<128xf16>
++}
 diff --git a/tools/ktir-opt/ktir-opt.cpp b/tools/ktir-opt/ktir-opt.cpp
 index 95a4b75..b9351e7 100644
 --- a/tools/ktir-opt/ktir-opt.cpp
