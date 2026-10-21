@@ -117,4 +117,37 @@ LogicalResult PinOp::verify() {
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// tts.spyre_op
+//===----------------------------------------------------------------------===//
+
+LogicalResult SpyreOpOp::verify() {
+  // A hard-coded check, not a table lookup -- there is exactly one
+  // registered intrinsic today. It generalizes into a real table (arity,
+  // dtype, result-shape rules, keyed by name) once a second intrinsic
+  // exists; see the note in TTSOps.td.
+  StringRef name = getName();
+  if (name != "gelu")
+    return emitError() << "tts.spyre_op: '" << name
+                       << "' names no registered intrinsic; the only one "
+                          "registered today is 'gelu'";
+
+  // `gelu`'s real hardware op (`spyreop.gelu`) is F16-only -- no F32, no
+  // DF16 at this level either, since DF16 is not a real frontend type yet.
+  // `SameOperandsAndResultType` is not available here (operand/result are
+  // declared independently, unlike `ktdp.gelu`'s `Ktdp_IntrinsicOp`), so
+  // both the element type and the operand/result agreement are checked by
+  // hand.
+  auto inputType = cast<RankedTensorType>(getInput().getType());
+  auto resultType = cast<RankedTensorType>(getResult().getType());
+  if (!inputType.getElementType().isF16())
+    return emitError() << "tts.spyre_op(\"gelu\"): operand must be a tensor "
+                          "of f16, got "
+                       << inputType;
+  if (resultType != inputType)
+    return emitError() << "tts.spyre_op(\"gelu\"): result type " << resultType
+                       << " must match the operand type " << inputType;
+  return success();
+}
+
 } // namespace mlir::triton::tts

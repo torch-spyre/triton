@@ -101,6 +101,7 @@
 
 #include "Transforms/Passes.h"
 
+#include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/SpyreOp/SpyreOp.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
@@ -620,6 +621,13 @@ struct LowerSpyreOpsPass
     patterns.add<SelectUnaryFloat<math::SqrtOp, spyreop::Sqrt>,
                  SelectUnaryFloat<math::ExpOp, spyreop::Exp>,
                  SelectUnaryFloat<math::RsqrtOp, spyreop::RSqrt>>(ctx);
+    // Same shape, different family: an EXPLICIT request (`ktdp.gelu`, from
+    // `tl.spyre_op("gelu", x)`) rather than a transparent one. The template
+    // doesn't care which -- `ktdp.gelu` scalarizes into the same
+    // one-operand/one-result form `math.sqrt` does, by the time this pass
+    // sees it (see ConvertElementwiseToLinalg, which the KTDP op's
+    // `Elementwise` trait makes pick it up for free).
+    patterns.add<SelectUnaryFloat<ktdp::GeLUOp, spyreop::GeLU>>(ctx);
 
     // Upstream's, and load-bearing rather than tidying: a group rule that stops
     // reading a block argument leaves an `ins` operand, that argument and its

@@ -13,6 +13,7 @@
 # very often still link.  Treat this list as documentation that has to be right
 # rather than as something the build will check.
 add_triton_library(TritonToKTIR
+  ConvertSpyreOpToKTDP.cpp
   LowerDescriptorMemory.cpp
   LowerScalarLoad.cpp
   LowerComputeOps.cpp

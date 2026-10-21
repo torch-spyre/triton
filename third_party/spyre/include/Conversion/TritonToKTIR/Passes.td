@@ -29,6 +29,32 @@ include "mlir/Pass/PassBase.td"
 //   - the `ktir` stage in third_party/spyre/backend/compiler.py
 // ============================================================================
 
+def ConvertSpyreOpToKTDP : Pass<"convert-spyre-op-to-ktdp", "mlir::ModuleOp"> {
+    let summary = "Convert tts.spyre_op to its device-neutral ktdp.* mirror.";
+    let description = [{
+        Input: TTIR — a `tts.spyre_op "name"` request, as traced from
+        `tl.spyre_op(name, x)`. Carries no region and no fallback body, so
+        there is nothing to inline and nothing to tag — this is a 1:1
+        rename, not a staging-and-recovery problem.
+
+        Lowering:
+        - tts.spyre_op "gelu" → ktdp.gelu
+
+        Runs first in the pipeline (see Pipeline.cpp): nothing else needs
+        to run before it, and converting immediately after tracing means
+        every later `_make_ktir` pass only ever sees `ktdp.gelu`, never
+        `tts.spyre_op`.
+
+        Output: no `tts.spyre_op` remains. `ktdp.gelu` is still
+        tensor-level — scalarizing it is a later, Spyre-specific concern
+        (see `LowerSpyreOps`'s `SelectKtdpGeLU` pattern), not this pass's.
+    }];
+
+    let dependentDialects = [
+        "mlir::ktdp::KtdpDialect"
+    ];
+}
+
 def LowerDescriptorMemory : Pass<"lower-descriptor-memory", "mlir::ModuleOp"> {
     let summary = "Lower tt.descriptor_* ops to ktdp memory ops.";
     let description = [{
