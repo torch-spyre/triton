@@ -88,7 +88,7 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
 
 void init_triton_spyre_ir_builders(py::module &&m) {
   // Op builders for the `tts` dialect, called from the Triton frontend --
-  // tl.spyre_tensor_layout and tl.spyre_pin, through
+  // tl.spyre_tensor_layout, tl.spyre_pin and tl.spyre_intrinsic, through
   // triton.language.semantic.
   //
   // The frontend reaches this as `from triton._C.libtriton import spyre`, lazily
@@ -165,6 +165,37 @@ void init_triton_spyre_ir_builders(py::module &&m) {
       },
       py::arg("builder"), py::arg("value"), py::arg("memory_space"),
       py::arg("offset") = py::none());
+
+  // tl.spyre_intrinsic. The op is built EMPTY and returned, and the frontend
+  // then traces the registered fallback into its region -- the shape
+  // `create_reduce` has, since a region belongs to an op and so the op has to
+  // exist first. That is also why the result types are an argument rather than
+  // read off the body: the frontend passes operand 0's type, and the region
+  // verifier holds the yield to it.
+  //
+  // `target` is not checked here. Which targets exist is the registry's, in the
+  // backend's Python, and semantic.py refuses an unknown one before this runs;
+  // the op's verifier then checks that it is a registered op.
+  m.def(
+      "create_spyre_intrinsic",
+      [](TritonOpBuilder &self, const std::string &target,
+         std::vector<mlir::Value> &inputs,
+         std::vector<mlir::Type> &resultTypes) -> mlir::OpState {
+        // LOAD, not register -- see create_tensor_layout above.
+        self.getContext()->loadDialect<mlir::triton::tts::TTSDialect>();
+        return self.create<mlir::triton::tts::SpyreIntrinsicOp>(
+            mlir::TypeRange(resultTypes),
+            self.getBuilder().getStringAttr(target), mlir::ValueRange(inputs));
+      },
+      py::arg("builder"), py::arg("target"), py::arg("inputs"),
+      py::arg("result_types"));
+  m.def(
+      "create_spyre_intrinsic_yield",
+      [](TritonOpBuilder &self, std::vector<mlir::Value> &values) -> void {
+        self.create<mlir::triton::tts::SpyreIntrinsicYieldOp>(
+            mlir::ValueRange(values));
+      },
+      py::arg("builder"), py::arg("values"));
 }
 
 /// One `tts.tensor_layout` marker, reduced to what a footprint is computed from.
@@ -404,6 +435,21 @@ void init_triton_spyre_ir_utils(py::module &&m) {
             d["elem_type"] = elemStr;
           }
           return d;
+        });
+
+  // is_registered_op: whether `name` is an op `context` registers -- the
+  // question tts.spyre_intrinsic's region verifier asks of its `target`, asked
+  // here of `backend/intrinsics.py`'s registration so a misspelled target is
+  // refused where it is written. RegisteredOperationName::lookup finds only the
+  // ops of a LOADED dialect, and `spyre.load_dialects` only registers, so tts
+  // is loaded first, which loads spyreop, its dependent dialect and the one the
+  // targets are in. Any other dialect counts as it would at verification: only
+  // if something has loaded it.
+  m.def("is_registered_op",
+        [](mlir::MLIRContext &context, const std::string &name) -> bool {
+          context.loadDialect<mlir::triton::tts::TTSDialect>();
+          return mlir::RegisteredOperationName::lookup(name, &context)
+              .has_value();
         });
 }
 

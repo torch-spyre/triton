@@ -8,6 +8,12 @@ def TTS_Dialect : Dialect {
 
   let cppNamespace = "::mlir::triton::tts";
 
+  // A `tts.spyre_intrinsic` names the op its call site becomes, and the
+  // verifiers check that the name is a registered op. Every target today is
+  // spyreop's, so loading this dialect loads that one, wherever the request is
+  // built or parsed.
+  let dependentDialects = ["::mlir::spyreop::SpyreOpDialect"];
+
   let summary = "Triton-to-Spyre authoring annotations";
 
   let description = [{
@@ -44,6 +50,12 @@ def TTS_Dialect : Dialect {
     descriptor became, a pin names a value and lands on the op producing it.
     What does not differ is that the value of either is built out of builtin
     attributes only.
+
+    The third op, `tts.spyre_intrinsic`, is a request for one spyreop intrinsic
+    and holds a body rather than naming a value, so it is not a marker; it is
+    bound by the same rule all the same, and its attribute shares its name as
+    theirs do. `LowerTTSMarkers` inlines the body and leaves the request as the
+    `tts.spyre_intrinsic` attribute on every op it inlined.
   }];
 
   let extraClassDeclaration = [{
@@ -109,6 +121,67 @@ def TTS_Dialect : Dialect {
     /// The two entry names of that dictionary.
     static constexpr ::llvm::StringLiteral kMemorySpaceName = "memory_space";
     static constexpr ::llvm::StringLiteral kOffsetName = "offset";
+
+    /// Which `tts.spyre_intrinsic` call site an op was inlined from, as a
+    /// `DictionaryAttr` on every op `LowerTTSMarkers` inlined out of that op's
+    /// body:
+    ///
+    ///   target   : the op the call site names, the op's `target`, as the
+    ///              string of a registered operation name
+    ///   id       : an `i64` unique per `tts.spyre_intrinsic` in the module, so
+    ///              two call sites of the same target stay distinguishable
+    ///              after both are inlined into one function. It alone says
+    ///              which call site an op is of: the ops of one call site carry
+    ///              different dictionaries, since `operands` is per op
+    ///   arity    : an `i64`, the call site's operand count, on every op of it
+    ///   operands : on an op reading a call operand directly, and only there, a
+    ///              `DenseI64ArrayAttr` with one entry per operand of the op it
+    ///              sits on: the index of the call operand that operand IS, or
+    ///              -1 when it is not one (a value computed in the body, or a
+    ///              constant). E.g. `array<i64: 1, -1>` on the `arith.divf` of
+    ///              `b / t`, `b` the call's operand 1
+    ///
+    /// `operands` is the call site's operand order, written when it is known
+    /// exactly -- LowerTTSMarkers replacing block argument k with call operand
+    /// k -- because nothing later can recover it: a generic's block arguments
+    /// follow its `ins`, which ConvertElementwiseToLinalg orders by the first
+    /// op's operands and fusion splices and deduplicates. It is per operand of
+    /// an op, and what it says depends on the op:
+    ///
+    ///   - on a NON-COMMUTATIVE op, positions are exact. Every pass between
+    ///     the tagging and selection keeps such an op's operand order:
+    ///     ConvertElementwiseToLinalg gives operand j of the scalar op block
+    ///     argument j, whose `ins` operand is the tensor op's operand j; fusion
+    ///     and the layout rewrite clone body ops whole; and a rewrite replacing
+    ///     a hinted op keeps lhs and rhs and copies its `tts` attributes.
+    ///   - on a COMMUTATIVE op, the binding is a set: which call operands the
+    ///     op reads, not at which positions. The one transformation that
+    ///     permutes operands, the commutative trait fold any folding driver
+    ///     applies, moves constants after the other operands, and fires only
+    ///     on an op where operand order does not matter.
+    ///
+    /// LowerSpyreIntrinsicCalls reads it that way; see matchCallSite.
+    ///
+    /// On the ops and not on what they become: ConvertElementwiseToLinalg
+    /// writes a tensor op's attributes onto the scalar op it puts in the body,
+    /// and fusion and the layout rewrite clone body ops whole, while every
+    /// pass that rebuilds a `linalg.generic` drops the generic's own
+    /// attributes. FuseComputeAndDataMovement fuses two generics whose bodies
+    /// carry one call site, and LowerSpyreIntrinsicCalls replaces the body the
+    /// call site became with the op `target` names. What is checked about it,
+    /// and where, is stated once, in `tts.spyre_intrinsic`'s description.
+    ///
+    /// Builtin-valued like the two above, so the `ktir` artifact carrying it
+    /// parses in a consumer that does not load this dialect.
+    static constexpr ::llvm::StringLiteral kSpyreIntrinsicAttrName =
+        "tts.spyre_intrinsic";
+
+    /// The entry names of that dictionary.
+    static constexpr ::llvm::StringLiteral kSpyreIntrinsicTargetKey = "target";
+    static constexpr ::llvm::StringLiteral kSpyreIntrinsicIdKey = "id";
+    static constexpr ::llvm::StringLiteral kSpyreIntrinsicArityKey = "arity";
+    static constexpr ::llvm::StringLiteral kSpyreIntrinsicOperandsKey =
+        "operands";
   }];
 
   let hasOperationAttrVerify = 1;

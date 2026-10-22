@@ -49,7 +49,11 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
   pm.addPass(mlir::createCanonicalizerPass());
 
   // LAST, and after that canonicalize rather than before it. Each tts marker op's
-  // annotation -> an attribute on the op the marked value resolved to.
+  // annotation -> an attribute on the op the marked value resolved to, and each
+  // tts.spyre_intrinsic -> its fallback body inlined, every op tagged
+  // `tts.spyre_intrinsic`. The body's tt ops were lowered in place by
+  // LowerComputeOps, above, so what is inlined is already this stage's output
+  // dialects.
   //
   // Bounded below by two passes, one per marker. LowerDescriptorMemory, because a
   // tts.tensor_layout lands on the memory view that pass builds, reached through
@@ -178,6 +182,11 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // Every coordinate change becomes an `indexing_maps` entry on the generic that
   // consumes it, so nothing whose only effect is to re-index survives.
   //
+  // It also fuses the generics holding one `tl.spyre_intrinsic` request's
+  // fallback into one body, which LowerSpyreIntrinsicCalls needs, and which has
+  // to happen on this side of the layout pass: see the clause in that pass's
+  // header.
+  //
   // Both neighbours fix the position. It must follow the three passes above,
   // which are what make every compute a linalg.generic: the fusion it drives
   // matches generic -> generic, so a named producer or consumer blocks it whatever
@@ -198,20 +207,17 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // is logical.
   pm.addPass(ktdp::createRewriteDescriptorLayoutGeneric());
 
-  // The cleanup belonging to the pass above, moved across the boundary with it.
-  // Physicalization emits an arith.divsi/remsi per access-tile index and a cast
-  // chain per retyped value; the `ktir` stage's tail canonicalize used to fold the
-  // static ones and now runs before them. Nothing else here would -- the
-  // canonicalize and CSE below are inside the bind-base-addresses branch, which a
-  // device launch does not take -- so omitting this hands dbo-opt the unfolded form
-  // on exactly the path that matters. Observed as a nondeterministic dbo-opt crash,
-  // not a diagnostic.
+  // Requested selection: each `tl.spyre_intrinsic` call site's fallback body
+  // becomes the op the call names, and a request not selected is an error. Its
+  // own pass, ahead of the implicit selection below, because the two fail
+  // oppositely -- an explicit request unmatched is refused, an arith op
+  // unmatched flows through -- and because a fallback's ops are arith and math
+  // that the implicit rules would otherwise select one by one.
   //
-  // Canonicalize only, for the reason the `ktir` stage's header gives: on an
-  // author-written HBM round trip a store's ktdp.construct_access_tile and the
-  // matching load's are both Pure over the same block, so CSE merges them and
-  // dbo-opt's compute-group extraction aborts. See issue #161.
-  pm.addPass(mlir::createCanonicalizerPass());
+  // Needs FuseComputeAndDataMovement, well above, to have made each call site
+  // one body, and that before the layout rewrite: after it the request's first
+  // generic keeps a linearizing result map that fusion cannot fuse through.
+  pm.addPass(createLowerSpyreIntrinsicCallsPass());
 
   // Instruction selection: the arith and math ops in each compute body become the
   // spyreop intrinsics that do the same thing. One pass for all of it -- the
@@ -232,6 +238,28 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // Nothing is reported here. An op with no device form flows through to dbo-opt,
   // which is the component that knows what it can take.
   pm.addPass(createLowerSpyreOpsPass());
+
+  // The cleanup belonging to the layout pass, moved across the boundary with
+  // it. Physicalization emits an arith.divsi/remsi per access-tile index and a
+  // cast chain per retyped value; the `ktir` stage's tail canonicalize used to
+  // fold the static ones and now runs before them. Nothing else here would --
+  // the canonicalize and CSE below are inside the bind-base-addresses branch,
+  // which a device launch does not take -- so omitting this hands dbo-opt the
+  // unfolded form on exactly the path that matters. Observed as a
+  // nondeterministic dbo-opt crash, not a diagnostic.
+  //
+  // Canonicalize only, for the reason the `ktir` stage's header gives: on an
+  // author-written HBM round trip a store's ktdp.construct_access_tile and the
+  // matching load's are both Pure over the same block, so CSE merges them and
+  // dbo-opt's compute-group extraction aborts. See issue #161.
+  //
+  // After LowerSpyreIntrinsicCalls, not directly after the layout pass. Its
+  // arith patterns replace an op by a new one built without the original's
+  // discardable attributes, so on a `tl.spyre_intrinsic` call site they would
+  // drop the `tts.spyre_intrinsic` attribute that pass reads. Nothing it folds
+  // is selected by either pass: the index arithmetic is outside every compute
+  // body.
+  pm.addPass(mlir::createCanonicalizerPass());
 
   if (options.bindBaseAddresses) {
     // The one genuine choice in this stage: symbolic and bound are real
