@@ -12,6 +12,8 @@
 // Case 1 is a store and a load through one view on separate access tiles, case 2
 // the same through ONE access tile (the shape CSE leaves), which the pass splits
 // into one physical tile per direction, and case 3 a view that is only read.
+// Case 4 is case 2's shared tile under a layout with no splat dim, where both
+// directions keep the one physical tile.
 //
 // Captures are hand-named and this file is hand-maintained: do not regenerate it
 // with generate-test-checks.py.
@@ -194,6 +196,41 @@ tt.func @splat_read_only(%x_ptr: index, %stat_ptr: index, %out_ptr: index) {
   } -> tensor<64x128xf16>
   %ot = ktdp.construct_access_tile %out_desc[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
   ktdp.store %diff, %ot : tensor<64x128xf16>, <64x128xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 4 -- one access tile with a load and a store, under a stick-on-N layout
+// with no splat dim. The read block equals the write block, so the pass builds a
+// single physical tile and both users keep it.
+
+// CHECK-DAG: #[[$C4_SET:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+// CHECK-LABEL: tt.func @shared_tile_no_splat(
+// CHECK:         %[[V:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [2, 64, 64]
+// CHECK:         %[[T:.*]] = ktdp.construct_access_tile %[[V]]{{.*}} {access_tile_order = #{{.*}}, access_tile_set = #[[$C4_SET]]} : memref<2x64x64xf16> -> !ktdp.access_tile<2x64x64xindex>
+// CHECK-NOT:     ktdp.construct_access_tile
+// CHECK:         %[[L:.*]] = ktdp.load %[[T]] : <2x64x64xindex> -> tensor<2x64x64xf16>
+// CHECK:         ktdp.store %{{.*}}, %[[T]] : tensor<2x64x64xf16>, <2x64x64xindex>
+// CHECK:         tt.return
+tt.func @shared_tile_no_splat(%ptr: index) {
+  %c0 = arith.constant 0 : index
+  %v = ktdp.construct_memory_view %ptr, sizes: [64, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>}} : memref<64x128xf16>
+  %t = ktdp.construct_access_tile %v[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+  %l = ktdp.load %t : <64x128xindex> -> tensor<64x128xf16>
+  %e = tensor.empty() : tensor<64x128xf16>
+  %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel"]} ins(%l : tensor<64x128xf16>) outs(%e : tensor<64x128xf16>) {
+  ^bb0(%in: f16, %acc: f16):
+    %d = arith.addf %in, %in : f16
+    linalg.yield %d : f16
+  } -> tensor<64x128xf16>
+  ktdp.store %r, %t : tensor<64x128xf16>, <64x128xindex>
   tt.return
 }
 }

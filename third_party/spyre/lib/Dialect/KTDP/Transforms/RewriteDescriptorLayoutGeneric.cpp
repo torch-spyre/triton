@@ -1169,24 +1169,28 @@ struct RewriteDescriptorLayoutGenericPass
     return success();
   }
 
-  /// Build one physical tile per direction among an access tile's users and
-  /// point those users at it: `stores` at a tile of `physBlock`, `loads` at a
-  /// tile of its readBlock, each load's result retyped to that block. A
-  /// direction with no users gets no tile.
+  /// Build the physical tiles for an access tile's users and point those users
+  /// at them: `stores` at a tile of `physBlock`, `loads` at a tile of its
+  /// readBlock, each load's result retyped to that block. The two directions
+  /// share one tile when the blocks are equal, i.e. when the layout has no
+  /// splat dim. A direction with no users gets no tile.
   static LogicalResult buildTilesPerDirection(
       const CoordMap &cm, ArrayRef<int64_t> physBlock,
       ArrayRef<mlir::ktdp::LoadOp> loads, ArrayRef<mlir::ktdp::StoreOp> stores,
       llvm::function_ref<FailureOr<Value>(ArrayRef<int64_t>)> buildTile) {
+    SmallVector<int64_t> block = readBlock(cm, physBlock);
+    bool shared = ArrayRef<int64_t>(block) == physBlock;
+    FailureOr<Value> writeTile = failure();
     if (!stores.empty()) {
-      auto writeTile = buildTile(physBlock);
+      writeTile = buildTile(physBlock);
       if (failed(writeTile))
         return failure();
       for (auto st : stores)
         st.getAccessTileMutable().assign(*writeTile);
     }
     if (!loads.empty()) {
-      SmallVector<int64_t> block = readBlock(cm, physBlock);
-      auto readTile = buildTile(block);
+      FailureOr<Value> readTile =
+          shared && succeeded(writeTile) ? writeTile : buildTile(block);
       if (failed(readTile))
         return failure();
       for (auto ld : loads) {
@@ -1201,9 +1205,9 @@ struct RewriteDescriptorLayoutGenericPass
 
   /// Physicalize one direct access tile over the already-physical `physMemView`.
   ///
-  /// One physical tile per direction among the tile's users — see
-  /// buildTilesPerDirection. A tile with both kinds of user becomes two tiles
-  /// over the same subscripts.
+  /// The physical tiles for the tile's users — see buildTilesPerDirection.
+  /// Under a splat layout, a tile with both kinds of
+  /// user becomes two tiles over the same subscripts.
   LogicalResult physicalizeAccessTile(mlir::ktdp::ConstructAccessTilesOp tileOp,
                                       Value physMemView, const CoordMap &cm) {
     OpBuilder b(tileOp);
@@ -1465,7 +1469,7 @@ struct RewriteDescriptorLayoutGenericPass
       newIndirect.push_back(tileOp.getIndirectMemrefs()[oldIndirectIdx]);
     }
 
-    // One physical tile per direction among the users, as for a direct tile.
+    // The physical tiles for the users, as for a direct tile.
     auto buildTile = [&](ArrayRef<int64_t> block) -> FailureOr<Value> {
       auto physTile = mlir::ktdp::ConstructIndirectAccessTilesOp::create(
           b, tileOp.getLoc(),
