@@ -15,13 +15,17 @@ serve the whole fixture: the output shape is the input's with axis 1 dropped.
 ## Variant hierarchy
 
 ```
-Level D  device               loop-free, stick-tiled; 5 variants, 4 launch
+Level D  device               loop-free, stick-tiled; 8 variants, 7 launch
          one_tile                   1 key (folds the NON-stick axis; launches)
          one_tile_on_stick          1 key (folds the STICK axis, split; ktir_cpu only)
          one_tile_on_stick_splat    1 key (the stick axis, statistic SPLAT; launches)
       -- the reduce's CONSUMER: out = x - sum(x, axis), statistic through HBM
          stat_chain_off_stick       1 key (launches; checked on both tiers)
-         stat_chain_on_stick        1 key (launches; ktir_cpu arm strict-xfailed)
+         stat_chain_off_stick_fp32  1 key (launches; checked on both tiers)
+         stat_chain_on_stick        1 key (launches; checked on both tiers)
+      -- softmax: the on-stick chain carried to its end
+         max_shift_exp_on_stick     1 key (launches; checked on both tiers)
+         softmax_on_stick           1 key (launches; checked on both tiers)
 
 Level C  layout                stick physicalization, one dtype per variant
          spyre_stick               1 key (fp16, stick on the REDUCED axis)
@@ -193,4 +197,11 @@ full tile. Both launch. What they needed was not a layout change but a pass:
 reading a statistic back is a Triton broadcast, which used to survive to the
 layout pass as a generic with no descriptor and get bridged with a linearizing
 operand map; `FuseComputeAndDataMovement` folds it into its consumer's map instead.
-The group banner in `meta.py` has the maps and the measurements.
+Each arm reads its statistic back through the same rank-1 descriptor that wrote
+it. On stick the statistic's layout is a splat, which the layout pass writes
+across the stick and reads at lane 0, so the kernel never names the stick width.
+The group banner in `meta.py` has the maps.
+
+**The third group — softmax.** `max_shift_exp_on_stick` (three groups, four
+buffers) and `softmax_on_stick` (six groups, all seven buffers) continue the
+on-stick chain, with every statistic a rank-1 splat.
