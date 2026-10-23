@@ -15,7 +15,11 @@
 //   => physical size [ceil(N/64), M, 64].
 // A splat dim replicates its source logical dim across `phys_arg` lanes
 // instead of partitioning it, so [M] -> phys_src=[0,0] phys_op=[0,3]
-// phys_arg=[0,64] gives physical size [M, 64].
+// phys_arg=[0,64] gives physical size [M, 64]. The view is that size in both
+// directions; an access is not. A write fills every lane: its access tile is
+// `phys_arg` wide on the splat dim and the generic supplying it names that dim
+// with a loop of its own. A read takes lane 0: its access tile is 1 wide there,
+// and the generic reading it names that dim with the constant 0 (#225).
 //
 // The layout sits ON the view rather than beside it, so the annotated view IS
 // the root of the rewrite: there is no marker op to find the view from and no
@@ -467,6 +471,16 @@ inline AffineExpr linearizeStickLane(AffineExpr stick, int64_t width,
   return stick * width + lane;
 }
 
+/// The block a read under `cm` takes, given the block `block` a write takes:
+/// every splat physical dim at extent 1, its lane 0.
+SmallVector<int64_t> readBlock(const CoordMap &cm, ArrayRef<int64_t> block) {
+  SmallVector<int64_t> out(block);
+  for (unsigned p = 0, e = cm.physRank(); p < e; ++p)
+    if (cm.opAt(p) == CoordOp::Splat)
+      out[p] = 1;
+  return out;
+}
+
 /// The physical tensor type `cm` prescribes for a logical shape.
 /// Fails when a physical extent cannot be stated statically.
 FailureOr<RankedTensorType> physicalTensorType(const CoordMap &cm,
@@ -481,16 +495,22 @@ FailureOr<RankedTensorType> physicalTensorType(const CoordMap &cm,
 // The map rebuild, for rewriteAdjacentGenerics
 //===----------------------------------------------------------------------===//
 
-/// One value's place in the rebuild: its logical indexing map, and the layout
-/// it is physicalized under. `layout` is null for a value on no annotated chain,
-/// which therefore stays logical.
+/// Which way an operand's layout was reached: a read is an `ins` operand loaded
+/// from a physicalized view, a write an `outs` operand whose result is stored
+/// into one. The two differ only on a splat physical dim.
+enum class Access { Read, Write };
+
+/// One value's place in the rebuild: its logical indexing map, the layout it is
+/// physicalized under, and the direction it accesses that layout in. `layout` is
+/// null for a value on no annotated chain, which therefore stays logical.
 struct RebuildOperand {
   AffineMap logicalMap;
   const CoordMap *layout = nullptr;
+  Access access = Access::Read;
   /// Loop dim assigned to each of this operand's SPLAT physical dims, keyed
-  /// by physical dim; -1 for every dim that is not a splat. Filled by
-  /// buildLoopDomain, because a splat axis is the one physical dim that no
-  /// logical loop dim accounts for — see LoopDomain.
+  /// by physical dim; -1 for every dim that is not a splat, and empty for a
+  /// read. Filled by buildLoopDomain, because a written splat axis is the
+  /// one physical dim that no logical loop dim accounts for — see LoopDomain.
   SmallVector<int> splatDim;
 };
 
@@ -544,8 +564,9 @@ struct DomainPiece {
 /// delinearized the dim.
 ///
 /// Splat physical dims are not in this numbering: a splat is an axis no logical
-/// loop dim accounts for, so it gets its own loop dim per operand, allocated
-/// after the pieces are ordered and recorded in RebuildOperand::splatDim.
+/// loop dim accounts for, so a write gets its own loop dim per splat dim,
+/// allocated after the pieces are ordered and recorded in
+/// RebuildOperand::splatDim. A read names it with the constant 0 and gets none.
 struct LoopDomain {
   /// Loop dim carrying logical dim d's stick index, or its whole extent when
   /// the dim is unsplit.
@@ -576,11 +597,11 @@ void collectPieces(const RebuildOperand &o,
   for (unsigned p = 0; p < numDims; ++p) {
     CoordOp coordOp = o.layout ? o.layout->opAt(p) : CoordOp::Identity;
     if (coordOp == CoordOp::Splat)
-      // A splat partitions nothing, so it names no piece — it gets a loop of its
-      // own once the pieces are ordered. Nothing is lost by skipping it: a splat
-      // dim's logical dim is carried whole by an identity dim too (readCoordMap's
-      // splat-companion rule), so that logical position is visited anyway, later
-      // in this same walk.
+      // A splat partitions nothing, so it names no piece — a write gets a loop
+      // of its own once the pieces are ordered, a read none. Nothing is lost by
+      // skipping it: a splat dim's logical dim is carried whole by an identity
+      // dim too (readCoordMap's splat-companion rule), so that logical position
+      // is visited anyway, later in this same walk.
       continue;
     int64_t logDim = o.layout ? o.layout->src[p] : p;
     auto dimExpr = dyn_cast<AffineDimExpr>(o.logicalMap.getResult(logDim));
@@ -622,7 +643,8 @@ void collectPieces(const RebuildOperand &o,
 /// reasons set out at the assertion below.
 ///
 /// Splat physical dims are outside all of this: they name no piece, so each one
-/// gets a fresh loop dim appended after the ordering is fixed.
+/// a write carries gets a fresh loop dim appended after the ordering is fixed.
+/// A read's splat dims get none.
 FailureOr<LoopDomain>
 buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
                 unsigned logicalNumLoops,
@@ -725,9 +747,9 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
     (pc.lane ? dom.laneDim : dom.stickDim)[pc.loop] = n;
   dom.numLoopDims = order.size();
 
-  // One loop per splat physical dim, after the refinement.
+  // One loop per splat physical dim of a write, after the refinement.
   for (RebuildOperand &o : operands) {
-    if (!o.layout)
+    if (!o.layout || o.access == Access::Read)
       continue;
     o.splatDim.assign(o.layout->physRank(), -1);
     for (unsigned p = 0, e = o.layout->physRank(); p < e; ++p)
@@ -742,8 +764,9 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
 /// Mechanical, once the domain has decided the numbering and the order: walk this
 /// operand's physical dims and, per dim, emit the loop dim the domain assigned to
 /// the component that dim carries — the stick, the lane, or this operand's own
-/// splat loop — and where the operand holds whole a dim the domain delinearized,
-/// the linearization of that dim's two components.
+/// splat loop, which a read replaces with the constant 0 — and where the operand
+/// holds whole a dim the domain delinearized, the linearization of that dim's two
+/// components.
 AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
                      MLIRContext *ctx) {
   auto loopExpr = [&](int loopDim) { return getAffineDimExpr(loopDim, ctx); };
@@ -773,8 +796,11 @@ AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
       results.push_back(loopExpr(dom.laneDim[loop]));
       break;
     case CoordOp::Splat:
-      // The replication axis, named by the loop the domain allocated for it.
-      results.push_back(loopExpr(o.splatDim[p]));
+      // A write names the replication axis by the loop the domain allocated for
+      // it; a read takes lane 0.
+      results.push_back(o.access == Access::Read
+                            ? getAffineConstantExpr(0, ctx)
+                            : loopExpr(o.splatDim[p]));
       break;
     case CoordOp::Identity:
       // This operand holds the dim whole. If the domain delinearized it, the two
@@ -1125,11 +1151,69 @@ struct RewriteDescriptorLayoutGenericPass
     return physOp.getResult();
   }
 
+  /// Split the users of an access tile by direction. Fails on a user that is
+  /// neither a load nor a store.
+  static LogicalResult
+  partitionTileUsers(Value tile, SmallVectorImpl<mlir::ktdp::LoadOp> &loads,
+                     SmallVectorImpl<mlir::ktdp::StoreOp> &stores,
+                     StringRef what) {
+    for (Operation *user : tile.getUsers()) {
+      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user))
+        loads.push_back(ld);
+      else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user))
+        stores.push_back(st);
+      else
+        return user->emitError("tts.tensor_layout: unexpected user of ")
+               << what;
+    }
+    return success();
+  }
+
+  /// Build one physical tile per direction among an access tile's users and
+  /// point those users at it: `stores` at a tile of `physBlock`, `loads` at a
+  /// tile of its readBlock, each load's result retyped to that block. A
+  /// direction with no users gets no tile.
+  static LogicalResult buildTilesPerDirection(
+      const CoordMap &cm, ArrayRef<int64_t> physBlock,
+      ArrayRef<mlir::ktdp::LoadOp> loads, ArrayRef<mlir::ktdp::StoreOp> stores,
+      llvm::function_ref<FailureOr<Value>(ArrayRef<int64_t>)> buildTile) {
+    if (!stores.empty()) {
+      auto writeTile = buildTile(physBlock);
+      if (failed(writeTile))
+        return failure();
+      for (auto st : stores)
+        st.getAccessTileMutable().assign(*writeTile);
+    }
+    if (!loads.empty()) {
+      SmallVector<int64_t> block = readBlock(cm, physBlock);
+      auto readTile = buildTile(block);
+      if (failed(readTile))
+        return failure();
+      for (auto ld : loads) {
+        ld.getAccessTileMutable().assign(*readTile);
+        auto logResTy = cast<RankedTensorType>(ld.getResult().getType());
+        ld.getResult().setType(
+            RankedTensorType::get(block, logResTy.getElementType()));
+      }
+    }
+    return success();
+  }
+
   /// Physicalize one direct access tile over the already-physical `physMemView`.
+  ///
+  /// One physical tile per direction among the tile's users — see
+  /// buildTilesPerDirection. A tile with both kinds of user becomes two tiles
+  /// over the same subscripts.
   LogicalResult physicalizeAccessTile(mlir::ktdp::ConstructAccessTilesOp tileOp,
                                       Value physMemView, const CoordMap &cm) {
     OpBuilder b(tileOp);
     Location loc = tileOp.getLoc();
+
+    SmallVector<mlir::ktdp::LoadOp> loads;
+    SmallVector<mlir::ktdp::StoreOp> stores;
+    if (failed(partitionTileUsers(tileOp.getResult(), loads, stores,
+                                  "an access tile")))
+      return failure();
 
     ArrayRef<int64_t> logBlock = tileOp.getResult().getType().getShape();
     unsigned logRank = logBlock.size();
@@ -1215,37 +1299,27 @@ struct RewriteDescriptorLayoutGenericPass
 
     auto identity =
         AffineMap::getMultiDimIdentityMap(cm.physRank(), b.getContext());
-    auto physTile = cast<mlir::ktdp::ConstructAccessTilesOp>(b.clone(*tileOp));
-    physTile.getBaseMutable().assign(physMemView);
-    physTile.getIndicesMutable().assign(physIdx);
-    physTile.setBaseMapAttr(AffineMapAttr::get(identity));
-    physTile.setAccessTileOrderAttr(AffineMapAttr::get(identity));
-    physTile.setAccessTileSetAttr(
-        IntegerSetAttr::get(buildRangeSetND(b.getContext(), physBlock)));
-    physTile.getResult().setType(
-        mlir::ktdp::AccessTileType::get(physBlock, b.getIndexType()));
+    auto buildTile = [&](ArrayRef<int64_t> block) -> FailureOr<Value> {
+      auto physTile =
+          cast<mlir::ktdp::ConstructAccessTilesOp>(b.clone(*tileOp));
+      physTile.getBaseMutable().assign(physMemView);
+      physTile.getIndicesMutable().assign(physIdx);
+      physTile.setBaseMapAttr(AffineMapAttr::get(identity));
+      physTile.setAccessTileOrderAttr(AffineMapAttr::get(identity));
+      physTile.setAccessTileSetAttr(
+          IntegerSetAttr::get(buildRangeSetND(b.getContext(), block)));
+      physTile.getResult().setType(
+          mlir::ktdp::AccessTileType::get(block, b.getIndexType()));
+      if (failed(verifyAttributesCarried(tileOp, physTile)))
+        return failure();
+      LLVM_DEBUG(llvm::dbgs()
+                 << "    access tile " << tileOp.getResult().getType()
+                 << " -> " << physTile.getResult().getType() << "\n");
+      return physTile.getResult();
+    };
 
-    if (failed(verifyAttributesCarried(tileOp, physTile)))
+    if (failed(buildTilesPerDirection(cm, physBlock, loads, stores, buildTile)))
       return failure();
-
-    LLVM_DEBUG(llvm::dbgs()
-               << "    access tile " << tileOp.getResult().getType() << " -> "
-               << physTile.getResult().getType() << "\n");
-
-    for (Operation *user :
-         llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
-      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
-        ld.getAccessTileMutable().assign(physTile.getResult());
-        auto logResTy = cast<RankedTensorType>(ld.getResult().getType());
-        ld.getResult().setType(
-            RankedTensorType::get(physBlock, logResTy.getElementType()));
-      } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
-        st.getAccessTileMutable().assign(physTile.getResult());
-      } else {
-        return user->emitError(
-            "tts.tensor_layout: unexpected user of an access tile");
-      }
-    }
 
     tileOp.erase();
     return success();
@@ -1259,6 +1333,12 @@ struct RewriteDescriptorLayoutGenericPass
       Value physMemView, const CoordMap &cm) {
     OpBuilder b(tileOp);
     MLIRContext *ctx = b.getContext();
+
+    SmallVector<mlir::ktdp::LoadOp> loads;
+    SmallVector<mlir::ktdp::StoreOp> stores;
+    if (failed(partitionTileUsers(tileOp.getResult(), loads, stores,
+                                  "an indirect access tile")))
+      return failure();
 
     ArrayRef<int64_t> logBlock = tileOp.getResult().getType().getShape();
     unsigned logRank = logBlock.size();
@@ -1385,41 +1465,33 @@ struct RewriteDescriptorLayoutGenericPass
       newIndirect.push_back(tileOp.getIndirectMemrefs()[oldIndirectIdx]);
     }
 
-    auto physTile = mlir::ktdp::ConstructIndirectAccessTilesOp::create(
-        b, tileOp.getLoc(),
-        mlir::ktdp::AccessTileType::get(physBlock, b.getIndexType()),
-        physMemView, ArrayAttr::get(ctx, newKinds),
-        ArrayAttr::get(ctx, newMaps), newIndirect,
-        tileOp.getCapturedVariables(), tileOp.getSymbolOperands(),
-        buildRangeSetND(ctx, physBlock),
-        AffineMap::getMultiDimIdentityMap(physRank, ctx));
+    // One physical tile per direction among the users, as for a direct tile.
+    auto buildTile = [&](ArrayRef<int64_t> block) -> FailureOr<Value> {
+      auto physTile = mlir::ktdp::ConstructIndirectAccessTilesOp::create(
+          b, tileOp.getLoc(),
+          mlir::ktdp::AccessTileType::get(block, b.getIndexType()),
+          physMemView, ArrayAttr::get(ctx, newKinds),
+          ArrayAttr::get(ctx, newMaps), newIndirect,
+          tileOp.getCapturedVariables(), tileOp.getSymbolOperands(),
+          buildRangeSetND(ctx, block),
+          AffineMap::getMultiDimIdentityMap(physRank, ctx));
 
-    // Built rather than cloned: the physical tile's variable space has a
-    // different number of intermediate variables, which are this op's region's
-    // block arguments, so there is no clone-and-retype to do. Everything the
-    // builder does not take is therefore carried across by hand — and then held
-    // to the same standard as the cloned ops below.
-    for (NamedAttribute attr : tileOp->getAttrs())
-      if (!isShapeOwnedAttr(attr.getName().strref(), tileOp))
-        physTile->setAttr(attr.getName(), attr.getValue());
+      // Built rather than cloned: the physical tile's variable space has a
+      // different number of intermediate variables, which are this op's
+      // region's block arguments, so there is no clone-and-retype to do.
+      // Everything the builder does not take is therefore carried across by
+      // hand — and then held to the same standard as the cloned ops below.
+      for (NamedAttribute attr : tileOp->getAttrs())
+        if (!isShapeOwnedAttr(attr.getName().strref(), tileOp))
+          physTile->setAttr(attr.getName(), attr.getValue());
 
-    if (failed(verifyAttributesCarried(tileOp, physTile)))
+      if (failed(verifyAttributesCarried(tileOp, physTile)))
+        return failure();
+      return physTile.getResult();
+    };
+
+    if (failed(buildTilesPerDirection(cm, physBlock, loads, stores, buildTile)))
       return failure();
-
-    for (Operation *user :
-         llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
-      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
-        ld.getAccessTileMutable().assign(physTile.getResult());
-        auto logResTy = cast<RankedTensorType>(ld.getResult().getType());
-        ld.getResult().setType(
-            RankedTensorType::get(physBlock, logResTy.getElementType()));
-      } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
-        st.getAccessTileMutable().assign(physTile.getResult());
-      } else {
-        return user->emitError(
-            "tts.tensor_layout: unexpected user of an indirect access tile");
-      }
-    }
 
     tileOp.erase();
     return success();
@@ -1603,7 +1675,8 @@ struct RewriteDescriptorLayoutGenericPass
     SmallVector<RebuildOperand> rebuildOperands;
     SmallVector<AffineMap> logicalMaps = op.getIndexingMapsArray();
     for (auto [i, m] : llvm::enumerate(logicalMaps))
-      rebuildOperands.push_back(RebuildOperand{m, layouts[i]});
+      rebuildOperands.push_back(RebuildOperand{
+          m, layouts[i], i < numIns ? Access::Read : Access::Write});
 
     unsigned resultIdx = op.getDpsInitOperand(0)->getOperandNumber();
     if (resultIdx >= rebuildOperands.size())

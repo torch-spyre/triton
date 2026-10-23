@@ -144,6 +144,8 @@ tt.func @rank3_indirect_middle(%base: index, %idx: index, %c0: index) {
 // subscript is the axis's own origin: the constant 0. That is the same answer
 // physicalizeAccessTile gives a direct tile by pushing an arith.constant 0 --
 // here it is a constant affine expression instead, because the carrier is a map.
+// The tile's only user is a load, so it is 1 wide on that dim: a read takes lane
+// 0 (#225).
 //
 // A broadcast on an INDIRECT dim is not reachable: it is a non-identity coord op,
 // so case 4's gate takes it first.
@@ -162,7 +164,7 @@ tt.func @broadcast_direct_dim(%base: index, %idx: index, %c0: index) {
   %mv = ktdp.construct_memory_view %base, sizes: [512, 1], strides: [1, 1] {coordinate_set = #s_base3, memory_space = #ktdp.memory_space<global>,
       tts.tensor_layout = {phys_src = array<i64: 0, 1, 1>, phys_op = array<i64: 0, 0, 3>, phys_arg = array<i64: 0, 0, 64>}} : memref<512x1xf32>
   // CHECK:      %[[MV:.*]] = ktdp.construct_memory_view %[[BASE]], sizes: [512, 1, 64]
-  // CHECK:      ktdp.construct_indirect_access_tile intermediate_variables(%[[M:.*]], %[[K:.*]], %{{.*}}) %[[MV]][ind(%[[IV]]{{\[}}%[[C0]] + %[[M]]]), (%[[C0]] + %[[K]]), (0)] {{.*}} -> !ktdp.access_tile<32x1x64xindex>
+  // CHECK:      ktdp.construct_indirect_access_tile intermediate_variables(%[[M:.*]], %[[K:.*]], %{{.*}}) %[[MV]][ind(%[[IV]]{{\[}}%[[C0]] + %[[M]]]), (%[[C0]] + %[[K]]), (0)] {{.*}} -> !ktdp.access_tile<32x1x1xindex>
   %t = ktdp.construct_indirect_access_tile intermediate_variables(%m, %k) %mv[ind(%iv[%c0 + %m]), (%c0 + %k)] {variables_space_order = #order2b, variables_space_set = #s_tile3} : memref<512x1xf32>, memref<32xi32> -> !ktdp.access_tile<32x1xindex>
   %l = ktdp.load %t : <32x1xindex> -> tensor<32x1xf32>
   tt.return

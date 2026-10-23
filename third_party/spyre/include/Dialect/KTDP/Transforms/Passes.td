@@ -45,7 +45,10 @@ def RewriteDescriptorLayoutGeneric
              device data, so the logical strides are not read -- rebuild each
              access tile with physical block shape and remapped subscripts,
              retype load results and record the physicalized view against the
-             layout it was physicalized under.
+             layout it was physicalized under.  An access tile is rebuilt once
+             per direction among its users: a store's is `phys_arg` wide on a
+             splat dim, a load's 1 wide (lane 0), and a reading generic names
+             that dim with the constant 0 (#225).
 
     Phase 2  Rewrite the generics adjacent to those views.  For each recorded
              view, every generic that reads one of its loads or supplies one of
