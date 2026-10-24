@@ -1188,7 +1188,8 @@ struct RewriteDescriptorLayoutGenericPass
   /// every other user at one of `stickBlock`. Each tile is built once, and only
   /// if a user needs it. Each load's result is retyped to its tile's block.
   /// Fails, before building anything, on a user that is neither a load nor a
-  /// store.
+  /// store. Both tiles are built before any user is repointed; if the second
+  /// build fails, the first is erased and `tile` keeps every user.
   static LogicalResult repointTileUsers(
       Value tile, const CoordMap &cm, ArrayRef<int64_t> stickBlock,
       llvm::function_ref<FailureOr<Value>(ArrayRef<int64_t>)> buildTile,
@@ -1217,8 +1218,11 @@ struct RewriteDescriptorLayoutGenericPass
     }
     if (llvm::any_of(users, isBroadcastRead)) {
       auto built = buildTile(lane0);
-      if (failed(built))
+      if (failed(built)) {
+        if (stickTile)
+          stickTile.getDefiningOp()->erase();
         return failure();
+      }
       lane0Tile = *built;
     }
 
