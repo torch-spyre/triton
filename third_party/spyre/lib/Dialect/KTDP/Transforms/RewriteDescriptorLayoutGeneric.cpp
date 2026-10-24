@@ -1926,9 +1926,7 @@ struct RewriteDescriptorLayoutGenericPass
   /// and ktdp.store's own verifier reports `data tile shape must match access
   /// tile shape` about an op nobody named.
   ///
-  /// The named pass absorbs this in a widening stage (ContractionSynthesis.cpp,
-  /// "widen one op-tile into physical (a store's data)"). This pass has none by
-  /// choice: every case where a compute op sits between the load and the store is
+  /// This pass has no stage that widens a store's data, by choice: every case where a compute op sits between the load and the store is
   /// already handled by the rebuild giving both ends the same domain (see
   /// rebuild-composite.mlir case 3), and the remaining case is a copy, for which
   /// annotating the source as well costs one marker and needs no new machinery.

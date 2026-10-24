@@ -136,10 +136,10 @@ def _make_inputs_stat_chain(M, N, DTYPE="fp16", *, axis) -> dict:
     would be dead code. The dtype still comes from ``params`` as it does there.
 
     fp16 is the default because it is the only dtype BOTH arms reach a binary at:
-    the lane-0 read that spreads a statistic across its stick becomes a
-    ``vectorchain.shuffle``, which ``dbo-opt`` takes at 2 bytes and not at 4. The
-    off-stick arm partitions its statistic instead of splatting it, so nothing
-    there spreads a lane and it has a working fp32 device variant.
+    the on-stick arm's consumer broadcasts lane 0 of its splat statistic across
+    the stick, which ``dbo-opt`` takes at 2 bytes and not at 4. The off-stick arm
+    partitions its statistic instead of splatting it, so nothing there is
+    broadcast and it has a working fp32 device variant.
     """
     np_dtype = DTYPE_MAP[DTYPE]
     rng = np.random.default_rng(seed=0)
