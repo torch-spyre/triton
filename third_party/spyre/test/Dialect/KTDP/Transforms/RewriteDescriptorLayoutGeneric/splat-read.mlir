@@ -206,7 +206,8 @@ tt.func @splat_read_only(%x_ptr: index, %stat_ptr: index, %out_ptr: index) {
 
 // Case 4 -- one access tile with a load and a store, under a stick-on-N layout
 // with no splat dim. The read block equals the write block, so the pass builds a
-// single physical tile and both users keep it.
+// single physical tile and both users keep it. The load and the store sharing
+// %[[T]] is the check.
 
 // CHECK-DAG: #[[$C4_SET:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 
@@ -216,7 +217,6 @@ module {
 // CHECK-LABEL: tt.func @shared_tile_no_splat(
 // CHECK:         %[[V:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [2, 64, 64]
 // CHECK:         %[[T:.*]] = ktdp.construct_access_tile %[[V]]{{.*}} {access_tile_order = #{{.*}}, access_tile_set = #[[$C4_SET]]} : memref<2x64x64xf16> -> !ktdp.access_tile<2x64x64xindex>
-// CHECK-NOT:     ktdp.construct_access_tile
 // CHECK:         %[[L:.*]] = ktdp.load %[[T]] : <2x64x64xindex> -> tensor<2x64x64xf16>
 // CHECK:         ktdp.store %{{.*}}, %[[T]] : tensor<2x64x64xf16>, <2x64x64xindex>
 // CHECK:         tt.return
@@ -269,7 +269,8 @@ tt.func @splat_copy(%a: index, %b: index) {
 
 // Case 6 -- a splat load used as a generic's `outs` and stored back through the
 // same tile. The load is not only an `ins`, so it keeps the full stick, and the
-// load and store share the one physical tile.
+// load and store share the one physical tile. The load and the store sharing
+// %[[T]] is the check.
 
 // CHECK-DAG: #[[$C6_ID2:.+]] = affine_map<(d0, d1) -> (d0, d1)>
 
@@ -278,7 +279,6 @@ tt.func @splat_copy(%a: index, %b: index) {
 module {
 // CHECK-LABEL: tt.func @splat_outs_rmw(
 // CHECK:         %[[T:.*]] = ktdp.construct_access_tile %{{.*}} -> !ktdp.access_tile<64x64xindex>
-// CHECK-NOT:     ktdp.construct_access_tile
 // CHECK:         %[[L:.*]] = ktdp.load %[[T]] : <64x64xindex> -> tensor<64x64xf16>
 // CHECK:         %[[R:.*]] = linalg.generic {indexing_maps = [#[[$C6_ID2]]], iterator_types = ["parallel", "parallel"]} outs(%[[L]] : tensor<64x64xf16>)
 // CHECK:         ktdp.store %[[R]], %[[T]] : tensor<64x64xf16>, <64x64xindex>

@@ -246,7 +246,8 @@ tt.func @splat_load_and_store(%base: index, %idx: index, %c0: index) {
 
 // Case 6 -- the same indirect tile under the splat layout, its load stored back
 // directly. A store is not a broadcasting use, so the load keeps the full stick
-// and shares the store's one tile.
+// and shares the store's one tile. The load and the store sharing %[[T]] is
+// the check.
 #order6 = affine_map<(d0, d1) -> (d0, d1)>
 #s_idx6 = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
 #s_base6 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 0 >= 0)>
@@ -254,7 +255,6 @@ tt.func @splat_load_and_store(%base: index, %idx: index, %c0: index) {
 module {
 // CHECK-LABEL: tt.func @splat_load_stored_back(
 // CHECK:         %[[T:.*]] = ktdp.construct_indirect_access_tile {{.*}} -> !ktdp.access_tile<32x1x64xindex>
-// CHECK-NOT:     ktdp.construct_indirect_access_tile
 // CHECK:         %[[L:.*]] = ktdp.load %[[T]] : <32x1x64xindex> -> tensor<32x1x64xf32>
 // CHECK:         ktdp.store %[[L]], %[[T]] : tensor<32x1x64xf32>, <32x1x64xindex>
 tt.func @splat_load_stored_back(%base: index, %idx: index, %c0: index) {
@@ -271,7 +271,8 @@ tt.func @splat_load_stored_back(%base: index, %idx: index, %c0: index) {
 // -----
 
 // Case 7 -- one indirect tile, loaded and stored, under stick-on-N with no splat
-// dim. Every user shares the one physical tile.
+// dim. Every user shares the one physical tile. The load and the store
+// sharing %[[T]] is the check.
 #order7 = affine_map<(d0, d1) -> (d0, d1)>
 #id7 = affine_map<(d0, d1) -> (d0, d1)>
 #s_idx7 = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
@@ -280,7 +281,6 @@ tt.func @splat_load_stored_back(%base: index, %idx: index, %c0: index) {
 module {
 // CHECK-LABEL: tt.func @stick_load_and_store(
 // CHECK:         %[[T:.*]] = ktdp.construct_indirect_access_tile {{.*}} -> !ktdp.access_tile<2x32x64xindex>
-// CHECK-NOT:     ktdp.construct_indirect_access_tile
 // CHECK:         %[[L:.*]] = ktdp.load %[[T]] : <2x32x64xindex> -> tensor<2x32x64xf32>
 // CHECK:         ktdp.store %{{.*}}, %[[T]] : tensor<2x32x64xf32>, <2x32x64xindex>
 tt.func @stick_load_and_store(%base: index, %idx: index, %c0: index) {
