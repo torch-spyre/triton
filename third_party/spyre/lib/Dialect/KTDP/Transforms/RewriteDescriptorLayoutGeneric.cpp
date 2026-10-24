@@ -1520,6 +1520,9 @@ struct RewriteDescriptorLayoutGenericPass
 
       if (failed(verifyAttributesCarried(tileOp, physTile)))
         return failure();
+      LLVM_DEBUG(llvm::dbgs()
+                 << "    indirect access tile " << tileOp.getResult().getType()
+                 << " -> " << physTile.getResult().getType() << "\n");
       return physTile.getResult();
     };
 
