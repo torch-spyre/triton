@@ -156,9 +156,7 @@
 //     BACKWARD from each `ins` operand of a to-be-rewritten generic, through
 //     every generic that is not itself in the rewrite set, stopping at anything
 //     that is not a coordinate restatement. This is the half that matters. It
-//     catches a re-indexing op whose OWN load is on an UNANNOTATED view -- the
-//     `stat_chain_on_stick` shape, its statistic read view deliberately
-//     carrying no layout because its logical shape already is its physical one.
+//     catches a re-indexing op whose OWN load is on an UNANNOTATED view.
 //     Nothing else looks there: RewriteDescriptorLayoutGeneric calls
 //     retypeToPhysical only for an operand that HAS a layout, so an operand
 //     that has none is bridged by rebuildMap with no check at all.

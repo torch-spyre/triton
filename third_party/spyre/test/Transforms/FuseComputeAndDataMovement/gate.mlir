@@ -11,13 +11,11 @@
 // coverage grows, the gate fires more often and converges to ungated behaviour by
 // itself, so it never needs removing. See FuseComputeAndDataMovement.cpp.
 //
-// THE SHAPE OF CASES 1-6 is `stat_chain_on_stick`'s, because that is the shape
-// nothing else catches: the data view is annotated, but the STATISTIC view that
-// feeds the re-indexing op is deliberately NOT, its logical shape already being
-// its physical one. RewriteDescriptorLayoutGeneric calls retypeToPhysical only for
-// an operand that HAS a layout, so an operand that has none is bridged by
-// rebuildMap with no check at all, and a forward-only walk from the annotated
-// view's loads would miss all of it.
+// CASES 1-6 put the re-indexing op behind a load from an UNANNOTATED statistic
+// view while the data view is annotated. RewriteDescriptorLayoutGeneric calls
+// retypeToPhysical only for an operand that HAS a layout, so an operand that has
+// none is bridged by rebuildMap with no check at all, and a forward-only walk
+// from the annotated view's loads would miss all of it.
 
 // -----
 

@@ -45,7 +45,12 @@ def RewriteDescriptorLayoutGeneric
              device data, so the logical strides are not read -- rebuild each
              access tile with physical block shape and remapped subscripts,
              retype load results and record the physicalized view against the
-             layout it was physicalized under.
+             layout it was physicalized under.  A generic's rebuilt map names a
+             splat dim of an `ins` operand at the constant 0 (lane 0).  A load
+             from a splat layout whose every use is such an `ins` gets its own
+             access tile, one lane wide on the splat dim (#225); stores and every
+             other load share one tile spanning the stick.  Without a splat dim,
+             all users share one tile.
 
     Phase 2  Rewrite the generics adjacent to those views.  For each recorded
              view, every generic that reads one of its loads or supplies one of

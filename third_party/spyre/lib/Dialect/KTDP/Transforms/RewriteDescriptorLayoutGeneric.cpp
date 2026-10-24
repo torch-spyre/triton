@@ -15,7 +15,12 @@
 //   => physical size [ceil(N/64), M, 64].
 // A splat dim replicates its source logical dim across `phys_arg` lanes
 // instead of partitioning it, so [M] -> phys_src=[0,0] phys_op=[0,3]
-// phys_arg=[0,64] gives physical size [M, 64].
+// phys_arg=[0,64] gives physical size [M, 64]. The view is that size for every
+// access; the accesses differ, by Access (#225). A Write covers every lane: its
+// access tile spans the stick and the generic supplying it names the splat dim
+// with a loop of its own. A Read names the splat dim at lane 0 in its generic's
+// map. A BroadcastRead load, whose every use is such a Read, needs only that
+// lane, so its tile is one lane wide. Every other load spans the stick.
 //
 // The layout sits ON the view rather than beside it, so the annotated view IS
 // the root of the rewrite: there is no marker op to find the view from and no
@@ -467,6 +472,17 @@ inline AffineExpr linearizeStickLane(AffineExpr stick, int64_t width,
   return stick * width + lane;
 }
 
+/// `stickBlock`, a physical block spanning every splat dim's whole stick, cut
+/// to lane 0 of each splat dim. Every other dim is unchanged.
+SmallVector<int64_t> lane0Block(const CoordMap &cm,
+                                ArrayRef<int64_t> stickBlock) {
+  SmallVector<int64_t> out(stickBlock);
+  for (unsigned p = 0, e = cm.physRank(); p < e; ++p)
+    if (cm.opAt(p) == CoordOp::Splat)
+      out[p] = 1;
+  return out;
+}
+
 /// The physical tensor type `cm` prescribes for a logical shape.
 /// Fails when a physical extent cannot be stated statically.
 FailureOr<RankedTensorType> physicalTensorType(const CoordMap &cm,
@@ -481,16 +497,32 @@ FailureOr<RankedTensorType> physicalTensorType(const CoordMap &cm,
 // The map rebuild, for rewriteAdjacentGenerics
 //===----------------------------------------------------------------------===//
 
-/// One value's place in the rebuild: its logical indexing map, and the layout
-/// it is physicalized under. `layout` is null for a value on no annotated chain,
-/// which therefore stays logical.
+/// How an access touches a physicalized view. The three differ only on a splat
+/// physical dim.
+enum class Access {
+  /// A store, or a generic `outs` operand whose result is stored: every lane of
+  /// a splat dim.
+  Write,
+  /// A load, or a generic `ins` operand loaded from a view. A generic's rebuilt
+  /// map names each splat dim of a Read operand at lane 0.
+  Read,
+  /// A load from a splat layout whose every use is a generic `ins` operand, so
+  /// it is read only at lane 0 and its tile is one lane wide. A load's alone;
+  /// a RebuildOperand is a Read or a Write.
+  BroadcastRead,
+};
+
+/// One value's place in the rebuild: its logical indexing map, the layout it is
+/// physicalized under, and the direction it accesses that layout in. `layout` is
+/// null for a value on no annotated chain, which therefore stays logical.
 struct RebuildOperand {
   AffineMap logicalMap;
   const CoordMap *layout = nullptr;
+  Access access = Access::Read;
   /// Loop dim assigned to each of this operand's SPLAT physical dims, keyed
-  /// by physical dim; -1 for every dim that is not a splat. Filled by
-  /// buildLoopDomain, because a splat axis is the one physical dim that no
-  /// logical loop dim accounts for — see LoopDomain.
+  /// by physical dim; -1 for every dim that is not a splat, and empty for a
+  /// read. Filled by buildLoopDomain, because a written splat axis is the
+  /// one physical dim that no logical loop dim accounts for — see LoopDomain.
   SmallVector<int> splatDim;
 };
 
@@ -544,8 +576,9 @@ struct DomainPiece {
 /// delinearized the dim.
 ///
 /// Splat physical dims are not in this numbering: a splat is an axis no logical
-/// loop dim accounts for, so it gets its own loop dim per operand, allocated
-/// after the pieces are ordered and recorded in RebuildOperand::splatDim.
+/// loop dim accounts for, so a write gets its own loop dim per splat dim,
+/// allocated after the pieces are ordered and recorded in
+/// RebuildOperand::splatDim. A read names it with the constant 0 and gets none.
 struct LoopDomain {
   /// Loop dim carrying logical dim d's stick index, or its whole extent when
   /// the dim is unsplit.
@@ -576,11 +609,11 @@ void collectPieces(const RebuildOperand &o,
   for (unsigned p = 0; p < numDims; ++p) {
     CoordOp coordOp = o.layout ? o.layout->opAt(p) : CoordOp::Identity;
     if (coordOp == CoordOp::Splat)
-      // A splat partitions nothing, so it names no piece — it gets a loop of its
-      // own once the pieces are ordered. Nothing is lost by skipping it: a splat
-      // dim's logical dim is carried whole by an identity dim too (readCoordMap's
-      // splat-companion rule), so that logical position is visited anyway, later
-      // in this same walk.
+      // A splat partitions nothing, so it names no piece — a write gets a loop
+      // of its own once the pieces are ordered, a read none. Nothing is lost by
+      // skipping it: a splat dim's logical dim is carried whole by an identity
+      // dim too (readCoordMap's splat-companion rule), so that logical position
+      // is visited anyway, later in this same walk.
       continue;
     int64_t logDim = o.layout ? o.layout->src[p] : p;
     auto dimExpr = dyn_cast<AffineDimExpr>(o.logicalMap.getResult(logDim));
@@ -622,7 +655,8 @@ void collectPieces(const RebuildOperand &o,
 /// reasons set out at the assertion below.
 ///
 /// Splat physical dims are outside all of this: they name no piece, so each one
-/// gets a fresh loop dim appended after the ordering is fixed.
+/// a write carries gets a fresh loop dim appended after the ordering is fixed.
+/// A read's splat dims get none.
 FailureOr<LoopDomain>
 buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
                 unsigned logicalNumLoops,
@@ -725,9 +759,9 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
     (pc.lane ? dom.laneDim : dom.stickDim)[pc.loop] = n;
   dom.numLoopDims = order.size();
 
-  // One loop per splat physical dim, after the refinement.
+  // One loop per splat physical dim of a write, after the refinement.
   for (RebuildOperand &o : operands) {
-    if (!o.layout)
+    if (!o.layout || o.access == Access::Read)
       continue;
     o.splatDim.assign(o.layout->physRank(), -1);
     for (unsigned p = 0, e = o.layout->physRank(); p < e; ++p)
@@ -742,8 +776,9 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands, unsigned resultIdx,
 /// Mechanical, once the domain has decided the numbering and the order: walk this
 /// operand's physical dims and, per dim, emit the loop dim the domain assigned to
 /// the component that dim carries — the stick, the lane, or this operand's own
-/// splat loop — and where the operand holds whole a dim the domain delinearized,
-/// the linearization of that dim's two components.
+/// splat loop, which a read replaces with the constant 0 — and where the operand
+/// holds whole a dim the domain delinearized, the linearization of that dim's two
+/// components.
 AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
                      MLIRContext *ctx) {
   auto loopExpr = [&](int loopDim) { return getAffineDimExpr(loopDim, ctx); };
@@ -773,8 +808,11 @@ AffineMap rebuildMap(const RebuildOperand &o, const LoopDomain &dom,
       results.push_back(loopExpr(dom.laneDim[loop]));
       break;
     case CoordOp::Splat:
-      // The replication axis, named by the loop the domain allocated for it.
-      results.push_back(loopExpr(o.splatDim[p]));
+      // A write names the replication axis by the loop the domain allocated for
+      // it; a read takes lane 0.
+      results.push_back(o.access == Access::Read
+                            ? getAffineConstantExpr(0, ctx)
+                            : loopExpr(o.splatDim[p]));
       break;
     case CoordOp::Identity:
       // This operand holds the dim whole. If the domain delinearized it, the two
@@ -1125,7 +1163,91 @@ struct RewriteDescriptorLayoutGenericPass
     return physOp.getResult();
   }
 
+  /// How load `ld` from a view under `cm` accesses it: BroadcastRead when `cm`
+  /// has a splat dim and every use of `ld` is a linalg.generic `ins` operand,
+  /// Read otherwise. Every generic reading a load from an annotated view is
+  /// rewritten by this pass, and its rebuilt map names each splat dim of an
+  /// `ins` operand at lane 0, so those uses need only that lane.
+  static Access classifyLoad(mlir::ktdp::LoadOp ld, const CoordMap &cm) {
+    bool hasSplat = llvm::any_of(llvm::seq(cm.physRank()), [&](unsigned p) {
+      return cm.opAt(p) == CoordOp::Splat;
+    });
+    // A generic `ins` is the only use that broadcasts lane 0 across the stick,
+    // through the map this pass rebuilds. A store or an `outs` takes the value
+    // as a whole stick, so it needs the full tile.
+    bool onlyGenericIns =
+        llvm::all_of(ld.getResult().getUses(), [](OpOperand &use) {
+          auto generic = dyn_cast<linalg::GenericOp>(use.getOwner());
+          return generic && generic.isDpsInput(&use);
+        });
+    return hasSplat && onlyGenericIns ? Access::BroadcastRead : Access::Read;
+  }
+
+  /// Point every user of access tile `tile` at a physical tile from
+  /// `buildTile`: a BroadcastRead load at one of lane0Block(cm, stickBlock),
+  /// every other user at one of `stickBlock`. Each tile is built once, and only
+  /// if a user needs it. Each load's result is retyped to its tile's block.
+  /// Fails, before building anything, on a user that is neither a load nor a
+  /// store. Both tiles are built before any user is repointed; if the second
+  /// build fails, the first is erased and `tile` keeps every user.
+  static LogicalResult repointTileUsers(
+      Value tile, const CoordMap &cm, ArrayRef<int64_t> stickBlock,
+      llvm::function_ref<FailureOr<Value>(ArrayRef<int64_t>)> buildTile,
+      StringRef what) {
+    SmallVector<std::pair<Operation *, Access>> users;
+    for (Operation *user : tile.getUsers()) {
+      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user))
+        users.push_back({user, classifyLoad(ld, cm)});
+      else if (isa<mlir::ktdp::StoreOp>(user))
+        users.push_back({user, Access::Write});
+      else
+        return user->emitError("tts.tensor_layout: unexpected user of ")
+               << what;
+    }
+    auto isBroadcastRead = [](auto &u) {
+      return u.second == Access::BroadcastRead;
+    };
+
+    SmallVector<int64_t> lane0 = lane0Block(cm, stickBlock);
+    Value stickTile, lane0Tile;
+    if (!llvm::all_of(users, isBroadcastRead)) {
+      auto built = buildTile(stickBlock);
+      if (failed(built))
+        return failure();
+      stickTile = *built;
+    }
+    if (llvm::any_of(users, isBroadcastRead)) {
+      auto built = buildTile(lane0);
+      if (failed(built)) {
+        if (stickTile)
+          stickTile.getDefiningOp()->erase();
+        return failure();
+      }
+      lane0Tile = *built;
+    }
+
+    for (auto [user, access] : users) {
+      bool narrow = access == Access::BroadcastRead;
+      Value phys = narrow ? lane0Tile : stickTile;
+      if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
+        st.getAccessTileMutable().assign(phys);
+        continue;
+      }
+      auto ld = cast<mlir::ktdp::LoadOp>(user);
+      ld.getAccessTileMutable().assign(phys);
+      auto logResTy = cast<RankedTensorType>(ld.getResult().getType());
+      ld.getResult().setType(RankedTensorType::get(
+          narrow ? ArrayRef<int64_t>(lane0) : stickBlock,
+          logResTy.getElementType()));
+    }
+    return success();
+  }
+
   /// Physicalize one direct access tile over the already-physical `physMemView`.
+  ///
+  /// The physical tiles for the tile's users — see repointTileUsers. A tile
+  /// with a BroadcastRead load and any other user becomes two tiles over the
+  /// same subscripts.
   LogicalResult physicalizeAccessTile(mlir::ktdp::ConstructAccessTilesOp tileOp,
                                       Value physMemView, const CoordMap &cm) {
     OpBuilder b(tileOp);
@@ -1133,8 +1255,8 @@ struct RewriteDescriptorLayoutGenericPass
 
     ArrayRef<int64_t> logBlock = tileOp.getResult().getType().getShape();
     unsigned logRank = logBlock.size();
-    SmallVector<int64_t> physBlock;
-    if (!applyCoordMap(logBlock, cm.src, cm.op, cm.arg, physBlock))
+    SmallVector<int64_t> stickBlock;
+    if (!applyCoordMap(logBlock, cm.src, cm.op, cm.arg, stickBlock))
       return tileOp.emitError("tts.tensor_layout: cannot derive a static "
                               "physical block shape for this access tile");
 
@@ -1215,37 +1337,28 @@ struct RewriteDescriptorLayoutGenericPass
 
     auto identity =
         AffineMap::getMultiDimIdentityMap(cm.physRank(), b.getContext());
-    auto physTile = cast<mlir::ktdp::ConstructAccessTilesOp>(b.clone(*tileOp));
-    physTile.getBaseMutable().assign(physMemView);
-    physTile.getIndicesMutable().assign(physIdx);
-    physTile.setBaseMapAttr(AffineMapAttr::get(identity));
-    physTile.setAccessTileOrderAttr(AffineMapAttr::get(identity));
-    physTile.setAccessTileSetAttr(
-        IntegerSetAttr::get(buildRangeSetND(b.getContext(), physBlock)));
-    physTile.getResult().setType(
-        mlir::ktdp::AccessTileType::get(physBlock, b.getIndexType()));
+    auto buildTile = [&](ArrayRef<int64_t> block) -> FailureOr<Value> {
+      auto physTile =
+          cast<mlir::ktdp::ConstructAccessTilesOp>(b.clone(*tileOp));
+      physTile.getBaseMutable().assign(physMemView);
+      physTile.getIndicesMutable().assign(physIdx);
+      physTile.setBaseMapAttr(AffineMapAttr::get(identity));
+      physTile.setAccessTileOrderAttr(AffineMapAttr::get(identity));
+      physTile.setAccessTileSetAttr(
+          IntegerSetAttr::get(buildRangeSetND(b.getContext(), block)));
+      physTile.getResult().setType(
+          mlir::ktdp::AccessTileType::get(block, b.getIndexType()));
+      if (failed(verifyAttributesCarried(tileOp, physTile)))
+        return failure();
+      LLVM_DEBUG(llvm::dbgs()
+                 << "    access tile " << tileOp.getResult().getType()
+                 << " -> " << physTile.getResult().getType() << "\n");
+      return physTile.getResult();
+    };
 
-    if (failed(verifyAttributesCarried(tileOp, physTile)))
+    if (failed(repointTileUsers(tileOp.getResult(), cm, stickBlock, buildTile,
+                                "an access tile")))
       return failure();
-
-    LLVM_DEBUG(llvm::dbgs()
-               << "    access tile " << tileOp.getResult().getType() << " -> "
-               << physTile.getResult().getType() << "\n");
-
-    for (Operation *user :
-         llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
-      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
-        ld.getAccessTileMutable().assign(physTile.getResult());
-        auto logResTy = cast<RankedTensorType>(ld.getResult().getType());
-        ld.getResult().setType(
-            RankedTensorType::get(physBlock, logResTy.getElementType()));
-      } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
-        st.getAccessTileMutable().assign(physTile.getResult());
-      } else {
-        return user->emitError(
-            "tts.tensor_layout: unexpected user of an access tile");
-      }
-    }
 
     tileOp.erase();
     return success();
@@ -1282,8 +1395,8 @@ struct RewriteDescriptorLayoutGenericPass
                 "stick-split";
     }
 
-    SmallVector<int64_t> physBlock;
-    if (!applyCoordMap(logBlock, cm.src, cm.op, cm.arg, physBlock))
+    SmallVector<int64_t> stickBlock;
+    if (!applyCoordMap(logBlock, cm.src, cm.op, cm.arg, stickBlock))
       return tileOp.emitError("tts.tensor_layout: cannot derive a static "
                               "physical block shape for this indirect access "
                               "tile");
@@ -1385,41 +1498,37 @@ struct RewriteDescriptorLayoutGenericPass
       newIndirect.push_back(tileOp.getIndirectMemrefs()[oldIndirectIdx]);
     }
 
-    auto physTile = mlir::ktdp::ConstructIndirectAccessTilesOp::create(
-        b, tileOp.getLoc(),
-        mlir::ktdp::AccessTileType::get(physBlock, b.getIndexType()),
-        physMemView, ArrayAttr::get(ctx, newKinds),
-        ArrayAttr::get(ctx, newMaps), newIndirect,
-        tileOp.getCapturedVariables(), tileOp.getSymbolOperands(),
-        buildRangeSetND(ctx, physBlock),
-        AffineMap::getMultiDimIdentityMap(physRank, ctx));
+    // The physical tiles for the users, as for a direct tile.
+    auto buildTile = [&](ArrayRef<int64_t> block) -> FailureOr<Value> {
+      auto physTile = mlir::ktdp::ConstructIndirectAccessTilesOp::create(
+          b, tileOp.getLoc(),
+          mlir::ktdp::AccessTileType::get(block, b.getIndexType()),
+          physMemView, ArrayAttr::get(ctx, newKinds),
+          ArrayAttr::get(ctx, newMaps), newIndirect,
+          tileOp.getCapturedVariables(), tileOp.getSymbolOperands(),
+          buildRangeSetND(ctx, block),
+          AffineMap::getMultiDimIdentityMap(physRank, ctx));
 
-    // Built rather than cloned: the physical tile's variable space has a
-    // different number of intermediate variables, which are this op's region's
-    // block arguments, so there is no clone-and-retype to do. Everything the
-    // builder does not take is therefore carried across by hand — and then held
-    // to the same standard as the cloned ops below.
-    for (NamedAttribute attr : tileOp->getAttrs())
-      if (!isShapeOwnedAttr(attr.getName().strref(), tileOp))
-        physTile->setAttr(attr.getName(), attr.getValue());
+      // Built rather than cloned: the physical tile's variable space has a
+      // different number of intermediate variables, which are this op's
+      // region's block arguments, so there is no clone-and-retype to do.
+      // Everything the builder does not take is therefore carried across by
+      // hand — and then held to the same standard as the cloned ops below.
+      for (NamedAttribute attr : tileOp->getAttrs())
+        if (!isShapeOwnedAttr(attr.getName().strref(), tileOp))
+          physTile->setAttr(attr.getName(), attr.getValue());
 
-    if (failed(verifyAttributesCarried(tileOp, physTile)))
+      if (failed(verifyAttributesCarried(tileOp, physTile)))
+        return failure();
+      LLVM_DEBUG(llvm::dbgs()
+                 << "    indirect access tile " << tileOp.getResult().getType()
+                 << " -> " << physTile.getResult().getType() << "\n");
+      return physTile.getResult();
+    };
+
+    if (failed(repointTileUsers(tileOp.getResult(), cm, stickBlock, buildTile,
+                                "an indirect access tile")))
       return failure();
-
-    for (Operation *user :
-         llvm::make_early_inc_range(tileOp.getResult().getUsers())) {
-      if (auto ld = dyn_cast<mlir::ktdp::LoadOp>(user)) {
-        ld.getAccessTileMutable().assign(physTile.getResult());
-        auto logResTy = cast<RankedTensorType>(ld.getResult().getType());
-        ld.getResult().setType(
-            RankedTensorType::get(physBlock, logResTy.getElementType()));
-      } else if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
-        st.getAccessTileMutable().assign(physTile.getResult());
-      } else {
-        return user->emitError(
-            "tts.tensor_layout: unexpected user of an indirect access tile");
-      }
-    }
 
     tileOp.erase();
     return success();
@@ -1603,7 +1712,8 @@ struct RewriteDescriptorLayoutGenericPass
     SmallVector<RebuildOperand> rebuildOperands;
     SmallVector<AffineMap> logicalMaps = op.getIndexingMapsArray();
     for (auto [i, m] : llvm::enumerate(logicalMaps))
-      rebuildOperands.push_back(RebuildOperand{m, layouts[i]});
+      rebuildOperands.push_back(RebuildOperand{
+          m, layouts[i], i < numIns ? Access::Read : Access::Write});
 
     unsigned resultIdx = op.getDpsInitOperand(0)->getOperandNumber();
     if (resultIdx >= rebuildOperands.size())
@@ -1823,9 +1933,7 @@ struct RewriteDescriptorLayoutGenericPass
   /// and ktdp.store's own verifier reports `data tile shape must match access
   /// tile shape` about an op nobody named.
   ///
-  /// The named pass absorbs this in a widening stage (ContractionSynthesis.cpp,
-  /// "widen one op-tile into physical (a store's data)"). This pass has none by
-  /// choice: every case where a compute op sits between the load and the store is
+  /// This pass has no stage that widens a store's data, by choice: every case where a compute op sits between the load and the store is
   /// already handled by the rebuild giving both ends the same domain (see
   /// rebuild-composite.mlir case 3), and the remaining case is a copy, for which
   /// annotating the source as well costs one marker and needs no new machinery.
