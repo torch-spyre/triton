@@ -17,7 +17,9 @@
 // and the coord op that made it, and the indirect subscript rides along at
 // whatever physical position its logical dim lands at. Cases 1 to 3 are the
 // variations that shows up in; case 4 is the one shape that cannot be expressed
-// at all.
+// at all. Cases 5 to 7 are an indirect tile with both a load and a store: under
+// a splat layout with a broadcast read, without that read, and without a splat
+// dim.
 //
 // Cases 2 to 4 are unreachable from Triton-level input: tt.descriptor_gather only
 // ever builds a rank-2 tile with the indirect subscript at dim 0, so only a module
@@ -195,6 +197,105 @@ tt.func @split_indirect_dim(%base: index, %idx: index, %c0: index) {
   // expected-error @below {{tts.tensor_layout: logical dim 0 is an indirect (gather) subscript, so it cannot be stick-split}}
   %t = ktdp.construct_indirect_access_tile intermediate_variables(%m, %k) %mv[ind(%iv[%c0 + %m]), (%c0 + %k)] {variables_space_order = #order2, variables_space_set = #s_tile2} : memref<512x128xf32>, memref<32xi32> -> !ktdp.access_tile<32x128xindex>
   %l = ktdp.load %t : <32x128xindex> -> tensor<32x128xf32>
+  tt.return
+}
+}
+
+// -----
+
+// Case 5 -- one indirect tile, loaded and stored, under a splat layout.
+//
+// The load's only use is a generic's `ins`, so it is a BroadcastRead: the tile is
+// rebuilt twice over the same subscripts, 64 lanes wide for the store and one lane
+// wide for the load, and the generic reads the splat dim at lane 0.
+// CHECK-DAG: #[[$C5_LANE0:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, 0)>
+// CHECK-DAG: #[[$C5_ID3:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+// CHECK-DAG: #[[$C5_SET_S:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+// CHECK-DAG: #[[$C5_SET_1:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 >= 0, d2 >= 0, -d2 >= 0)>
+#order5 = affine_map<(d0, d1) -> (d0, d1)>
+#id5 = affine_map<(d0, d1) -> (d0, d1)>
+#s_idx5 = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
+#s_base5 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 0 >= 0)>
+#s_tile5 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 0 >= 0)>
+module {
+// CHECK-LABEL: tt.func @splat_load_and_store(
+// CHECK:         %[[MV:.*]] = ktdp.construct_memory_view %{{.*}}, sizes: [512, 1, 64]
+// CHECK:         %[[WT:.*]] = ktdp.construct_indirect_access_tile {{.*}} %[[MV]][{{.*}}, (0)] {variables_space_order = #[[$C5_ID3]], variables_space_set = #[[$C5_SET_S]]} {{.*}} -> !ktdp.access_tile<32x1x64xindex>
+// CHECK:         %[[RT:.*]] = ktdp.construct_indirect_access_tile {{.*}} %[[MV]][{{.*}}, (0)] {variables_space_order = #[[$C5_ID3]], variables_space_set = #[[$C5_SET_1]]} {{.*}} -> !ktdp.access_tile<32x1x1xindex>
+// CHECK:         %[[L:.*]] = ktdp.load %[[RT]] : <32x1x1xindex> -> tensor<32x1x1xf32>
+// CHECK:         %[[R:.*]] = linalg.generic {indexing_maps = [#[[$C5_LANE0]], #[[$C5_ID3]]], iterator_types = ["parallel", "parallel", "parallel"]} ins(%[[L]] : tensor<32x1x1xf32>) outs(%{{.*}} : tensor<32x1x64xf32>)
+// CHECK:         ktdp.store %[[R]], %[[WT]] : tensor<32x1x64xf32>, <32x1x64xindex>
+tt.func @splat_load_and_store(%base: index, %idx: index, %c0: index) {
+  %iv = ktdp.construct_memory_view %idx, sizes: [32], strides: [1] {coordinate_set = #s_idx5, memory_space = #ktdp.memory_space<global>} : memref<32xi32>
+  %mv = ktdp.construct_memory_view %base, sizes: [512, 1], strides: [1, 1] {coordinate_set = #s_base5, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 1, 1>, phys_op = array<i64: 0, 0, 3>, phys_arg = array<i64: 0, 0, 64>}} : memref<512x1xf32>
+  %t = ktdp.construct_indirect_access_tile intermediate_variables(%m, %k) %mv[ind(%iv[%c0 + %m]), (%c0 + %k)] {variables_space_order = #order5, variables_space_set = #s_tile5} : memref<512x1xf32>, memref<32xi32> -> !ktdp.access_tile<32x1xindex>
+  %l = ktdp.load %t : <32x1xindex> -> tensor<32x1xf32>
+  %e = tensor.empty() : tensor<32x1xf32>
+  %r = linalg.generic {indexing_maps = [#id5, #id5], iterator_types = ["parallel", "parallel"]} ins(%l : tensor<32x1xf32>) outs(%e : tensor<32x1xf32>) {
+  ^bb0(%in: f32, %acc: f32):
+    %d = arith.addf %in, %in : f32
+    linalg.yield %d : f32
+  } -> tensor<32x1xf32>
+  ktdp.store %r, %t : tensor<32x1xf32>, <32x1xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 6 -- the same indirect tile under the splat layout, its load stored back
+// directly. A store is not a broadcasting use, so the load keeps the full stick
+// and shares the store's one tile.
+#order6 = affine_map<(d0, d1) -> (d0, d1)>
+#s_idx6 = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
+#s_base6 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 0 >= 0)>
+#s_tile6 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 0 >= 0)>
+module {
+// CHECK-LABEL: tt.func @splat_load_stored_back(
+// CHECK:         %[[T:.*]] = ktdp.construct_indirect_access_tile {{.*}} -> !ktdp.access_tile<32x1x64xindex>
+// CHECK-NOT:     ktdp.construct_indirect_access_tile
+// CHECK:         %[[L:.*]] = ktdp.load %[[T]] : <32x1x64xindex> -> tensor<32x1x64xf32>
+// CHECK:         ktdp.store %[[L]], %[[T]] : tensor<32x1x64xf32>, <32x1x64xindex>
+tt.func @splat_load_stored_back(%base: index, %idx: index, %c0: index) {
+  %iv = ktdp.construct_memory_view %idx, sizes: [32], strides: [1] {coordinate_set = #s_idx6, memory_space = #ktdp.memory_space<global>} : memref<32xi32>
+  %mv = ktdp.construct_memory_view %base, sizes: [512, 1], strides: [1, 1] {coordinate_set = #s_base6, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 1, 1>, phys_op = array<i64: 0, 0, 3>, phys_arg = array<i64: 0, 0, 64>}} : memref<512x1xf32>
+  %t = ktdp.construct_indirect_access_tile intermediate_variables(%m, %k) %mv[ind(%iv[%c0 + %m]), (%c0 + %k)] {variables_space_order = #order6, variables_space_set = #s_tile6} : memref<512x1xf32>, memref<32xi32> -> !ktdp.access_tile<32x1xindex>
+  %l = ktdp.load %t : <32x1xindex> -> tensor<32x1xf32>
+  ktdp.store %l, %t : tensor<32x1xf32>, <32x1xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 7 -- one indirect tile, loaded and stored, under stick-on-N with no splat
+// dim. Every user shares the one physical tile.
+#order7 = affine_map<(d0, d1) -> (d0, d1)>
+#id7 = affine_map<(d0, d1) -> (d0, d1)>
+#s_idx7 = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>
+#s_base7 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#s_tile7 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+// CHECK-LABEL: tt.func @stick_load_and_store(
+// CHECK:         %[[T:.*]] = ktdp.construct_indirect_access_tile {{.*}} -> !ktdp.access_tile<2x32x64xindex>
+// CHECK-NOT:     ktdp.construct_indirect_access_tile
+// CHECK:         %[[L:.*]] = ktdp.load %[[T]] : <2x32x64xindex> -> tensor<2x32x64xf32>
+// CHECK:         ktdp.store %{{.*}}, %[[T]] : tensor<2x32x64xf32>, <2x32x64xindex>
+tt.func @stick_load_and_store(%base: index, %idx: index, %c0: index) {
+  %iv = ktdp.construct_memory_view %idx, sizes: [32], strides: [1] {coordinate_set = #s_idx7, memory_space = #ktdp.memory_space<global>} : memref<32xi32>
+  %mv = ktdp.construct_memory_view %base, sizes: [512, 128], strides: [128, 1] {coordinate_set = #s_base7, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<512x128xf32>
+  %t = ktdp.construct_indirect_access_tile intermediate_variables(%m, %k) %mv[ind(%iv[%c0 + %m]), (%c0 + %k)] {variables_space_order = #order7, variables_space_set = #s_tile7} : memref<512x128xf32>, memref<32xi32> -> !ktdp.access_tile<32x128xindex>
+  %l = ktdp.load %t : <32x128xindex> -> tensor<32x128xf32>
+  %e = tensor.empty() : tensor<32x128xf32>
+  %r = linalg.generic {indexing_maps = [#id7, #id7], iterator_types = ["parallel", "parallel"]} ins(%l : tensor<32x128xf32>) outs(%e : tensor<32x128xf32>) {
+  ^bb0(%in: f32, %acc: f32):
+    %d = arith.addf %in, %in : f32
+    linalg.yield %d : f32
+  } -> tensor<32x128xf32>
+  ktdp.store %r, %t : tensor<32x128xf32>, <32x128xindex>
   tt.return
 }
 }
