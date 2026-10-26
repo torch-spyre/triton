@@ -205,7 +205,7 @@ tt.func @split_indirect_dim(%base: index, %idx: index, %c0: index) {
 
 // Case 5 -- one indirect tile, loaded and stored, under a splat layout.
 //
-// The load's only use is a generic's `ins`, so it is a BroadcastRead: the tile is
+// The load's only use is a generic's `ins`, so it is a Lane0 load: the tile is
 // rebuilt twice over the same subscripts, 64 lanes wide for the store and one lane
 // wide for the load, and the generic reads the splat dim at lane 0.
 // CHECK-DAG: #[[$C5_LANE0:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, 0)>
