@@ -1933,10 +1933,11 @@ struct RewriteDescriptorLayoutGenericPass
   /// and ktdp.store's own verifier reports `data tile shape must match access
   /// tile shape` about an op nobody named.
   ///
-  /// This pass has no stage that widens a store's data, by choice: every case where a compute op sits between the load and the store is
-  /// already handled by the rebuild giving both ends the same domain (see
-  /// rebuild-composite.mlir case 3), and the remaining case is a copy, for which
-  /// annotating the source as well costs one marker and needs no new machinery.
+  /// This pass has no stage that widens a store's data, by choice: every case
+  /// where a compute op sits between the load and the store is already handled
+  /// by the rebuild giving both ends the same domain (see rebuild-composite.mlir
+  /// case 3), and the remaining case is a copy, for which annotating the source
+  /// as well costs one marker and needs no new machinery.
   ///
   /// Only this direction is checked. The mirror image — a physicalized data value
   /// stored through an unannotated, still-logical access tile — is also
