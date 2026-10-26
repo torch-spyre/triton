@@ -77,6 +77,20 @@ def reduce_to_stick(in_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr,
 
 
 @triton.jit
+def reduce_rank3_to_stick(in_ptr, out_ptr, B: tl.constexpr, M: tl.constexpr,
+                          N: tl.constexpr, IN_LAYOUT: tl.constexpr,
+                          OUT_LAYOUT: tl.constexpr):
+    """``reduce_to_stick`` with a leading batch dim: ``[B, M, N]`` reduced over N."""
+    src = tl.make_tensor_descriptor(in_ptr, shape=[B, M, N], strides=[M * N, N, 1],
+                                    block_shape=[B, M, N])
+    tl.spyre_tensor_layout(src, IN_LAYOUT)
+    dst = tl.make_tensor_descriptor(out_ptr, shape=[B, M], strides=[M, 1],
+                                    block_shape=[B, M])
+    tl.spyre_tensor_layout(dst, OUT_LAYOUT)
+    dst.store([0, 0], tl.sum(src.load([0, 0, 0]), axis=2))
+
+
+@triton.jit
 def unannotated(in_ptr, out_ptr, M: tl.constexpr):
     """The same shape with no annotation anywhere."""
     src = tl.make_tensor_descriptor(in_ptr, shape=[M], strides=[1],
@@ -353,33 +367,44 @@ def test_the_convention_is_discriminating():
     assert not stick_axis_is_harmless([64, 64], [1, -1])
 
 
-#: ``[M, N]`` -> ``[ceil(M/8), 8, ceil(N/S), S]``: both logical dims split, so the
-#: axis third from the end is the mod half of the OUTER dim while the last is the
-#: lane of the inner one. Neither exemption applies and the tile-half test fails, so
-#: this is where the padding fires at a rank the splat case cannot reach.
-DOUBLE_SPLIT_2D = ((0, "floordiv", 8), (0, "mod", 8), (1, "floordiv", S),
-                   (1, "mod", S))
+#: ``[B, M, N]`` -> ``[ceil(N/S), B, M, S]``: stick on the reduced axis, with the
+#: batch dim third from the end. That axis is a real host dim of extent > 1 rather
+#: than the tile half of the lane's dim, so neither exemption applies and the
+#: tile-half test fails: this is where the padding fires at a rank the splat case
+#: cannot reach.
+STICK_ON_N_BATCHED = ((2, "floordiv", S), 0, 1, (2, "mod", S))
+
+#: ``[B, M]`` -> ``[ceil(M/S), B, S]`` and ``[B, M]`` -> ``[B, M, S]``: the rank-2
+#: outputs of ``reduce_rank3_to_stick``, split and splat.
+SPLIT_2D = ((1, "floordiv", S), 0, (1, "mod", S))
+SPLAT_2D = (0, 1, (1, "splat", S))
+
+#: Shapes for each kernel, so a parametrized case names only the kernel it runs.
+SHAPES = {
+    reduce_to_stick: {"M": 64, "N": 128},
+    reduce_rank3_to_stick: {"B": 2, "M": 64, "N": 128},
+}
 
 
-@pytest.mark.parametrize("in_layout, out_layout", [
-    (STICK_ON_N, SPLIT_1D),
-    (STICK_ON_N, SPLAT_1D),
-    (DOUBLE_SPLIT_2D, SPLIT_1D),
-    (DOUBLE_SPLIT_2D, SPLAT_1D),
+@pytest.mark.parametrize("kernel_fn, in_layout, out_layout", [
+    (reduce_to_stick, STICK_ON_N, SPLIT_1D),
+    (reduce_to_stick, STICK_ON_N, SPLAT_1D),
+    (reduce_rank3_to_stick, STICK_ON_N_BATCHED, SPLIT_2D),
+    (reduce_rank3_to_stick, STICK_ON_N_BATCHED, SPLAT_2D),
 ])
-def test_every_emitted_pair_satisfies_the_convention(tmp_path, in_layout,
-                                                     out_layout):
+def test_every_emitted_pair_satisfies_the_convention(tmp_path, kernel_fn,
+                                                     in_layout, out_layout):
     """What the evaluator emits is held to the rule the wrappers are held to.
 
     Four combinations rather than one because the padding decision is per layout
     and its three exemptions are reached by different shapes: the split output
     takes the tile-half exemption, the splat output is padded at rank 2, and
-    ``DOUBLE_SPLIT_2D`` is padded at rank 4 -- the rank where the axis inserted and
-    the axis being neutralized stop being the same one.
+    ``STICK_ON_N_BATCHED`` is padded at rank 4 -- the rank where the axis inserted
+    and the axis being neutralized stop being the same one.
     """
-    entries = capture(tmp_path, reduce_to_stick,
+    entries = capture(tmp_path, kernel_fn,
                       {"in_ptr": "*fp16", "out_ptr": "*fp16"},
-                      {"M": 64, "N": 128, "IN_LAYOUT": in_layout,
+                      {**SHAPES[kernel_fn], "IN_LAYOUT": in_layout,
                        "OUT_LAYOUT": out_layout})
     assert entries
     for entry in entries:
@@ -387,15 +412,15 @@ def test_every_emitted_pair_satisfies_the_convention(tmp_path, in_layout,
                                       entry["stride_map"]), entry
 
 
-@pytest.mark.parametrize("which, in_layout", [
+@pytest.mark.parametrize("which, kernel_fn, in_layout, out_layout", [
     # The splat output, padded at rank 2 -- entry 1, the `out_ptr` claim.
-    (1, STICK_ON_N),
-    # The double-split input, padded at rank 4 -- entry 0, where the axis inserted
-    # and the axis being neutralized are not the same one.
-    (0, DOUBLE_SPLIT_2D),
+    (1, reduce_to_stick, STICK_ON_N, SPLAT_1D),
+    # The batched input, padded at rank 4 -- entry 0, where the axis inserted and
+    # the axis being neutralized are not the same one.
+    (0, reduce_rank3_to_stick, STICK_ON_N_BATCHED, SPLIT_2D),
 ])
-def test_an_inserted_axis_is_spelled_the_way_theirs_is(tmp_path, which,
-                                                      in_layout):
+def test_an_inserted_axis_is_spelled_the_way_theirs_is(tmp_path, which, kernel_fn,
+                                                      in_layout, out_layout):
     """A padded layout's unit axis carries extent 1 and ``stride_map`` ``-1`` together.
 
     The same spelling the wrappers use for an axis the host tensor does not
@@ -407,10 +432,10 @@ def test_an_inserted_axis_is_spelled_the_way_theirs_is(tmp_path, which,
     Both padded ranks are covered, because the insertion goes second from the end
     of the unpadded layout, which is the axis being neutralized only at rank 2.
     """
-    entry = capture(tmp_path, reduce_to_stick,
+    entry = capture(tmp_path, kernel_fn,
                     {"in_ptr": "*fp16", "out_ptr": "*fp16"},
-                    {"M": 64, "N": 128, "IN_LAYOUT": in_layout,
-                     "OUT_LAYOUT": SPLAT_1D})[which]
+                    {**SHAPES[kernel_fn], "IN_LAYOUT": in_layout,
+                     "OUT_LAYOUT": out_layout})[which]
     p = len(entry["device_size"]) - 3
     assert (entry["device_size"][p], entry["stride_map"][p]) == (1, -1), entry
 

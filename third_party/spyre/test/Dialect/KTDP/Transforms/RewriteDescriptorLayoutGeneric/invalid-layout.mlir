@@ -1,19 +1,26 @@
 // RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic -split-input-file -verify-diagnostics
+// RUN: spyre-triton-opt %s --mlir-very-unsafe-disable-verifier-on-parsing --rewrite-descriptor-layout-generic -split-input-file -verify-diagnostics
 
 // A layout that is well formed and still wrong for the context it annotates.
 //
-// Every tts.tensor_layout here passes the tts dialect's own verifier: the fields
-// are consistent, the splits are paired, the ranks line up. What is wrong is the
-// fit between the layout and something the verifier cannot see -- the block the
-// tile reads, another operand's layout, or the op that consumes the load. So each
-// diagnostic has to come from the pass, and each has to name the pass or the op
-// rather than surfacing later as a verifier failure about an indexing map.
+// Every tts.tensor_layout in cases 1 to 5 passes the tts dialect's own verifier:
+// the fields are consistent, the splits are paired, the ranks line up. What is
+// wrong is the fit between the layout and something the verifier cannot see --
+// the block the tile reads, another operand's layout, or the op that consumes the
+// load. So each diagnostic has to come from the pass, and each has to name the
+// pass or the op rather than surfacing later as a verifier failure about an
+// indexing map.
 //
-// Every case here is reachable through the shapes the backend's own lowering
+// Every one of those cases is reachable through the shapes the backend's own lowering
 // produces. Diagnostics about a layout the pass cannot consume at all, or a
 // malformed KTIR chain beneath one it can, live in invalid-ktir.mlir; the
 // structural rules the verifier owns are in
 // test/Dialect/TTS/tensor-layout-verifier.mlir.
+//
+// Case 6 is the exception: a layout that breaks one of those structural rules,
+// read by the pass itself. The second RUN line skips the verifier on parsing, so
+// the diagnostic there comes from readCoordMap, which calls the same shared
+// checker; under the first RUN line the parser's verifier emits it.
 
 // Case 1 -- the layout does not fit the block.
 //
@@ -209,6 +216,29 @@ tt.func @annotation_never_reached(%o: !tt.ptr<f16>) {
   %ov = ktdp.construct_memory_view %oi, sizes: [128], strides: [1] {coordinate_set = #sd, memory_space = #ktdp.memory_space<global>,
       tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 1, 2>, phys_arg = array<i64: 64, 64>}} : memref<128xf16>
   %od = builtin.unrealized_conversion_cast %ov : memref<128xf16> to !tt.tensordesc<128xf16>
+  tt.return
+}
+}
+
+// -----
+
+// Case 6 -- a layout with two stick dims, read by the pass.
+//
+// [M, K] -> [M/64, K/64, M%64, K%64]: each logical dim is a well-formed split,
+// and the layout as a whole has two stick dims. readCoordMap rejects it with the
+// shared checker's message.
+
+#s6 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#id6 = affine_map<(d0, d1) -> (d0, d1)>
+module {
+tt.func @two_mods(%a: !tt.ptr<f16>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f16> to index
+  // expected-error @below {{tts.tensor_layout: a layout has at most one stick dim (a mod or splat entry), got 2}}
+  %av = ktdp.construct_memory_view %ai, sizes: [128, 128], strides: [128, 1] {coordinate_set = #s6, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 1, 0, 1>, phys_op = array<i64: 1, 1, 2, 2>, phys_arg = array<i64: 64, 64, 64, 64>}} : memref<128x128xf16>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id6, access_tile_set = #s6} : memref<128x128xf16> -> !ktdp.access_tile<128x128xindex>
+  %al = ktdp.load %at : <128x128xindex> -> tensor<128x128xf16>
   tt.return
 }
 }

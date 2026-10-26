@@ -26,9 +26,7 @@
 //      non-monotone input map comes from: rebuild-contraction.mlir cases 1
 //      and 3.
 //   5. a splat, whose loop is allocated after the ordering is fixed:
-//      rebuild-reduction.mlir cases 2, 3 and 4 -- case 3 being the one where the
-//      splat is not last in its operand's physical order, so the output map
-//      comes out non-monotone.
+//      rebuild-reduction.mlir cases 2 and 3.
 //
 // Branch 4 is the case below, which nothing else reached.
 //

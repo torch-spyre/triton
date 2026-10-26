@@ -191,9 +191,9 @@ tt.func @broadcast_direct_dim(%base: index, %idx: index, %c0: index) {
 module {
 tt.func @split_indirect_dim(%base: index, %idx: index, %c0: index) {
   %iv = ktdp.construct_memory_view %idx, sizes: [32], strides: [1] {coordinate_set = #s_idx2, memory_space = #ktdp.memory_space<global>} : memref<32xi32>
-  // Stick-on-dim-0 (stick=64) -- and dim 0 is the indirect one.
+  // Stick-on-dim-0 (stick=32) -- and dim 0 is the indirect one.
   %mv = ktdp.construct_memory_view %base, sizes: [512, 128], strides: [128, 1] {coordinate_set = #s_base2, memory_space = #ktdp.memory_space<global>,
-      tts.tensor_layout = {phys_src = array<i64: 0, 0, 1>, phys_op = array<i64: 1, 2, 0>, phys_arg = array<i64: 64, 64, 0>}} : memref<512x128xf32>
+      tts.tensor_layout = {phys_src = array<i64: 0, 1, 0>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 32>}} : memref<512x128xf32>
   // expected-error @below {{tts.tensor_layout: logical dim 0 is an indirect (gather) subscript, so it cannot be stick-split}}
   %t = ktdp.construct_indirect_access_tile intermediate_variables(%m, %k) %mv[ind(%iv[%c0 + %m]), (%c0 + %k)] {variables_space_order = #order2, variables_space_set = #s_tile2} : memref<512x128xf32>, memref<32xi32> -> !ktdp.access_tile<32x128xindex>
   %l = ktdp.load %t : <32x128xindex> -> tensor<32x128xf32>

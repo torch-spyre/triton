@@ -217,3 +217,89 @@ tt.func @splat_restick_accepted(%desc: !tt.tensordesc<256xf32>) {
      phys_arg = array<i64: 0, 64>} : !tt.tensordesc<256xf32>
   tt.return
 }
+
+// -----
+
+// Case 14 -- a layout with two stick dims, both mods.
+//
+// Each logical dim is a well-formed split on its own, so the per-dim pairing rule
+// passes it; the count across the whole layout is what rejects it.
+tt.func @two_mods(%desc: !tt.tensordesc<128x128xf16>) {
+  // expected-error @below {{tts.tensor_layout: a layout has at most one stick dim (a mod or splat entry), got 2}}
+  tts.tensor_layout %desc
+    {phys_src = array<i64: 0, 1, 0, 1>,
+     phys_op = array<i64: 1, 1, 2, 2>,
+     phys_arg = array<i64: 64, 64, 64, 64>} : !tt.tensordesc<128x128xf16>
+  tt.return
+}
+
+// -----
+
+// Case 15 -- a layout with two stick dims, a mod and a splat.
+//
+// A split of dim 1 and a splat re-stick of dim 0, each well formed on its own.
+tt.func @mod_plus_splat(%desc: !tt.tensordesc<64x128xf16>) {
+  // expected-error @below {{tts.tensor_layout: a layout has at most one stick dim (a mod or splat entry), got 2}}
+  tts.tensor_layout %desc
+    {phys_src = array<i64: 1, 0, 1, 0>,
+     phys_op = array<i64: 1, 0, 2, 3>,
+     phys_arg = array<i64: 64, 0, 64, 64>} : !tt.tensordesc<64x128xf16>
+  tt.return
+}
+
+// -----
+
+// Case 16 -- a layout with two stick dims, splats on two different logical dims.
+//
+// Each logical dim is an identity plus a splat, so the pairing rule passes it.
+tt.func @two_splats(%desc: !tt.tensordesc<64x64xf16>) {
+  // expected-error @below {{tts.tensor_layout: a layout has at most one stick dim (a mod or splat entry), got 2}}
+  tts.tensor_layout %desc
+    {phys_src = array<i64: 0, 1, 0, 1>,
+     phys_op = array<i64: 0, 0, 3, 3>,
+     phys_arg = array<i64: 0, 0, 64, 64>} : !tt.tensordesc<64x64xf16>
+  tt.return
+}
+
+// -----
+
+// Case 17 -- the one stick dim, a mod, is not the last physical dim.
+//
+// phys [N/64, N%64, M]: the lanes sit in the middle dim.
+tt.func @mod_not_last(%desc: !tt.tensordesc<64x128xf16>) {
+  // expected-error @below {{tts.tensor_layout: the stick dim must be the last physical dim, got it at phys dim 1 of 3}}
+  tts.tensor_layout %desc
+    {phys_src = array<i64: 1, 1, 0>,
+     phys_op = array<i64: 1, 2, 0>,
+     phys_arg = array<i64: 64, 64, 0>} : !tt.tensordesc<64x128xf16>
+  tt.return
+}
+
+// -----
+
+// Case 18 -- the one stick dim, a splat, is not the last physical dim.
+//
+// phys [64, M]: the replicated lanes come first.
+tt.func @splat_not_last(%desc: !tt.tensordesc<64xf16>) {
+  // expected-error @below {{tts.tensor_layout: the stick dim must be the last physical dim, got it at phys dim 0 of 2}}
+  tts.tensor_layout %desc
+    {phys_src = array<i64: 0, 0>,
+     phys_op = array<i64: 3, 0>,
+     phys_arg = array<i64: 64, 0>} : !tt.tensordesc<64xf16>
+  tt.return
+}
+
+// -----
+
+// Case 19 -- a split whose floordiv divisor differs from its mod modulus.
+//
+// The floordiv counts sticks of 32 and the mod counts lanes of 64, so the two
+// halves name different stick widths.
+tt.func @split_width_mismatch(%desc: !tt.tensordesc<64x128xf16>) {
+  // expected-error @below {{tts.tensor_layout: logical dim 1 is split with floordiv 32 but mod 64; the two must be the same stick width}}
+  tts.tensor_layout %desc
+    {phys_src = array<i64: 1, 0, 1>,
+     phys_op = array<i64: 1, 0, 2>,
+     phys_arg = array<i64: 32, 0, 64>} : !tt.tensordesc<64x128xf16>
+  tt.return
+}

@@ -14,7 +14,7 @@
 // half of each case; the named-op pass emits a stick loop, a rescaling multiply
 // and a pair of slices for these same kernels.
 //
-// Eleven cases, all positive. Cases 1 to 4 vary where the contracted dim sits:
+// Ten cases, all positive. Cases 1 to 4 vary where the contracted dim sits:
 // at one stick, at one stick inside a batched kernel that has a program-id loop
 // of its own, at two sticks, and an accumulator carried across an enclosing
 // scf.for as its iter_arg.
@@ -25,8 +25,7 @@
 //
 // Cases 7 to 9 vary WHICH dim each operand splits rather than how far: a parallel
 // dim on both, the same reduced dim on both, and one of each. Case 10 chains two
-// contractions through a scratchpad intermediate on no layout, and case 11 splits
-// TWO dims of a single operand, taking it to rank 5.
+// contractions through a scratchpad intermediate on no layout.
 //
 // What this pass DECLINES is not shaped like a contraction -- a named
 // linalg.matmul is in invalid-layout.mlir and the malformed-input declines are in
@@ -874,72 +873,3 @@ module {
   }
 }
 
-// -----
-
-// Case 11 -- TWO independent splits on ONE operand, taking it to rank 5.
-//
-// A batch contraction whose A splits both M and K at 64, so A alone contributes
-// four of the rebuilt domain's six loop dims and lands at [M/64, K/64, B, M%64,
-// K%64] = [2, 2, 2, 64, 64]. B splits only K, so it names K's pair and holds N
-// whole; the unannotated result holds M whole and carries M's composite. Nothing
-// in the rule counts splits per operand, which is what this case says: two splits
-// on one operand are two splits, threaded independently, and the physical dim
-// order is the layout's rather than the logical one grown on the right -- A's map
-// is a non-monotone projected permutation for that reason.
-//
-// A[B=2, M=128, K=128] split on M(64) and K(64) -> [2, 2, 2, 64, 64];
-// B[B=2, K=128, N=64] split on K(64) -> [2, 2, 64, 64];
-// C[2, 128, 64] on no layout. Iterators [p, p, r, p, r, p]: batch, M's stick, K's
-// stick, M's lane, K's lane, N.
-
-// CHECK: #[[$S11_A:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d1, d2, d0, d3, d4)>
-// CHECK: #[[$S11_B:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d2, d0, d4, d5)>
-// CHECK: #[[$S11_C:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1 * 64 + d3, d5)>
-
-#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
-#bA = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
-#bB = affine_map<(d0, d1, d2, d3) -> (d0, d3, d2)>
-#bC = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
-#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 127 >= 0)>
-#set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 63 >= 0)>
-module {
-// NOLOOP-LABEL:   tt.func @parallel_floor_rank5(
-// NOLOOP-NOT:       scf.for
-// NOLOOP-NOT:       tensor.extract_slice
-// NOLOOP-NOT:       tensor.insert_slice
-// NOLOOP:           tt.return
-// CHECK-LABEL:   tt.func @parallel_floor_rank5(
-// CHECK:           %[[AL:.*]] = ktdp.load %{{.*}} : <2x2x2x64x64xindex> -> tensor<2x2x2x64x64xf16>
-// CHECK:           %[[BL:.*]] = ktdp.load %{{.*}} : <2x2x64x64xindex> -> tensor<2x2x64x64xf16>
-// CHECK:           %[[CL:.*]] = ktdp.load %{{.*}} : <2x128x64xindex> -> tensor<2x128x64xf16>
-// CHECK:           %[[R:.*]] = linalg.generic {indexing_maps = [#[[$S11_A]], #[[$S11_B]], #[[$S11_C]]], iterator_types = ["parallel", "parallel", "reduction", "parallel", "reduction", "parallel"]} ins(%[[AL]], %[[BL]] : tensor<2x2x2x64x64xf16>, tensor<2x2x64x64xf16>) outs(%[[CL]] : tensor<2x128x64xf16>) {
-// CHECK:           } -> tensor<2x128x64xf16>
-// CHECK:           ktdp.store %[[R]], %{{.*}} : tensor<2x128x64xf16>, <2x128x64xindex>
-// CHECK:           tt.return
-  tt.func @parallel_floor_rank5(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>, %arg2: !tt.ptr<f16>) {
-    %c0 = arith.constant 0 : index
-    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f16> to index
-    %1 = ktdp.construct_memory_view %0, sizes: [2, 128, 128], strides: [16384, 128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>,
-        tts.tensor_layout = {phys_src = array<i64: 1, 2, 0, 1, 2>, phys_op = array<i64: 1, 1, 0, 2, 2>, phys_arg = array<i64: 64, 64, 0, 64, 64>}} : memref<2x128x128xf16>
-    %2 = ktdp.construct_access_tile %1[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<2x128x128xf16> -> !ktdp.access_tile<2x128x128xindex>
-    %3 = ktdp.load %2 : <2x128x128xindex> -> tensor<2x128x128xf16>
-    %4 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f16> to index
-    %5 = ktdp.construct_memory_view %4, sizes: [2, 128, 64], strides: [8192, 64, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>,
-        tts.tensor_layout = {phys_src = array<i64: 1, 0, 1, 2>, phys_op = array<i64: 1, 0, 2, 0>, phys_arg = array<i64: 64, 0, 64, 0>}} : memref<2x128x64xf16>
-    %6 = ktdp.construct_access_tile %5[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x128x64xf16> -> !ktdp.access_tile<2x128x64xindex>
-    %7 = ktdp.load %6 : <2x128x64xindex> -> tensor<2x128x64xf16>
-    %8 = builtin.unrealized_conversion_cast %arg2 : !tt.ptr<f16> to index
-    %9 = ktdp.construct_memory_view %8, sizes: [2, 128, 64], strides: [8192, 64, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<2x128x64xf16>
-    %10 = ktdp.construct_access_tile %9[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x128x64xf16> -> !ktdp.access_tile<2x128x64xindex>
-    %11 = ktdp.load %10 : <2x128x64xindex> -> tensor<2x128x64xf16>
-    %12 = linalg.generic {indexing_maps = [#bA, #bB, #bC], iterator_types = ["parallel", "parallel", "parallel", "reduction"]} ins(%3, %7 : tensor<2x128x128xf16>, tensor<2x128x64xf16>) outs(%11 : tensor<2x128x64xf16>) {
-    ^bb0(%x: f16, %y: f16, %z: f16):
-      %p = arith.mulf %x, %y : f16
-      %s = arith.addf %z, %p : f16
-      linalg.yield %s : f16
-    } -> tensor<2x128x64xf16>
-    %13 = ktdp.construct_access_tile %9[%c0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<2x128x64xf16> -> !ktdp.access_tile<2x128x64xindex>
-    ktdp.store %12, %13 : tensor<2x128x64xf16>, <2x128x64xindex>
-    tt.return
-  }
-}

@@ -141,7 +141,7 @@ bool evaluateDeviceLayout(ArrayRef<int64_t> logSizes,
   // UNTESTED for rank >= 4, and this is the line to test first when a rank-4
   // layout reaches the device, because nothing in tree can tell the two positions
   // apart: they COINCIDE at rank 2 -- the splat case, the only one verified on
-  // hardware -- and of the 8 insertions this performs across the fixtures, the 7
+  // hardware -- and of the 6 insertions this performs across the fixtures, the 5
   // where they differ are all rank >= 4 (`matmul__bmm_*`,
   // `reduce__middle_axis_spyre_stick`), none of which declares
   // `compiles_to_binary`, so no tier reaches them. Confirmed by mutation:
@@ -180,6 +180,10 @@ LogicalResult verifyTensorLayoutArrays(
   SmallVector<int64_t> numIdentity(logicalRank, 0), numFloorDiv(logicalRank, 0),
       numMod(logicalRank, 0), numSplat(logicalRank, 0),
       numTotal(logicalRank, 0);
+  // The floordiv divisor and mod modulus per logical dim, and the physical dims
+  // carrying a mod or splat entry, for the stick-dim checks below.
+  SmallVector<int64_t> floorDivArg(logicalRank, 0), modArg(logicalRank, 0);
+  SmallVector<unsigned> stickDims;
 
   for (unsigned k = 0; k < src.size(); ++k) {
     // Consumers index the logical shape/stride arrays with phys_src[k].
@@ -218,12 +222,16 @@ LogicalResult verifyTensorLayoutArrays(
       break;
     case CoordOp::FloorDiv:
       ++numFloorDiv[src[k]];
+      floorDivArg[src[k]] = arg[k];
       break;
     case CoordOp::Mod:
       ++numMod[src[k]];
+      modArg[src[k]] = arg[k];
+      stickDims.push_back(k);
       break;
     case CoordOp::Splat:
       ++numSplat[src[k]];
+      stickDims.push_back(k);
       break;
     }
   }
@@ -259,6 +267,29 @@ LogicalResult verifyTensorLayoutArrays(
               "re-stick (exactly one identity entry and one splat entry), got "
            << numIdentity[d] << " identity, " << numFloorDiv[d] << " floordiv, "
            << numMod[d] << " mod, " << numSplat[d] << " splat";
+  }
+
+  // The stick dim is the physical dim whose positions are the lanes of one
+  // stick: a split's mod entry, or a splat entry. A layout has at most one, and
+  // it is the innermost physical dim.
+  if (stickDims.size() > 1)
+    return emitError() << "tts.tensor_layout: a layout has at most one stick "
+                          "dim (a mod or splat entry), got "
+                       << stickDims.size();
+  if (!stickDims.empty() && stickDims.front() != src.size() - 1)
+    return emitError() << "tts.tensor_layout: the stick dim must be the last "
+                          "physical dim, got it at phys dim "
+                       << stickDims.front() << " of " << src.size();
+
+  // A split's floordiv counts sticks of the width its mod counts lanes in.
+  for (unsigned d = 0; d < logicalRank; ++d) {
+    if (numFloorDiv[d] != 1 || numMod[d] != 1)
+      continue;
+    if (floorDivArg[d] != modArg[d])
+      return emitError() << "tts.tensor_layout: logical dim " << d
+                         << " is split with floordiv " << floorDivArg[d]
+                         << " but mod " << modArg[d]
+                         << "; the two must be the same stick width";
   }
 
   return success();

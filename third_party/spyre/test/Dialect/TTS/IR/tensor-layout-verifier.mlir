@@ -268,3 +268,95 @@ func.func @splat_restick_accepted(%base: index) {
   return
 }
 }
+
+// -----
+
+// Case 17 -- a layout with two stick dims, both mods.
+//
+// Each logical dim is a well-formed split on its own, so the per-dim pairing rule
+// passes it; the count across the whole layout is what rejects it.
+#s = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+func.func @two_mods(%base: index) {
+  // expected-error @below {{tts.tensor_layout: a layout has at most one stick dim (a mod or splat entry), got 2}}
+  %v = ktdp.construct_memory_view %base, sizes: [128, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 1, 0, 1>, phys_op = array<i64: 1, 1, 2, 2>, phys_arg = array<i64: 64, 64, 64, 64>}} : memref<128x128xf16>
+  return
+}
+}
+
+// -----
+
+// Case 18 -- a layout with two stick dims, a mod and a splat.
+//
+// A split of dim 1 and a splat re-stick of dim 0, each well formed on its own.
+#s = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+func.func @mod_plus_splat(%base: index) {
+  // expected-error @below {{tts.tensor_layout: a layout has at most one stick dim (a mod or splat entry), got 2}}
+  %v = ktdp.construct_memory_view %base, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1, 0>, phys_op = array<i64: 1, 0, 2, 3>, phys_arg = array<i64: 64, 0, 64, 64>}} : memref<64x128xf16>
+  return
+}
+}
+
+// -----
+
+// Case 19 -- a layout with two stick dims, splats on two different logical dims.
+//
+// Each logical dim is an identity plus a splat, so the pairing rule passes it.
+#s = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+module {
+func.func @two_splats(%base: index) {
+  // expected-error @below {{tts.tensor_layout: a layout has at most one stick dim (a mod or splat entry), got 2}}
+  %v = ktdp.construct_memory_view %base, sizes: [64, 64], strides: [64, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 1, 0, 1>, phys_op = array<i64: 0, 0, 3, 3>, phys_arg = array<i64: 0, 0, 64, 64>}} : memref<64x64xf16>
+  return
+}
+}
+
+// -----
+
+// Case 20 -- the one stick dim, a mod, is not the last physical dim.
+//
+// phys [N/64, N%64, M]: the lanes sit in the middle dim.
+#s = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+func.func @mod_not_last(%base: index) {
+  // expected-error @below {{tts.tensor_layout: the stick dim must be the last physical dim, got it at phys dim 1 of 3}}
+  %v = ktdp.construct_memory_view %base, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 1, 0>, phys_op = array<i64: 1, 2, 0>, phys_arg = array<i64: 64, 64, 0>}} : memref<64x128xf16>
+  return
+}
+}
+
+// -----
+
+// Case 21 -- the one stick dim, a splat, is not the last physical dim.
+//
+// phys [64, M]: the replicated lanes come first.
+#s = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+module {
+func.func @splat_not_last(%base: index) {
+  // expected-error @below {{tts.tensor_layout: the stick dim must be the last physical dim, got it at phys dim 0 of 2}}
+  %v = ktdp.construct_memory_view %base, sizes: [64], strides: [1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 3, 0>, phys_arg = array<i64: 64, 0>}} : memref<64xf16>
+  return
+}
+}
+
+// -----
+
+// Case 22 -- a split whose floordiv divisor differs from its mod modulus.
+//
+// The floordiv counts sticks of 32 and the mod counts lanes of 64, so the two
+// halves name different stick widths.
+#s = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+func.func @split_width_mismatch(%base: index) {
+  // expected-error @below {{tts.tensor_layout: logical dim 1 is split with floordiv 32 but mod 64; the two must be the same stick width}}
+  %v = ktdp.construct_memory_view %base, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 64>}} : memref<64x128xf16>
+  return
+}
+}

@@ -645,34 +645,6 @@ VARIANTS = {
             "C_LAYOUT": [[1, (2, "floordiv", _SB("c_ptr")), 0, (2, "mod", _SB("c_ptr"))]],
         },
     },
-    # BMM with two independent stick splits on A: M (parallel) and K
-    # (reduction), giving a rank-5 physical view. Numerical counterpart of the
-    # @parallel_floor_rank5 lit case in
-    # test/Dialect/KTDP/Transforms/RewriteDescriptorLayoutGeneric/rebuild-contraction.mlir.
-    # The two splits become two loop-dim pairs of the one rebuilt contraction,
-    # one parallel and one reduction. C is left logical (rank-3), so its operand
-    # map carries M's composite.
-    "bmm_spyre_stick_rank5": {
-        "base": "bmm_spyre_stick",
-        "summary": (
-            "Batch matmul with two independent stick splits on A: M (parallel, "
-            "outer loop) and K (reduction, inner loop) -> rank-5 physical view "
-            "[M/S, K/S, B, M%S, K%S]. B splits K only (rank 4); C stays logical."
-        ),
-        "params":       {
-            # fp16 stick=64. M=128 -> 2 M-sticks (parallel, trip 2);
-            # K=128 -> 2 K-sticks (reduction, trip 2); N=64 -> 1 N-stick.
-            "B": [2], "M": [128], "K": [128], "N": [64],
-            "BLOCK_B": [2], "BLOCK_M": [128], "BLOCK_K": [128], "BLOCK_N": [64],
-            # A[B,M,K] split on M(dim 1) and K(dim 2): phys [M/S, K/S, B, M%S, K%S]
-            "A_LAYOUT": [[(1, "floordiv", _SB("a_ptr")), (2, "floordiv", _SB("a_ptr")),
-                          0,
-                          (1, "mod", _SB("a_ptr")), (2, "mod", _SB("a_ptr"))]],
-            # B_operand[B,K,N] split on K(dim 1): phys [K/S, B, K%S, N]
-            "B_LAYOUT": [[(1, "floordiv", _SB("b_ptr")), 0, (1, "mod", _SB("b_ptr")), 2]],
-            "C_LAYOUT": [None],
-        },
-    },
     # --- Chained matmul: D = A @ (B @ C) with physical annotations ---
     # A[M,K1] stick-on-M, B[K1,K2] stick-on-K2, C[K2,N] stick-on-N,
     # D[M,N] stick-on-N. The inner B@C loop produces a logical scratchpad

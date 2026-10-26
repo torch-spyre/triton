@@ -857,10 +857,10 @@ void collectNamedLoopDims(AffineExpr e, SmallVectorImpl<unsigned> &out) {
 /// part in the ordering and is given its loop AFTER the pieces are numbered —
 /// the last loop dim, wherever the splat sits in the operand's physical order.
 /// A result whose splat is not last therefore has a non-monotone map by
-/// construction: rebuild-reduction.mlir case 3 pins `(d0, d1, d2, d3) -> (d3,
-/// d1)`, which is correct and which linalg accepts, since a projected
-/// permutation need not be monotone. Asserting monotonicity over the splat dims
-/// too would be asserting something this pass never promised.
+/// construction, e.g. `(d0, d1, d2, d3) -> (d3, d1)`, which is correct and
+/// which linalg accepts, since a projected permutation need not be monotone.
+/// Asserting monotonicity over the splat dims too would be asserting something
+/// this pass never promised.
 [[maybe_unused]] bool resultMapIsMonotone(const RebuildOperand &result,
                                           AffineMap map) {
   SmallVector<unsigned> dims;

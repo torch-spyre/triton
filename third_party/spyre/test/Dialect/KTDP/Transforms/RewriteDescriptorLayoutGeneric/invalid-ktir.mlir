@@ -47,7 +47,7 @@ tt.func @lone_mod_half(%arg0: !tt.ptr<f32>) {
   %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
   // expected-error @below {{tts.tensor_layout: logical dim 1 has a mod physical dim without the matching floordiv half}}
   %1 = ktdp.construct_memory_view %0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>,
-      tts.tensor_layout = {phys_src = array<i64: 1, 0>, phys_op = array<i64: 2, 0>, phys_arg = array<i64: 64, 0>}} : memref<64x128xf32>
+      tts.tensor_layout = {phys_src = array<i64: 0, 1>, phys_op = array<i64: 0, 2>, phys_arg = array<i64: 0, 32>}} : memref<64x128xf32>
   tt.return
 }
 }

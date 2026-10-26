@@ -223,7 +223,10 @@ bool evaluateDeviceLayout(ArrayRef<int64_t> logSizes,
 ///   - `phys_arg[k] > 0` wherever `phys_op[k]` is not identity;
 ///   - a logical dim named by more than one physical dim is named either as a
 ///     stick split (one floordiv + one mod) or a splat re-stick (one identity +
-///     one splat), and by exactly two dims.
+///     one splat), and by exactly two dims;
+///   - at most one physical dim is a stick dim (a mod or splat entry), and it
+///     is the last physical dim;
+///   - a stick split's floordiv divisor equals its mod modulus.
 ///
 /// Deliberately NOT here: that every logical dim is named at least once, and
 /// that a split's two halves and a splat's identity companion are both present.
