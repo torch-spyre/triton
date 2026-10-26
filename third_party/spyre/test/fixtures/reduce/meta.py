@@ -8,9 +8,9 @@ Rank-3, middle axis  ``out[d0, d2] = OP(in[d0, :, d2])`` -- the reduced axis is
 
 Three reductions lower: ``sum``, ``max`` and ``min``, dispatched by
 ``OP: tl.constexpr``. All three reach ``linalg.reduce`` and run on ``ktir_cpu``.
-One combination reaches a Spyre binary and launches -- ``one_tile`` at
-``AXIS=0``, the loop-free shape folding the non-stick axis. The Level D banner
-records why that one and not the others.
+The loop-free shapes reach a Spyre binary and launch -- ``one_tile`` at either
+axis and ``middle_axis_one_tile``. The Level D banner records why those and not
+the others.
 
 Level D has a SECOND GROUP, and it is a reduce's CONSUMER rather than a fourth
 reduction: ``out = x - sum(x, axis)``, a statistic written to HBM and read back by
@@ -266,6 +266,9 @@ _SHAPE_ARGS = {
     "one_tile": {"M": "i32", "N": "i32",
                  "IN_LAYOUT": "constexpr", "OUT_LAYOUT": "constexpr",
                  "AXIS": "constexpr"},
+    # reduce_middle_axis_one_tile: the rank-3 shape without BLOCK_D0.
+    "3d_one_tile": {"D0": "i32", "D1": "i32", "D2": "i32",
+                    "IN_LAYOUT": "constexpr", "OUT_LAYOUT": "constexpr"},
 }
 
 
@@ -347,9 +350,9 @@ def _stick_1d_splat(dtype: str) -> tuple:
     ``_stick_1d`` *partitions* M's elements over two physical dims, so the element
     count is unchanged and one statistic lands in one lane. This one *splats*:
     physical dim 1 is a replication of width S, so each statistic occupies a whole
-    stick. That is the form a stick-axis reduce has to store, because the lanes it
-    reduced are read as one dim and written as another -- a floordiv/mod split,
-    which keeps the element count, has nowhere to put the surviving extent.
+    stick. That is the form a stick-axis reduce stores: torch-spyre's
+    ``_single_arg_op_layout`` gives a reduction over the stick dim a sparse
+    ``[1, M, S]`` output with lane 0 valid, and this is that footprint.
 
     A store writes the value across the stick; a load reads lane 0 and
     broadcasts it, so one descriptor serves both roles and the kernel never names
@@ -364,22 +367,24 @@ def _stick_1d_splat(dtype: str) -> tuple:
 
 
 def _stick_2d_on_n(dtype: str) -> tuple:
-    """``[M, N]`` -> ``[ceil(N/S), M, S]``: stick on the reduced axis.
+    """``[M, N]`` -> ``[ceil(N/S), M, S]``: stick on the trailing axis.
 
-    The reduced axis is split across the leading and trailing physical dims, so
-    this is the source-reduce path through ``RewriteDescriptorLayoutGeneric``.
+    torch-spyre's default 2-D layout, from ``SpyreTensorLayout::init``. The
+    trailing axis is split across the leading and trailing physical dims.
     """
     stick = _stick_of(dtype)
     return ("stick", ((1, "floordiv", stick), 0, (1, "mod", stick)))
 
 
 def _stick_3d_on_d2(dtype: str) -> tuple:
-    """``[D0, D1, D2]`` -> ``[ceil(D2/S), D0, D1, S]``: stick on the *unreduced*
-    trailing axis, which leaves the reduced axis (D1) non-trailing in the
-    physical tile.
+    """``[D0, D1, D2]`` -> ``[D1, ceil(D2/S), D0, S]``: stick on the *unreduced*
+    trailing axis, with D1 leading the physical tile.
+
+    torch-spyre's default 3-D layout, from ``SpyreTensorLayout::init``. The
+    reduced axis (D1) is non-trailing in the physical tile.
     """
     stick = _stick_of(dtype)
-    return ("stick", ((2, "floordiv", stick), 0, 1, (2, "mod", stick)))
+    return ("stick", (1, (2, "floordiv", stick), 0, (2, "mod", stick)))
 
 
 def _stick_on_n_row(dtype: str, n_sticks: int) -> tuple:
@@ -400,10 +405,9 @@ def _stick_on_n_row(dtype: str, n_sticks: int) -> tuple:
         OUT_LAYOUT = ((0, "floordiv", 64),    (0, "mod", 64))
 
     ``OUT_LAYOUT`` is the same idea over a 1-D output: ``[X]`` ->
-    ``[X // 64, X % 64]``. It does not depend on which axis was reduced, so one
-    layout serves both -- only the surviving extent differs, and the kernel
-    derives that. At ``M=64, N=128``: reducing N leaves M, so ``[64]`` ->
-    ``memref<1x64>``; reducing M leaves N, so ``[128]`` -> ``memref<2x64>``.
+    ``[X // 64, X % 64]``. It is the layout of the extent a reduce over M leaves:
+    at ``M=64, N=128`` that is ``[128]`` -> ``memref<2x64>``. A reduce over N
+    stores through :func:`_stick_on_n_row_splat` instead.
     """
     return (dtype, n_sticks * _stick_of(dtype),
             _stick_2d_on_n(dtype), _stick_1d(dtype))
@@ -423,13 +427,20 @@ def _stick_on_n_row_splat(dtype: str, n_sticks: int) -> tuple:
 
 
 def _stick_on_d2_row(dtype: str, n_sticks: int) -> tuple:
-    """One row for the ``("DTYPE", "D2", "IN_LAYOUT")`` group -- the rank-3
-    counterpart of :func:`_stick_on_n_row`.
+    """One row for the ``("DTYPE", "D2", "IN_LAYOUT", "OUT_LAYOUT")`` group --
+    the rank-3 counterpart of :func:`_stick_on_n_row`.
 
-    ``OUT_LAYOUT`` is outside the group because it stays ``None``: it follows
-    from nothing, and a row is for values that follow from the dtype.
+    ``OUT_LAYOUT`` is the default 2-D layout of ``[D0, D2]``: reducing a non-stick
+    axis keeps D2 as the stick, which is what torch-spyre's
+    ``_single_arg_op_layout`` gives. At ``D0=16, D1=96`` fp32 this is::
+
+        DTYPE      = "fp32"                                      # stick S = 32
+        D2         = 64                                          # 2 sticks of 32
+        IN_LAYOUT  = (1, (2, "floordiv", 32), 0, (2, "mod", 32)) # -> [96, 2, 16, 32]
+        OUT_LAYOUT = ((1, "floordiv", 32), 0, (1, "mod", 32))    # -> [2, 16, 32]
     """
-    return (dtype, n_sticks * _stick_of(dtype), _stick_3d_on_d2(dtype))
+    return (dtype, n_sticks * _stick_of(dtype),
+            _stick_3d_on_d2(dtype), _stick_2d_on_n(dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +470,7 @@ class Reduce(conftest.VariantFactory):
         return _oracle(OP, AXIS)
 
     def inputs(self, **_):
-        return make_inputs_3d if self.shape == "3d" else make_inputs
+        return make_inputs_3d if self.shape.startswith("3d") else make_inputs
 
 
 @dataclass(frozen=True)
@@ -608,8 +619,8 @@ VARIANTS = {
     #
     # All nine entries pass. None carries ``compiles_to_binary``, and not because
     # of the arithmetic: these distribute over the program id and dbo-opt refuses
-    # the loop that outlines from that. The one reduce that does reach a binary is
-    # the loop-free ``one_tile`` at ``AXIS=0`` (Level D).
+    # the loop that outlines from that. The reduces that do reach a binary are the
+    # loop-free ones at Level D.
     # -----------------------------------------------------------------------
     "2d_compute": {
         # No base: the factory produces SIGNATURE, reference and inputs, and a
@@ -669,13 +680,15 @@ VARIANTS = {
     # -----------------------------------------------------------------------
     "spyre_stick": {
         # in_ptr  [M, N] stick-on-N: phys [ceil(N/S), M, S]
-        # out_ptr [M]    stick:      phys [ceil(M/S), S]
+        # out_ptr [M]    splat:      phys [M, S]
+        # Both are torch-spyre's: SpyreTensorLayout::init's default for the
+        # input, and _single_arg_op_layout's for a reduction over the stick dim.
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
                  "program-id-1d", "spyre-tensor-layout"],
         "summary": (
-            "Row-sum reduce with in_ptr stick-on-N and out_ptr 1D stick. "
-            "Exercises the RewriteDescriptorLayoutGeneric source reduce path."
+            "Row-sum reduce with in_ptr stick-on-N and out_ptr splat across a "
+            "stick. Exercises the RewriteDescriptorLayoutGeneric source reduce path."
         ),
         "kernel_fn":  kernel.reduce_spyre,
         "factory":    Reduce(shape="2d"),
@@ -685,7 +698,7 @@ VARIANTS = {
             # sticks is 256 lanes at fp16. M and BLOCK_M are outside the group
             # because they follow from nothing.
             ("DTYPE", "N", "IN_LAYOUT", "OUT_LAYOUT"): [
-                _stick_on_n_row("fp16", n_sticks=4),
+                _stick_on_n_row_splat("fp16", n_sticks=4),
             ],
             "M": [64], "BLOCK_M": [64], "OP": ["sum"],
         },
@@ -700,18 +713,22 @@ VARIANTS = {
         "atol":        5e-2,
     },
     "middle_axis_spyre_stick": {
-        # in_ptr stick-on-D2 (fp32 stick = 32, D2 = 64 = 2 sticks exactly):
-        #   phys [D2//32, D0, D1, D2%32] = [2, 16, 96, 32]
-        # The reduced axis (D1) is non-trailing in the physical tile, and that is
-        # the case: linalg.reduce takes a sorted `dimensions` list, so D1 is named
-        # where it sits and no transpose is emitted. A slot-index-derived
-        # permutation would be identity here and would reduce the wrong axis.
+        # in_ptr  stick-on-D2 (fp32 stick = 32, D2 = 64 = 2 sticks exactly):
+        #   phys [D1, D2//32, D0, D2%32] = [96, 2, 16, 32]
+        # out_ptr stick-on-D2:
+        #   phys [D2//32, D0, D2%32]     = [2, 16, 32]
+        # Both are torch-spyre's: SpyreTensorLayout::init's default 3-D layout for
+        # the input, and _single_arg_op_layout's for a reduction over a non-stick
+        # dim, which is the default 2-D layout of [D0, D2].
+        # The reduced axis (D1) leads the physical tile, and that is the case:
+        # linalg.reduce takes a sorted `dimensions` list, so D1 is named where it
+        # sits and no transpose is emitted.
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
                  "spyre-tensor-layout"],
         "summary": (
-            "Rank-3 middle-axis reduce with in_ptr stick-on-D2. The reduced "
-            "axis is non-trailing in the physical tile, and stays where it is: "
+            "Rank-3 middle-axis reduce with in_ptr and out_ptr stick-on-D2. The "
+            "reduced axis leads the physical tile, and stays where it is: "
             "linalg.reduce names it rather than rotating it to the end."
         ),
         "kernel_fn":  kernel.reduce_middle_axis_spyre,
@@ -719,11 +736,10 @@ VARIANTS = {
         "constexpr":  ["D0", "D1", "D2", "BLOCK_D0", "IN_LAYOUT", "OUT_LAYOUT",
                        "OP"],
         "params": {
-            ("DTYPE", "D2", "IN_LAYOUT"): [
+            ("DTYPE", "D2", "IN_LAYOUT", "OUT_LAYOUT"): [
                 _stick_on_d2_row("fp32", n_sticks=2),
             ],
-            "D0": [16], "D1": [96], "BLOCK_D0": [16],
-            "OUT_LAYOUT": [None], "OP": ["sum"],
+            "D0": [16], "D1": [96], "BLOCK_D0": [16], "OP": ["sum"],
         },
         "grid":        [1],
         "output_key":  "out_ptr",
@@ -746,14 +762,15 @@ VARIANTS = {
     # TWO GROUPS OF VARIANTS, at that one shape, and the split is what the reduce
     # is asked to do rather than another axis of the ladder:
     #
-    #   the reduce alone        ``one_tile`` and its two on-stick siblings: where a
-    #                           statistic LANDS, at either axis and at either
-    #                           output layout.
+    #   the reduce alone        ``one_tile``, its on-stick sibling and
+    #                           ``middle_axis_one_tile``: where a statistic LANDS,
+    #                           at either axis of a 2-D tile and at the middle
+    #                           axis of a rank-3 one.
     #   the reduce's consumer   ``stat_chain_*``: the same statistic READ BACK by a
     #                           later compute group, ``out = x - sum(x, axis)``.
     #                           Softmax's G1 and G2. Each arm's G1 is verbatim one
-    #                           of the three above, so everything that is new is
-    #                           G2.
+    #                           of the 2-D variants above, so everything that is
+    #                           new is G2.
     #
     # Both groups belong at this level and not at a new one: the ladder's levels
     # are what a band VARIES -- shape, compute, layout, device -- and the chain
@@ -761,13 +778,10 @@ VARIANTS = {
     # aimed at the same tier. The second group's own banner is below,
     # above ``stat_chain_off_stick``.
     #
-    # TWO VARIANTS RATHER THAN ONE AXIS SWEEP, because the two axes have
-    # different device stories and a variant is the unit that can say so. What
-    # divides them is not params -- ``compiles_to_binary`` is a field, so one
-    # variant cannot carry two answers. (``atol`` was the other half of this
-    # reason and no longer is: it takes a per-dtype dict now. The split rests on
-    # ``compiles_to_binary`` alone.) Collapse them back into a single
-    # ``AXIS: [0, 1]`` sweep the day the on-stick arm reaches the device too.
+    # TWO 2-D VARIANTS RATHER THAN ONE AXIS SWEEP, one per axis, each with the
+    # output layout that axis leaves: a partition of the surviving stick for
+    # ``one_tile``, a splat for its on-stick sibling. A joint ``(AXIS,
+    # OUT_LAYOUT)`` row group would collapse them into one variant.
     #
     # The scheduler's compute allowlist takes ``linalg.reduce`` but not the
     # neutral-element ``linalg.fill`` LowerComputeOps puts on the reduction's
@@ -776,7 +790,7 @@ VARIANTS = {
     # the emission with the fill already gone -- which is what makes it match
     # torch-spyre's, whose emitter never writes one.
     #
-    # DTYPE and OP are pinned in both: the fill and then the shape are what
+    # DTYPE and OP are pinned in each: the fill and then the shape are what
     # decide the outcome, and every dtype and every combiner produce those alike.
     # -----------------------------------------------------------------------
 
@@ -829,61 +843,18 @@ VARIANTS = {
         # for bit, so there is no oracle-side order to match, and widening the
         # oracle to an fp32 accumulator does not close the gap.
         #
-        # The on-stick sibling below keeps 5e-2: it never runs on the device, so
-        # nothing there asks for this. That is what the split buys.
-        #
         # An output that was never written is caught by test_device_launch's own
         # nonzero assertion, not by a tolerance.
         "atol":        2.5e-1,
     },
 
     # Folds N, the STICK axis, which stick-on-N splits across physical dims 0
-    # and 2. The reduce names both and collapses to a rank-1 result that needs
-    # widening for the rank-2 store, and dbo-opt stops on ktdf.data_transfer
-    # having a rank-2 dest against a 1-result dest_map. No batch dimension
-    # survives to carry the split, so the sibling above's path does not apply --
-    # and torch-spyre does not emit linalg.reduce for this case at all, using a
-    # linalg.generic with the maps written out, so there is no working emission to
-    # match.
-    #
-    # That refusal is why this variant carries no ``compiles_to_binary``. It is
-    # not asserted anywhere: what is under test is that the reduce lowers and
-    # computes the right numbers on ktir_cpu at this axis.
-    "one_tile_on_stick": {
-        "base": "one_tile",
-        "summary": (
-            "The same single-tile sum folding the stick axis instead. Two "
-            "physical dims are reduced, no batch dimension survives, and it "
-            "stops in the scheduler — so ktir_cpu only."
-        ),
-        "params": {
-            ("DTYPE", "N", "IN_LAYOUT", "OUT_LAYOUT"): [
-                _stick_on_n_row("fp16", n_sticks=2),
-            ],
-            # Folding N leaves M = 64, one whole stick at fp16.
-            "M": [64], "OP": ["sum"], "AXIS": [1],
-        },
-        # Shallow merge replaces the whole field, so the device arm's
-        # compiles_to_binary is not inherited -- but say so rather than relying
-        # on a reader knowing that: this arm does not reach a binary.
-        "compiles_to_binary": False,
-        # Back to the elementwise-shaped tolerance: nothing here runs on the
-        # device, so 5e-2 (3.2 ulp of this output) is already generous and
-        # inheriting the sibling's 0.25 would check it 20x looser than it needs.
-        "atol":        5e-2,
-    },
-
-    # The same stick-axis fold as the sibling above, storing its statistic
-    # REPLICATED across a stick instead of split across one -- and that is what
-    # reaches a binary where the split form does not.
-    #
-    # The split cannot work and it is structural, not a tuning question. Under
-    # stick-on-N the lanes being folded are read as one physical dim and the
-    # statistic is written as another, so _stick_1d's floordiv/mod -- which
-    # PARTITIONS, keeping the element count -- has nowhere to put the surviving
-    # extent. A splat coord op REPLICATES: logical [M] becomes physical [M, S],
-    # one whole stick per statistic. The emitted reduce is then byte-identical to
-    # the form torch-spyre's own KTIR backend emits for torch.sum(x, dim=-1):
+    # and 2, and stores its statistic REPLICATED across a stick. A splat coord op
+    # REPLICATES: logical [M] becomes physical [M, S], one whole stick per
+    # statistic -- the footprint of the sparse [1, M, S] output torch-spyre's
+    # _single_arg_op_layout gives a reduction over the stick dim. The emitted
+    # reduce is byte-identical to the form torch-spyre's own KTIR backend emits
+    # for torch.sum(x, dim=-1):
     #
     #   indexing_maps  = [(d0,d1,d2,d3) -> (d0,d1,d2),
     #                     (d0,d1,d2,d3) -> (d1,d3)]
@@ -905,11 +876,9 @@ VARIANTS = {
     "one_tile_on_stick_splat": {
         "base": "one_tile",
         "summary": (
-            "The stick-axis sum again, storing its statistic SPLAT across a "
-            "stick instead of split across one. The split form cannot be "
-            "scheduled -- the lanes are reduced as one physical dim and would be "
-            "written as another -- and the splat form is what the reference "
-            "chains store. This is the arm that reaches a binary."
+            "The same single-tile sum folding the stick axis instead, storing "
+            "its statistic SPLAT across a stick -- the form the reference chains "
+            "store. Reaches a binary and launches."
         ),
         "params": {
             ("DTYPE", "N", "IN_LAYOUT", "OUT_LAYOUT"): [
@@ -927,6 +896,41 @@ VARIANTS = {
         # variant declares nothing about it. See device_alloc_from in
         # test_device_launch.py.
         "atol":        2.5e-1,
+    },
+
+    # middle_axis_spyre_stick without its distribution loop: the whole rank-3
+    # tile in one block, at the same torch-spyre layouts.
+    #   in_ptr  phys [D1, D2//32, D0, D2%32] = [96, 2, 16, 32]
+    #   out_ptr phys [D2//32, D0, D2%32]     = [2, 16, 32]
+    # Folding D1 deletes the leading physical dim, and D2's split survives into
+    # the output, so the surviving stick index is a batch dimension of the
+    # reduce -- ``one_tile``'s shape one rank up.
+    "middle_axis_one_tile": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "simplified:no-loop", "spyre-tensor-layout"],
+        "summary": (
+            "Rank-3 middle-axis sum over a single stick-tiled tile, no "
+            "distribution loop: the reduced axis leads the physical tile and the "
+            "surviving stick index is a batch dimension. Reaches a binary and "
+            "launches."
+        ),
+        "kernel_fn":  kernel.reduce_middle_axis_one_tile,
+        "factory":    Reduce(shape="3d_one_tile"),
+        "constexpr":  ["D0", "D1", "D2", "IN_LAYOUT", "OUT_LAYOUT", "OP"],
+        "params": {
+            ("DTYPE", "D2", "IN_LAYOUT", "OUT_LAYOUT"): [
+                _stick_on_d2_row("fp32", n_sticks=2),
+            ],
+            "D0": [16], "D1": [96], "OP": ["sum"],
+        },
+        "grid":        [1],
+        "compiles_to_binary": True,
+        "output_key":  "out_ptr",
+        "rtol":        1e-4,
+        # linalg.reduce accumulates the 96 terms in a different order than
+        # NumPy's sum, so fp32 drifts ~1e-5 absolute on a few elements.
+        "atol":        1e-4,
     },
 
 

@@ -32,7 +32,7 @@ def reduce_spyre(
     IN_LAYOUT  — stick-tiling for in_ptr's [M, N] extent
                  (stick-on-N: [(1,"floordiv",S), 0, (1,"mod",S)]).
     OUT_LAYOUT — stick-tiling for out_ptr's [M] extent
-                 (stick: [(0,"floordiv",S), (0,"mod",S)]).
+                 (splat: [0, (0,"splat",S)]).
     Pass None for no layout annotation.
     """
     pid_m = tl.program_id(0)
@@ -176,17 +176,14 @@ def reduce_one_tile(
       shape torch-spyre's working ``sum`` emits. This one reaches a binary and
       launches.
     - ``AXIS=1`` folds N, the *stick* axis. Stick-on-N splits N across physical
-      dimensions 0 and 2, so the reduce names both and collapses to a rank-1
-      result that then has to be widened back for a rank-2 store. No batch
-      dimension survives to carry the split. torch-spyre does not emit
-      ``linalg.reduce`` for this at all -- its ``sum-onstick`` case uses
-      ``linalg.generic`` with the maps written out, because the lanes are read as
-      one dimension and written as another. It still stops in the scheduler; the
-      Level D banner in ``meta.py`` says where.
+      dimensions 0 and 2, so the reduce names both and no stick index survives
+      into the result. The output layout is then a *splat*, ``[M] -> [M, S]``:
+      each row's value is written across a whole stick, the form torch-spyre's
+      ``_single_arg_op_layout`` gives a reduction over the stick dim. This one
+      reaches a binary and launches too.
 
-    They stop in different places, which is the point of being able to ask for
-    both. ``AXIS`` also makes the output extent vary, so the variant states no
-    output shape: it follows from the axis.
+    ``AXIS`` also makes the output extent vary, so the variant states no output
+    shape: it follows from the axis.
     """
     in_desc = tl.make_tensor_descriptor(
         in_ptr,
@@ -219,6 +216,59 @@ def reduce_one_tile(
     else:
         reduced = tl.min(a_tile, AXIS)
     out_desc.store([0], reduced)
+
+
+@triton.jit
+def reduce_middle_axis_one_tile(
+    in_ptr,
+    out_ptr,
+    D0: tl.constexpr,
+    D1: tl.constexpr,
+    D2: tl.constexpr,
+    IN_LAYOUT: tl.constexpr,
+    OUT_LAYOUT: tl.constexpr,
+    OP: tl.constexpr,
+):
+    """:func:`reduce_middle_axis_spyre` in one tile: no ``tl.program_id``, no loop.
+
+    out[d0, d2] = OP(in[d0, :, d2]) over the D1 axis, the whole ``[D0, D1, D2]``
+    extent loaded as one block and the whole ``[D0, D2]`` result stored as one.
+
+    Stuck on D2, the reduced axis D1 is a whole physical dimension of the input
+    and D2's stick split survives into the output, so the reduce keeps the
+    surviving stick index as a batch dimension -- the rank-3 counterpart of
+    :func:`reduce_one_tile` at ``AXIS=0``.
+
+    IN_LAYOUT  — stick-tiling for in_ptr's [D0, D1, D2] extent.
+    OUT_LAYOUT — stick-tiling for out_ptr's [D0, D2] extent.
+    Pass None for no layout annotation.
+    """
+    in_desc = tl.make_tensor_descriptor(
+        in_ptr,
+        shape=[D0, D1, D2],
+        strides=[D1 * D2, D2, 1],
+        block_shape=[D0, D1, D2],
+    )
+    if IN_LAYOUT is not None:
+        tl.spyre_tensor_layout(in_desc, IN_LAYOUT)
+
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr,
+        shape=[D0, D2],
+        strides=[D2, 1],
+        block_shape=[D0, D2],
+    )
+    if OUT_LAYOUT is not None:
+        tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
+
+    a_tile = in_desc.load([0, 0, 0])
+    if OP == "sum":
+        reduced = a_tile.sum(1)
+    elif OP == "max":
+        reduced = tl.max(a_tile, 1)
+    else:
+        reduced = tl.min(a_tile, 1)
+    out_desc.store([0, 0], reduced)
 
 
 # ---------------------------------------------------------------------------
