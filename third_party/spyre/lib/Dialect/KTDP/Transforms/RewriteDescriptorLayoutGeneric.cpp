@@ -153,48 +153,13 @@ static bool isDenseRangeSet(IntegerSet set, MLIRContext *ctx,
 //===----------------------------------------------------------------------===//
 // IndexDomain lifting helpers
 //
-// Copies, and deliberately so. The originals are in IndexDomain.cpp under
-// RewriteDescriptorLayout/, the named pass's own subdirectory, and that whole
-// subdirectory goes away when the named pass does — the deletion note at the top
-// of RewriteDescriptorLayout.cpp sequences it. Sharing these would make this
-// pass, the one that survives, depend on a directory scheduled for deletion. So
-// these are the copies that outlive it.
-//
-// Not the same judgement as buildRangeSetND, which this pass calls from
-// Dialect/KTDP/Utils instead of copying: that one is shared infrastructure in a
-// settled home. These only look like duplication because their current home is
-// doomed.
+// rebuildInIndexDomain re-emits an access tile subscript that is computed in
+// fixed-width integer arithmetic as the same arithmetic in `index`, so the
+// div/rem physicalizeAccessTile adds is emitted at the subscript's own type.
 //===----------------------------------------------------------------------===//
-
-static bool isIdentityTracingIntCast(Operation *op) {
-  return isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::TruncIOp,
-             arith::ExtSIOp, arith::ExtUIOp>(op);
-}
 
 static bool isValuePreservingIntCast(Operation *op) {
   return isa<arith::IndexCastOp, arith::ExtSIOp>(op);
-}
-
-[[maybe_unused]] static BlockArgument traceToMLIRBlockArg(Value v) {
-  while (true) {
-    if (auto ba = dyn_cast<BlockArgument>(v))
-      return ba;
-    auto *op = v.getDefiningOp();
-    if (!op)
-      return nullptr;
-    if (isIdentityTracingIntCast(op)) {
-      v = op->getOperand(0);
-      continue;
-    }
-    if (isa<arith::MulIOp, arith::DivSIOp, arith::RemSIOp, arith::AddIOp>(op)) {
-      if (op->getNumOperands() == 2 &&
-          triton::spyre::getConstantInt(op->getOperand(1))) {
-        v = op->getOperand(0);
-        continue;
-      }
-    }
-    return nullptr;
-  }
 }
 
 static bool isArithIntOp(Operation *op) {
