@@ -92,26 +92,28 @@ bool evaluateDeviceLayout(ArrayRef<int64_t> logSizes,
     return false;
   unsigned rank = extents.size();
 
-  // How far does one step along each device axis move the host pointer? Innermost
-  // to outermost, so that an outer half of a partitioned dim can multiply up by
-  // whatever the inner half turned out to be: `running[d]` is the stride the next
-  // axis over logical dim d will take, seeded with the dim's own host stride.
+  // How far does one step along each device axis move the host pointer? A splat
+  // axis, or an axis over a logical dim of extent one, moves it nowhere. An
+  // identity axis and a split's mod (lane) axis move it by the logical dim's own
+  // host stride; a split's floordiv (stick) axis moves it by one whole stick,
+  // that stride times the width. The mod axis, when there is one, is the last
+  // axis and its width is the floordiv's divisor, so the stick stride is stated
+  // directly from phys_arg.
   SmallVector<int64_t> strides(rank, 0);
-  SmallVector<int64_t> running(logStrides.begin(), logStrides.end());
-  for (int k = (int)rank - 1; k >= 0; --k) {
+  for (unsigned k = 0; k < rank; ++k) {
     int64_t d = physSrc[k];
-    if (static_cast<CoordOp>(physOp[k]) == CoordOp::Splat || logSizes[d] == 1) {
+    CoordOp c = static_cast<CoordOp>(physOp[k]);
+    if (c == CoordOp::Splat || logSizes[d] == 1) {
       strides[k] = -1;
       continue;
     }
-    strides[k] = running[d];
+    strides[k] = logStrides[d];
     // A dynamic logical stride stays dynamic rather than being multiplied: the
     // product would overflow. Unreachable for anything in tree -- a dynamic dim
     // only survives applyCoordMap under mod or splat -- and the alternative is
     // signed-overflow UB rather than a number.
-    running[d] = strides[k] == ShapedType::kDynamic
-                     ? ShapedType::kDynamic
-                     : strides[k] * extents[k];
+    if (c == CoordOp::FloorDiv && strides[k] != ShapedType::kDynamic)
+      strides[k] *= physArg[k];
   }
 
   deviceSize.assign(extents.begin(), extents.end());

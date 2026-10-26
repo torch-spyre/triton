@@ -137,14 +137,12 @@ bool applyCoordMap(ArrayRef<int64_t> logSizes, ArrayRef<int64_t> physSrc,
 ///     advance over. torch-spyre treats the two identically (same branch of
 ///     `dim_map_to_stride_map`, `spyre_tensor_impl.cpp`).
 ///
-///     This is their loop re-derived rather than a table of cases: the outer
-///     half's stride is a PRODUCT. The loop runs INNERMOST TO OUTERMOST and
-///     carries a per-logical-dim running stride: a stick split's inner (mod) half
-///     takes `logStrides[d]`, and its outer (floordiv) half then takes
-///     `logStrides[d] x (the inner half's device extent)`, which is `phys_arg`
-///     since `verifyTensorLayoutArrays` makes the mod half the last axis. Neither
-///     `-1` case updates the running stride, so an outer axis over the same
-///     logical dim is unaffected by a splat inside it.
+///     Each axis's stride is stated directly. An identity axis and a stick
+///     split's inner (mod) half take `logStrides[d]`, and its outer (floordiv)
+///     half takes `logStrides[d] x phys_arg`: one whole stick. That product is the
+///     inner half's device extent because `verifyTensorLayoutArrays` requires the
+///     mod half to be the last axis and its modulus to equal the floordiv's
+///     divisor.
 ///
 ///   - **The unit-axis padding.** torch-spyre's DMA setup reads one particular
 ///     device axis as the tile-count half of the stick split: the one THIRD FROM
