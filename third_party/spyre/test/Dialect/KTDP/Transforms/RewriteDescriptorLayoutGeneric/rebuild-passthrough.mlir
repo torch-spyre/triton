@@ -9,8 +9,10 @@
 // cases below are those two ways of having nothing to add -- there is no
 // broadcast-specific logic and no elementwise-specific logic, which is the claim.
 //
-// Contrast rebuild-composite.mlir, where one operand holds whole a dim another
-// operand splits and the maps do have to carry a composite.
+// Contrast rebuild-composite.mlir, where the operands split the same dim from
+// different physical positions and the maps carry a permutation, and
+// invalid-layout.mlir cases 7 to 12, where one operand holds whole a dim another
+// operand splits and the pass refuses the generic.
 //
 // Captures are hand-named and this file is hand-maintained: do not regenerate it
 // with generate-test-checks.py, which numbers captures globally across a file and

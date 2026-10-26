@@ -20,7 +20,7 @@
 //   1. the result names every piece -- the merge finds everything and inserts
 //      nothing: rebuild-passthrough.mlir case 1, rebuild-composite.mlir case 1.
 //   2. an input names a piece the result does not -- the insert-at-cursor path:
-//      rebuild-reduction.mlir case 1, rebuild-composite.mlir cases 2 and 3.
+//      rebuild-reduction.mlir cases 1 and 8, rebuild-contraction.mlir case 1.
 //   3. a second input whose pieces are already placed -- the cursor-advance
 //      path, including a piece found BEHIND the cursor, which is where a
 //      non-monotone input map comes from: rebuild-contraction.mlir cases 1
@@ -39,14 +39,10 @@
 // admit no valid order, and that is the point at which this pass needs a
 // diagnostic rather than an assertion.
 //
-// LINEARIZATION. composeStickSplit emits `stick * width + lane` -- the
-// expression affine.linearize_index computes -- on the happy path, in nearly
-// every passing test in this directory. What is recorded elsewhere of dbo-opt's
-// rules is that it REJECTS a linearizing map. Both cannot be true as stated, so
-// either that rule is narrower than recorded (an output map only, say, or a map
-// that is an op's only one) or there is a tension these tests are not catching.
-// Neither invariant asserted in the pass mentions linearization, so this round
-// does not resolve it; the question is recorded here so it is not lost.
+// LINEARIZATION. No map here, or anywhere in this directory's positive cases,
+// carries `stick * width + lane`: the pass refuses a generic in which an
+// operand holds whole a dim another operand splits (invalid-layout.mlir cases 7
+// to 12), so every rebuilt map result is a bare loop dim or a constant.
 
 // Branch 4 -- two inputs naming a shared pair of pieces in OPPOSITE relative
 // order.

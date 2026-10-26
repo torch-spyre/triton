@@ -183,8 +183,9 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // matches generic -> generic, so a named producer or consumer blocks it whatever
   // the control function says. And it must precede the layout pass below, whose
   // behaviour it changes -- left in place, a data-movement generic has no layout
-  // marker, so that pass leaves its result logical and bridges the gap with a
-  // linearizing operand map the scheduler cannot project loop IVs through.
+  // marker, so that pass leaves its result logical and refuses the consumer,
+  // whose operand map would have to bridge the gap with a linearizing map the
+  // scheduler cannot project loop IVs through.
   pm.addPass(createFuseComputeAndDataMovementPass());
 
   // Logical descriptors -> physical (stick-tiled) layout, rooted on the

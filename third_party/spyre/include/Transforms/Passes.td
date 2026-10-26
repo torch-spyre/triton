@@ -421,12 +421,12 @@ def FuseComputeAndDataMovement
 
         Motivation: a data-movement generic has no descriptor and so no layout
         marker, so RewriteDescriptorLayoutGeneric leaves its result logical while
-        its consumer is physical. The consumer's operand map then has to bridge
-        the two and a LINEARIZATION is folded into it
+        its consumer is physical. The consumer's operand map would then have to
+        bridge the two with a LINEARIZATION
         (`(d0, d1, d2) -> (d1, d0 * 64 + d2)`), which the dataflow-scheduler
-        cannot schedule: "could not locate matching linalg operand to project
+        cannot schedule ("could not locate matching linalg operand to project
         loop IVs and tile sizes through; the data_transfer rank would not match
-        the underlying memref". Folded into the consumer, the same coordinate
+        the underlying memref"), so that pass refuses the consumer. Folded into the consumer, the same coordinate
         change is an operand map the layout pass restates at physical rank like
         any other — a statistic read at a constant lane comes out as
         `(d0, d1, d2) -> (d1, 0)`, which is what hand-written reference KTIR
@@ -488,7 +488,7 @@ def FuseComputeAndDataMovement
         HAS a layout). BACKWARD from the DATA of each store over an annotated
         view, the exact mirror: findLayoutForResult walks a generic's result users
         for a `ktdp.store` DIRECTLY, so a shape op between the two makes it return
-        null and the linearization lands on the `outs` map instead — `gather__1d`
+        null and the linearization would be on the `outs` map instead — `gather__1d`
         carries an `8x1 → 8` `tt.reshape` into a store, so the shape is real.
         FORWARD one hop off each physicalized load, for a result neither backward
         walk reaches; where it reaches a generic this is redundant with
@@ -513,7 +513,7 @@ def FuseComputeAndDataMovement
         (fusion matches generic → generic only, so a named producer or consumer
         blocks it whatever the control function says), and before
         RewriteDescriptorLayoutGeneric, which must see the folded maps so that no
-        data-movement generic survives for it to linearize — and whose scope the
+        data-movement generic survives for it to refuse — and whose scope the
         gate above predicts.
 
         Output: no linalg.generic whose body is a lone yield of an input remains

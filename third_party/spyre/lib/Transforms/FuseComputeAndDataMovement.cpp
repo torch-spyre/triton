@@ -10,9 +10,10 @@
 // whose body computes nothing: it yields its input, and only its indexing maps
 // differ. That op has no descriptor and no layout marker, so
 // RewriteDescriptorLayoutGeneric leaves its result LOGICAL while its consumer
-// is physical, and the consumer's operand map then bridges the two with a
-// LINEARIZATION -- `(d0, d1, d2) -> (d1, d0 * 64 + d2)` -- which the scheduler
-// cannot project loop IVs and tile sizes through. Folded into the consumer
+// is physical, and the consumer's operand map would then have to bridge the two
+// with a LINEARIZATION -- `(d0, d1, d2) -> (d1, d0 * 64 + d2)` -- which the
+// scheduler cannot project loop IVs and tile sizes through, so that pass refuses
+// the consumer instead. Folded into the consumer
 // instead, the coordinate change becomes part of an operand map the layout pass
 // restates at physical rank like any other.
 //
@@ -159,14 +160,14 @@
 //     catches a re-indexing op whose OWN load is on an UNANNOTATED view.
 //     Nothing else looks there: RewriteDescriptorLayoutGeneric calls
 //     retypeToPhysical only for an operand that HAS a layout, so an operand
-//     that has none is bridged by rebuildMap with no check at all.
+//     that has none reaches its refuseLinearization instead.
 //
 //     BACKWARD from the DATA of each store over an annotated view, which is the
 //     exact mirror. findLayoutForResult walks a generic's result users for a
 //     `ktdp.store` DIRECTLY -- `dyn_cast<StoreOp>`, `continue` otherwise -- so
 //     a shape op between the generic and the store makes it return null, the
-//     outs gets CoordOp::Identity, and the LINEARIZATION lands on the outs map
-//     instead of an ins map. `gather__1d` carries an 8x1 -> 8 `tt.reshape` into
+//     outs gets CoordOp::Identity, and the LINEARIZATION it would need is on the
+//     outs map instead of an ins map. `gather__1d` carries an 8x1 -> 8 `tt.reshape` into
 //     a store, so the shape is real and in the tree -- on a kernel this pass
 //     never sees, since it stops at the `ktir` stage. Rejection only on this
 //     side, never absorption: see THE STORE SIDE, above.
@@ -188,8 +189,8 @@
 //   restatement nor a linalg.generic, so a reshape behind an `scf.for` result
 //   is not found -- and could not be absorbed either. And the linearization
 //   hazard is wider than re-indexing ops: ANY unphysicalized operand of a
-//   generic whose domain got split is bridged by rebuildMap's
-//   linearizeStickLane, a plain compute chain included. That is not this
+//   generic whose domain got split is refused by RewriteDescriptorLayoutGeneric's
+//   refuseLinearization, a plain compute chain included. That is not this
 //   gate's, because absorption is not its fix.
 //
 // `--debug-only=fuse-compute-and-data-movement` traces the decisions rather
@@ -202,7 +203,7 @@
 // matches generic -> generic only, so a named producer or consumer blocks it
 // whatever the control function says. Before rewrite_descriptor_layout_generic,
 // which must see the folded maps so that no data-movement generic is left for
-// it to linearize, and which is also the pass whose scope the gate above
+// it to refuse, and which is also the pass whose scope the gate above
 // predicts.
 //
 //===----------------------------------------------------------------------===//
@@ -796,12 +797,12 @@ LogicalResult rejectOnPhysicalizedPaths(ModuleOp mod, Tally &tally) {
   //
   // The two seeds are the two sides of one hazard, and neither is optional:
   //   the generic's `ins` -- findLayoutForInput takes a ktdp.load and nothing
-  //   else, so an operand behind a shape op has no layout and rebuildMap
-  //   bridges it with linearizeStickLane; the store's data --
+  //   else, so an operand behind a shape op has no layout and the layout pass
+  //   refuses it as needing a linearizing map; the store's data --
   //   findLayoutForResult walks the generic's result users for a ktdp.store
   //   DIRECTLY (`dyn_cast<StoreOp>`, `continue` otherwise), so a shape op
-  //   between the two makes it return null and the LINEARIZATION lands on the
-  //   `outs` map instead. `gather__1d` carries an 8x1 -> 8 tt.reshape into a
+  //   between the two makes it return null and the LINEARIZATION it would need
+  //   is on the `outs` map instead. `gather__1d` carries an 8x1 -> 8 tt.reshape into a
   //   store, which is that shape in the tree -- unannotated, hence the gate.
   //
   // Nothing here absorbs on the store side; rejection only, per the header.
