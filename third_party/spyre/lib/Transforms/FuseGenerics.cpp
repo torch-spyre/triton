@@ -17,8 +17,9 @@
 //
 // Both patterns check the consumer's operand list as it would be after the
 // rewrite, before mutating anything (checkOperandRewrite): D1, the producer is
-// all-parallel; D2, every map is projected; D3, every loop dim is named; D4, no
-// value is both an `ins` and an `outs`.
+// all-parallel; D3, every loop dim is named; D4, no value is both an `ins` and
+// an `outs`. Every producer map has every result a bare dim or a constant, and
+// composing through a permutation keeps that, so no map is checked for it.
 //
 // HOW TO ADD A PATTERN. A pattern matches on its PRODUCER'S KIND: the op that
 // defines the operand, or what the producer's body computes for it. Never on
@@ -187,7 +188,7 @@ struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
 ///     at least one;
 ///   - when `P` has a user other than the consumer, every non-terminator op in
 ///     `P`'s body is the anchor, so nothing outside the group is copied;
-///   - D2-D4 hold on the fused operand list.
+///   - D3 and D4 hold on the fused operand list.
 ///
 /// The rewrite is linalg::fuseElementwiseOps, then
 /// linalg::deduplicateOperandsAndRemoveDeadResults on the fused op, which

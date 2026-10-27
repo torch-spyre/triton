@@ -5,9 +5,9 @@
 // one generic out, or a reshape replaced by a generic: nothing is fused here.
 //
 //   ReshapeToGeneric       a static tensor.collapse_shape / tensor.expand_shape
-//                          whose every user is a generic `ins` becomes one
-//                          forwarding generic, its input map the reshape's
-//                          result -> source map
+//                          whose every user is a generic `ins`, and whose
+//                          result -> source map is projected, becomes one
+//                          forwarding generic with that map as its input map
 //   SplatOperandToScalar   a splat dense constant `ins` becomes a scalar
 //                          arith.constant read in the body
 //
@@ -63,79 +63,45 @@ SmallVector<int64_t> nonUnitDims(ArrayRef<int64_t> shape,
   return out;
 }
 
-/// The extents of `shape` at `dims`, multiplied. Every entry is static.
-int64_t productOf(ArrayRef<int64_t> shape, ArrayRef<int64_t> dims) {
-  int64_t p = 1;
-  for (int64_t d : dims)
-    p *= shape[d];
-  return p;
-}
-
-/// collapse_shape, result coords -> source coords. One group per result dim,
-/// listing the source dims it merged. A group with at most one non-unit dim
-/// carries the collapsed index on that dim and 0 elsewhere; a group with
-/// several delinearizes it with floordiv and mod, e.g. `[64,2] -> [128]` gives
-/// `(d0) -> (d0 floordiv 2, d0 mod 2)`. A source dim in no group (a rank-0
-/// result) reads 0. Every extent is static.
-AffineMap collapseResultToSource(tensor::CollapseShapeOp op) {
+/// The result -> source map of a static tensor.collapse_shape, or failure when
+/// a reassociation group merges more than one non-unit source dim. Each group
+/// lists the source dims one result dim merged: its one non-unit dim reads that
+/// result dim, and every other source dim, including one in no group (a rank-0
+/// result), reads 0. For example `[64,1] -> [64]` gives `(d0) -> (d0, 0)` and
+/// `[1,1] -> []` gives `() -> (0, 0)`.
+FailureOr<AffineMap> collapseResultToSource(tensor::CollapseShapeOp op) {
   MLIRContext *ctx = op.getContext();
   ArrayRef<int64_t> srcShape = op.getSrcType().getShape();
-  unsigned resultRank = op.getResultType().getRank();
-  auto groups = op.getReassociationIndices();
-
   SmallVector<AffineExpr> results(srcShape.size(),
                                   getAffineConstantExpr(0, ctx));
-  for (auto [g, group] : llvm::enumerate(groups)) {
-    AffineExpr collapsed = getAffineDimExpr(g, ctx);
+  for (auto [g, group] : llvm::enumerate(op.getReassociationIndices())) {
     SmallVector<int64_t> nonUnit = nonUnitDims(srcShape, group);
-    if (nonUnit.size() <= 1) {
-      if (!nonUnit.empty())
-        results[nonUnit.front()] = collapsed;
-      continue;
-    }
-    for (auto [idx, d] : llvm::enumerate(group)) {
-      if (srcShape[d] == 1)
-        continue;
-      int64_t stride =
-          productOf(srcShape, ArrayRef<int64_t>(group).drop_front(idx + 1));
-      AffineExpr e = stride == 1 ? collapsed : collapsed.floorDiv(stride);
-      // The collapsed index is bounded by the group's product, so the
-      // outermost non-unit dim needs no modulus.
-      if (d != nonUnit.front())
-        e = e % srcShape[d];
-      results[d] = e;
-    }
+    if (nonUnit.size() > 1)
+      return failure();
+    if (!nonUnit.empty())
+      results[nonUnit.front()] = getAffineDimExpr(g, ctx);
   }
-  return AffineMap::get(resultRank, /*symbolCount=*/0, results, ctx);
+  return AffineMap::get(op.getResultType().getRank(), /*symbolCount=*/0,
+                        results, ctx);
 }
 
-/// expand_shape, result coords -> source coords. One group per source dim,
-/// listing the result dims it was split into. Each source dim reads its one
-/// non-unit result dim, 0 when there is none, or a mul-add linearization of
-/// several. Every extent is static.
-AffineMap expandResultToSource(tensor::ExpandShapeOp op) {
+/// The result -> source map of a static tensor.expand_shape, or failure when a
+/// reassociation group splits a source dim into more than one non-unit result
+/// dim. Each group lists the result dims one source dim was split into: the
+/// source dim reads its one non-unit result dim, or 0 when there is none. For
+/// example `[4] -> [4,1]` gives `(d0, d1) -> (d0)` and `[] -> [1]` gives
+/// `(d0) -> ()`.
+FailureOr<AffineMap> expandResultToSource(tensor::ExpandShapeOp op) {
   MLIRContext *ctx = op.getContext();
   ArrayRef<int64_t> resultShape = op.getResultType().getShape();
-  auto groups = op.getReassociationIndices();
-
   SmallVector<AffineExpr> results;
-  for (ArrayRef<int64_t> group : groups) {
+  for (ArrayRef<int64_t> group : op.getReassociationIndices()) {
     SmallVector<int64_t> nonUnit = nonUnitDims(resultShape, group);
-    if (nonUnit.size() <= 1) {
-      results.push_back(nonUnit.empty()
-                            ? getAffineConstantExpr(0, ctx)
-                            : getAffineDimExpr(nonUnit.front(), ctx));
-      continue;
-    }
-    AffineExpr e = getAffineConstantExpr(0, ctx);
-    for (auto [idx, d] : llvm::enumerate(group)) {
-      if (resultShape[d] == 1)
-        continue;
-      int64_t stride = productOf(resultShape, group.drop_front(idx + 1));
-      AffineExpr term = getAffineDimExpr(d, ctx);
-      e = e + (stride == 1 ? term : term * stride);
-    }
-    results.push_back(e);
+    if (nonUnit.size() > 1)
+      return failure();
+    results.push_back(nonUnit.empty()
+                          ? getAffineConstantExpr(0, ctx)
+                          : getAffineDimExpr(nonUnit.front(), ctx));
   }
   return AffineMap::get(resultShape.size(), /*symbolCount=*/0, results, ctx);
 }
@@ -143,8 +109,8 @@ AffineMap expandResultToSource(tensor::ExpandShapeOp op) {
 /// A static tensor.collapse_shape or tensor.expand_shape whose every user is an
 /// `ins` operand of a linalg.generic -> one linalg.generic over the result's
 /// shape, all-parallel, reading the source under the result -> source map and
-/// yielding it. Left alone: a reshape with a dynamic extent, or with any other
-/// user, e.g. a ktdp.store.
+/// yielding it. Left alone: a reshape with a dynamic extent, a linearizing
+/// reshape, or a reshape with any other user, e.g. a ktdp.store.
 template <typename ReshapeOp>
 struct ReshapeToGeneric : OpRewritePattern<ReshapeOp> {
   using OpRewritePattern<ReshapeOp>::OpRewritePattern;
@@ -169,14 +135,17 @@ struct ReshapeToGeneric : OpRewritePattern<ReshapeOp> {
         return leave("a user is not a linalg.generic ins");
     }
 
-    AffineMap resultToSource;
+    FailureOr<AffineMap> resultToSource;
     if constexpr (std::is_same_v<ReshapeOp, tensor::CollapseShapeOp>)
       resultToSource = collapseResultToSource(op);
     else
       resultToSource = expandResultToSource(op);
+    if (failed(resultToSource))
+      return leave("a linearizing reshape: a group has more than one non-unit "
+                   "dim");
     unsigned rank = resultType.getRank();
     SmallVector<AffineMap> maps = {
-        resultToSource,
+        *resultToSource,
         AffineMap::getMultiDimIdentityMap(rank, op.getContext())};
     SmallVector<utils::IteratorType> iterators(rank,
                                                utils::IteratorType::parallel);
@@ -192,7 +161,7 @@ struct ReshapeToGeneric : OpRewritePattern<ReshapeOp> {
     LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] ReshapeToGeneric: "
                             << op->getName() << " at " << loc
                             << " -> forwarding generic, input map "
-                            << resultToSource << "\n");
+                            << *resultToSource << "\n");
     rewriter.replaceOp(op, generic->getResults());
     return success();
   }

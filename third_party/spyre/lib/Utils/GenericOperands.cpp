@@ -10,30 +10,15 @@
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
 
 namespace mlir::triton::spyre {
 
-bool isProjectedMap(AffineMap map) {
-  return llvm::all_of(map.getResults(), [](AffineExpr e) {
-    return isa<AffineDimExpr, AffineConstantExpr>(e);
-  });
-}
-
 LogicalResult checkOperandRewrite(ArrayRef<std::pair<Value, AffineMap>> ins,
                                   ArrayRef<std::pair<Value, AffineMap>> outs,
                                   unsigned numLoops, std::string &why) {
   auto all = llvm::concat<const std::pair<Value, AffineMap>>(ins, outs);
-
-  // D2: every map projected.
-  for (const auto &[value, map] : all)
-    if (!isProjectedMap(map)) {
-      llvm::raw_string_ostream os(why);
-      os << "D2 not projected: " << map;
-      return failure();
-    }
 
   // D3: every loop dim named, as a bare dim, by some map.
   SmallVector<bool> named(numLoops, false);

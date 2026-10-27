@@ -372,13 +372,13 @@ def CanonicalizeGenericOperands
         Lowering:
         - ReshapeToGeneric: a `tensor.collapse_shape` or `tensor.expand_shape`
           with static extents whose every user is an `ins` operand of a
-          `linalg.generic` → one forwarding `linalg.generic` over the result's
-          shape, all-parallel, whose body yields its input. The input map is
-          the reshape's result → source map: `(d0) → (d0, 0)` for
-          `[64,1] → [64]`, `(d0, d1) → (d0)` for `[4] → [4,1]`, `() → (0, 0)`
-          for a collapse to rank 0, and a linearizing map such as
-          `(d0) → (d0 floordiv 2, d0 mod 2)` for `[64,2] → [128]`. The output
-          map is the identity.
+          `linalg.generic`, and whose result → source map is projected (every
+          result a bare dim or a constant) → one forwarding `linalg.generic`
+          over the result's shape, all-parallel, whose body yields its input.
+          The input map is that result → source map: `(d0) → (d0, 0)` for
+          `[64,1] → [64]`, `(d0, d1) → (d0)` for `[4] → [4,1]`, and
+          `() → (0, 0)` for a collapse to rank 0. The output map is the
+          identity.
         - SplatOperandToScalar: an `ins` operand defined by an `arith.constant`
           of a splat int-or-float dense tensor → a scalar `arith.constant`
           above the generic, read in the body; the operand, its indexing map
@@ -388,6 +388,9 @@ def CanonicalizeGenericOperands
         - Left alone:
           - a reshape with any user that is not a generic `ins`, e.g. one
             feeding a `ktdp.store`;
+          - a linearizing reshape, one that merges or splits more than one
+            non-unit dim, e.g. `[64,2] → [128]`, whose result → source map
+            `(d0) → (d0 floordiv 2, d0 mod 2)` is not projected;
           - a reshape with a dynamic extent: none reaches this pass from the
             fixture kernels, so no `tensor.empty` with `tensor.dim` sizes is
             built for one;
@@ -396,10 +399,11 @@ def CanonicalizeGenericOperands
             map; a non-splat constant; a scalar `arith.constant` passed as an
             `ins`.
 
-        Nothing is fused, and no map is checked for being projected: that is
-        decided where a map is composed, in FuseGenerics. A linearizing map
-        that is never composed away reaches RewriteDescriptorLayoutGeneric on a
-        forwarding generic, which refuses it on a physicalized path.
+        Nothing is fused. Every forwarding generic this pass emits has
+        projected maps, so FuseGenerics, which composes them through a
+        permutation, only ever composes projected maps. A linearizing reshape
+        stays a tensor op and reaches RewriteDescriptorLayoutGeneric as one,
+        which refuses it on a physicalized path.
 
         HOW TO ADD A PATTERN: a pattern is rooted on, and matches, one kind of
         producer — the op that defines the operand — never the operand's type,
@@ -473,12 +477,13 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         the rewrite, before mutating anything (`checkOperandRewrite`,
         Utils/GenericOperands):
           D1  the producer is all-parallel;
-          D2  every operand map is projected: each result a bare loop dim or a
-              constant, so a linearizing map is never composed in;
           D3  every consumer loop dim is named, as a bare dim, by some map;
           D4  no value is both an `ins` and an `outs`.
-        D2 is on the COMPOSED map: a linearizing reshape read at a constant
-        coordinate composes to `(d0, d1) → (0, 0)` and is absorbed.
+        No map is checked for being projected (every result a bare dim or a
+        constant). Every generic reaching this pass has projected maps, since
+        CanonicalizeGenericOperands emits a forwarding generic only for a
+        reshape with a projected map, and composing projected maps through a
+        permutation keeps every result a bare dim or a constant.
 
         Anything else is left alone: two computes that form no group, a
         reduction producer, an `outs` operand, any tensor op.
@@ -515,8 +520,8 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         absorbed maps so that no forwarding generic is left for it to refuse,
         and before LowerSpyreOps, whose groups must be in one body.
 
-        Output: no forwarding generic whose absorption passes D1-D4 feeds a
-        generic `ins`; every group LowerSpyreOps lowers whose edge passes the
+        Output: no forwarding generic whose absorption passes D1, D3 and D4
+        feeds a generic `ins`; every group LowerSpyreOps lowers whose edge passes the
         checks is in one body; no `i1` tensor between generics, or the pass
         fails.
 
