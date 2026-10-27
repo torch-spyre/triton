@@ -24,22 +24,10 @@ add_triton_library(SpyreTransforms
 
   DEPENDS
   SpyreTransformsIncGen
-  # FuseGenerics includes the tts dialect's generated declarations
-  # through Dialect/TTS/IR/Dialect.h, so a clean parallel build must not rely on
-  # the link edge to order that tablegen ahead of it.
-  TTSIncGen
 
   LINK_LIBS PUBLIC
   # For createEmptyTensor in UnaliasLinalgOuts, and GenericOperands.
   SpyreUtils
-  # FuseGenerics refuses an unabsorbable re-indexing op only on a
-  # path RewriteDescriptorLayoutGeneric will physicalize, and asks that question
-  # with that pass's own seed traversals -- hence the ktdp dialect, KTDPUtils
-  # where the shared walks live, and TTSIR for the layout attribute's name.  It
-  # is the only pass here that reaches a ktdp op; the other three still do not.
-  KTDPUtils
-  TTSIR
-  KTIR::KtdpDialect
   # LowerSpyreOps emits spyreop intrinsics -- the one dialect here that is a
   # TARGET rather than a subject.  Its rules match arith and math; it is KTIR ->
   # KTIR and reads no tt op, which is why it is here rather than in Conversion/.

@@ -31,7 +31,8 @@
 // is at `stick * 64 + lane`, a computed index the scheduler cannot take. So
 // every operand of a generic must stick the same dims at the same width. The
 // pass refuses the generic, once per operand that does not, with a note at its
-// producer.
+// producer. Cases 10 and 11 reach the same refusal through a producer that is
+// not a load, and case 12 is case 4's refusal with a generic on the path.
 
 // Case 1 -- the layout does not fit the block.
 //
@@ -434,3 +435,134 @@ module {
   }
 }
 
+// -----
+
+// Case 10 -- a reshape behind a tensor.extract_slice, on no layout.
+//
+// `tt.split` after a `tt.reshape` to `[..., 2]`: a tensor.reshape, an
+// extract_slice, and the collapse_shape FuseGenerics has already absorbed into
+// the generic's operand map. The slice reaches the generic on no layout and
+// reads loop dim 1 whole, which %a's layout splits, so the pass refuses it like
+// case 7 and points at the slice.
+
+#id = affine_map<(d0, d1) -> (d0, d1)>
+#s0map = affine_map<(d0, d1) -> (d0, d1, 0)>
+#s = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#s2 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 255 >= 0)>
+module {
+tt.func @reshape_behind_extract_slice(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %o: !tt.ptr<f16>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f16> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf16>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+  %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf16>
+  %bi = builtin.unrealized_conversion_cast %b : !tt.ptr<f16> to index
+  %bv = ktdp.construct_memory_view %bi, sizes: [64, 256], strides: [256, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>} : memref<64x256xf16>
+  %bt = ktdp.construct_access_tile %bv[%c0, %c0] {access_tile_order = #id, access_tile_set = #s2} : memref<64x256xf16> -> !ktdp.access_tile<64x256xindex>
+  %bl = ktdp.load %bt : <64x256xindex> -> tensor<64x256xf16>
+  %shape = arith.constant dense<[64, 128, 2]> : tensor<3xindex>
+  %r = tensor.reshape %bl(%shape) : (tensor<64x256xf16>, tensor<3xindex>) -> tensor<64x128x2xf16>
+  // expected-note @below {{operand 1 is produced here}}
+  %s0 = tensor.extract_slice %r[0, 0, 0] [64, 128, 1] [1, 1, 1] : tensor<64x128x2xf16> to tensor<64x128x1xf16>
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f16> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf16>
+  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+  %e = tensor.empty() : tensor<64x128xf16>
+  // expected-error @below {{rewrite-descriptor-layout-generic: operand 1 has no layout and reads logical loop dim 1 whole, which operand 0 splits into stick and lane at width 64; restating operand 1 over that split would need the linearizing map `stick * 64 + lane`, which the scheduler cannot take. Give operand 1 a layout that splits loop dim 1 at width 64 too}}
+  %g = linalg.generic {indexing_maps = [#id, #s0map, #id], iterator_types = ["parallel", "parallel"]} ins(%al, %s0 : tensor<64x128xf16>, tensor<64x128x1xf16>) outs(%e : tensor<64x128xf16>) {
+  ^bb0(%x: f16, %y: f16, %z: f16):
+    %v = arith.addf %x, %y : f16
+    linalg.yield %v : f16
+  } -> tensor<64x128xf16>
+  ktdp.store %g, %ot : tensor<64x128xf16>, <64x128xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 11 -- a linearizing reshape, as the forwarding generic in front of the
+// consumer.
+//
+// CanonicalizeGenericOperands makes a `[64,2] -> [128]` collapse a forwarding
+// generic with input map `(d0) -> (d0 floordiv 2, d0 mod 2)`, and FuseGenerics
+// does not absorb it, since the composed map is not projected. Its result reaches
+// the consumer on no layout and reads loop dim 1 whole, which %a's layout
+// splits, so the pass refuses it like case 7 and points at that generic.
+
+#id = affine_map<(d0, d1) -> (d0, d1)>
+#d1 = affine_map<(d0, d1) -> (d1)>
+#lin = affine_map<(d0) -> (d0 floordiv 2, d0 mod 2)>
+#id1 = affine_map<(d0) -> (d0)>
+#s = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#s2 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 1 >= 0)>
+module {
+tt.func @linearizing_forwarding_generic(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f16> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf16>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+  %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf16>
+  %bi = builtin.unrealized_conversion_cast %b : !tt.ptr<f16> to index
+  %bv = ktdp.construct_memory_view %bi, sizes: [64, 2], strides: [2, 1] {coordinate_set = #s2, memory_space = #ktdp.memory_space<global>} : memref<64x2xf16>
+  %bt = ktdp.construct_access_tile %bv[%c0, %c0] {access_tile_order = #id, access_tile_set = #s2} : memref<64x2xf16> -> !ktdp.access_tile<64x2xindex>
+  %bl = ktdp.load %bt : <64x2xindex> -> tensor<64x2xf16>
+  %e1 = tensor.empty() : tensor<128xf16>
+  // expected-note @below {{operand 1 is produced here}}
+  %f = linalg.generic {indexing_maps = [#lin, #id1], iterator_types = ["parallel"]} ins(%bl : tensor<64x2xf16>) outs(%e1 : tensor<128xf16>) {
+  ^bb0(%x: f16, %o: f16):
+    linalg.yield %x : f16
+  } -> tensor<128xf16>
+  %e = tensor.empty() : tensor<64x128xf16>
+  // expected-error @below {{rewrite-descriptor-layout-generic: operand 1 has no layout and reads logical loop dim 1 whole, which operand 0 splits into stick and lane at width 64; restating operand 1 over that split would need the linearizing map `stick * 64 + lane`, which the scheduler cannot take. Give operand 1 a layout that splits loop dim 1 at width 64 too}}
+  %g = linalg.generic {indexing_maps = [#id, #d1, #id], iterator_types = ["parallel", "parallel"]} ins(%al, %f : tensor<64x128xf16>, tensor<128xf16>) outs(%e : tensor<64x128xf16>) {
+  ^bb0(%x: f16, %y: f16, %z: f16):
+    %v = arith.subf %x, %y : f16
+    linalg.yield %v : f16
+  } -> tensor<64x128xf16>
+  %ot = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+  ktdp.store %g, %ot : tensor<64x128xf16>, <64x128xindex>
+  tt.return
+}
+}
+
+// -----
+
+// Case 12 -- a reshape between a generic and an annotated store.
+//
+// Case 4's refusal with a generic on the path: the `tensor.reshape` between the
+// generic and the store is not a generic, so the store's data is not on a
+// physicalized chain. FuseGenerics leaves a tensor op where it is, and this pass
+// refuses the store.
+
+#id = affine_map<(d0, d1) -> (d0, d1)>
+#id1 = affine_map<(d0) -> (d0)>
+#s = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 >= 0)>
+#s1 = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+module {
+tt.func @reshape_between_generic_and_store(%a: !tt.ptr<f16>, %o: !tt.ptr<f16>) {
+  %c0 = arith.constant 0 : index
+  %shape = arith.constant dense<[64]> : tensor<1xindex>
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f16> to index
+  %av = ktdp.construct_memory_view %ai, sizes: [64, 1], strides: [1, 1] {coordinate_set = #s, memory_space = #ktdp.memory_space<global>} : memref<64x1xf16>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id, access_tile_set = #s} : memref<64x1xf16> -> !ktdp.access_tile<64x1xindex>
+  %al = ktdp.load %at : <64x1xindex> -> tensor<64x1xf16>
+  %e = tensor.empty() : tensor<64x1xf16>
+  %g = linalg.generic {indexing_maps = [#id, #id], iterator_types = ["parallel", "parallel"]} ins(%al : tensor<64x1xf16>) outs(%e : tensor<64x1xf16>) {
+  ^bb0(%x: f16, %z: f16):
+    %v = arith.mulf %x, %x : f16
+    linalg.yield %v : f16
+  } -> tensor<64x1xf16>
+  %r = tensor.reshape %g(%shape) : (tensor<64x1xf16>, tensor<1xindex>) -> tensor<64xf16>
+  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f16> to index
+  %ov = ktdp.construct_memory_view %oi, sizes: [64], strides: [1] {coordinate_set = #s1, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 0, 0>, phys_op = array<i64: 0, 3>, phys_arg = array<i64: 0, 64>}} : memref<64xf16>
+  %ot = ktdp.construct_access_tile %ov[%c0] {access_tile_order = #id1, access_tile_set = #s1} : memref<64xf16> -> !ktdp.access_tile<64xindex>
+  // expected-error @below {{rewrite-descriptor-layout-generic: this store's access tile is physicalized but its data is not on a physicalized chain, and this pass restates only linalg.generic; a one-sided annotation has no vehicle for the shape change, so annotate the source descriptor too, at a layout compatible with this one}}
+  ktdp.store %r, %ot : tensor<64xf16>, <64xindex>
+  tt.return
+}
+}

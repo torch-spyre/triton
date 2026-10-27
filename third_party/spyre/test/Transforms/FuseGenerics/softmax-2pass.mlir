@@ -5,12 +5,9 @@
 // the only case here that is a whole kernel, and the only one needing the four
 // passes ahead of this one in the pipeline.
 //
-// Two things at once. As a POSITIVE it is AbsorbForwardingGeneric on a kernel
-// nobody wrote for it: 2 `tensor.expand_shape` and 3 `tensor.collapse_shape`,
-// each made a forwarding generic by CanonicalizeGenericOperands and all
-// absorbed, none surviving. As an OVER-INCLUSION check it carries zero
-// `tts.tensor_layout`, so the gate must stay shut over all five; a gate keyed on
-// the shape ops rather than on the path would refuse the whole kernel.
+// AbsorbForwardingGeneric on a kernel nobody wrote for it: 2
+// `tensor.expand_shape` and 3 `tensor.collapse_shape`, each made a forwarding
+// generic by CanonicalizeGenericOperands and all absorbed, none surviving.
 //
 // The RUN line needs the other four passes because they are what puts the shape
 // ops in front of generics: at the `ktir` stage the computes are still `arith.*`

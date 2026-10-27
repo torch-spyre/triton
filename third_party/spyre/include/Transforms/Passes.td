@@ -498,45 +498,6 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         the compiler, with the intermediate held in the local scratchpad rather
         than in HBM, is a follow-up.
 
-        THE GATE on rejection: an unabsorbable restatement is refused only on a
-        path RewriteDescriptorLayoutGeneric will physicalize, asked with THAT
-        PASS'S OWN seed traversals (shared from Dialect/KTDP/Utils, not copied):
-        seed from every `tts.tensor_layout`-annotated
-        `ktdp.construct_memory_view`, reach its loads and stores through its
-        access tiles, take the generics one hop off those. One hop, not a
-        transitive closure — that is the scope the layout pass rewrites.
-
-        Why gated, and the reason is forward-looking rather than protective. As
-        annotation coverage grows toward everything on a device path being
-        physicalized, the gate fires more often and converges to the ungated
-        behaviour by itself, so it never needs removing; shipping ungated would
-        instead mean adding a gate later, the moment an unannotated path has to
-        be legal. Kept pending the LX roundtrip, at which point the better move
-        may be to invert it into an assertion that anything on a device path IS
-        annotated.
-
-        Three seeds, because the hazard has two sides. BACKWARD from each `ins`
-        operand of such a generic, through every generic not itself in the rewrite
-        set, stopping at anything that is not a coordinate restatement; this
-        catches a re-indexing op whose own load is on an UNANNOTATED view, which
-        nothing else looks at (retypeToPhysical is only called for an operand that
-        HAS a layout). BACKWARD from the DATA of each store over an annotated
-        view, the exact mirror: findLayoutForResult walks a generic's result users
-        for a `ktdp.store` DIRECTLY, so a shape op between the two makes it return
-        null and the linearization would be on the `outs` map instead — `gather__1d`
-        carries an `8x1 → 8` `tt.reshape` into a store, so the shape is real.
-        FORWARD one hop off each physicalized load, for a result neither backward
-        walk reaches; where it reaches a generic this is redundant with
-        checkConsumersAreRewritable and is kept only because it fires a stage
-        earlier and says which property of the op is the problem.
-
-        The store side is REJECTION ONLY, never absorption.
-
-        Rejection is DERIVED, not a declared op list: the condition is exactly
-        "no projected result → source map" and "on a physicalized path", and the
-        first is asked of resultToSourceMap. Teaching that function a static
-        `tensor.reshape` stops the rejection for it with nothing else to update.
-
         HOW TO ADD A PATTERN: a pattern matches on its producer's kind — the op
         that defines the operand, or what the producer's body computes for it —
         never on the operand's type, nor on anything downstream. A new pattern
@@ -557,14 +518,14 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         Output: no forwarding generic whose absorption passes D1-D4 feeds a
         generic `ins`; every group LowerSpyreOps lowers whose edge passes the
         checks is in one body; no `i1` tensor between generics, or the pass
-        fails. On a module with at least one annotated memory view, no
-        re-indexing tensor op without a projected map is left on a path that
-        view physicalizes; the pass fails instead.
+        fails.
+
+        Not checked here: a re-indexing tensor op this pass leaves in front of
+        a generic, e.g. a `tensor.reshape` or `tensor.concat`.
+        RewriteDescriptorLayoutGeneric refuses one that would need a
+        linearizing map on a physicalized path; anything else reaches dbo-opt.
     }];
 
-    // No ktdp and no tts, though the gate reads both: dependentDialects is about
-    // ops a pass CREATES, and this one only inspects them.  The link edges those
-    // reads need are in the CMakeLists, derived from the #includes.
     let dependentDialects = [
         "mlir::linalg::LinalgDialect",
         "mlir::tensor::TensorDialect"
