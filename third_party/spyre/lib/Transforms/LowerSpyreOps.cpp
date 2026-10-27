@@ -36,13 +36,14 @@
 // WHAT THIS PASS RELIES ON ITS PREDECESSOR FOR. A rule matches ops in ONE body,
 // and ConvertElementwiseToLinalg gives every tensor-level op a body of its own
 // -- so a group spanning two tensor ops arrives spread over two generics unless
-// something fused them. FuseComputeAndDataMovement is that something, and its
-// `i1` clause exists for exactly this: the compare rule sees its pair only
-// because that pass brought them together, and the reciprocal's constant is a
-// scalar in the body for the same reason. Stated as a contract between adjacent
-// passes rather than left to be discovered -- and `resolveThroughBody` below
-// keeps the reciprocal working on the unfused form too, so for that rule the
-// dependency is about whether it FIRES, never about whether it is correct.
+// something fused them. FuseGenerics' GroupComputes is that something, and it
+// fuses a pair only when formsLowerableGroup -- the export below, which calls
+// the same match function the selection pattern does -- says the pair is a
+// group. The reciprocal's constant is a scalar in the body because
+// CanonicalizeGenericOperands folded the splat in. Stated as a contract between
+// adjacent passes rather than left to be discovered -- and `resolveThroughBody`
+// below keeps the reciprocal working on the unfused form too, so for that rule
+// the dependency is about whether it FIRES, never about whether it is correct.
 //
 // THE GENERIC BODY IS THE SCOPE for a group rule, and not a predicate. Every
 // compute reaches this pass as a linalg.generic, so "inside a body" is not a
@@ -168,7 +169,7 @@ bool isInsideLinalgGeneric(Operation *op) {
 ///
 /// This is what lets a rule ask about an operand's DEFINITION without caring
 /// how the value reached the body. The same `1.0` is a scalar `arith.constant`
-/// above the generic once FuseComputeAndDataMovement has folded the splat in,
+/// above the generic once CanonicalizeGenericOperands has folded the splat in,
 /// and a splat `ins` operand if that pass has not run; resolved, both answer
 /// the same question.
 ///
@@ -593,7 +594,7 @@ struct SelectArithMulI : public OpRewritePattern<arith::MulIOp> {
 ///   - `cmpf oeq` read by `arith.sitofp` (the compare rule wants `uitofp`).
 ///
 /// Not reported, because each is the tensor form crossing a body boundary,
-/// which FuseComputeAndDataMovement removes:
+/// which FuseGenerics reports:
 ///
 ///   - an `i1` block argument, e.g. `^bb0(%cond: i1, ...)`;
 ///   - an `i1` that is yielded, e.g. `linalg.yield %c : i1`.

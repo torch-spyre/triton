@@ -9,7 +9,7 @@
 //
 // Why gated at all is forward-looking rather than protective: as annotation
 // coverage grows, the gate fires more often and converges to ungated behaviour by
-// itself, so it never needs removing. See FuseComputeAndDataMovement.cpp.
+// itself, so it never needs removing.
 //
 // CASES 1-6 put the re-indexing op behind a load from an UNANNOTATED statistic
 // view while the data view is annotated. RewriteDescriptorLayoutGeneric calls
@@ -248,10 +248,9 @@ func.func @pair_unannotated(%base: index, %stat: index) {
 // the LINEARIZATION into the outs map rather than an ins map. Same hazard, other
 // end of the op.
 //
-// Rejection only, never absorption: see THE STORE SIDE in the header of
-// FuseComputeAndDataMovement.cpp for why, and for what the eventual fix chooses
-// between. `gather__1d` shows the shape is real -- an `8x1 -> 8` `tt.reshape`
-// feeding `ktdp.store` -- on a kernel this pass never sees.
+// Rejection only, never absorption. `gather__1d` shows the shape is real -- an
+// `8x1 -> 8` `tt.reshape` feeding `ktdp.store` -- on a kernel this pass never
+// sees.
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #map1 = affine_map<(d0) -> (d0)>

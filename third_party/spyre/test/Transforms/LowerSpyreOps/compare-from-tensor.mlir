@@ -18,7 +18,7 @@
 // its own: a rule matches ops in ONE body, and ConvertElementwiseToLinalg gives
 // every tensor-level op a body of its own, so this group starts out spread over TWO
 // generics with a `tensor<i1>` between them. No rule can see that.
-// FuseComputeAndDataMovement is what brings it together.
+// FuseGenerics is what brings it together.
 //
 // One module per file here, because the interesting claim is "ONE generic comes
 // out" and a -NOT directive asserting that cannot be scoped to one module in a
