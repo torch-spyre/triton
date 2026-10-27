@@ -12,8 +12,10 @@
 //                            form a group LowerSpyreOps lowers as one intrinsic
 //                            (formsLowerableGroup).
 //
-// After the fixpoint, checkNoBooleanBetweenGenerics reports every `i1` tensor
-// still passed from one generic to another.
+// After the greedy driver converges, a separate step, legalizeAfterFusion,
+// checks what the patterns left. Today its one check,
+// checkNoBooleanBetweenGenerics, reports every `i1` tensor still passed from
+// one generic to another.
 //
 // Both patterns check the consumer's operand list as it would be after the
 // rewrite, before mutating anything (checkOperandRewrite): D1, the producer is
@@ -304,7 +306,7 @@ private:
 };
 
 //===----------------------------------------------------------------------===//
-// After the fixpoint: an i1 tensor between generics
+// Legalization: an i1 tensor between generics
 //===----------------------------------------------------------------------===//
 
 /// Every `ins` of element type i1 defined by a linalg.generic is an error at
@@ -350,6 +352,17 @@ LogicalResult checkNoBooleanBetweenGenerics(ModuleOp mod) {
   return result;
 }
 
+//===----------------------------------------------------------------------===//
+// After the patterns: legalization
+//===----------------------------------------------------------------------===//
+
+/// The check step run once the fusion patterns have converged. Rewrites
+/// nothing; fails when any check reports an error. Its one check is
+/// checkNoBooleanBetweenGenerics.
+LogicalResult legalizeAfterFusion(ModuleOp mod) {
+  return checkNoBooleanBetweenGenerics(mod);
+}
+
 struct FuseGenericsPass
     : public mlir::triton::spyre::impl::FuseGenericsBase<FuseGenericsPass> {
   void runOnOperation() override {
@@ -360,7 +373,7 @@ struct FuseGenericsPass
     if (failed(applyPatternsGreedily(mod, std::move(patterns))))
       return signalPassFailure();
 
-    if (failed(checkNoBooleanBetweenGenerics(mod)))
+    if (failed(legalizeAfterFusion(mod)))
       signalPassFailure();
   }
 };

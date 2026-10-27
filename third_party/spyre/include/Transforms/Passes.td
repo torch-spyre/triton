@@ -213,7 +213,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         had the chance to select and did not.
 
         An i1 crossing a generic BOUNDARY is the other pass's finding. It is the
-        tensor form, and [FuseGenerics] reports it after its fixpoint; before
+        tensor form, and [FuseGenerics]' legalization step reports it; before
         that pass has run every compare sits in a generic of its own yielding
         precisely that — so refusing it here would report IR a predecessor was
         meant to reshape, while naming the wrong cause. The two
@@ -488,11 +488,12 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         Anything else is left alone: two computes that form no group, a
         reduction producer, an `outs` operand, any tensor op.
 
-        After the fixpoint, an `ins` of element type `i1` defined by a
-        `linalg.generic` is an error at the consumer, with notes naming the op
-        that made it, each reader, and the groups LowerSpyreOps lowers an `i1`
-        in. No spyreop op produces or consumes `i1`, so it has no device form
-        on any path. LowerSpyreOps' rejectSurvivingBooleans reports the other
+        Legalization, a separate step after the patterns converge
+        (`legalizeAfterFusion`). It rewrites nothing, and runs one check: an
+        `ins` of element type `i1` defined by a `linalg.generic` is an error
+        at the consumer, with notes naming the op that made it, each reader,
+        and the groups LowerSpyreOps lowers an `i1` in. No spyreop op produces
+        or consumes `i1`, so it has no device form on any path. LowerSpyreOps' rejectSurvivingBooleans reports the other
         form, an `i1` made and read inside one body.
 
         A general `where(x > y, p, q)` forms a group and is fused; LowerSpyreOps
