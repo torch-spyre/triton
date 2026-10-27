@@ -1,4 +1,4 @@
-// RUN: spyre-triton-opt %s --convert-elementwise-to-linalg --fuse-compute-and-data-movement --lower-spyre-ops | FileCheck %s --check-prefix=FROMTENSOR
+// RUN: spyre-triton-opt %s --convert-elementwise-to-linalg --canonicalize-generic-operands --fuse-generics --lower-spyre-ops | FileCheck %s --check-prefix=FROMTENSOR
 // The rule fires ONLY because the fusion pass ran. Driven without it, the group is
 // still two generics and nothing is selected -- which is the claim, so it is a run
 // line rather than a sentence.

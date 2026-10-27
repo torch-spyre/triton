@@ -1,4 +1,4 @@
-// RUN: spyre-triton-opt %s --fuse-compute-and-data-movement -split-input-file -verify-diagnostics
+// RUN: spyre-triton-opt %s --fuse-generics -split-input-file -verify-diagnostics
 
 // THE GATE: the condition is "absorption failed" AND "on a path
 // RewriteDescriptorLayoutGeneric will physicalize". absorb.mlir has the same
@@ -39,7 +39,7 @@ func.func @reshape_on_physicalized_path(%base: index, %stat: index) {
   %sv = ktdp.construct_memory_view %stat, sizes: [64], strides: [1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<64xf16>
   %stile = ktdp.construct_access_tile %sv[%c0] {access_tile_order = #map1, access_tile_set = #set1} : memref<64xf16> -> !ktdp.access_tile<64xindex>
   %sl = ktdp.load %stile : <64xindex> -> tensor<64xf16>
-  // expected-error @below {{fuse-compute-and-data-movement: this op re-indexes a value on a path the layout pass will physicalize and it cannot be restated as an indexing map on its consumer (no affine map from its result coordinates to its source coordinates is derivable -- its shape is an operand rather than a reassociation), so the layout pass would bridge it with a linearizing map, which the scheduler cannot project loop IVs through}}
+  // expected-error @below {{fuse-generics: this op re-indexes a value on a path the layout pass will physicalize and it cannot be restated as an indexing map on its consumer (no affine map from its result coordinates to its source coordinates is derivable -- its shape is an operand rather than a reassociation), so the layout pass would bridge it with a linearizing map, which the scheduler cannot project loop IVs through}}
   %r = tensor.reshape %sl(%shape) : (tensor<64xf16>, tensor<2xindex>) -> tensor<64x1xf16>
   %e = tensor.empty() : tensor<64x128xf16>
   %g = linalg.generic {indexing_maps = [#map, #lane0, #map], iterator_types = ["parallel", "parallel"]} ins(%l, %r : tensor<64x128xf16>, tensor<64x1xf16>) outs(%e : tensor<64x128xf16>) {
@@ -73,7 +73,7 @@ func.func @concat_on_physicalized_path(%base: index, %stat: index) {
   %sv = ktdp.construct_memory_view %stat, sizes: [64, 1], strides: [1, 1] {coordinate_set = #set3, memory_space = #ktdp.memory_space<global>} : memref<64x1xf16>
   %stile = ktdp.construct_access_tile %sv[%c0, %c0] {access_tile_order = #map2, access_tile_set = #set3} : memref<64x1xf16> -> !ktdp.access_tile<64x1xindex>
   %sl = ktdp.load %stile : <64x1xindex> -> tensor<64x1xf16>
-  // expected-error @below {{fuse-compute-and-data-movement: this op re-indexes a value on a path the layout pass will physicalize and it cannot be restated as an indexing map on its consumer (it selects between operands per coordinate, which one operand map cannot state), so the layout pass would bridge it with a linearizing map, which the scheduler cannot project loop IVs through}}
+  // expected-error @below {{fuse-generics: this op re-indexes a value on a path the layout pass will physicalize and it cannot be restated as an indexing map on its consumer (it selects between operands per coordinate, which one operand map cannot state), so the layout pass would bridge it with a linearizing map, which the scheduler cannot project loop IVs through}}
   %c = tensor.concat dim(1) %sl, %sl : (tensor<64x1xf16>, tensor<64x1xf16>) -> tensor<64x2xf16>
   %e = tensor.empty() : tensor<64x128xf16>
   %g = linalg.generic {indexing_maps = [#map, #lane0, #map], iterator_types = ["parallel", "parallel"]} ins(%l, %c : tensor<64x128xf16>, tensor<64x2xf16>) outs(%e : tensor<64x128xf16>) {
@@ -111,7 +111,7 @@ func.func @linearizing_collapse_on_physicalized_path(%base: index, %stat: index)
   %sv = ktdp.construct_memory_view %stat, sizes: [64, 2], strides: [2, 1] {coordinate_set = #set4, memory_space = #ktdp.memory_space<global>} : memref<64x2xf16>
   %stile = ktdp.construct_access_tile %sv[%c0, %c0] {access_tile_order = #map2, access_tile_set = #set4} : memref<64x2xf16> -> !ktdp.access_tile<64x2xindex>
   %sl = ktdp.load %stile : <64x2xindex> -> tensor<64x2xf16>
-  // expected-error @below {{fuse-compute-and-data-movement: this op re-indexes a value on a path the layout pass will physicalize and it cannot be restated as an indexing map on its consumer (reassociation group 0 fuses 2 non-unit dims, which only a linearizing map can state), so the layout pass would bridge it with a linearizing map, which the scheduler cannot project loop IVs through}}
+  // expected-error @below {{fuse-generics: this op re-indexes a value on a path the layout pass will physicalize and it cannot be restated as an indexing map on its consumer (reassociation group 0 fuses 2 non-unit dims, which only a linearizing map can state), so the layout pass would bridge it with a linearizing map, which the scheduler cannot project loop IVs through}}
   %c = tensor.collapse_shape %sl [[0, 1]] : tensor<64x2xf16> into tensor<128xf16>
   %e = tensor.empty() : tensor<64x128xf16>
   %g = linalg.generic {indexing_maps = [#map, #col, #map], iterator_types = ["parallel", "parallel"]} ins(%l, %c : tensor<64x128xf16>, tensor<128xf16>) outs(%e : tensor<64x128xf16>) {
@@ -188,7 +188,7 @@ func.func @pair_annotated(%base: index, %stat: index) {
   %sv = ktdp.construct_memory_view %stat, sizes: [64], strides: [1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<64xf16>
   %stile = ktdp.construct_access_tile %sv[%c0] {access_tile_order = #map1, access_tile_set = #set1} : memref<64xf16> -> !ktdp.access_tile<64xindex>
   %sl = ktdp.load %stile : <64xindex> -> tensor<64xf16>
-  // expected-error @below {{fuse-compute-and-data-movement: this op re-indexes a value on a path the layout pass will physicalize}}
+  // expected-error @below {{fuse-generics: this op re-indexes a value on a path the layout pass will physicalize}}
   %r = tensor.reshape %sl(%shape) : (tensor<64xf16>, tensor<2xindex>) -> tensor<64x1xf16>
   %e = tensor.empty() : tensor<64x128xf16>
   %g = linalg.generic {indexing_maps = [#map, #lane0, #map], iterator_types = ["parallel", "parallel"]} ins(%l, %r : tensor<64x128xf16>, tensor<64x1xf16>) outs(%e : tensor<64x128xf16>) {
@@ -273,7 +273,7 @@ func.func @reshape_between_generic_and_store(%src: index, %out: index) {
     %d = arith.mulf %in, %in : f16
     linalg.yield %d : f16
   } -> tensor<64x1xf16>
-  // expected-error @below {{fuse-compute-and-data-movement: this op re-indexes a value on a path the layout pass will physicalize and it cannot be restated as an indexing map on its consumer (no affine map from its result coordinates to its source coordinates is derivable -- its shape is an operand rather than a reassociation), so the layout pass would bridge it with a linearizing map, which the scheduler cannot project loop IVs through}}
+  // expected-error @below {{fuse-generics: this op re-indexes a value on a path the layout pass will physicalize and it cannot be restated as an indexing map on its consumer (no affine map from its result coordinates to its source coordinates is derivable -- its shape is an operand rather than a reassociation), so the layout pass would bridge it with a linearizing map, which the scheduler cannot project loop IVs through}}
   %r = tensor.reshape %g(%shape) : (tensor<64x1xf16>, tensor<1xindex>) -> tensor<64xf16>
   %ov = ktdp.construct_memory_view %out, sizes: [64], strides: [1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>, tts.tensor_layout = {phys_arg = array<i64: 0, 64>, phys_op = array<i64: 0, 3>, phys_src = array<i64: 0, 0>}} : memref<64xf16>
   %ot = ktdp.construct_access_tile %ov[%c0] {access_tile_order = #map1, access_tile_set = #set1} : memref<64xf16> -> !ktdp.access_tile<64xindex>
