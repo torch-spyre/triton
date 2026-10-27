@@ -7,10 +7,11 @@
 // GroupComputes declines leaves such an i1, so its negatives are here:
 //
 //   2a  the anchor (arith.andi) forms no group
-//   2b  the producer has a reduction loop (D1), whatever it yields
+//   2b  the producer has a reduction loop, whatever it yields
 //   2c  the producer has another user and its body is more than the anchor
 //   and a reader that forms no group with a compare: a width mismatch, a
-//   predicate with no spyreop.compare counterpart, arith.sitofp; and D4.
+//   predicate with no spyreop.compare counterpart, arith.sitofp; and a value
+//   that would be both an ins and an outs of the consumer.
 
 // 2a: the producer yields an arith.andi of two compares, which forms no group.
 func.func @andi_chain(%x: tensor<8xf16>, %y: tensor<8xf16>, %p: tensor<8xf16>, %q: tensor<8xf16>) -> tensor<8xf16> {
@@ -61,8 +62,8 @@ func.func @reduction_i1(%x: tensor<8x4xf16>, %y: tensor<8x4xf16>, %p: tensor<8xf
 
 // -----
 
-// 2b, D1: a reduction producer yielding an arith.cmpf is claimed, and D1
-// declines it.
+// 2b: a reduction producer yielding an arith.cmpf is claimed, and declined
+// because the producer has a reduction loop.
 func.func @reduction_cmp(%x: tensor<8x4xf16>, %y: tensor<8x4xf16>, %p: tensor<8xf16>, %q: tensor<8xf16>, %e1: tensor<8xi1>) -> tensor<8xf16> {
   %c = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>], iterator_types = ["parallel", "reduction"]} ins(%x, %y : tensor<8x4xf16>, tensor<8x4xf16>) outs(%e1 : tensor<8xi1>) {
   ^bb0(%a: f16, %b: f16, %acc: i1):
@@ -179,7 +180,8 @@ func.func @sitofp(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
 
 // -----
 
-// D4, fusion: the producer's ins is the consumer's outs.
+// A value would be both an ins and an outs of the consumer: the producer's ins
+// is the consumer's outs.
 func.func @d4_fusion(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
   %e1 = tensor.empty() : tensor<8xi1>
   %c = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%x, %y : tensor<8xf16>, tensor<8xf16>) outs(%e1 : tensor<8xi1>) {

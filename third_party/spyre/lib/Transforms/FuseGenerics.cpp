@@ -17,11 +17,15 @@
 // checkNoBooleanBetweenGenerics, reports every `i1` tensor still passed from
 // one generic to another.
 //
-// Both patterns check the consumer's operand list as it would be after the
-// rewrite, before mutating anything (checkOperandRewrite): D1, the producer is
-// all-parallel; D3, every loop dim is named; D4, no value is both an `ins` and
-// an `outs`. Every producer map has every result a bare dim or a constant, and
-// composing through a permutation keeps that, so no map is checked for it.
+// Both patterns decline a producer that has a reduction loop. Both then check
+// the consumer's operand list as it would be after the rewrite, before mutating
+// anything (checkOperandRewrite):
+//
+//   - every loop dim of the consumer is named by some operand map;
+//   - no value is both an `ins` and an `outs` of the consumer.
+//
+// Every producer map has every result a bare dim or a constant, and composing
+// such maps through a permutation keeps that, so no map is checked for it.
 //
 // HOW TO ADD A PATTERN. A pattern matches on its PRODUCER'S KIND: the op that
 // defines the operand, or what the producer's body computes for it. Never on
@@ -32,8 +36,9 @@
 // is not a pattern here: it is a match function in LowerSpyreOps, which
 // formsLowerableGroup then answers for.
 //
-// `--debug-only=fuse-generics` traces each rewrite and each decline, with the
-// check that declined it.
+// `--debug-only=fuse-generics` traces, one line per decision, each operand
+// skipped before any check, each decline with the check that declined it, each
+// group formed, each rewrite, and each `i1` legalizeAfterFusion reports.
 //
 //===----------------------------------------------------------------------===//
 
@@ -72,7 +77,8 @@ namespace {
 
 using OperandList = SmallVector<std::pair<Value, AffineMap>>;
 
-/// `op`'s ins and outs, each with its indexing map.
+/// Fills `ins` and `outs` with `op`'s ins and outs operands, in order, each
+/// paired with its indexing map.
 void operandLists(linalg::GenericOp op, OperandList &ins, OperandList &outs) {
   for (OpOperand *in : op.getDpsInputOperands())
     ins.emplace_back(in->get(), op.getMatchingIndexingMap(in));
@@ -80,13 +86,15 @@ void operandLists(linalg::GenericOp op, OperandList &ins, OperandList &outs) {
     outs.emplace_back(out.get(), op.getMatchingIndexingMap(&out));
 }
 
-/// The value `producer` yields for its result `result`.
+/// Returns the value `producer`'s linalg.yield yields for its result `result`.
 Value yieldedFor(linalg::GenericOp producer, OpResult result) {
   return producer.getBlock()->getTerminator()->getOperand(
       result.getResultNumber());
 }
 
-/// The `ins` block argument `producer` yields for `result`, or null.
+/// Returns the `ins` block argument of `producer`'s body that it yields for
+/// `result`, or null when it yields an op result, an `outs` block argument or
+/// a value defined outside the body.
 BlockArgument forwardedInput(linalg::GenericOp producer, OpResult result) {
   auto arg = dyn_cast<BlockArgument>(yieldedFor(producer, result));
   if (!arg || arg.getOwner() != producer.getBlock() ||
@@ -95,10 +103,13 @@ BlockArgument forwardedInput(linalg::GenericOp producer, OpResult result) {
   return arg;
 }
 
+/// Returns true when every loop of `op` is parallel.
 bool isAllParallel(linalg::GenericOp op) {
   return op.getNumParallelLoops() == op.getNumLoops();
 }
 
+/// Traces, under `--debug-only=fuse-generics`, that `pattern` declined
+/// `operand` because of `why`.
 void traceDecline(StringRef pattern, OpOperand *operand, const llvm::Twine &why) {
   LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << pattern << ": operand "
                           << operand->getOperandNumber() << " of generic at "
@@ -106,6 +117,8 @@ void traceDecline(StringRef pattern, OpOperand *operand, const llvm::Twine &why)
                           << why << "\n");
 }
 
+/// Traces, under `--debug-only=fuse-generics`, that `pattern` skipped `operand`
+/// before any check, because of `why`.
 void traceSkip(StringRef pattern, OpOperand *operand, const llvm::Twine &why) {
   LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << pattern << ": operand "
                           << operand->getOperandNumber() << " of generic at "
@@ -117,12 +130,40 @@ void traceSkip(StringRef pattern, OpOperand *operand, const llvm::Twine &why) {
 // AbsorbForwardingGeneric
 //===----------------------------------------------------------------------===//
 
-/// A consumer `ins` that is result `r` of an all-parallel linalg.generic `P`
-/// which yields for `r` one of its `ins` block arguments, `x`, under a
-/// permutation result map `R` -> the operand repointed at `x`, under
+/// Absorbs a producer generic that only forwards one of its inputs into the
+/// operand map of the consumer that reads it.
+///
+/// Before:
+///
+///   %b = linalg.generic {indexing_maps = [(d0, d1) -> (d0),
+///                                         (d0, d1) -> (d0, d1)]}
+///          ins(%s : tensor<64xf16>) outs(%e : tensor<64x128xf16>) {
+///     ^bb0(%in: f16, %out: f16): linalg.yield %in : f16 }
+///   %r = linalg.generic {indexing_maps = [(d0, d1) -> (d0, d1), ...]}
+///          ins(%b : tensor<64x128xf16>) ...
+///
+/// After:
+///
+///   %r = linalg.generic {indexing_maps = [(d0, d1) -> (d0), ...]}
+///          ins(%s : tensor<64xf16>) ...
+///
+/// Conditions, for a consumer `ins` operand that is result `r` of producer `P`:
+///
+///   - `P` is a linalg.generic;
+///   - `P` yields, for `r`, one of its own `ins` block arguments, `x`;
+///   - `P` has no reduction loop;
+///   - `P`'s indexing map for `r`, `R`, is a permutation;
+///   - after the rewrite, every loop dim of the consumer is named by some
+///     operand map;
+///   - after the rewrite, no value is both an `ins` and an `outs` of the
+///     consumer.
+///
+/// The rest of `P`'s body is not read.
+///
+/// Rewrite: the operand is set to `P`'s input for `x`, and its map to
 /// `A.compose(inversePermutation(R)).compose(C)`, where `A` is `P`'s map for
-/// `x` and `C` the consumer's map for the operand. The rest of `P`'s body is
-/// not read. `P` is erased by the driver once dead.
+/// `x` and `C` the consumer's map for the operand. The greedy driver erases `P`
+/// once it is dead.
 struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -146,7 +187,7 @@ struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
       }
       if (!isAllParallel(producer)) {
         traceDecline("AbsorbForwardingGeneric", operand,
-                     "D1 the producer has a reduction loop");
+                     "the producer has a reduction loop");
         continue;
       }
       AffineMap r = producer.getIndexingMapMatchingResult(result);
@@ -193,21 +234,49 @@ struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
 // GroupComputes
 //===----------------------------------------------------------------------===//
 
-/// A consumer `ins` that is result `r` of an all-parallel linalg.generic `P`
-/// which yields for `r` an op result, the anchor -> `P` fused into the
-/// consumer, when:
+/// Fuses a producer generic into its consumer when the op the producer yields
+/// and the consumer ops that read it form a group LowerSpyreOps lowers as one
+/// intrinsic.
 ///
-///   - linalg::areElementwiseOpsFusable holds;
-///   - every use of the matching block argument in the consumer is a reader
-///     that, with the anchor, forms a group (formsLowerableGroup), and there is
-///     at least one;
-///   - when `P` has a user other than the consumer, every non-terminator op in
-///     `P`'s body is the anchor, so nothing outside the group is copied;
-///   - D3 and D4 hold on the fused operand list.
+/// Before:
 ///
-/// The rewrite is linalg::fuseElementwiseOps, then
+///   %c = linalg.generic ... ins(%a, %b : ...) {
+///     ^bb0(%x: f16, %y: f16, %o: i1):
+///       %0 = arith.cmpf ogt, %x, %y : f16
+///       linalg.yield %0 : i1 }
+///   %m = linalg.generic ... ins(%c : tensor<64xi1>) {
+///     ^bb0(%in: i1, %o: f16):
+///       %1 = arith.uitofp %in : i1 to f16
+///       linalg.yield %1 : f16 }
+///
+/// After:
+///
+///   %m = linalg.generic ... ins(%a, %b : ...) {
+///     ^bb0(%x: f16, %y: f16, %o: f16):
+///       %0 = arith.cmpf ogt, %x, %y : f16
+///       %1 = arith.uitofp %0 : i1 to f16
+///       linalg.yield %1 : f16 }
+///
+/// Conditions, for a consumer `ins` operand that is result `r` of producer `P`:
+///
+///   - `P` is a linalg.generic;
+///   - `P` yields, for `r`, the result of an op in its body, the anchor;
+///   - `P` has no reduction loop;
+///   - linalg::areElementwiseOpsFusable holds for the operand;
+///   - the consumer reads the operand's block argument at least once, and
+///     every op reading it, with the anchor, forms a group
+///     (formsLowerableGroup);
+///   - when `P` has a user other than the consumer, the anchor is the only
+///     non-terminator op in `P`'s body;
+///   - after the rewrite, every loop dim of the consumer is named by some
+///     operand map;
+///   - after the rewrite, no value is both an `ins` and an `outs` of the
+///     consumer.
+///
+/// Rewrite: linalg::fuseElementwiseOps, then
 /// linalg::deduplicateOperandsAndRemoveDeadResults on the fused op, which
-/// removes the result kept for `P`'s other users that nothing reads.
+/// removes the result kept for `P`'s other users. Those users keep reading
+/// `P`.
 struct GroupComputes : OpRewritePattern<linalg::GenericOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -222,13 +291,16 @@ struct GroupComputes : OpRewritePattern<linalg::GenericOp> {
   }
 
 private:
-  /// The candidate, group, duplication and operand checks, without rewriting.
+  /// Checks whether `producer`, whose body yields `anchor` for `operand`, can
+  /// be fused into `consumer`: every condition of the pattern after the
+  /// producer and the anchor are found. Rewrites nothing. Returns failure with
+  /// `why` set to the first condition that does not hold.
   static LogicalResult checkGroup(linalg::GenericOp consumer,
                                   OpOperand *operand,
                                   linalg::GenericOp producer, Operation *anchor,
                                   std::string &why) {
     if (!isAllParallel(producer)) {
-      why = "D1 the producer has a reduction loop";
+      why = "the producer has a reduction loop";
       return failure();
     }
     if (!linalg::areElementwiseOpsFusable(operand)) {
@@ -283,6 +355,9 @@ private:
                                               consumer.getNumLoops(), why);
   }
 
+  /// Finds the producer and the anchor of `operand`, checks the group with
+  /// checkGroup, and when it holds fuses the producer into `consumer` and
+  /// erases `consumer`. Returns success when it rewrote.
   static LogicalResult groupOperand(linalg::GenericOp consumer,
                                     OpOperand *operand,
                                     PatternRewriter &rewriter) {
@@ -337,10 +412,11 @@ private:
 // Legalization: an i1 tensor between generics
 //===----------------------------------------------------------------------===//
 
-/// Every `ins` of element type i1 defined by a linalg.generic is an error at
-/// the consumer. Notes: the op that made the i1 in the producer (or the operand
-/// it forwards), each reader in the consumer, and the group shapes
-/// LowerSpyreOps lowers an i1 in.
+/// Reports, as an error at the consumer, every `ins` of element type i1 that a
+/// linalg.generic defines. The notes name the op that made the i1 in the
+/// producer, or the operand the producer forwards; each op reading it in the
+/// consumer; and the group shapes LowerSpyreOps lowers an i1 in. Returns
+/// failure when it reported anything.
 LogicalResult checkNoBooleanBetweenGenerics(ModuleOp mod) {
   LogicalResult result = success();
   mod.walk([&](linalg::GenericOp consumer) {

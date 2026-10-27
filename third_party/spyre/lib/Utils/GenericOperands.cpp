@@ -20,7 +20,7 @@ LogicalResult checkOperandRewrite(ArrayRef<std::pair<Value, AffineMap>> ins,
                                   unsigned numLoops, std::string &why) {
   auto all = llvm::concat<const std::pair<Value, AffineMap>>(ins, outs);
 
-  // D3: every loop dim named, as a bare dim, by some map.
+  // Every loop dim is named, as a bare dim, by some map.
   SmallVector<bool> named(numLoops, false);
   for (const auto &[value, map] : all)
     for (AffineExpr r : map.getResults())
@@ -28,15 +28,16 @@ LogicalResult checkOperandRewrite(ArrayRef<std::pair<Value, AffineMap>> ins,
         named[d.getPosition()] = true;
   for (auto [d, isNamed] : llvm::enumerate(named))
     if (!isNamed) {
-      why = "D3 loop dim d" + std::to_string(d) + " is named by no map";
+      why = "a loop dim of the consumer, d" + std::to_string(d) +
+            ", is named by no operand map";
       return failure();
     }
 
-  // D4: no value in both ins and outs.
+  // No value is both an ins and an outs.
   for (const auto &in : ins)
     for (const auto &out : outs)
       if (in.first == out.first) {
-        why = "D4 an ins would alias an outs";
+        why = "a value would be both an ins and an outs of the consumer";
         return failure();
       }
   return success();
