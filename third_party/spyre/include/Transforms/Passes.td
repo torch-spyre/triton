@@ -6,10 +6,11 @@ include "mlir/Pass/PassBase.td"
 // ============================================================================
 // Transforms whose subject is upstream structure or the whole program rather
 // than any one dialect's abstractions.  UnaliasLinalgOuts,
-// DropReductionInitFill and FuseComputeAndDataMovement act on linalg form --
-// generic bodies, indexing maps, reshape reassociations; NormalizeForDevice on
-// upstream ops the toolchain downstream of this tree will not take, wherever
-// they appear; MaterializeBaseAddresses acts on the entry function's signature.
+// DropReductionInitFill, CanonicalizeGenericOperands and FuseGenerics act on
+// linalg form -- generic bodies, indexing maps, reshape reassociations;
+// NormalizeForDevice on upstream ops the toolchain downstream of this tree will
+// not take, wherever they appear; MaterializeBaseAddresses acts on the entry
+// function's signature.
 // None of them translates a dialect, and none is about ktdp's own memory-view
 // model, so they sit at the top level -- which does not stop them including
 // dialect headers freely.
@@ -19,11 +20,12 @@ include "mlir/Pass/PassBase.td"
 //   Lowering - ops it converts and what they become
 //   Output   - what the IR looks like after this pass
 //
-// All five are members of a fixed stage pipeline in lib/Pipeline.cpp, not
-// opt-in, and all five run in `spyrecode`: NormalizeForDevice at that stage's
-// head, DropReductionInitFill, UnaliasLinalgOuts and
-// FuseComputeAndDataMovement in its shaping prefix, MaterializeBaseAddresses at its tail and only when
-// `bindBaseAddresses` is set.
+// All of them are members of a fixed stage pipeline in lib/Pipeline.cpp, not
+// opt-in, and all run in `spyrecode`: NormalizeForDevice at that stage's head,
+// DropReductionInitFill, UnaliasLinalgOuts, CanonicalizeGenericOperands and
+// FuseGenerics in its shaping prefix, LowerSpyreOps after the layout rewrite,
+// and MaterializeBaseAddresses at its tail and only when `bindBaseAddresses` is
+// set.
 // A pass's position there is chosen in C++ from a typed factory, so there is no
 // caller hook for inserting one at a named point.
 // ============================================================================
@@ -105,7 +107,7 @@ def NormalizeForDevice : Pass<"normalize-for-device", "mlir::ModuleOp"> {
            same file: a rewrite whose target is a spyreop intrinsic belongs in
            [LowerSpyreOps], whether it takes one op or a group, and a rewrite
            that changes which generic an op sits in belongs in
-           [FuseComputeAndDataMovement]. The reciprocal is the worked example:
+           [FuseGenerics]. The reciprocal is the worked example:
            its motive is a device behaviour exactly like the patterns here, but
            its target is `spyreop.reciprocal`, so it is a selection rule and not
            a normalization.
@@ -144,7 +146,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
     let description = [{
         Input: KTIR whose computes are linalg.generic — so after
         ConvertElementwiseToLinalg and LinalgGeneralizeNamedOps, and after
-        [FuseComputeAndDataMovement], on which see the contract below. Bodies hold
+        [FuseGenerics], on which see the contract below. Bodies hold
         arith/math ops. KTIR in, KTIR out: nothing here reads a `tt` op, which
         is why the pass is here and not in Conversion/TritonToKTIR/, whose
         criterion is a `tt` source dialect.
@@ -211,10 +213,10 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         had the chance to select and did not.
 
         An i1 crossing a generic BOUNDARY is the other pass's finding. It is the
-        tensor form, [FuseComputeAndDataMovement] has the clause that removes it,
-        and before that pass has run every compare sits in a generic of its own
-        yielding precisely that — so refusing it here would report IR a
-        predecessor was meant to reshape, while naming the wrong cause. The two
+        tensor form, and [FuseGenerics] reports it after its fixpoint; before
+        that pass has run every compare sits in a generic of its own yielding
+        precisely that — so refusing it here would report IR a predecessor was
+        meant to reshape, while naming the wrong cause. The two
         shapes are indistinguishable at this point, which is why the line is drawn
         by where the value lives rather than by how it got there.
 
@@ -232,13 +234,16 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         once scalarized — and holds today only because the tensor-of-pointers
         tt.load path is unimplemented.
 
-        WHAT THIS PASS RELIES ON [FuseComputeAndDataMovement] FOR. A rule
-        matches ops in ONE body, and ConvertElementwiseToLinalg gives every tensor-level op a
-        body of its own — so a group spanning two tensor ops arrives spread over
-        two generics unless something fused them. That pass's `i1` clause exists
-        for exactly this: the compare rule sees its pair only because that pass
-        brought them together, and the reciprocal's constant is a scalar in the
-        body for the same reason. A contract between adjacent passes rather than
+        WHAT THIS PASS RELIES ON [FuseGenerics] FOR. A rule matches ops in ONE
+        body, and ConvertElementwiseToLinalg gives every tensor-level op a body
+        of its own — so a group spanning two tensor ops arrives spread over two
+        generics unless something fused them. FuseGenerics' GroupComputes does,
+        and only for a group this pass lowers: it asks `formsLowerableGroup`
+        (include/Transforms/LowerSpyreOps.h), which calls the same match
+        function SelectCompare or SelectWhere does, so the two passes cannot
+        disagree on what a group is. The reciprocal's constant is a scalar in
+        the body because CanonicalizeGenericOperands' SplatOperandToScalar put
+        it there. A contract between adjacent passes rather than
         an accident — and the reciprocal reads its numerator THROUGH the body, so
         for that rule the dependency is about whether it FIRES, never about
         whether it is correct.
@@ -274,7 +279,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         what an author can act on.
 
         Ordering: after the passes that make every compute a linalg.generic, and
-        after [FuseComputeAndDataMovement] per the contract above.
+        after [FuseGenerics] per the contract above.
 
         Output: the selected ops replaced by their intrinsics. Everything else
         unchanged.
@@ -383,7 +388,9 @@ def CanonicalizeGenericOperands
         - Left alone:
           - a reshape with any user that is not a generic `ins`, e.g. one
             feeding a `ktdp.store`;
-          - a reshape with a dynamic extent;
+          - a reshape with a dynamic extent: none reaches this pass from the
+            fixture kernels, so no `tensor.empty` with `tensor.dim` sizes is
+            built for one;
           - `tensor.reshape`, `tensor.concat` and `tensor.extract_slice`;
           - a splat operand whose removal leaves some loop dim named by no
             map; a non-splat constant; a scalar `arith.constant` passed as an
@@ -394,9 +401,14 @@ def CanonicalizeGenericOperands
         that is never composed away reaches RewriteDescriptorLayoutGeneric on a
         forwarding generic, which refuses it on a physicalized path.
 
-        The two patterns are rooted on different producer kinds, a reshape and
-        a generic with a splat-constant operand, so they never match the same
-        op.
+        HOW TO ADD A PATTERN: a pattern is rooted on, and matches, one kind of
+        producer — the op that defines the operand — never the operand's type,
+        nor anything downstream. A new pattern names a producer kind no
+        existing pattern matches; one whose kind overlaps an existing pattern's
+        is a new case of that pattern. Its lit file feeds it the other
+        patterns' producers and checks that it does not fire. The two today
+        are rooted on a reshape and on a generic with a splat-constant operand,
+        so they never match the same op.
 
         `--debug-only=canonicalize-generic-operands` traces each rewrite and
         each reshape left alone.
@@ -418,111 +430,73 @@ def CanonicalizeGenericOperands
 
 
 def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
-    let summary = "Fold a pure data-movement linalg.generic into the indexing "
-                  "map of the op that consumes it.";
+    let summary = "Combine a producer linalg.generic into its consumer: absorb "
+                  "a forwarding generic into an operand map, or group the ops "
+                  "LowerSpyreOps lowers as one intrinsic into one body.";
     let description = [{
-        Input: IR in which every compute op is already a `linalg.generic` — so
-        after ConvertElementwiseToLinalg, UnaliasLinalgOuts and
-        LinalgGeneralizeNamedOps. A coordinate change (broadcast, transpose,
-        inserted unit dim) arrives as its own generic whose body computes
-        nothing; only its indexing maps differ.
+        Input: IR in which every compute op is a `linalg.generic` and every
+        reshape or splat constant operand has been stated as a generic by
+        CanonicalizeGenericOperands — so after ConvertElementwiseToLinalg,
+        LinalgGeneralizeNamedOps, UnaliasLinalgOuts and
+        CanonicalizeGenericOperands.
 
-        Lowering:
-        - linalg.generic PRODUCER whose body is exactly one operation, a
-          `linalg.yield` of an `ins` block argument, feeding a linalg.generic
-          consumer → fused, its operand map composed into the consumer's.
-          Upstream's `populateElementwiseOpsFusionPatterns` does the
-          composition; this pass supplies the control function that decides
-          which fusions may happen.
-        - A COORDINATE RESTATEMENT on a generic's `ins` operand — currently
-          `tensor.collapse_shape` or `tensor.expand_shape` — whose
-          result-to-source map, COMPOSED with the consumer's operand map, has
-          every result a bare loop dim or a constant → absorbed: the operand is
-          repointed at the restatement's source and given the composed map. A
-          unit-dim collapse `[64,1] → [64]` gives `(d0) → (d0, 0)`, the reshape
-          `tt.broadcast`'s lowering puts in front of the broadcast generic;
-          a unit-dim expand `[4] → [4,1]` gives `(d0, d1) → (d0)`, the one
-          `tt.expand_dims` leaves behind where no collapse cancelled it.
-        - Anything else is left alone. Two computes never merge, and a compute
-          already carrying a shape change never merges with a downstream compute.
-        - A coordinate restatement whose composed map LINEARIZES — a collapse
-          fusing two non-unit dims, an expand splitting into two — is not
-          absorbed. `tensor.reshape` and `tensor.concat` have no result-to-source
-          map at all: a reshape takes its shape as a tensor operand, so there is
-          no static structure to read one off, and a concat selects between
-          operands per coordinate. All three are left alone SILENTLY where
-          nothing physicalizes them, and REJECTED where something does — see the
-          gate below.
+        Two patterns, both rooted on a consumer `linalg.generic` and looking at
+        one `ins` operand at a time. They differ in what the operand's producer
+        generic `P` yields for the result the consumer reads, so no operand
+        matches both:
 
-        The predicate is STRUCTURAL, not an attribute: it is what gates every
-        fusion decision, so a stale or missing label would not merely mislead a
-        reader, it would silently change the emitted program. There is also
-        nothing to read — the ops it keys on reach this pass from
-        LinalgGeneralizeNamedOps rewriting a linalg.broadcast or
-        linalg.transpose, neither of which records its provenance, and
-        RewriteDescriptorLayoutGeneric rebuilds every generic on a physicalized
-        chain, so a label would have to be maintained by a pass with no other
-        reason to know it exists.
+        - AbsorbForwardingGeneric: `P` yields one of its `ins` block arguments,
+          `x`. When `P` is all-parallel and its result map `R` is a
+          permutation → the operand is repointed at `x` under
+          `A.compose(inversePermutation(R)).compose(C)`, `A` being `P`'s map
+          for `x` and `C` the consumer's map for the operand. This covers a
+          generalized `linalg.broadcast` / `linalg.transpose`, the forwarding
+          generics CanonicalizeGenericOperands emits for a reshape, and one
+          forwarded result of a multi-result generic. `P` is erased once
+          dead.
+        - GroupComputes: `P` yields an op result, the anchor. When `P` is
+          all-parallel, `linalg::areElementwiseOpsFusable` holds, and every use
+          of the matching block argument in the consumer is a reader that
+          forms, with the anchor, a group LowerSpyreOps lowers as one intrinsic
+          (`formsLowerableGroup`, include/Transforms/LowerSpyreOps.h) → `P` is
+          fused into the consumer by `linalg::fuseElementwiseOps`, and the
+          fused op's dead results and duplicate operands are removed by
+          `linalg::deduplicateOperandsAndRemoveDeadResults`. When `P` has a
+          user other than the consumer, it is fused only if every
+          non-terminator op in its body is the anchor, so nothing outside the
+          group is copied. The groups today are an `arith.cmpf` read by
+          `arith.uitofp` (SelectCompare) or by `arith.select` as its condition
+          (SelectWhere), at the compared width; the group shapes are owned by
+          LowerSpyreOps, and a new one there is groupable here with no change.
 
-        The control function does not check `hasOneUse`, unlike the one
-        upstream's own --linalg-fuse-elementwise-ops supplies. A data-movement
-        generic feeding two consumers is folded into each and then dies, which is
-        the intent: the goal is that none survives, and duplicating a coordinate
-        change costs nothing because there is no body to duplicate — the second
-        consumer gains an operand map, not an op.
+        Both patterns check the consumer's operand list as it would be after
+        the rewrite, before mutating anything (`checkOperandRewrite`,
+        Utils/GenericOperands):
+          D1  the producer is all-parallel;
+          D2  every operand map is projected: each result a bare loop dim or a
+              constant, so a linearizing map is never composed in;
+          D3  every consumer loop dim is named, as a bare dim, by some map;
+          D4  no value is both an `ins` and an `outs`.
+        D2 is on the COMPOSED map: a linearizing reshape read at a constant
+        coordinate composes to `(d0, d1) → (0, 0)` and is absorbed.
 
-        Two properties fall out rather than needing cases of their own. A
-        generic that is both a compute and a shape change is declined as a
-        producer and remains eligible as a consumer. And because the predicate
-        keys on the producer, a REDUCTION consumer is fine: the shape change
-        folds into its operand map while its `iterator_types` and single-compute
-        body are untouched — which is also what keeps DropReductionInitFill's
-        precondition (a reduce body of exactly two ops) true, since a pure
-        data-movement producer contributes no body op.
+        Anything else is left alone: two computes that form no group, a
+        reduction producer, an `outs` operand, any tensor op.
 
-        Motivation: a data-movement generic has no descriptor and so no layout
-        marker, so RewriteDescriptorLayoutGeneric leaves its result logical while
-        its consumer is physical. The consumer's operand map would then have to
-        bridge the two with a LINEARIZATION
-        (`(d0, d1, d2) -> (d1, d0 * 64 + d2)`), which the dataflow-scheduler
-        cannot schedule ("could not locate matching linalg operand to project
-        loop IVs and tile sizes through; the data_transfer rank would not match
-        the underlying memref"), so that pass refuses the consumer. Folded into the consumer, the same coordinate
-        change is an operand map the layout pass restates at physical rank like
-        any other — a statistic read at a constant lane comes out as
-        `(d0, d1, d2) -> (d1, 0)`, which is what hand-written reference KTIR
-        states.
+        After the fixpoint, an `ins` of element type `i1` defined by a
+        `linalg.generic` is an error at the consumer, with notes naming the op
+        that made it, each reader, and the groups LowerSpyreOps lowers an `i1`
+        in. No spyreop op produces or consumes `i1`, so it has no device form
+        on any path. LowerSpyreOps' rejectSurvivingBooleans reports the other
+        form, an `i1` made and read inside one body.
 
-        Why the projection check is on the COMPOSED map and not on the
-        reassociation: a linearizing collapse is not INEXPRESSIBLE as an affine
-        map — AffineExpr has FloorDiv and Mod, and this pass emits
-        `(d0) → (d0 floordiv 2, d0 mod 2)` for `[64,2] → [128]`. The reason to
-        decline it is that the scheduler cannot project loop IVs and tile sizes
-        through floordiv or mod, which is a property of the map the CONSUMER ends
-        up holding. The two can differ, because composition folds: the same
-        collapse read at a constant coordinate composes to `(d0, d1) → (0, 0)`,
-        which projects fine and is absorbed.
-
-        Not used here: upstream's `populateFoldReshapeOpsBy{Expansion,
-        Collapsing}Patterns`, which take the same control-function type. They
-        answer a general reshape by changing the consumer's iteration space and
-        pushing a reshape onto its other operands, which on a physicalized chain
-        emits a `tensor.expand_shape` that RewriteDescriptorLayoutGeneric
-        rejects ("this op reads a value the rewrite retyped, but the rewrite
-        restates only linalg.generic"). The absorption above keeps the iteration
-        space and moves the coordinate change into one operand's map, which is
-        the whole of the difference.
-
-        `tensor.extract_slice` is deliberately NOT a coordinate restatement, and
-        not for the reason one would guess. Its coordinate map is derivable —
-        static offsets and unit strides give `(d0, d1) → (d0 + o0, d1 + o1)`. What
-        is not is its EXTENT change: linalg infers its loop bounds from the
-        operand shapes through the indexing maps, so repointing an operand at the
-        larger unsliced source under any map makes the inferred extents
-        inconsistent and fails linalg's own verifier. A slice crops; an operand
-        map re-indexes. It is also the one shape op the scheduler already looks
-        through, and has zero occurrences across the fixture artifacts. Being
-        "not a restatement" means it is neither absorbed nor rejected.
+        A general `where(x > y, p, q)` forms a group and is fused; LowerSpyreOps
+        lowers it to `spyreop.compare` feeding `spyreop.select` in one body,
+        which dbo-opt refuses, and it reports that itself. Kernels write the
+        spilled form instead (`where__spilled*`): a compare to a float mask, a
+        store, a load, then a zero-test select. Producing the two-group form in
+        the compiler, with the intermediate held in the local scratchpad rather
+        than in HBM, is a follow-up.
 
         THE GATE on rejection: an unabsorbable restatement is refused only on a
         path RewriteDescriptorLayoutGeneric will physicalize, asked with THAT
@@ -556,33 +530,36 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         checkConsumersAreRewritable and is kept only because it fires a stage
         earlier and says which property of the op is the problem.
 
-        The store side is REJECTION ONLY, never absorption; the header of
-        FuseComputeAndDataMovement.cpp says why, and what the eventual fix would
-        have to choose between.
+        The store side is REJECTION ONLY, never absorption.
 
         Rejection is DERIVED, not a declared op list: the condition is exactly
-        "absorption failed" and "on a physicalized path", and the first is asked
-        of the same function the absorber asks. Teaching that function a static
+        "no projected result → source map" and "on a physicalized path", and the
+        first is asked of resultToSourceMap. Teaching that function a static
         `tensor.reshape` stops the rejection for it with nothing else to update.
 
-        `--debug-only=fuse-compute-and-data-movement` traces the decisions: each
-        restatement asked for and the answer, each operand the absorber considered
-        with the composition spelled out, the gate's seeds and scope, and each
-        rejection with the path that reached it.
+        HOW TO ADD A PATTERN: a pattern matches on its producer's kind — the op
+        that defines the operand, or what the producer's body computes for it —
+        never on the operand's type, nor on anything downstream. A new pattern
+        names a producer kind no existing pattern matches; one whose kind
+        overlaps an existing pattern's is a new case of that pattern. Its lit
+        file feeds it the other patterns' producers and checks that it does not
+        fire. A new group shape is a match function in LowerSpyreOps, not a
+        pattern here.
 
-        Ordering: after the passes that make every compute op a linalg.generic
-        (fusion matches generic → generic only, so a named producer or consumer
-        blocks it whatever the control function says), and before
-        RewriteDescriptorLayoutGeneric, which must see the folded maps so that no
-        data-movement generic survives for it to refuse — and whose scope the
-        gate above predicts.
+        `--debug-only=fuse-generics` traces each rewrite and each decline, with
+        the check that declined it.
 
-        Output: no linalg.generic whose body is a lone yield of an input remains
-        where a linalg.generic consumes its result, and no coordinate restatement
-        with a projectable composed map feeds a generic. Every op is left with the
-        same single compute in its body it had before. On a module with at least
-        one annotated memory view, no unabsorbable coordinate restatement is left
-        on a path that view physicalizes; the pass fails instead.
+        Ordering: after CanonicalizeGenericOperands, so the only producers are
+        generics, and before RewriteDescriptorLayoutGeneric, which must see the
+        absorbed maps so that no forwarding generic is left for it to refuse,
+        and before LowerSpyreOps, whose groups must be in one body.
+
+        Output: no forwarding generic whose absorption passes D1-D4 feeds a
+        generic `ins`; every group LowerSpyreOps lowers whose edge passes the
+        checks is in one body; no `i1` tensor between generics, or the pass
+        fails. On a module with at least one annotated memory view, no
+        re-indexing tensor op without a projected map is left on a path that
+        view physicalizes; the pass fails instead.
     }];
 
     // No ktdp and no tts, though the gate reads both: dependentDialects is about

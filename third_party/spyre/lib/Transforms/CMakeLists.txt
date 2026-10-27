@@ -1,17 +1,18 @@
 # Passes whose subject is upstream structure or the whole program rather than
-# any one dialect's abstractions: UnaliasLinalgOuts, DropReductionInitFill and
-# FuseComputeAndDataMovement act on linalg form -- generic bodies, indexing maps,
-# reshape reassociations -- NormalizeForDevice hosts patterns rewriting upstream
-# ops the toolchain downstream of this tree will not take, wherever they appear,
-# and MaterializeBaseAddresses acts on the entry function signature.  Sitting at
-# the top level does not stop them including dialect headers.
+# any one dialect's abstractions: UnaliasLinalgOuts, DropReductionInitFill,
+# CanonicalizeGenericOperands and FuseGenerics act on linalg form -- generic
+# bodies, indexing maps, reshape reassociations -- NormalizeForDevice hosts
+# patterns rewriting upstream ops the toolchain downstream of this tree will not
+# take, wherever they appear, and MaterializeBaseAddresses acts on the entry
+# function signature.  Sitting at the top level does not stop them including
+# dialect headers.
 #
 # LINK_LIBS derived from actual #includes plus Passes.td's dependentDialects.
 # One absence is the interesting content here: no TritonIR, because none of the
-# five touches a tt op.  MLIRTransformUtils used to be a second such absence,
-# every pass here walking and rewriting directly; FuseComputeAndDataMovement and
-# NormalizeForDevice both drive the greedy rewriter now, so the claim is only
-# about the dialects, not about the rewrite machinery.
+# passes touches a tt op.  MLIRTransformUtils used to be a second such absence,
+# every pass here walking and rewriting directly; CanonicalizeGenericOperands,
+# FuseGenerics and NormalizeForDevice drive the greedy rewriter now, so the
+# claim is only about the dialects, not about the rewrite machinery.
 add_triton_library(SpyreTransforms
   UnaliasLinalgOuts.cpp
   NormalizeForDevice.cpp
@@ -23,7 +24,7 @@ add_triton_library(SpyreTransforms
 
   DEPENDS
   SpyreTransformsIncGen
-  # FuseComputeAndDataMovement includes the tts dialect's generated declarations
+  # FuseGenerics includes the tts dialect's generated declarations
   # through Dialect/TTS/IR/Dialect.h, so a clean parallel build must not rely on
   # the link edge to order that tablegen ahead of it.
   TTSIncGen
@@ -31,7 +32,7 @@ add_triton_library(SpyreTransforms
   LINK_LIBS PUBLIC
   # For createEmptyTensor in UnaliasLinalgOuts, and GenericOperands.
   SpyreUtils
-  # FuseComputeAndDataMovement refuses an unabsorbable re-indexing op only on a
+  # FuseGenerics refuses an unabsorbable re-indexing op only on a
   # path RewriteDescriptorLayoutGeneric will physicalize, and asks that question
   # with that pass's own seed traversals -- hence the ktdp dialect, KTDPUtils
   # where the shared walks live, and TTSIR for the layout attribute's name.  It
@@ -51,10 +52,10 @@ add_triton_library(SpyreTransforms
   # math.sqrt/exp/rsqrt, which LowerSpyreOps selects intrinsics for.
   MLIRMathDialect
   MLIRTensorDialect
-  # For populateElementwiseOpsFusionPatterns, the composition
-  # FuseComputeAndDataMovement supplies a control function to.
+  # For fuseElementwiseOps and deduplicateOperandsAndRemoveDeadResults, which
+  # FuseGenerics' GroupComputes rewrites with.
   MLIRLinalgTransforms
-  # For applyPatternsGreedily, which that pass drives its two pattern kinds with
-  # and NormalizeForDevice its own.
+  # For applyPatternsGreedily, which drives the patterns of
+  # CanonicalizeGenericOperands, FuseGenerics and NormalizeForDevice.
   MLIRTransformUtils
 )

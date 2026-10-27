@@ -197,7 +197,7 @@ and what is new is a SECOND group reading that statistic back and applying it to
 full tile. Both launch. What they needed was not a layout change but a pass:
 reading a statistic back is a Triton broadcast, which used to survive to the
 layout pass as a generic with no descriptor and get bridged with a linearizing
-operand map; `FuseComputeAndDataMovement` folds it into its consumer's map instead.
+operand map; `FuseGenerics` absorbs it into its consumer's map instead.
 Each arm reads its statistic back through the same rank-1 descriptor that wrote
 it. On stick the statistic's layout is a splat, which the layout pass writes
 across the stick and reads at lane 0, so the kernel never names the stick width.

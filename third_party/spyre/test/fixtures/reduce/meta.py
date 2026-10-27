@@ -951,7 +951,7 @@ VARIANTS = {
     # BOTH REACH A BINARY AND LAUNCH, and what makes that true is one pass. Reading
     # a statistic back and applying it to a full tile is a Triton BROADCAST, which
     # reaches the layout pass as a linalg.generic of its own that computes nothing.
-    # FuseComputeAndDataMovement folds it into its consumer's operand map, in the
+    # FuseGenerics absorbs it into its consumer's operand map, in the
     # spyrecode stage ahead of the layout pass, which then restates that map at
     # physical rank like any other. What each arm emits:
     #
@@ -1000,7 +1000,7 @@ VARIANTS = {
         "grid":        [1],
         # No tl.program_id, so DistributeWork has nothing to place and there is no
         # scf.for for dbo-opt to refuse. The chain reaches a binary because
-        # FuseComputeAndDataMovement folds the statistic broadcast into its consumer's
+        # FuseGenerics absorbs the statistic broadcast into its consumer's
         # operand map; see the group banner above for the map it lands on.
         "compiles_to_binary": True,
         "output_key":  "out_ptr",
