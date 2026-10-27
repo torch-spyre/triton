@@ -1,8 +1,9 @@
 // RUN: spyre-triton-opt %s --fuse-generics -split-input-file -verify-diagnostics
 
-// After the fixpoint, an i1 tensor passed from one linalg.generic to another
-// is an error at the consumer. Its notes name the op that made the i1, each
-// reader, and the group shapes LowerSpyreOps lowers an i1 in. Every edge
+// legalizeAfterFusion, the check step run after the patterns converge: an i1
+// tensor passed from one linalg.generic to another is an error at the
+// consumer. Its notes name the op that made the i1, each reader, and the group
+// shapes LowerSpyreOps lowers an i1 in. Every edge
 // GroupComputes declines leaves such an i1, so its negatives are here:
 //
 //   2a  the anchor (arith.andi) forms no group
