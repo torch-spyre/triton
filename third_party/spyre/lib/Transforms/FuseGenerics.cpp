@@ -106,6 +106,13 @@ void traceDecline(StringRef pattern, OpOperand *operand, const llvm::Twine &why)
                           << why << "\n");
 }
 
+void traceSkip(StringRef pattern, OpOperand *operand, const llvm::Twine &why) {
+  LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << pattern << ": operand "
+                          << operand->getOperandNumber() << " of generic at "
+                          << operand->getOwner()->getLoc() << ": skipped, "
+                          << why << "\n");
+}
+
 //===----------------------------------------------------------------------===//
 // AbsorbForwardingGeneric
 //===----------------------------------------------------------------------===//
@@ -126,11 +133,17 @@ struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
     for (OpOperand *operand : consumer.getDpsInputOperands()) {
       auto result = dyn_cast<OpResult>(operand->get());
       auto producer = operand->get().getDefiningOp<linalg::GenericOp>();
-      if (!producer)
+      if (!producer) {
+        traceSkip("AbsorbForwardingGeneric", operand,
+                  "the producer is not a linalg.generic");
         continue;
+      }
       BlockArgument arg = forwardedInput(producer, result);
-      if (!arg)
+      if (!arg) {
+        traceSkip("AbsorbForwardingGeneric", operand,
+                  "the producer does not yield one of its ins block arguments");
         continue;
+      }
       if (!isAllParallel(producer)) {
         traceDecline("AbsorbForwardingGeneric", operand,
                      "D1 the producer has a reduction loop");
@@ -237,6 +250,11 @@ private:
               "' form no group: " + reason;
         return failure();
       }
+      LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] GroupComputes: operand "
+                              << operand->getOperandNumber() << " of generic at "
+                              << consumer.getLoc() << ": '" << anchor->getName()
+                              << "' and its reader '" << reader->getName()
+                              << "' form a group\n");
     }
 
     bool shared = llvm::any_of(producer->getUsers(), [&](Operation *user) {
@@ -269,12 +287,22 @@ private:
                                     OpOperand *operand,
                                     PatternRewriter &rewriter) {
     auto producer = operand->get().getDefiningOp<linalg::GenericOp>();
-    if (!producer)
+    if (!producer) {
+      traceSkip("GroupComputes", operand, "the producer is not a linalg.generic");
       return failure();
+    }
     Value yielded = yieldedFor(producer, cast<OpResult>(operand->get()));
     Operation *anchor = yielded.getDefiningOp();
-    if (!anchor || anchor->getBlock() != producer.getBlock())
+    if (!anchor) {
+      traceSkip("GroupComputes", operand,
+                "the yielded value is a block argument, not an op result");
       return failure();
+    }
+    if (anchor->getBlock() != producer.getBlock()) {
+      traceSkip("GroupComputes", operand,
+                "the yielded value is defined outside the body");
+      return failure();
+    }
 
     std::string why;
     if (failed(checkGroup(consumer, operand, producer, anchor, why))) {
@@ -323,6 +351,11 @@ LogicalResult checkNoBooleanBetweenGenerics(ModuleOp mod) {
       if (!producer)
         continue;
       result = failure();
+      LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] legalizeAfterFusion: operand "
+                              << operand->getOperandNumber() << " of generic at "
+                              << consumer.getLoc()
+                              << ": an i1 tensor from the generic at "
+                              << producer.getLoc() << ", reported\n");
 
       Value yielded = yieldedFor(producer, cast<OpResult>(operand->get()));
       InFlightDiagnostic diag =

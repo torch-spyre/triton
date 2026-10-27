@@ -128,7 +128,7 @@ struct ReshapeToGeneric : OpRewritePattern<ReshapeOp> {
     if (!srcType.hasStaticShape() || !resultType.hasStaticShape())
       return leave("a dynamic extent");
     if (op->use_empty())
-      return failure();
+      return leave("it has no users");
     for (OpOperand &use : op->getUses()) {
       auto generic = dyn_cast<linalg::GenericOp>(use.getOwner());
       if (!generic || !generic.isDpsInput(&use))
