@@ -3,9 +3,10 @@
 // AbsorbForwardingGeneric: a consumer ins whose producer generic yields, for
 // that result, one of its own ins block arguments is repointed at that input,
 // under A o R^-1 o C. The reshape cases arrive as CanonicalizeGenericOperands
-// leaves them: a forwarding generic in place of each collapse_shape and
-// expand_shape. The declines are D1-D4, a non-permutation result map, and the
-// other pattern's producers (a generic yielding an op result, a tensor op).
+// leaves them: a forwarding generic in place of each unit-dim or rank-0
+// collapse_shape and expand_shape, and a tensor op for a linearizing one. The
+// declines are D1, D3, D4, a non-permutation result map, and the other
+// pattern's producers (a generic yielding an op result, a tensor op).
 
 // -----
 
@@ -354,43 +355,33 @@ module {
 // -----
 
 // CHECK: #[[$ATTR_14:.+]] = affine_map<(d0, d1) -> (d0, d1)>
-// CHECK: #[[$ATTR_15:.+]] = affine_map<(d0, d1) -> (0, 0)>
+// CHECK: #[[$ATTR_15:.+]] = affine_map<(d0, d1) -> (0)>
 
-// D2 reads the COMPOSED map, not the reassociation. `[64,2] -> [128]` fuses two non-unit dims, so its
-// result-to-source map is `(d0) -> (d0 floordiv 2, d0 mod 2)` -- a genuine
-// linearization, which this pass emits rather than refusing to state. But the
-// consumer reads the collapsed value at a CONSTANT coordinate, so the composite
-// is `(d0, d1) -> (0, 0)`: the floordiv and the mod fold away against the
-// constant and nothing is left for a loop IV to be projected through. Restated.
-#map = affine_map<(d0) -> (d0 floordiv 2, d0 mod 2)>
-#map1 = affine_map<(d0) -> (d0)>
-#map2 = affine_map<(d0, d1) -> (d0, d1)>
-#map3 = affine_map<(d0, d1) -> (0)>
+// Not this pattern's producer: a linearizing `[64,2] -> [128]` collapse read at
+// a constant coordinate. CanonicalizeGenericOperands leaves a linearizing
+// reshape a tensor op, and no pattern here matches a tensor op, so it stays.
 module {
 // CHECK-LABEL:   func.func @linearizing_collapse_at_a_constant(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<64x2xf16>, %[[VAL_1:.*]]: tensor<8x16xf16>) -> tensor<8x16xf16> {
-// CHECK:           %[[VAL_2:.*]] = tensor.empty() : tensor<8x16xf16>
-// CHECK:           %[[VAL_3:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_14]], #[[$ATTR_15]], #[[$ATTR_14]]], iterator_types = ["parallel", "parallel"]} ins(%[[VAL_1]], %[[VAL_0]] : tensor<8x16xf16>, tensor<64x2xf16>) outs(%[[VAL_2]] : tensor<8x16xf16>) {
-// CHECK:           ^bb0(%[[VAL_4:.*]]: f16, %[[VAL_5:.*]]: f16, %[[VAL_6:.*]]: f16):
-// CHECK:             %[[VAL_7:.*]] = arith.subf %[[VAL_4]], %[[VAL_5]] : f16
-// CHECK:             linalg.yield %[[VAL_7]] : f16
+// CHECK:           %[[VAL_2:.*]] = tensor.collapse_shape %[[VAL_0]] {{\[\[}}0, 1]] : tensor<64x2xf16> into tensor<128xf16>
+// CHECK:           %[[VAL_3:.*]] = tensor.empty() : tensor<8x16xf16>
+// CHECK:           %[[VAL_4:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_14]], #[[$ATTR_15]], #[[$ATTR_14]]], iterator_types = ["parallel", "parallel"]} ins(%[[VAL_1]], %[[VAL_2]] : tensor<8x16xf16>, tensor<128xf16>) outs(%[[VAL_3]] : tensor<8x16xf16>) {
+// CHECK:           ^bb0(%[[VAL_5:.*]]: f16, %[[VAL_6:.*]]: f16, %[[VAL_7:.*]]: f16):
+// CHECK:             %[[VAL_8:.*]] = arith.subf %[[VAL_5]], %[[VAL_6]] : f16
+// CHECK:             linalg.yield %[[VAL_8]] : f16
 // CHECK:           } -> tensor<8x16xf16>
-// CHECK:           return %[[VAL_3]] : tensor<8x16xf16>
+// CHECK:           return %[[VAL_4]] : tensor<8x16xf16>
 // CHECK:         }
-  func.func @linearizing_collapse_at_a_constant(%arg0: tensor<64x2xf16>, %arg1: tensor<8x16xf16>) -> tensor<8x16xf16> {
-    %0 = tensor.empty() : tensor<128xf16>
-    %1 = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel"]} ins(%arg0 : tensor<64x2xf16>) outs(%0 : tensor<128xf16>) {
-    ^bb0(%in: f16, %out: f16):
-      linalg.yield %in : f16
-    } -> tensor<128xf16>
-    %2 = tensor.empty() : tensor<8x16xf16>
-    %3 = linalg.generic {indexing_maps = [#map2, #map3, #map2], iterator_types = ["parallel", "parallel"]} ins(%arg1, %1 : tensor<8x16xf16>, tensor<128xf16>) outs(%2 : tensor<8x16xf16>) {
-    ^bb0(%in: f16, %in_0: f16, %out: f16):
-      %4 = arith.subf %in, %in_0 : f16
-      linalg.yield %4 : f16
-    } -> tensor<8x16xf16>
-    return %3 : tensor<8x16xf16>
-  }
+func.func @linearizing_collapse_at_a_constant(%s: tensor<64x2xf16>, %y: tensor<8x16xf16>) -> tensor<8x16xf16> {
+  %c = tensor.collapse_shape %s [[0, 1]] : tensor<64x2xf16> into tensor<128xf16>
+  %e = tensor.empty() : tensor<8x16xf16>
+  %r = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (0)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%y, %c : tensor<8x16xf16>, tensor<128xf16>) outs(%e : tensor<8x16xf16>) {
+  ^bb0(%a: f16, %b: f16, %out: f16):
+    %v = arith.subf %a, %b : f16
+    linalg.yield %v : f16
+  } -> tensor<8x16xf16>
+  return %r : tensor<8x16xf16>
+}
 }
 
 // -----
@@ -626,121 +617,61 @@ module {
 
 // -----
 
-// CHECK: #[[$ATTR_30:.+]] = affine_map<(d0) -> (d0 floordiv 2, d0 mod 2)>
-// CHECK: #[[$ATTR_31:.+]] = affine_map<(d0) -> (d0)>
+// CHECK: #[[$ATTR_30:.+]] = affine_map<(d0) -> (d0)>
 
-// D2, repoint: a `[64,2] -> [128]` collapse read at a LOOP DIM. Nothing folds
-// away, the consumer would hold the floordiv and the mod, and D2 declines it.
-// The same collapse read at a constant, above, is accepted.
-#map = affine_map<(d0) -> (d0 floordiv 2, d0 mod 2)>
-#map1 = affine_map<(d0) -> (d0)>
+// Not this pattern's producer: the same linearizing collapse read at a loop
+// dim. It stays a tensor op.
 module {
 // CHECK-LABEL:   func.func @linearizing_collapse_not_absorbed(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<64x2xf16>) -> tensor<128xf16> {
-// CHECK:           %[[VAL_1:.*]] = tensor.empty() : tensor<128xf16>
-// CHECK:           %[[VAL_2:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_30]], #[[$ATTR_31]]], iterator_types = ["parallel"]} ins(%[[VAL_0]] : tensor<64x2xf16>) outs(%[[VAL_1]] : tensor<128xf16>) {
-// CHECK:           ^bb0(%[[VAL_3:.*]]: f16, %[[VAL_4:.*]]: f16):
-// CHECK:             linalg.yield %[[VAL_3]] : f16
-// CHECK:           } -> tensor<128xf16>
-// CHECK:           %[[VAL_5:.*]] = tensor.empty() : tensor<128xf16>
-// CHECK:           %[[VAL_6:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_31]], #[[$ATTR_31]]], iterator_types = ["parallel"]} ins(%[[VAL_2]] : tensor<128xf16>) outs(%[[VAL_5]] : tensor<128xf16>) {
-// CHECK:           ^bb0(%[[VAL_7:.*]]: f16, %[[VAL_8:.*]]: f16):
-// CHECK:             %[[VAL_9:.*]] = arith.mulf %[[VAL_7]], %[[VAL_7]] : f16
-// CHECK:             linalg.yield %[[VAL_9]] : f16
-// CHECK:           } -> tensor<128xf16>
-// CHECK:           return %[[VAL_6]] : tensor<128xf16>
-// CHECK:         }
-  func.func @linearizing_collapse_not_absorbed(%arg0: tensor<64x2xf16>) -> tensor<128xf16> {
-    %0 = tensor.empty() : tensor<128xf16>
-    %1 = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel"]} ins(%arg0 : tensor<64x2xf16>) outs(%0 : tensor<128xf16>) {
-    ^bb0(%in: f16, %out: f16):
-      linalg.yield %in : f16
-    } -> tensor<128xf16>
-    %2 = tensor.empty() : tensor<128xf16>
-    %3 = linalg.generic {indexing_maps = [#map1, #map1], iterator_types = ["parallel"]} ins(%1 : tensor<128xf16>) outs(%2 : tensor<128xf16>) {
-    ^bb0(%in: f16, %out: f16):
-      %4 = arith.mulf %in, %in : f16
-      linalg.yield %4 : f16
-    } -> tensor<128xf16>
-    return %3 : tensor<128xf16>
-  }
-}
-
-// -----
-
-// CHECK: #[[$ATTR_32:.+]] = affine_map<(d0, d1) -> (d0 * 2 + d1)>
-// CHECK: #[[$ATTR_33:.+]] = affine_map<(d0, d1) -> (d0, d1)>
-
-// D2, repoint: a linearizing `tensor.expand_shape`. `[128] -> [64,2]` splits one
-// dim into two non-unit ones, so the source coordinate is `d0 * 2 + d1`.
-#map = affine_map<(d0, d1) -> (d0 * 2 + d1)>
-#map1 = affine_map<(d0, d1) -> (d0, d1)>
-module {
-// CHECK-LABEL:   func.func @linearizing_expand_not_absorbed(
-// CHECK-SAME:  %[[VAL_0:.*]]: tensor<128xf16>) -> tensor<64x2xf16> {
-// CHECK:           %[[VAL_1:.*]] = tensor.empty() : tensor<64x2xf16>
-// CHECK:           %[[VAL_2:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_32]], #[[$ATTR_33]]], iterator_types = ["parallel", "parallel"]} ins(%[[VAL_0]] : tensor<128xf16>) outs(%[[VAL_1]] : tensor<64x2xf16>) {
-// CHECK:           ^bb0(%[[VAL_3:.*]]: f16, %[[VAL_4:.*]]: f16):
-// CHECK:             linalg.yield %[[VAL_3]] : f16
-// CHECK:           } -> tensor<64x2xf16>
-// CHECK:           %[[VAL_5:.*]] = tensor.empty() : tensor<64x2xf16>
-// CHECK:           %[[VAL_6:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_33]], #[[$ATTR_33]]], iterator_types = ["parallel", "parallel"]} ins(%[[VAL_2]] : tensor<64x2xf16>) outs(%[[VAL_5]] : tensor<64x2xf16>) {
-// CHECK:           ^bb0(%[[VAL_7:.*]]: f16, %[[VAL_8:.*]]: f16):
-// CHECK:             %[[VAL_9:.*]] = arith.mulf %[[VAL_7]], %[[VAL_7]] : f16
-// CHECK:             linalg.yield %[[VAL_9]] : f16
-// CHECK:           } -> tensor<64x2xf16>
-// CHECK:           return %[[VAL_6]] : tensor<64x2xf16>
-// CHECK:         }
-  func.func @linearizing_expand_not_absorbed(%arg0: tensor<128xf16>) -> tensor<64x2xf16> {
-    %0 = tensor.empty() : tensor<64x2xf16>
-    %1 = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "parallel"]} ins(%arg0 : tensor<128xf16>) outs(%0 : tensor<64x2xf16>) {
-    ^bb0(%in: f16, %out: f16):
-      linalg.yield %in : f16
-    } -> tensor<64x2xf16>
-    %2 = tensor.empty() : tensor<64x2xf16>
-    %3 = linalg.generic {indexing_maps = [#map1, #map1], iterator_types = ["parallel", "parallel"]} ins(%1 : tensor<64x2xf16>) outs(%2 : tensor<64x2xf16>) {
-    ^bb0(%in: f16, %out: f16):
-      %4 = arith.mulf %in, %in : f16
-      linalg.yield %4 : f16
-    } -> tensor<64x2xf16>
-    return %3 : tensor<64x2xf16>
-  }
-}
-
-// -----
-
-// CHECK: #[[$ATTR_34:.+]] = affine_map<(d0) -> (d0 floordiv 2, d0 mod 2)>
-// CHECK: #[[$ATTR_35:.+]] = affine_map<(d0) -> (d0)>
-
-// D2, repoint: a lone-yield generic whose ins map linearizes. Its composed
-// map is `(d0) -> (d0 floordiv 2, d0 mod 2)`, which D2 declines.
-module {
-// CHECK-LABEL:   func.func @d2_lone_yield_linearizing(
-// CHECK-SAME:  %[[VAL_0:.*]]: tensor<64x2xf16>, %[[VAL_1:.*]]: tensor<128xf16>) -> tensor<128xf16> {
+// CHECK:           %[[VAL_1:.*]] = tensor.collapse_shape %[[VAL_0]] {{\[\[}}0, 1]] : tensor<64x2xf16> into tensor<128xf16>
 // CHECK:           %[[VAL_2:.*]] = tensor.empty() : tensor<128xf16>
-// CHECK:           %[[VAL_3:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_34]], #[[$ATTR_35]]], iterator_types = ["parallel"]} ins(%[[VAL_0]] : tensor<64x2xf16>) outs(%[[VAL_2]] : tensor<128xf16>) {
+// CHECK:           %[[VAL_3:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_30]], #[[$ATTR_30]]], iterator_types = ["parallel"]} ins(%[[VAL_1]] : tensor<128xf16>) outs(%[[VAL_2]] : tensor<128xf16>) {
 // CHECK:           ^bb0(%[[VAL_4:.*]]: f16, %[[VAL_5:.*]]: f16):
-// CHECK:             linalg.yield %[[VAL_4]] : f16
+// CHECK:             %[[VAL_6:.*]] = arith.mulf %[[VAL_4]], %[[VAL_4]] : f16
+// CHECK:             linalg.yield %[[VAL_6]] : f16
 // CHECK:           } -> tensor<128xf16>
-// CHECK:           %[[VAL_6:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_35]], #[[$ATTR_35]], #[[$ATTR_35]]], iterator_types = ["parallel"]} ins(%[[VAL_3]], %[[VAL_1]] : tensor<128xf16>, tensor<128xf16>) outs(%[[VAL_2]] : tensor<128xf16>) {
-// CHECK:           ^bb0(%[[VAL_7:.*]]: f16, %[[VAL_8:.*]]: f16, %[[VAL_9:.*]]: f16):
-// CHECK:             %[[VAL_10:.*]] = arith.addf %[[VAL_7]], %[[VAL_8]] : f16
-// CHECK:             linalg.yield %[[VAL_10]] : f16
-// CHECK:           } -> tensor<128xf16>
-// CHECK:           return %[[VAL_6]] : tensor<128xf16>
+// CHECK:           return %[[VAL_3]] : tensor<128xf16>
 // CHECK:         }
-func.func @d2_lone_yield_linearizing(%s: tensor<64x2xf16>, %y: tensor<128xf16>) -> tensor<128xf16> {
+func.func @linearizing_collapse_not_absorbed(%s: tensor<64x2xf16>) -> tensor<128xf16> {
+  %c = tensor.collapse_shape %s [[0, 1]] : tensor<64x2xf16> into tensor<128xf16>
   %e = tensor.empty() : tensor<128xf16>
-  %b = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0 floordiv 2, d0 mod 2)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%s : tensor<64x2xf16>) outs(%e : tensor<128xf16>) {
-  ^bb0(%in: f16, %out: f16):
-    linalg.yield %in : f16
-  } -> tensor<128xf16>
-  %r = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%b, %y : tensor<128xf16>, tensor<128xf16>) outs(%e : tensor<128xf16>) {
-  ^bb0(%a: f16, %c: f16, %out: f16):
-    %v = arith.addf %a, %c : f16
+  %r = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%c : tensor<128xf16>) outs(%e : tensor<128xf16>) {
+  ^bb0(%a: f16, %out: f16):
+    %v = arith.mulf %a, %a : f16
     linalg.yield %v : f16
   } -> tensor<128xf16>
   return %r : tensor<128xf16>
+}
+}
+
+// -----
+
+// CHECK: #[[$ATTR_32:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+
+// Not this pattern's producer: a linearizing `[128] -> [64,2]` expand, which
+// CanonicalizeGenericOperands leaves a tensor op. It stays.
+module {
+// CHECK-LABEL:   func.func @linearizing_expand_not_absorbed(
+// CHECK-SAME:  %[[VAL_0:.*]]: tensor<128xf16>) -> tensor<64x2xf16> {
+// CHECK:           %[[VAL_1:.*]] = tensor.expand_shape %[[VAL_0]] {{\[\[}}0, 1]] output_shape [64, 2] : tensor<128xf16> into tensor<64x2xf16>
+// CHECK:           %[[VAL_2:.*]] = tensor.empty() : tensor<64x2xf16>
+// CHECK:           %[[VAL_3:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_32]], #[[$ATTR_32]]], iterator_types = ["parallel", "parallel"]} ins(%[[VAL_1]] : tensor<64x2xf16>) outs(%[[VAL_2]] : tensor<64x2xf16>) {
+// CHECK:           ^bb0(%[[VAL_4:.*]]: f16, %[[VAL_5:.*]]: f16):
+// CHECK:             %[[VAL_6:.*]] = arith.mulf %[[VAL_4]], %[[VAL_4]] : f16
+// CHECK:             linalg.yield %[[VAL_6]] : f16
+// CHECK:           } -> tensor<64x2xf16>
+// CHECK:           return %[[VAL_3]] : tensor<64x2xf16>
+// CHECK:         }
+func.func @linearizing_expand_not_absorbed(%s: tensor<128xf16>) -> tensor<64x2xf16> {
+  %x = tensor.expand_shape %s [[0, 1]] output_shape [64, 2] : tensor<128xf16> into tensor<64x2xf16>
+  %e = tensor.empty() : tensor<64x2xf16>
+  %r = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%x : tensor<64x2xf16>) outs(%e : tensor<64x2xf16>) {
+  ^bb0(%a: f16, %out: f16):
+    %v = arith.mulf %a, %a : f16
+    linalg.yield %v : f16
+  } -> tensor<64x2xf16>
+  return %r : tensor<64x2xf16>
 }
 }
 

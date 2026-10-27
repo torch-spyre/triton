@@ -1,8 +1,10 @@
 // RUN: spyre-triton-opt %s --canonicalize-generic-operands -split-input-file | FileCheck %s
 
 // ReshapeToGeneric: a static collapse_shape / expand_shape whose every user is
-// a linalg.generic ins becomes a forwarding generic whose input map is the
-// reshape's result -> source map. The consumer is not touched.
+// a linalg.generic ins, and whose result -> source map is projected, becomes a
+// forwarding generic with that map as its input map. A projected map has every
+// result a bare dim or a constant: unit-dim inserts and drops, and rank 0. The
+// consumer is not touched.
 
 // A unit-dim collapse in front of a broadcast generic, the tt.broadcast shape:
 // `[64,1] -> [64]` reads `(d0) -> (d0, 0)`.
@@ -213,27 +215,22 @@ func.func @chained_collapse_and_expand(%s: tensor<64x1xf16>, %y: tensor<1x64xf16
 
 // -----
 
-// CHECK: #[[$ATTR_16:.+]] = affine_map<(d0) -> (d0 floordiv 2, d0 mod 2)>
-// CHECK: #[[$ATTR_17:.+]] = affine_map<(d0) -> (d0)>
+// CHECK: #[[$ATTR_16:.+]] = affine_map<(d0) -> (d0)>
 
-// A linearizing collapse is emitted too: `[64,2] -> [128]` reads
-// `(d0) -> (d0 floordiv 2, d0 mod 2)`. Whether that map is usable is decided
-// where it is composed, not here.
+// Left alone: a linearizing collapse. `[64,2] -> [128]` merges two non-unit
+// dims, so its result -> source map, `(d0) -> (d0 floordiv 2, d0 mod 2)`, has
+// a result that is neither a bare dim nor a constant.
 module {
 // CHECK-LABEL:   func.func @linearizing_collapse(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<64x2xf16>, %[[VAL_1:.*]]: tensor<128xf16>) -> tensor<128xf16> {
-// CHECK:           %[[VAL_2:.*]] = tensor.empty() : tensor<128xf16>
-// CHECK:           %[[VAL_3:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_16]], #[[$ATTR_17]]], iterator_types = ["parallel"]} ins(%[[VAL_0]] : tensor<64x2xf16>) outs(%[[VAL_2]] : tensor<128xf16>) {
-// CHECK:           ^bb0(%[[VAL_4:.*]]: f16, %[[VAL_5:.*]]: f16):
-// CHECK:             linalg.yield %[[VAL_4]] : f16
+// CHECK:           %[[VAL_2:.*]] = tensor.collapse_shape %[[VAL_0]] {{\[\[}}0, 1]] : tensor<64x2xf16> into tensor<128xf16>
+// CHECK:           %[[VAL_3:.*]] = tensor.empty() : tensor<128xf16>
+// CHECK:           %[[VAL_4:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_16]], #[[$ATTR_16]], #[[$ATTR_16]]], iterator_types = ["parallel"]} ins(%[[VAL_1]], %[[VAL_2]] : tensor<128xf16>, tensor<128xf16>) outs(%[[VAL_3]] : tensor<128xf16>) {
+// CHECK:           ^bb0(%[[VAL_5:.*]]: f16, %[[VAL_6:.*]]: f16, %[[VAL_7:.*]]: f16):
+// CHECK:             %[[VAL_8:.*]] = arith.subf %[[VAL_5]], %[[VAL_6]] : f16
+// CHECK:             linalg.yield %[[VAL_8]] : f16
 // CHECK:           } -> tensor<128xf16>
-// CHECK:           %[[VAL_6:.*]] = tensor.empty() : tensor<128xf16>
-// CHECK:           %[[VAL_7:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_17]], #[[$ATTR_17]], #[[$ATTR_17]]], iterator_types = ["parallel"]} ins(%[[VAL_1]], %[[VAL_3]] : tensor<128xf16>, tensor<128xf16>) outs(%[[VAL_6]] : tensor<128xf16>) {
-// CHECK:           ^bb0(%[[VAL_8:.*]]: f16, %[[VAL_9:.*]]: f16, %[[VAL_10:.*]]: f16):
-// CHECK:             %[[VAL_11:.*]] = arith.subf %[[VAL_8]], %[[VAL_9]] : f16
-// CHECK:             linalg.yield %[[VAL_11]] : f16
-// CHECK:           } -> tensor<128xf16>
-// CHECK:           return %[[VAL_7]] : tensor<128xf16>
+// CHECK:           return %[[VAL_4]] : tensor<128xf16>
 // CHECK:         }
 func.func @linearizing_collapse(%s: tensor<64x2xf16>, %y: tensor<128xf16>) -> tensor<128xf16> {
   %c = tensor.collapse_shape %s [[0, 1]] : tensor<64x2xf16> into tensor<128xf16>
@@ -253,25 +250,22 @@ func.func @linearizing_collapse(%s: tensor<64x2xf16>, %y: tensor<128xf16>) -> te
 
 // -----
 
-// CHECK: #[[$ATTR_18:.+]] = affine_map<(d0, d1) -> (d0 * 2 + d1)>
-// CHECK: #[[$ATTR_19:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK: #[[$ATTR_17:.+]] = affine_map<(d0, d1) -> (d0, d1)>
 
-// A linearizing expand: `[128] -> [64,2]` reads `(d0, d1) -> (d0 * 2 + d1)`.
+// Left alone: a linearizing expand. `[128] -> [64,2]` splits one dim into two
+// non-unit ones, so its result -> source map, `(d0, d1) -> (d0 * 2 + d1)`, has
+// a result that is neither a bare dim nor a constant.
 module {
 // CHECK-LABEL:   func.func @linearizing_expand(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<128xf16>, %[[VAL_1:.*]]: tensor<64x2xf16>) -> tensor<64x2xf16> {
-// CHECK:           %[[VAL_2:.*]] = tensor.empty() : tensor<64x2xf16>
-// CHECK:           %[[VAL_3:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_18]], #[[$ATTR_19]]], iterator_types = ["parallel", "parallel"]} ins(%[[VAL_0]] : tensor<128xf16>) outs(%[[VAL_2]] : tensor<64x2xf16>) {
-// CHECK:           ^bb0(%[[VAL_4:.*]]: f16, %[[VAL_5:.*]]: f16):
-// CHECK:             linalg.yield %[[VAL_4]] : f16
+// CHECK:           %[[VAL_2:.*]] = tensor.expand_shape %[[VAL_0]] {{\[\[}}0, 1]] output_shape [64, 2] : tensor<128xf16> into tensor<64x2xf16>
+// CHECK:           %[[VAL_3:.*]] = tensor.empty() : tensor<64x2xf16>
+// CHECK:           %[[VAL_4:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_17]], #[[$ATTR_17]], #[[$ATTR_17]]], iterator_types = ["parallel", "parallel"]} ins(%[[VAL_1]], %[[VAL_2]] : tensor<64x2xf16>, tensor<64x2xf16>) outs(%[[VAL_3]] : tensor<64x2xf16>) {
+// CHECK:           ^bb0(%[[VAL_5:.*]]: f16, %[[VAL_6:.*]]: f16, %[[VAL_7:.*]]: f16):
+// CHECK:             %[[VAL_8:.*]] = arith.subf %[[VAL_5]], %[[VAL_6]] : f16
+// CHECK:             linalg.yield %[[VAL_8]] : f16
 // CHECK:           } -> tensor<64x2xf16>
-// CHECK:           %[[VAL_6:.*]] = tensor.empty() : tensor<64x2xf16>
-// CHECK:           %[[VAL_7:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_19]], #[[$ATTR_19]], #[[$ATTR_19]]], iterator_types = ["parallel", "parallel"]} ins(%[[VAL_1]], %[[VAL_3]] : tensor<64x2xf16>, tensor<64x2xf16>) outs(%[[VAL_6]] : tensor<64x2xf16>) {
-// CHECK:           ^bb0(%[[VAL_8:.*]]: f16, %[[VAL_9:.*]]: f16, %[[VAL_10:.*]]: f16):
-// CHECK:             %[[VAL_11:.*]] = arith.subf %[[VAL_8]], %[[VAL_9]] : f16
-// CHECK:             linalg.yield %[[VAL_11]] : f16
-// CHECK:           } -> tensor<64x2xf16>
-// CHECK:           return %[[VAL_7]] : tensor<64x2xf16>
+// CHECK:           return %[[VAL_4]] : tensor<64x2xf16>
 // CHECK:         }
 func.func @linearizing_expand(%s: tensor<128xf16>, %y: tensor<64x2xf16>) -> tensor<64x2xf16> {
   %c = tensor.expand_shape %s [[0, 1]] output_shape [64, 2]
