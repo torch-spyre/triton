@@ -191,7 +191,7 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // marker, so that pass leaves its result logical and refuses the consumer,
   // whose operand map would have to bridge the gap with a linearizing map the
   // scheduler cannot project loop IVs through.
-  pm.addPass(createFuseComputeAndDataMovementPass());
+  pm.addPass(createFuseGenericsPass());
 
   // Logical descriptors -> physical (stick-tiled) layout, rooted on the
   // `tts.tensor_layout` attribute LowerTTSMarkers wrote onto each annotated

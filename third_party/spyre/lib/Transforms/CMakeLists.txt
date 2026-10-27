@@ -17,7 +17,7 @@ add_triton_library(SpyreTransforms
   NormalizeForDevice.cpp
   DropReductionInitFill.cpp
   CanonicalizeGenericOperands.cpp
-  FuseComputeAndDataMovement.cpp
+  FuseGenerics.cpp
   LowerSpyreOps.cpp
   MaterializeBaseAddresses.cpp
 

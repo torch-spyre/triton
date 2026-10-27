@@ -417,8 +417,7 @@ def CanonicalizeGenericOperands
 }
 
 
-def FuseComputeAndDataMovement
-    : Pass<"fuse-compute-and-data-movement", "mlir::ModuleOp"> {
+def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
     let summary = "Fold a pure data-movement linalg.generic into the indexing "
                   "map of the op that consumes it.";
     let description = [{
