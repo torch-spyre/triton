@@ -473,12 +473,12 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
           (SelectWhere), at the compared width; the group shapes are owned by
           LowerSpyreOps, and a new one there is groupable here with no change.
 
-        Both patterns check the consumer's operand list as it would be after
-        the rewrite, before mutating anything (`checkOperandRewrite`,
-        Utils/GenericOperands):
-          D1  the producer is all-parallel;
-          D3  every consumer loop dim is named, as a bare dim, by some map;
-          D4  no value is both an `ins` and an `outs`.
+        Both patterns decline a producer that has a reduction loop. Both then
+        check the consumer's operand list as it would be after the rewrite,
+        before mutating anything (`checkOperandRewrite`,
+        Utils/GenericOperands), and decline when:
+          - a loop dim of the consumer is named by no operand map;
+          - a value would be both an `ins` and an `outs` of the consumer.
         No map is checked for being projected (every result a bare dim or a
         constant). Every generic reaching this pass has projected maps, since
         CanonicalizeGenericOperands emits a forwarding generic only for a
@@ -521,9 +521,9 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         absorbed maps so that no forwarding generic is left for it to refuse,
         and before LowerSpyreOps, whose groups must be in one body.
 
-        Output: no forwarding generic whose absorption passes D1, D3 and D4
-        feeds a generic `ins`; every group LowerSpyreOps lowers whose edge passes the
-        checks is in one body; no `i1` tensor between generics, or the pass
+        Output: no forwarding generic whose absorption passes these checks
+        feeds a generic `ins`; every group LowerSpyreOps lowers whose edge
+        passes the checks is in one body; no `i1` tensor between generics, or the pass
         fails.
 
         Not checked here: a re-indexing tensor op this pass leaves in front of

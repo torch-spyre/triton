@@ -106,11 +106,30 @@ FailureOr<AffineMap> expandResultToSource(tensor::ExpandShapeOp op) {
   return AffineMap::get(resultShape.size(), /*symbolCount=*/0, results, ctx);
 }
 
-/// A static tensor.collapse_shape or tensor.expand_shape whose every user is an
-/// `ins` operand of a linalg.generic -> one linalg.generic over the result's
-/// shape, all-parallel, reading the source under the result -> source map and
-/// yielding it. Left alone: a reshape with a dynamic extent, a linearizing
-/// reshape, or a reshape with any other user, e.g. a ktdp.store.
+/// Replaces a reshape that feeds only generics with a forwarding generic.
+///
+/// Before:
+///
+///   %c = tensor.collapse_shape %s [[0, 1]] : tensor<64x1xf16> into tensor<64xf16>
+///
+/// After:
+///
+///   %c = linalg.generic {indexing_maps = [(d0) -> (d0, 0), (d0) -> (d0)],
+///                        iterator_types = ["parallel"]}
+///          ins(%s : tensor<64x1xf16>) outs(%e : tensor<64xf16>) {
+///     ^bb0(%in: f16, %out: f16): linalg.yield %in : f16 }
+///
+/// Conditions, for a tensor.collapse_shape or tensor.expand_shape:
+///
+///   - every extent of its source and result is static;
+///   - it has at least one user, and every user is an `ins` operand of a
+///     linalg.generic;
+///   - no reassociation group has more than one non-unit dim, so its
+///     result -> source map has every result a bare dim or a constant.
+///
+/// Rewrite: a tensor.empty of the result's shape and one all-parallel
+/// linalg.generic over it, reading the source under the result -> source map,
+/// writing the result under the identity, and yielding its input.
 template <typename ReshapeOp>
 struct ReshapeToGeneric : OpRewritePattern<ReshapeOp> {
   using OpRewritePattern<ReshapeOp>::OpRewritePattern;
@@ -171,10 +190,31 @@ struct ReshapeToGeneric : OpRewritePattern<ReshapeOp> {
 // SplatOperandToScalar
 //===----------------------------------------------------------------------===//
 
-/// A linalg.generic `ins` defined by a splat int-or-float dense
-/// arith.constant -> a scalar arith.constant read in the body, through
-/// foldSplatConstantOperand. Declines an operand whose removal would leave
-/// some loop dim named by no map.
+/// Replaces a splat constant `ins` operand of a generic with a scalar constant
+/// read in the body.
+///
+/// Before:
+///
+///   %z = arith.constant dense<0.0> : tensor<64xf16>
+///   %r = linalg.generic ... ins(%m, %z : tensor<64xf16>, tensor<64xf16>) {
+///     ^bb0(%a: f16, %b: f16, %o: f16):
+///       %0 = arith.cmpf une, %a, %b : f16 ... }
+///
+/// After:
+///
+///   %cst = arith.constant 0.0 : f16
+///   %r = linalg.generic ... ins(%m : tensor<64xf16>) {
+///     ^bb0(%a: f16, %o: f16):
+///       %0 = arith.cmpf une, %a, %cst : f16 ... }
+///
+/// Conditions, for an `ins` operand of a linalg.generic with tensor semantics:
+///
+///   - it is defined by an arith.constant of a splat dense int-or-float tensor;
+///   - once its map is removed, every loop dim is still named by some operand
+///     map.
+///
+/// Rewrite: foldSplatConstantOperand, which builds the scalar arith.constant
+/// above the generic and erases the operand, its map and its block argument.
 struct SplatOperandToScalar : OpRewritePattern<linalg::GenericOp> {
   using OpRewritePattern::OpRewritePattern;
 

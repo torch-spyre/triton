@@ -5,8 +5,10 @@
 // under A o R^-1 o C. The reshape cases arrive as CanonicalizeGenericOperands
 // leaves them: a forwarding generic in place of each unit-dim or rank-0
 // collapse_shape and expand_shape, and a tensor op for a linearizing one. The
-// declines are D1, D3, D4, a non-permutation result map, and the other
-// pattern's producers (a generic yielding an op result, a tensor op).
+// declines are: the producer has a reduction loop; a loop dim of the consumer
+// is named by no operand map; a value would be both an ins and an outs of the
+// consumer; a non-permutation result map; and the other pattern's producers (a
+// generic yielding an op result, a tensor op).
 
 // -----
 
@@ -472,8 +474,8 @@ func.func @dm_feeds_outs(%s: tensor<64xf16>, %x: tensor<64x8xf16>) -> tensor<64x
 // CHECK: #[[$ATTR_22:.+]] = affine_map<(d0, d1) -> (d0)>
 // CHECK: #[[$ATTR_23:.+]] = affine_map<(d0) -> (d0)>
 
-// NEGATIVE: a lone-yield generic with a reduction loop is not absorbed
-// (D1).
+// NEGATIVE: a lone-yield generic with a reduction loop is not absorbed: the
+// producer has a reduction loop.
 module {
 // CHECK-LABEL:   func.func @lone_yield_reduction(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<64x8xf16>, %[[VAL_1:.*]]: tensor<64xf16>) -> tensor<64xf16> {
@@ -680,8 +682,9 @@ func.func @linearizing_expand_not_absorbed(%s: tensor<128xf16>) -> tensor<64x2xf
 // CHECK: #[[$ATTR_36:.+]] = affine_map<(d0, d1) -> (d0)>
 // CHECK: #[[$ATTR_37:.+]] = affine_map<(d0, d1) -> (d0, d1)>
 
-// D3, repoint: `expand_dims` then a reduce over the inserted unit dim. The
-// absorbed operand would name d1 nowhere, so the expand generic stays.
+// A loop dim of the consumer is named by no operand map: `expand_dims` then a
+// reduce over the inserted unit dim. The absorbed operand would name d1
+// nowhere, so the expand generic stays.
 #map = affine_map<(d0, d1) -> (d0)>
 #map1 = affine_map<(d0, d1) -> (d0, d1)>
 module {
@@ -721,8 +724,8 @@ module {
 // CHECK: #[[$ATTR_38:.+]] = affine_map<(d0, d1) -> (d0)>
 // CHECK: #[[$ATTR_39:.+]] = affine_map<(d0, d1) -> (d0, d1)>
 
-// D3, repoint: the same shape as the previous case, spelled as a broadcast
-// generic. Declined the same way.
+// A loop dim of the consumer is named by no operand map: the same shape as the
+// previous case, spelled as a broadcast generic. Declined the same way.
 module {
 // CHECK-LABEL:   func.func @d3_broadcast_into_reduce(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<4xf32>) -> tensor<4xf32> {
@@ -762,8 +765,8 @@ func.func @d3_broadcast_into_reduce(%s: tensor<4xf32>) -> tensor<4xf32> {
 // CHECK: #[[$ATTR_42:.+]] = affine_map<(d0, d1) -> (d0)>
 // CHECK: #[[$ATTR_43:.+]] = affine_map<(d0, d1) -> (d0, d1)>
 
-// D4, repoint: the collapse's source is the consumer's `outs`, so restating it
-// would make one value both an ins and an outs.
+// A value would be both an ins and an outs of the consumer: the collapse's
+// source is the consumer's `outs`, so repointing the operand at it is declined.
 #map = affine_map<(d0) -> (d0, 0)>
 #map1 = affine_map<(d0) -> (d0)>
 #map2 = affine_map<(d0, d1) -> (d0)>

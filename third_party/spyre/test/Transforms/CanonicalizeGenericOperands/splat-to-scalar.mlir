@@ -75,8 +75,9 @@ func.func @two_splats(%x: tensor<8xf32>) -> tensor<8xf32> {
 // CHECK: #[[$ATTR_2:.+]] = affine_map<(d0, d1) -> (d0, d1)>
 // CHECK: #[[$ATTR_3:.+]] = affine_map<(d0, d1) -> (d0)>
 
-// D3 decline: the splat is the only operand naming d1 (the outs is a reduced
-// rank-1 accumulator), so dropping it would leave d1 named by no map.
+// Declined because a loop dim would be named by no operand map: the splat is
+// the only operand naming d1 (the outs is a reduced rank-1 accumulator), so
+// dropping it would leave d1 named by no map.
 module {
 // CHECK-LABEL:   func.func @d3_decline(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<8xf16>) -> tensor<8xf16> {
