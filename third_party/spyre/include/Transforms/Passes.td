@@ -355,6 +355,68 @@ def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
 }
 
 
+def CanonicalizeGenericOperands
+    : Pass<"canonicalize-generic-operands", "mlir::ModuleOp"> {
+    let summary = "State reshape and splat-constant operands of a "
+                  "linalg.generic in the generic's own terms.";
+    let description = [{
+        Input: IR in which every compute op is already a `linalg.generic` — so
+        after ConvertElementwiseToLinalg, LinalgGeneralizeNamedOps and
+        UnaliasLinalgOuts.
+
+        Lowering:
+        - ReshapeToGeneric: a `tensor.collapse_shape` or `tensor.expand_shape`
+          with static extents whose every user is an `ins` operand of a
+          `linalg.generic` → one forwarding `linalg.generic` over the result's
+          shape, all-parallel, whose body yields its input. The input map is
+          the reshape's result → source map: `(d0) → (d0, 0)` for
+          `[64,1] → [64]`, `(d0, d1) → (d0)` for `[4] → [4,1]`, `() → (0, 0)`
+          for a collapse to rank 0, and a linearizing map such as
+          `(d0) → (d0 floordiv 2, d0 mod 2)` for `[64,2] → [128]`. The output
+          map is the identity.
+        - SplatOperandToScalar: an `ins` operand defined by an `arith.constant`
+          of a splat int-or-float dense tensor → a scalar `arith.constant`
+          above the generic, read in the body; the operand, its indexing map
+          and its block argument are erased. A reduced port of upstream
+          linalg's FoldScalarOrSplatConstant (foldSplatConstantOperand in
+          Utils/GenericOperands).
+        - Left alone:
+          - a reshape with any user that is not a generic `ins`, e.g. one
+            feeding a `ktdp.store`;
+          - a reshape with a dynamic extent;
+          - `tensor.reshape`, `tensor.concat` and `tensor.extract_slice`;
+          - a splat operand whose removal leaves some loop dim named by no
+            map; a non-splat constant; a scalar `arith.constant` passed as an
+            `ins`.
+
+        Nothing is fused, and no map is checked for being projected: that is
+        decided where a map is composed, in FuseGenerics. A linearizing map
+        that is never composed away reaches RewriteDescriptorLayoutGeneric on a
+        forwarding generic, which refuses it on a physicalized path.
+
+        The two patterns are rooted on different producer kinds, a reshape and
+        a generic with a splat-constant operand, so they never match the same
+        op.
+
+        `--debug-only=canonicalize-generic-operands` traces each rewrite and
+        each reshape left alone.
+
+        Ordering: after UnaliasLinalgOuts and before FuseGenerics, whose
+        AbsorbForwardingGeneric absorbs the forwarding generics this emits.
+
+        Output: no static `tensor.collapse_shape` / `tensor.expand_shape` whose
+        only users are generic `ins`, and no splat dense constant `ins` that
+        could be dropped without unnaming a loop dim.
+    }];
+
+    let dependentDialects = [
+        "mlir::arith::ArithDialect",
+        "mlir::linalg::LinalgDialect",
+        "mlir::tensor::TensorDialect"
+    ];
+}
+
+
 def FuseComputeAndDataMovement
     : Pass<"fuse-compute-and-data-movement", "mlir::ModuleOp"> {
     let summary = "Fold a pure data-movement linalg.generic into the indexing "

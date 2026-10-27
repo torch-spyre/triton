@@ -16,6 +16,7 @@ add_triton_library(SpyreTransforms
   UnaliasLinalgOuts.cpp
   NormalizeForDevice.cpp
   DropReductionInitFill.cpp
+  CanonicalizeGenericOperands.cpp
   FuseComputeAndDataMovement.cpp
   LowerSpyreOps.cpp
   MaterializeBaseAddresses.cpp
@@ -28,7 +29,7 @@ add_triton_library(SpyreTransforms
   TTSIncGen
 
   LINK_LIBS PUBLIC
-  # For createEmptyTensor in UnaliasLinalgOuts.
+  # For createEmptyTensor in UnaliasLinalgOuts, and GenericOperands.
   SpyreUtils
   # FuseComputeAndDataMovement refuses an unabsorbable re-indexing op only on a
   # path RewriteDescriptorLayoutGeneric will physicalize, and asks that question

@@ -175,6 +175,11 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
   pm.addPass(createUnaliasLinalgOutsPass());
 
+  // A reshape feeding generics becomes a forwarding generic, and a splat
+  // constant operand a scalar in the body, so the pass below meets only
+  // generics as producers.
+  pm.addPass(createCanonicalizeGenericOperandsPass());
+
   // Every coordinate change becomes an `indexing_maps` entry on the generic that
   // consumes it, so nothing whose only effect is to re-index survives.
   //
