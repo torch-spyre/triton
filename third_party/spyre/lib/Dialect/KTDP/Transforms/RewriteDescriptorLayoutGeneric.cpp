@@ -1269,15 +1269,13 @@ struct RewriteDescriptorLayoutGenericPass
       return tileOp.emitError("tts.tensor_layout: cannot derive a static "
                               "physical block shape for this access tile");
 
-    for (unsigned p = 0, e = cm.physRank(); p < e; ++p) {
-      if (cm.opAt(p) != CoordOp::Mod)
-        continue;
-      int64_t logExtent = logBlock[cm.src[p]];
-      if (logExtent != ShapedType::kDynamic && logExtent < cm.arg[p])
+    if (auto d = cm.splitDim()) {
+      int64_t logExtent = logBlock[*d];
+      if (logExtent != ShapedType::kDynamic && logExtent < cm.stickWidth())
         return tileOp.emitError(
                    "tts.tensor_layout: block extent of stick dim (")
-               << logExtent << ") is smaller than the stick size (" << cm.arg[p]
-               << "); a stick dim cannot be sub-stick";
+               << logExtent << ") is smaller than the stick size ("
+               << cm.stickWidth() << "); a stick dim cannot be sub-stick";
     }
 
     // Recover one index per logical dim. base_map may have fewer inputs than
