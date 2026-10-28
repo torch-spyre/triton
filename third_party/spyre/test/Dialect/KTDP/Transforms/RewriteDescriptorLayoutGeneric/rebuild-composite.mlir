@@ -6,7 +6,7 @@
 // The rebuilt loop domain splits every logical dim that ANY operand splits, so a
 // split dim becomes a (stick, lane) pair of loop dims, and every operand that
 // reads that dim splits it too -- an operand holding it whole is refused, see
-// invalid-layout.mlir cases 7 to 12. So each operand names the pair directly and
+// invalid-layout.mlir cases 7 to 9. So each operand names the pair directly and
 // every map is a projected permutation, however the operands order their
 // physical dims. Where an operand's physical order differs from the result's,
 // the difference is a permutation in its map and nothing more -- see

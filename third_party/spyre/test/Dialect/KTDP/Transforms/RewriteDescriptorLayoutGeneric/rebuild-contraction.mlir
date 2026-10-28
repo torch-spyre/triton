@@ -28,7 +28,7 @@
 // contractions through a scratchpad intermediate on no layout.
 //
 // A contraction in which an operand holds whole a dim another operand splits is
-// declined -- invalid-layout.mlir cases 7 to 10 -- as is a named linalg.matmul,
+// declined -- invalid-layout.mlir case 9 -- as is a named linalg.matmul,
 // in the same file; the malformed-input declines are in invalid-ktir.mlir.
 //
 // Captures are hand-named and this file is hand-maintained: do not regenerate it

@@ -11,7 +11,7 @@
 //
 // Contrast rebuild-composite.mlir, where the operands split the same dim from
 // different physical positions and the maps carry a permutation, and
-// invalid-layout.mlir cases 7 to 12, where one operand holds whole a dim another
+// invalid-layout.mlir cases 7 to 9, where one operand holds whole a dim another
 // operand splits and the pass refuses the generic.
 //
 // Captures are hand-named and this file is hand-maintained: do not regenerate it

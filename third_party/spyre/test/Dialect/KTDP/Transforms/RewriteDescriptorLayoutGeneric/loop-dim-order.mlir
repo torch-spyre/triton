@@ -42,7 +42,7 @@
 // LINEARIZATION. No map here, or anywhere in this directory's positive cases,
 // carries `stick * width + lane`: the pass refuses a generic in which an
 // operand holds whole a dim another operand splits (invalid-layout.mlir cases 7
-// to 12), so every rebuilt map result is a bare loop dim or a constant.
+// to 9), so every rebuilt map result is a bare loop dim or a constant.
 
 // Branch 4 -- two inputs naming a shared pair of pieces in OPPOSITE relative
 // order.

@@ -23,10 +23,14 @@
 // which calls the same shared checker; under the first RUN line the parser's
 // verifier emits it.
 //
-// Cases 7 to 12 are one refusal in six shapes: an operand that holds whole a dim
-// another operand of the same generic splits. Restating it would take the
-// linearizing map `stick * W + lane`, which the scheduler cannot take, so the pass
-// refuses the generic, once per such operand, with a note at the operand's
+// Cases 7 to 9 are layouts that are each valid and do not fit together. One
+// generic is one loop nest that every operand is read or written from. A layout
+// that sticks a dim, e.g. N as [N/64, M, N%64], turns the loop over N into two:
+// which stick, and which lane in it. An operand of the same generic that holds
+// N as one plain dim then has no loop of its own to be indexed by: its element
+// is at `stick * 64 + lane`, a computed index the scheduler cannot take. So
+// every operand of a generic must stick the same dims at the same width. The
+// pass refuses the generic, once per operand that does not, with a note at its
 // producer.
 
 // Case 1 -- the layout does not fit the block.
@@ -291,14 +295,16 @@ tt.func @split_width_mismatch(%a: !tt.ptr<f16>) {
 
 // -----
 
-// Case 7 -- an operand on no layout reads a dim another operand splits.
+// Case 7 -- `o = a + b`, with a layout on `a` and `o` but none on `b`.
 //
-// The focused form of the refusal. The domain splits logical loop dim 1 because
-// %a's layout does, so it has a stick loop and a lane loop for it. %b carries no
-// layout, so it keeps its one physical dim there, and the only map result naming
-// its element from the two loop dims is `stick * 64 + lane`. The pass refuses the
-// generic rather than emitting that map, names the operand, and points at the op
-// that produces it. Nothing is retyped first, so the generic is left as it was.
+//   a, o : [M, N] -> [N/64, M, N%64]   N in sticks of 64
+//   b    : [M, N]                      N plain
+//
+// The add walks `a` and `o` stick by stick. To find the matching element of
+// `b` it would have to compute `n = stick * 64 + lane`. In a kernel this is a
+// descriptor that was left unannotated: giving `b` the same layout as `a` fixes
+// it. The whole message is checked here, once; cases 8 and 9 check only the part
+// that identifies them.
 
 #id = affine_map<(d0, d1) -> (d0, d1)>
 #s = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
@@ -333,43 +339,17 @@ tt.func @unannotated_operand_reads_split_dim(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>,
 
 // -----
 
-// Case 8 -- an operand on no layout at the result.
+// Case 8 -- `o = a^T`, each side in sticks along its own last dim.
 //
-// The same refusal on the `outs` side: the input splits logical dim 1 and the
-// unannotated store destination leaves the generic's result holding it whole.
-
-#ide = affine_map<(d0, d1) -> (d0, d1)>
-#se = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
-module {
-tt.func @elementwise_unannotated_store(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
-  %c0 = arith.constant 0 : index
-  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f32> to index
-  %av = ktdp.construct_memory_view %ai, sizes: [64, 128], strides: [128, 1] {coordinate_set = #se, memory_space = #ktdp.memory_space<global>,
-      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
-  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #ide, access_tile_set = #se} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
-  %al = ktdp.load %at : <64x128xindex> -> tensor<64x128xf32>
-  %oi = builtin.unrealized_conversion_cast %o : !tt.ptr<f32> to index
-  %ov = ktdp.construct_memory_view %oi, sizes: [64, 128], strides: [128, 1] {coordinate_set = #se, memory_space = #ktdp.memory_space<global>} : memref<64x128xf32>
-  %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #ide, access_tile_set = #se} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
-  // expected-note @below {{operand 1 is produced here}}
-  %e = tensor.empty() : tensor<64x128xf32>
-  // expected-error @below {{rewrite-descriptor-layout-generic: operand 1 has no layout and reads logical loop dim 1 whole, which operand 0 splits into stick and lane at width 64; restating operand 1 over that split would need the linearizing map `stick * 64 + lane`, which the scheduler cannot take. Give operand 1 a layout that splits loop dim 1 at width 64 too}}
-  %r = linalg.generic {indexing_maps = [#ide, #ide], iterator_types = ["parallel", "parallel"]} ins(%al : tensor<64x128xf32>) outs(%e : tensor<64x128xf32>) {
-  ^bb0(%x: f32, %y: f32):
-    %n = arith.negf %x : f32
-    linalg.yield %n : f32
-  } -> tensor<64x128xf32>
-  ktdp.store %r, %ot : tensor<64x128xf32>, <64x128xindex>
-  tt.return
-}
-}
-
-// -----
-
-// Case 9 -- a transpose whose two operands split DIFFERENT loop dims.
+//   a : [N, M] -> [M/64, N, M%64]   M in sticks of 64
+//   o : [M, N] -> [N/64, M, N%64]   N in sticks of 64
 //
-// Each operand's layout carries whole the dim the other splits, so each would
-// need the other's linearization, and both are named.
+// Both are the default layout, and on their own both are fine. Across the
+// transpose they stick different dims: a stick of `a` is 64 consecutive M, a
+// stick of `o` is 64 consecutive N. No stick of one is a stick of the other, so
+// no loop nest addresses both without computing an index, and each operand is
+// refused for the dim the other sticks. Moving data from sticks along one dim to
+// sticks along another is a restickify, not a re-indexed copy.
 
 #in  = affine_map<(d0, d1) -> (d1, d0)>
 #out = affine_map<(d0, d1) -> (d0, d1)>
@@ -393,8 +373,8 @@ tt.func @transpose_different_split_dims(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
   %ot = ktdp.construct_access_tile %ov[%c0, %c0] {access_tile_order = #id2, access_tile_set = #sout} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
   // expected-note @below {{operand 1 is produced here}}
   %e = tensor.empty() : tensor<64x128xf32>
-  // expected-error @below {{rewrite-descriptor-layout-generic: operand 0's layout carries logical loop dim 1 whole, which operand 1 splits into stick and lane at width 64; restating operand 0 over that split would need the linearizing map `stick * 64 + lane`, which the scheduler cannot take. Give operand 0 a layout that splits loop dim 1 at width 64 too}}
-  // expected-error @below {{rewrite-descriptor-layout-generic: operand 1's layout carries logical loop dim 0 whole, which operand 0 splits into stick and lane at width 64; restating operand 1 over that split would need the linearizing map `stick * 64 + lane`, which the scheduler cannot take. Give operand 1 a layout that splits loop dim 0 at width 64 too}}
+  // expected-error @below {{operand 0's layout carries logical loop dim 1 whole, which operand 1 splits}}
+  // expected-error @below {{operand 1's layout carries logical loop dim 0 whole, which operand 0 splits}}
   %r = linalg.generic {indexing_maps = [#in, #out], iterator_types = ["parallel", "parallel"]} ins(%al : tensor<128x64xf32>) outs(%e : tensor<64x128xf32>) {
   ^bb0(%x: f32, %y: f32):
     linalg.yield %x : f32
@@ -406,58 +386,15 @@ tt.func @transpose_different_split_dims(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
 
 // -----
 
-// Case 10 -- a contraction whose physicalized result splits a dim an input holds
-// whole.
+// Case 9 -- `c = a @ b`, with `a` and `b` sticking different dims of `c`.
 //
-// A and B are stick-on-K and the output D is stick-on-N, so B, whose layout
-// splits K, carries N whole.
-
-#map = affine_map<(d0, d1) -> (d0, d1)>
-#map1 = affine_map<(d0, d1, d2) -> (d0, d2)>
-#map2 = affine_map<(d0, d1, d2) -> (d2, d1)>
-#map3 = affine_map<(d0, d1, d2) -> (d0, d1)>
-#seta = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
-#setb = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>
-#setc = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
-module {
-  tt.func @matmul_k_split_annotated_output(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: !tt.ptr<f32>) {
-    %c0 = arith.constant 0 : index
-    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
-    %1 = ktdp.construct_memory_view %0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #seta, memory_space = #ktdp.memory_space<global>,
-        tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
-    %2 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map, access_tile_set = #seta} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
-    %3 = ktdp.load %2 : <64x128xindex> -> tensor<64x128xf32>
-    %4 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
-    %5 = ktdp.construct_memory_view %4, sizes: [128, 64], strides: [64, 1] {coordinate_set = #setb, memory_space = #ktdp.memory_space<global>,
-        tts.tensor_layout = {phys_src = array<i64: 0, 1, 0>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<128x64xf32>
-    %6 = ktdp.construct_access_tile %5[%c0, %c0] {access_tile_order = #map, access_tile_set = #setb} : memref<128x64xf32> -> !ktdp.access_tile<128x64xindex>
-    // expected-note @below {{operand 1 is produced here}}
-    %7 = ktdp.load %6 : <128x64xindex> -> tensor<128x64xf32>
-    %8 = builtin.unrealized_conversion_cast %arg2 : !tt.ptr<f32> to index
-    %9 = ktdp.construct_memory_view %8, sizes: [64, 64], strides: [64, 1] {coordinate_set = #setc, memory_space = #ktdp.memory_space<global>,
-        tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x64xf32>
-    %10 = ktdp.construct_access_tile %9[%c0, %c0] {access_tile_order = #map, access_tile_set = #setc} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
-    %11 = ktdp.load %10 : <64x64xindex> -> tensor<64x64xf32>
-    // expected-error @below {{rewrite-descriptor-layout-generic: operand 1's layout carries logical loop dim 1 whole, which operand 2 splits into stick and lane at width 64; restating operand 1 over that split would need the linearizing map `stick * 64 + lane`, which the scheduler cannot take. Give operand 1 a layout that splits loop dim 1 at width 64 too}}
-    %12 = linalg.generic {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "reduction"]} ins(%3, %7 : tensor<64x128xf32>, tensor<128x64xf32>) outs(%11 : tensor<64x64xf32>) {
-    ^bb0(%in: f32, %in_0: f32, %out: f32):
-      %14 = arith.mulf %in, %in_0 : f32
-      %15 = arith.addf %out, %14 : f32
-      linalg.yield %15 : f32
-    } -> tensor<64x64xf32>
-    %13 = ktdp.construct_access_tile %9[%c0, %c0] {access_tile_order = #map, access_tile_set = #setc} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
-    ktdp.store %12, %13 : tensor<64x64xf32>, <64x64xindex>
-    tt.return
-  }
-}
-
-// -----
-
-// Case 11 -- both inputs split a PARALLEL dim, and the result holds both whole.
+//   a : [M, K] -> [M/64, K, M%64]   M in sticks of 64
+//   b : [K, N] -> [N/64, K, N%64]   N in sticks of 64
+//   c : [M, N]                      both plain
 //
-// A is stick-on-M and B stick-on-N; the unannotated result reads M and N whole,
-// so one operand would need two linearizations. One error per operand, naming
-// the first split dim it holds whole.
+// The loop nest has a stick and a lane loop for M, from `a`, and for N, from
+// `b`. `c` holds both whole, so it is wrong twice. It is reported once, for the
+// first of them: one error per operand, not per dim.
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #map1 = affine_map<(d0, d1, d2) -> (d0, d2)>
@@ -484,7 +421,7 @@ module {
     %10 = ktdp.construct_access_tile %9[%c0, %c0] {access_tile_order = #map, access_tile_set = #setc} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
     // expected-note @below {{operand 2 is produced here}}
     %11 = ktdp.load %10 : <64x64xindex> -> tensor<64x64xf32>
-    // expected-error @below {{rewrite-descriptor-layout-generic: operand 2 has no layout and reads logical loop dim 0 whole, which operand 0 splits into stick and lane at width 64; restating operand 2 over that split would need the linearizing map `stick * 64 + lane`, which the scheduler cannot take. Give operand 2 a layout that splits loop dim 0 at width 64 too}}
+    // expected-error @below {{operand 2 has no layout and reads logical loop dim 0 whole, which operand 0 splits}}
     %12 = linalg.generic {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "reduction"]} ins(%3, %7 : tensor<64x128xf32>, tensor<128x64xf32>) outs(%11 : tensor<64x64xf32>) {
     ^bb0(%in: f32, %in_0: f32, %out: f32):
       %14 = arith.mulf %in, %in_0 : f32
@@ -497,49 +434,3 @@ module {
   }
 }
 
-// -----
-
-// Case 12 -- one input splits a parallel dim and the other the reduced dim.
-//
-// A is stick-on-M and B stick-on-K, so A carries K whole and the unannotated
-// result carries M whole.
-
-#map = affine_map<(d0, d1) -> (d0, d1)>
-#map1 = affine_map<(d0, d1, d2) -> (d0, d2)>
-#map2 = affine_map<(d0, d1, d2) -> (d2, d1)>
-#map3 = affine_map<(d0, d1, d2) -> (d0, d1)>
-#seta = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
-#setb = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>
-#setc = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
-module {
-  tt.func @matmul_a_parallel_b_ksplit(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: !tt.ptr<f32>) {
-    %c0 = arith.constant 0 : index
-    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
-    %1 = ktdp.construct_memory_view %0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #seta, memory_space = #ktdp.memory_space<global>,
-        tts.tensor_layout = {phys_src = array<i64: 0, 1, 0>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<64x128xf32>
-    %2 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map, access_tile_set = #seta} : memref<64x128xf32> -> !ktdp.access_tile<64x128xindex>
-    // expected-note @below {{operand 0 is produced here}}
-    %3 = ktdp.load %2 : <64x128xindex> -> tensor<64x128xf32>
-    %4 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
-    %5 = ktdp.construct_memory_view %4, sizes: [128, 64], strides: [64, 1] {coordinate_set = #setb, memory_space = #ktdp.memory_space<global>,
-        tts.tensor_layout = {phys_src = array<i64: 0, 1, 0>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>}} : memref<128x64xf32>
-    %6 = ktdp.construct_access_tile %5[%c0, %c0] {access_tile_order = #map, access_tile_set = #setb} : memref<128x64xf32> -> !ktdp.access_tile<128x64xindex>
-    %7 = ktdp.load %6 : <128x64xindex> -> tensor<128x64xf32>
-    %8 = builtin.unrealized_conversion_cast %arg2 : !tt.ptr<f32> to index
-    %9 = ktdp.construct_memory_view %8, sizes: [64, 64], strides: [64, 1] {coordinate_set = #setc, memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
-    %10 = ktdp.construct_access_tile %9[%c0, %c0] {access_tile_order = #map, access_tile_set = #setc} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
-    // expected-note @below {{operand 2 is produced here}}
-    %11 = ktdp.load %10 : <64x64xindex> -> tensor<64x64xf32>
-    // expected-error @below {{rewrite-descriptor-layout-generic: operand 0's layout carries logical loop dim 2 whole, which operand 1 splits into stick and lane at width 64; restating operand 0 over that split would need the linearizing map `stick * 64 + lane`, which the scheduler cannot take. Give operand 0 a layout that splits loop dim 2 at width 64 too}}
-    // expected-error @below {{rewrite-descriptor-layout-generic: operand 2 has no layout and reads logical loop dim 0 whole, which operand 0 splits into stick and lane at width 64; restating operand 2 over that split would need the linearizing map `stick * 64 + lane`, which the scheduler cannot take. Give operand 2 a layout that splits loop dim 0 at width 64 too}}
-    %12 = linalg.generic {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "reduction"]} ins(%3, %7 : tensor<64x128xf32>, tensor<128x64xf32>) outs(%11 : tensor<64x64xf32>) {
-    ^bb0(%in: f32, %in_0: f32, %out: f32):
-      %14 = arith.mulf %in, %in_0 : f32
-      %15 = arith.addf %out, %14 : f32
-      linalg.yield %15 : f32
-    } -> tensor<64x64xf32>
-    %13 = ktdp.construct_access_tile %9[%c0, %c0] {access_tile_order = #map, access_tile_set = #setc} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
-    ktdp.store %12, %13 : tensor<64x64xf32>, <64x64xindex>
-    tt.return
-  }
-}
