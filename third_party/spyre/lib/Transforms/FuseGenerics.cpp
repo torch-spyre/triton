@@ -8,9 +8,13 @@
 //                            block arguments. The consumer's operand is
 //                            repointed at that input, under the composed map.
 //   GroupComputes            an op, the anchor: the producer is fused into the
-//                            consumer when the anchor and every reader of it
-//                            form a group LowerSpyreOps lowers as one intrinsic
-//                            (formsLowerableGroup).
+//                            consumer when one group shape LowerSpyreOps
+//                            lowers as one intrinsic covers the anchor and
+//                            every reader of it (matchLowerableGroup).
+//
+// One shape covers every reader of the producer's result. A result whose
+// readers form different shapes is not grouped: the `i1` stays between the two
+// generics, and legalizeAfterFusion reports it.
 //
 // After the greedy driver converges, a separate step, legalizeAfterFusion,
 // checks what the patterns left. Today its one check,
@@ -33,8 +37,10 @@
 // producer kind no existing pattern matches; one whose kind overlaps an
 // existing pattern's is a new case of that pattern. Its lit file feeds it the
 // other patterns' producers and checks that it does not fire. A new group shape
-// is not a pattern here: it is a match function in LowerSpyreOps, which
-// formsLowerableGroup then answers for.
+// is not a pattern here: it is one match function in LowerSpyreOps plus one
+// entry in its kGroupShapes list, which matchLowerableGroup then tries. The
+// match function receives every reader of the producer's result, and matches
+// only when it covers every one of them.
 //
 // `--debug-only=fuse-generics` traces, one line per decision, each operand
 // skipped before any check, each decline with the check that declined it, each
@@ -234,9 +240,10 @@ struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
 // GroupComputes
 //===----------------------------------------------------------------------===//
 
-/// Fuses a producer generic into its consumer when the op the producer yields
-/// and the consumer ops that read it form a group LowerSpyreOps lowers as one
-/// intrinsic.
+/// Fuses a producer generic into its consumer when one group shape
+/// LowerSpyreOps lowers as one intrinsic covers the op the producer yields and
+/// every consumer op that reads it. Readers that form different shapes are not
+/// grouped; legalizeAfterFusion reports the `i1` left between the generics.
 ///
 /// Before:
 ///
@@ -263,11 +270,11 @@ struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
 ///   - `P` yields, for `r`, the result of an op in its body, the anchor;
 ///   - `P` has no reduction loop;
 ///   - linalg::areElementwiseOpsFusable holds for the operand;
-///   - the consumer reads the operand's block argument at least once, and
-///     every op reading it, with the anchor, forms a group
-///     (formsLowerableGroup);
-///   - when `P` has a user other than the consumer, the anchor is the only
-///     non-terminator op in `P`'s body;
+///   - the consumer reads the operand's block argument at least once, and one
+///     group shape covers the anchor and every op reading it
+///     (matchLowerableGroup);
+///   - when `P` has a user other than the consumer, every non-terminator op in
+///     `P`'s body is one of the producer ops the group consumes;
 ///   - after the rewrite, every loop dim of the consumer is named by some
 ///     operand map;
 ///   - after the rewrite, no value is both an `ins` and an `outs` of the
@@ -308,32 +315,32 @@ private:
       return failure();
     }
 
-    BlockArgument arg = consumer.getMatchingBlockArgument(operand);
-    if (arg.use_empty()) {
-      why = "the consumer does not read it";
+    triton::spyre::GroupCandidate candidate{
+        producer, cast<OpResult>(operand->get()), consumer,
+        llvm::to_vector(consumer.getMatchingBlockArgument(operand).getUsers())};
+    std::string reason;
+    FailureOr<triton::spyre::GroupMatch> match =
+        triton::spyre::matchLowerableGroup(candidate, &reason);
+    if (failed(match)) {
+      why = "'" + anchor->getName().getStringRef().str() +
+            "' and its readers form no group: " + reason;
       return failure();
     }
-    for (Operation *reader : arg.getUsers()) {
-      std::string reason;
-      if (!triton::spyre::formsLowerableGroup(producer, anchor, reader,
-                                              &reason)) {
-        why = "'" + anchor->getName().getStringRef().str() + "' and its reader '" +
-              reader->getName().getStringRef().str() +
-              "' form no group: " + reason;
-        return failure();
-      }
-      LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] GroupComputes: operand "
-                              << operand->getOperandNumber() << " of generic at "
-                              << consumer.getLoc() << ": '" << anchor->getName()
-                              << "' and its reader '" << reader->getName()
-                              << "' form a group\n");
-    }
+    LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] GroupComputes: operand "
+                            << operand->getOperandNumber() << " of generic at "
+                            << consumer.getLoc() << ": '" << anchor->getName()
+                            << "' and its " << candidate.readers.size()
+                            << " reader(s) form the " << match->shape
+                            << " group\n");
 
     bool shared = llvm::any_of(producer->getUsers(), [&](Operation *user) {
       return user != consumer.getOperation();
     });
     if (shared && llvm::any_of(producer.getBlock()->without_terminator(),
-                               [&](Operation &op) { return &op != anchor; })) {
+                               [&](Operation &op) {
+                                 return !llvm::is_contained(match->producerOps,
+                                                            &op);
+                               })) {
       why = "the producer has another user and its body holds ops outside the "
             "group";
       return failure();
