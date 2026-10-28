@@ -238,15 +238,19 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         body, and ConvertElementwiseToLinalg gives every tensor-level op a body
         of its own — so a group spanning two tensor ops arrives spread over two
         generics unless something fused them. FuseGenerics' GroupComputes does,
-        and only for a group this pass lowers: it asks `formsLowerableGroup`
-        (include/Transforms/LowerSpyreOps.h), which calls the same match
-        function SelectCompare or SelectWhere does, so the two passes cannot
-        disagree on what a group is. The reciprocal's constant is a scalar in
-        the body because CanonicalizeGenericOperands' SplatOperandToScalar put
-        it there. A contract between adjacent passes rather than
-        an accident — and the reciprocal reads its numerator THROUGH the body, so
-        for that rule the dependency is about whether it FIRES, never about
-        whether it is correct.
+        and only for a group this pass lowers: it asks `matchLowerableGroup`
+        (include/Transforms/LowerSpyreOps.h), which SelectCompare and
+        SelectWhere ask too, so the two passes cannot disagree on what a group
+        is. Each group shape is one match function in kGroupShapes, and
+        matchLowerableGroup tries each in turn. One shape covers every reader of
+        the producer's result: a shape matches only when it covers every reader,
+        and a result whose readers form different shapes is not grouped, so
+        FuseGenerics reports the `i1` left between the generics. The
+        reciprocal's constant is a scalar in the body because
+        CanonicalizeGenericOperands' SplatOperandToScalar put it there. A
+        contract between adjacent passes rather than an accident — and the
+        reciprocal reads its numerator THROUGH the body, so for that rule the
+        dependency is about whether it FIRES, never about whether it is correct.
 
         WHAT IS NOT SELECTED, and what each costs. None is a diagnostic, per
         EVERYTHING UNMATCHED FLOWS THROUGH above.
@@ -459,19 +463,24 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
           forwarded result of a multi-result generic. `P` is erased once
           dead.
         - GroupComputes: `P` yields an op result, the anchor. When `P` is
-          all-parallel, `linalg::areElementwiseOpsFusable` holds, and every use
-          of the matching block argument in the consumer is a reader that
-          forms, with the anchor, a group LowerSpyreOps lowers as one intrinsic
-          (`formsLowerableGroup`, include/Transforms/LowerSpyreOps.h) → `P` is
-          fused into the consumer by `linalg::fuseElementwiseOps`, and the
-          fused op's dead results and duplicate operands are removed by
-          `linalg::deduplicateOperandsAndRemoveDeadResults`. When `P` has a
+          all-parallel, `linalg::areElementwiseOpsFusable` holds, and one
+          group shape LowerSpyreOps lowers as one intrinsic covers the anchor
+          and every use of the matching block argument in the consumer, its
+          readers (`matchLowerableGroup`, include/Transforms/LowerSpyreOps.h)
+          → `P` is fused into the consumer by `linalg::fuseElementwiseOps`,
+          and the fused op's dead results and duplicate operands are removed
+          by `linalg::deduplicateOperandsAndRemoveDeadResults`. When `P` has a
           user other than the consumer, it is fused only if every
-          non-terminator op in its body is the anchor, so nothing outside the
-          group is copied. The groups today are an `arith.cmpf` read by
-          `arith.uitofp` (SelectCompare) or by `arith.select` as its condition
-          (SelectWhere), at the compared width; the group shapes are owned by
-          LowerSpyreOps, and a new one there is groupable here with no change.
+          non-terminator op in its body is a producer op the group consumes,
+          so nothing outside the group is copied. The groups today are an
+          `arith.cmpf` read by `arith.uitofp` (SelectCompare) or by
+          `arith.select` as its condition (SelectWhere), at the compared
+          width; the group shapes are owned by LowerSpyreOps, and a new one
+          there is groupable here with no change. One shape covers every
+          reader of the producer's result. Readers that form different shapes,
+          e.g. one compare read by both an `arith.uitofp` and an
+          `arith.select`, are not grouped: no shape covers every reader, and
+          legalization reports the `i1`.
 
         Both patterns decline a producer that has a reduction loop. Both then
         check the consumer's operand list as it would be after the rewrite,

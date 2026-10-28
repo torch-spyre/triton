@@ -10,8 +10,9 @@
 //   2b  the producer has a reduction loop, whatever it yields
 //   2c  the producer has another user and its body is more than the anchor
 //   and a reader that forms no group with a compare: a width mismatch, a
-//   predicate with no spyreop.compare counterpart, arith.sitofp; and a value
-//   that would be both an ins and an outs of the consumer.
+//   predicate with no spyreop.compare counterpart, arith.sitofp; readers that
+//   form two different shapes, which no one shape covers; and a value that
+//   would be both an ins and an outs of the consumer.
 
 // 2a: the producer yields an arith.andi of two compares, which forms no group.
 func.func @andi_chain(%x: tensor<8xf16>, %y: tensor<8xf16>, %p: tensor<8xf16>, %q: tensor<8xf16>) -> tensor<8xf16> {
@@ -174,6 +175,33 @@ func.func @sitofp(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
     // expected-note @below {{read here, by 'arith.sitofp'}}
     %f = arith.sitofp %m : i1 to f16
     linalg.yield %f : f16
+  } -> tensor<8xf16>
+  return %r : tensor<8xf16>
+}
+
+// -----
+
+// A compare read by both an arith.uitofp and an arith.select: the readers form
+// two different shapes, compare-cast and compare-select, and no shape covers
+// both, so the edge is not grouped.
+func.func @both_readers(%x: tensor<8xf16>, %y: tensor<8xf16>, %p: tensor<8xf16>) -> tensor<8xf16> {
+  %e1 = tensor.empty() : tensor<8xi1>
+  %c = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%x, %y : tensor<8xf16>, tensor<8xf16>) outs(%e1 : tensor<8xi1>) {
+  ^bb0(%a: f16, %b: f16, %out: i1):
+    // expected-note @below {{made here, by 'arith.cmpf'}}
+    %v = arith.cmpf olt, %a, %b : f16
+    linalg.yield %v : i1
+  } -> tensor<8xi1>
+  %e = tensor.empty() : tensor<8xf16>
+  // expected-error @below {{fuse-generics: operand 0 is an i1 tensor passed from one linalg.generic to another; no spyreop op produces or}}
+  // expected-note @below {{LowerSpyreOps lowers an i1 only within a group}}
+  %r = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%c, %p : tensor<8xi1>, tensor<8xf16>) outs(%e : tensor<8xf16>) {
+  ^bb0(%m: i1, %a: f16, %out: f16):
+    // expected-note @below {{read here, by 'arith.uitofp'}}
+    %f = arith.uitofp %m : i1 to f16
+    // expected-note @below {{read here, by 'arith.select'}}
+    %s = arith.select %m, %a, %f : f16
+    linalg.yield %s : f16
   } -> tensor<8xf16>
   return %r : tensor<8xf16>
 }
