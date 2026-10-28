@@ -3829,6 +3829,11 @@ def spyre_tensor_layout(desc, layout, _semantic=None):
       identity entry on the same ``src``: that is the reduce-on-stick output
       layout, where a rank-1 logical result is stored one stick wide.
 
+    A ``"mod"`` or ``"splat"`` entry is the stick dim. A layout has at most one,
+    it is the last entry, and a split's ``"floordiv"`` divisor equals its
+    ``"mod"`` modulus. A layout breaking these is refused by the
+    ``tts.tensor_layout`` verifier.
+
     Example — ``[M, N]`` tensor stick-tiled on ``N``, physical layout
     ``[ceil(N/64), M, 64]``, indices ``[N//64, M, N%64]``::
 

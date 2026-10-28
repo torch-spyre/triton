@@ -18,9 +18,10 @@
 // test/Dialect/TTS/tensor-layout-verifier.mlir.
 //
 // Case 6 is the exception: a layout that breaks one of those structural rules,
-// read by the pass itself. The second RUN line skips the verifier on parsing, so
-// the diagnostic there comes from readCoordMap, which calls the same shared
-// checker; under the first RUN line the parser's verifier emits it.
+// read by the pass itself, once per stick-dim rule. The second RUN line skips
+// the verifier on parsing, so the diagnostic there comes from readCoordMap,
+// which calls the same shared checker; under the first RUN line the parser's
+// verifier emits it.
 
 // Case 1 -- the layout does not fit the block.
 //
@@ -222,11 +223,11 @@ tt.func @annotation_never_reached(%o: !tt.ptr<f16>) {
 
 // -----
 
-// Case 6 -- a layout with two stick dims, read by the pass.
+// Case 6 -- a layout breaking a stick-dim rule, read by the pass, one rule each.
 //
-// [M, K] -> [M/64, K/64, M%64, K%64]: each logical dim is a well-formed split,
-// and the layout as a whole has two stick dims. readCoordMap rejects it with the
-// shared checker's message.
+// Two stick dims: [M, K] -> [M/64, K/64, M%64, K%64]. Each logical dim is a
+// well-formed split, and the layout as a whole has two stick dims. readCoordMap
+// rejects it with the shared checker's message.
 
 #s6 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 127 >= 0)>
 #id6 = affine_map<(d0, d1) -> (d0, d1)>
@@ -238,6 +239,45 @@ tt.func @two_mods(%a: !tt.ptr<f16>) {
   %av = ktdp.construct_memory_view %ai, sizes: [128, 128], strides: [128, 1] {coordinate_set = #s6, memory_space = #ktdp.memory_space<global>,
       tts.tensor_layout = {phys_src = array<i64: 0, 1, 0, 1>, phys_op = array<i64: 1, 1, 2, 2>, phys_arg = array<i64: 64, 64, 64, 64>}} : memref<128x128xf16>
   %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id6, access_tile_set = #s6} : memref<128x128xf16> -> !ktdp.access_tile<128x128xindex>
+  %al = ktdp.load %at : <128x128xindex> -> tensor<128x128xf16>
+  tt.return
+}
+}
+
+// -----
+
+// Case 6, the stick dim not last: [M, K] -> [K/64, K%64, M].
+
+#s7 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#id7 = affine_map<(d0, d1) -> (d0, d1)>
+module {
+tt.func @stick_not_last(%a: !tt.ptr<f16>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f16> to index
+  // expected-error @below {{tts.tensor_layout: the stick dim must be the last physical dim, got it at phys dim 1 of 3}}
+  %av = ktdp.construct_memory_view %ai, sizes: [128, 128], strides: [128, 1] {coordinate_set = #s7, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 1, 0>, phys_op = array<i64: 1, 2, 0>, phys_arg = array<i64: 64, 64, 0>}} : memref<128x128xf16>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id7, access_tile_set = #s7} : memref<128x128xf16> -> !ktdp.access_tile<128x128xindex>
+  %al = ktdp.load %at : <128x128xindex> -> tensor<128x128xf16>
+  tt.return
+}
+}
+
+// -----
+
+// Case 6, a split of two widths: [M, K] -> [K/32, M, K%64]. The split's two
+// halves name different stick widths.
+
+#s8 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#id8 = affine_map<(d0, d1) -> (d0, d1)>
+module {
+tt.func @split_width_mismatch(%a: !tt.ptr<f16>) {
+  %c0 = arith.constant 0 : index
+  %ai = builtin.unrealized_conversion_cast %a : !tt.ptr<f16> to index
+  // expected-error @below {{tts.tensor_layout: logical dim 1 is split with floordiv 32 but mod 64; the two must be the same stick width}}
+  %av = ktdp.construct_memory_view %ai, sizes: [128, 128], strides: [128, 1] {coordinate_set = #s8, memory_space = #ktdp.memory_space<global>,
+      tts.tensor_layout = {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 32, 0, 64>}} : memref<128x128xf16>
+  %at = ktdp.construct_access_tile %av[%c0, %c0] {access_tile_order = #id8, access_tile_set = #s8} : memref<128x128xf16> -> !ktdp.access_tile<128x128xindex>
   %al = ktdp.load %at : <128x128xindex> -> tensor<128x128xf16>
   tt.return
 }

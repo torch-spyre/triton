@@ -844,31 +844,17 @@ void collectNamedLoopDims(AffineExpr e, SmallVectorImpl<unsigned> &out) {
 }
 
 /// (ii) The result operand's map names the loop dims in strictly increasing
-/// order, reading each linearized composite left to right — EXCEPT for the
-/// splat physical dims, which are excluded.
+/// order, reading each linearized composite left to right.
 ///
 /// The ordering exists for this: the result's coordinate order is the one the
 /// generic does not get to choose, so its map has to take the loop dims in the
 /// order its own physical type lays them out, and buildLoopDomain seeds the
-/// numbering from exactly that.
-///
-/// The splat dims are excluded because the code does not establish the property
-/// for them and is right not to. A splat names no domain piece, so it takes no
-/// part in the ordering and is given its loop AFTER the pieces are numbered —
-/// the last loop dim, wherever the splat sits in the operand's physical order.
-/// A result whose splat is not last therefore has a non-monotone map by
-/// construction, e.g. `(d0, d1, d2, d3) -> (d3, d1)`, which is correct and
-/// which linalg accepts, since a projected permutation need not be monotone.
-/// Asserting monotonicity over the splat dims too would be asserting something
-/// this pass never promised.
-[[maybe_unused]] bool resultMapIsMonotone(const RebuildOperand &result,
-                                          AffineMap map) {
+/// numbering from exactly that. A splat, when the result has one, is its last
+/// physical dim and is given the last loop dim, so it is covered too.
+[[maybe_unused]] bool resultMapIsMonotone(AffineMap map) {
   SmallVector<unsigned> dims;
-  for (unsigned p = 0, e = map.getNumResults(); p < e; ++p) {
-    if (result.layout && result.layout->opAt(p) == CoordOp::Splat)
-      continue;
-    collectNamedLoopDims(map.getResult(p), dims);
-  }
+  for (AffineExpr r : map.getResults())
+    collectNamedLoopDims(r, dims);
   for (unsigned i = 1; i < dims.size(); ++i)
     if (dims[i - 1] >= dims[i])
       return false;
@@ -1700,7 +1686,7 @@ struct RewriteDescriptorLayoutGenericPass
 
     assert(everyLoopDimIsNamed(physMaps, dom->numLoopDims) &&
            "a rebuilt loop dim is named by no operand's map");
-    assert(resultMapIsMonotone(rebuildOperands[resultIdx], physMaps[resultIdx]) &&
+    assert(resultMapIsMonotone(physMaps[resultIdx]) &&
            "the result's map takes the loop dims out of order");
 
     SmallVector<utils::IteratorType> physIterators =

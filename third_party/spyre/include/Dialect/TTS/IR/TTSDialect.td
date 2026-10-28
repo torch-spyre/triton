@@ -61,6 +61,11 @@ def TTS_Dialect : Dialect {
     /// giving physical size [ceildiv(N, 64), M, 64]. A splat dim replicates its
     /// source logical dim across `phys_arg` lanes instead of partitioning it.
     ///
+    /// The stick dim is the physical dim whose positions are the lanes of one
+    /// stick: a mod entry or a splat entry. A layout has at most one, it is
+    /// the last physical dim, and a split's floordiv divisor equals its mod
+    /// modulus. `tts::verifyTensorLayoutArrays` states every rule.
+    ///
     /// Discardable, so nothing forces a pass that rebuilds the view to carry it
     /// — see the note on `RewriteDescriptorLayoutGeneric`'s owned-attribute set,
     /// which drops it deliberately and is the only pass allowed to.
