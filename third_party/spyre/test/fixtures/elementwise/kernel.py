@@ -513,6 +513,39 @@ def elementwise_1d_device(
 
 
 @triton.jit
+def elementwise_const_1d_device(
+    x_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+    OP: tl.constexpr,
+    C: tl.constexpr,
+):
+    """:func:`elementwise_1d_device` with ``y`` a compile-time float ``C``
+    rather than a loaded tensor."""
+    pid = tl.program_id(0)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+    offset = pid * BLOCK_SIZE
+    x = x_desc.load([offset])
+    if OP == "add":
+        result = x + C
+    elif OP == "sub":
+        result = x - C
+    else:
+        result = x * C
+    out_desc.store([offset], result)
+
+
+@triton.jit
 def elementwise_2d_device(
     x_ptr,
     y_ptr,

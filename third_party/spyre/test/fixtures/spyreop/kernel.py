@@ -69,9 +69,13 @@ def spyreop_realdiv_1d_device(
     n_elements: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     LAYOUT: tl.constexpr,
+    D: tl.constexpr,
 ):
     """``x / y`` over exactly one tile, with no distribution loop. See
     :func:`spyreop_1d_device` -- same no-loop shape, binary instead of unary.
+
+    ``D`` is ``"y"`` for the denominator loaded from ``y_ptr``, or else a
+    compile-time float. ``y_ptr`` is taken either way.
     """
     pid = tl.program_id(0)
 
@@ -90,8 +94,10 @@ def spyreop_realdiv_1d_device(
 
     offset = pid * BLOCK_SIZE
     x = x_desc.load([offset])
-    y = y_desc.load([offset])
-    out_desc.store([offset], x / y)
+    if D == "y":
+        out_desc.store([offset], x / y_desc.load([offset]))
+    else:
+        out_desc.store([offset], x / D)
 
 
 @triton.jit
