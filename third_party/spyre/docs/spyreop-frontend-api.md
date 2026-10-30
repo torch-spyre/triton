@@ -67,23 +67,72 @@ tl.spyre_op(...)
 ```
 
 A call to `tl.spyre_op` traces to one TTIR op, `tts.spyre_op` (see
-below), which `_make_ktir`'s TTIR→KTIR pipeline converts directly into
-the real `spyreop.*` op the call named, wrapped in a `linalg.generic`
-body. There is no intermediate decomposition into `arith`/`math`, and no
-separate pass resolves anything later: by the time `_make_ktir` finishes,
-the real hardware op is already in the cached artifact.
+below), which `LowerComputeOps` — a pass that already runs inside
+`_make_ktir`'s TTIR→KTIR pipeline (`buildTTIRToKTIRPipeline`,
+`Pipeline.cpp`) and already converts other Triton compute ops into
+their KTIR-stage form (`tt.reduce → linalg.reduce`, `tt.dot →
+linalg.matmul`, and so on) — converts directly into the real
+`spyreop.*` op the call named, wrapped in a `linalg.generic` body. There
+is no intermediate decomposition into `arith`/`math`, and no separate
+pass resolves anything later: by the time `_make_ktir` finishes, the
+real hardware op is already in the cached artifact.
 
 ### Rationale
 
 This is the simplest path that gets every intrinsic in the initial
-operation set to a real, testable lowering now: one new conversion step,
-run once, inside `_make_ktir`'s existing TTIR→KTIR pipeline — the same
-stage that already converts `tt.reduce` into `linalg.reduce` for
-ordinary Triton code. It keeps the design small enough to implement and
+operation set to a real, testable lowering now: one new conversion
+pattern, added to a pass that already exists and already does this kind
+of job for every other Triton compute op, rather than a new pass or a
+new pipeline stage. It keeps the design small enough to implement and
 validate immediately, which is the priority while the broader question
 of how a SpyreOp request should ultimately be represented at the KTIR
 level is still being worked out — see *Future work*, at the end of this
 document.
+
+### Pass implementation: a new pattern group in `LowerComputeOps`
+
+`LowerComputeOps` (`third_party/spyre/lib/Conversion/TritonToKTIR/LowerComputeOps.cpp`)
+is already organized as pattern groups under one `ConversionTarget`/
+`RewritePatternSet`, converting Triton ops the pass's `ConversionTarget`
+marks illegal into KTIR-stage equivalents it marks legal:
+
+- **Group A** — shape manipulation (`tt.splat`, `tt.reshape`, ...)
+- **Group B** — reduction (`tt.reduce` + `tt.reduce.return` → `linalg.reduce`)
+- **Group C** — matrix multiply (`tt.dot` → `linalg.matmul`)
+
+`tts.spyre_op` is converted by a **new Group D**, added to the same
+pass, the same `ConversionTarget`, and the same `RewritePatternSet` —
+not a new pass, and not a new stage. `tts::SpyreOpOp` is added to the
+target's illegal-op list; `spyreop::SpyreOpDialect` is added to its
+legal-dialect list and to `LowerComputeOps`'s own `dependentDialects` in
+`Passes.td`. Group D has two patterns, matching Groups B and C's own
+precedent of using whichever existing conversion shape fits the target
+op, rather than inventing one per intrinsic:
+
+- **D1 — elementwise** (`gelu`, `silu`, `softplus`, `reciprocal`,
+  `layernormscale`, `layernormnorm`, the address-arithmetic ops): one
+  `OpConversionPattern<tts::SpyreOpOp>` builds the `linalg.generic`
+  wrapper directly — identity indexing maps, one block argument per
+  operand, the named `spyreop.*` op as the body, constructed by name and
+  verified before being committed (the same `OperationState`/
+  `rewriter.create(state)`/`mlir::verify` shape a real, working
+  instruction-selection pass elsewhere in this tree already uses to
+  build an op from a name it doesn't know the signature of at compile
+  time).
+- **D2 — reduction-shaped** (`exx2`): a second pattern, modeled directly
+  on Group B's existing `tt.reduce` conversion rather than invented
+  fresh — the same `(tensor.empty, linalg.fill)`-built neutral-element
+  init, the same `axis`-indexed reduction dimension, with the named
+  `spyreop.*` op as the reduction body instead of a cloned Triton
+  combiner region. See *Lowering `tts.spyre_op` to `spyreop.*`*, below,
+  for the resulting IR shape.
+
+Both patterns replace the whole `tts.spyre_op`, operands and attributes
+included, with the target op applied to those same operands — nothing
+about either pattern inspects or depends on what a kernel author's own
+code around the call looked like, since `tts.spyre_op` already carries
+everything the target needs directly, as its own operands and
+attributes (see *`tts.spyre_op`: the TTIR representation*, below).
 
 ## `tl.spyre_op`: the frontend entry point
 
@@ -142,9 +191,9 @@ bypassing the frontend) is held to the identical contract.
 For an intrinsic whose real `spyreop.*` op is elementwise — same shape
 in, same shape out, one operand through five (`gelu`, `silu`,
 `softplus`, `reciprocal`, `layernormscale`, `layernormnorm`, the
-address-arithmetic ops) — the TTIR→KTIR conversion that resolves
-`tts.spyre_op` builds the equivalent `linalg.generic`, with the real
-scalar `spyreop.*` op as its body, directly:
+address-arithmetic ops) — `LowerComputeOps`'s Group D1 pattern (see
+*Pass implementation*, above) builds the equivalent `linalg.generic`,
+with the real scalar `spyreop.*` op as its body, directly:
 
 ```mlir
 // tts.spyre_op {name = "gelu"} (%x) : (tensor<128xf16>) -> tensor<128xf16>
@@ -160,19 +209,21 @@ scalar `spyreop.*` op as its body, directly:
   } -> tensor<128xf16>
 ```
 
-This is a single conversion step, run once, inside `_make_ktir`'s own
-TTIR→KTIR pipeline. No decomposition into `arith`/`math`, no attribute
+This is a single conversion pattern, matched and rewritten once, inside
+`LowerComputeOps` — the same pass, same `_make_ktir`-stage pipeline
+position, that already converts every other Triton compute op into its
+KTIR-stage form. No decomposition into `arith`/`math`, no attribute
 tagging, and no later pass recognizes or regroups anything: the
 `spyreop.*` op this produces is already final, and it is what
 `_make_ktir` caches.
 
 For `"exx2"`, whose real `spyreop.exx2`/`spyreop.exx2_fused` op computes a
-mean and a mean-of-squares over a whole axis, the same wrapping strategy
-applies, built on a different `linalg` recipe: the reduction-shaped one
-this codebase already builds for ordinary `tt.reduce` (`ConvertTTReduce`
-in `LowerComputeOps.cpp`, which `_make_spyrecode`'s own
-`LinalgGeneralizeNamedOps` already turns into a `linalg.generic`), not
-the elementwise one above. The TTIR→KTIR conversion for `"exx2"` builds a
+mean and a mean-of-squares over a whole axis, `LowerComputeOps`'s Group
+D2 pattern applies the same wrapping strategy, built on a different
+`linalg` recipe: the reduction-shaped one Group B already builds for
+ordinary `tt.reduce` (`ConvertTTReduce`, in the same file, which
+`_make_spyrecode`'s own `LinalgGeneralizeNamedOps` already turns into a
+`linalg.generic`), not the elementwise one above. Group D2 builds a
 `linalg.generic` with a `reduction`-typed iterator over the named axis,
 a `tensor.empty`/`linalg.fill`-built init operand, and the real
 `spyreop.exx2`/`spyreop.exx2_fused` op as the whole reduction body,
@@ -344,8 +395,9 @@ def my_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
 `tl.exp(x)` traces to `math.exp`, which `LowerSpyreOps`'s structural
 matching turns into `spyreop.exp` in `_make_spyrecode` — no
 `tts.spyre_op` involved at any point. `tl.spyre_op("gelu", x)` traces to
-`tts.spyre_op {name = "gelu"}`, which `_make_ktir`'s TTIR→KTIR pipeline
-converts directly into `linalg.generic { spyreop.gelu }`. Both calls end
+`tts.spyre_op {name = "gelu"}`, which `LowerComputeOps`'s Group D1
+pattern converts directly into `linalg.generic { spyreop.gelu }` inside
+`_make_ktir`. Both calls end
 up at a real `spyreop.*` op — one by the end of `_make_ktir`, the other
 by the end of `_make_spyrecode` — but the difference is invisible from
 the kernel author's side and only matters to how the compiler gets
