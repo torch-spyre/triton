@@ -175,18 +175,24 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
   pm.addPass(createUnaliasLinalgOutsPass());
 
-  // Every coordinate change becomes an `indexing_maps` entry on the generic that
-  // consumes it, so nothing whose only effect is to re-index survives.
+  // A reshape feeding generics becomes a forwarding generic, and a splat
+  // constant operand a scalar in the body, so the pass below meets only
+  // generics as producers.
+  pm.addPass(createCanonicalizeGenericOperandsPass());
+
+  // A forwarding generic is absorbed into its consumer's operand map, so nothing
+  // whose only effect is to re-index survives; and a compare is fused with the
+  // reader LowerSpyreOps lowers it with, so the pair shares one body.
   //
-  // Both neighbours fix the position. It must follow the three passes above,
-  // which are what make every compute a linalg.generic: the fusion it drives
-  // matches generic -> generic, so a named producer or consumer blocks it whatever
-  // the control function says. And it must precede the layout pass below, whose
-  // behaviour it changes -- left in place, a data-movement generic has no layout
-  // marker, so that pass leaves its result logical and refuses the consumer,
-  // whose operand map would have to bridge the gap with a linearizing map the
-  // scheduler cannot project loop IVs through.
-  pm.addPass(createFuseComputeAndDataMovementPass());
+  // Both neighbours fix the position. It must follow the passes above, which
+  // are what make every compute and every reshape feeding one a linalg.generic:
+  // both of its patterns match generic -> generic. And it must precede the
+  // layout pass below, whose behaviour it changes -- left in place, a
+  // forwarding generic has no layout marker, so that pass leaves its result
+  // logical and refuses the consumer, whose operand map would have to bridge
+  // the gap with a linearizing map the scheduler cannot project loop IVs
+  // through.
+  pm.addPass(createFuseGenericsPass());
 
   // Logical descriptors -> physical (stick-tiled) layout, rooted on the
   // `tts.tensor_layout` attribute LowerTTSMarkers wrote onto each annotated
@@ -223,12 +229,13 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // group rule's SCOPE is the generic body, and the 1:1 rules leave a tensor-typed
   // op alone.
   //
-  // And it needs FuseComputeAndDataMovement to have run, which it has, well above. A rule
+  // And it needs FuseGenerics to have run, which it has, well above. A rule
   // matches ops in ONE body while ConvertElementwiseToLinalg gives every
-  // tensor-level op a body of its own, so a group spanning two tensor ops is two
-  // generics until something fuses them -- that pass's `i1` clause is what does,
-  // and the compare rule fires only because of it. The reciprocal is the softer
-  // case: it reads its numerator through the body, so it fires either way.
+  // tensor-level op a body of its own, so a group spanning two tensor ops is
+  // two generics until something fuses them -- FuseGenerics' GroupComputes is
+  // what does, and the compare rule fires only because of it. The reciprocal is
+  // the softer case: it reads its numerator through the body, so it fires
+  // either way.
   //
   // Nothing is reported here. An op with no device form flows through to dbo-opt,
   // which is the component that knows what it can take.

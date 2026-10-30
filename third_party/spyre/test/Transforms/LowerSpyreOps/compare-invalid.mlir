@@ -25,7 +25,7 @@
 // That is exactly a group it had the chance to select and did not.
 //
 // An i1 crossing a generic boundary is the other pass's finding, not this one's: it
-// is the TENSOR form, FuseComputeAndDataMovement has the clause that removes it,
+// is the TENSOR form, FuseGenerics reports it,
 // and before that pass has run every compare sits in a generic of its own yielding
 // precisely that. Refusing it here would report IR a predecessor was meant to
 // reshape while naming the wrong cause. compare-from-tensor.mlir's NOFUSE run line

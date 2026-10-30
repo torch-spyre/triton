@@ -11,7 +11,7 @@
 //   1. ONE op into ONE op, both of them upstream. Both halves matter, and each
 //      excludes a neighbour: a rewrite whose target is a spyreop intrinsic
 //      belongs in LowerSpyreOps, whether it takes one op or a group, and one that
-//      changes which generic an op sits in belongs in FuseComputeAndDataMovement. The
+//      changes which generic an op sits in belongs in FuseGenerics. The
 //      reciprocal is the worked example -- its motive is a device behaviour
 //      exactly like the patterns here, but its target is spyreop.reciprocal, so
 //      it is a selection rule.

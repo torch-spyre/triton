@@ -1,18 +1,15 @@
-// RUN: spyre-triton-opt %s --convert-elementwise-to-linalg --linalg-generalize-named-ops --unalias-linalg-outs --fuse-compute-and-data-movement 2>&1 | FileCheck %s
+// RUN: spyre-triton-opt %s --convert-elementwise-to-linalg --linalg-generalize-named-ops --unalias-linalg-outs --canonicalize-generic-operands --fuse-generics 2>&1 | FileCheck %s
 
 // REAL IR, not a hand-written shape: the `ktir`-stage output of the
 // `softmax_2pass` fixture verbatim, locations stripped. Its own file because it is
-// the only case here that is a whole kernel, and the only one needing the three
+// the only case here that is a whole kernel, and the only one needing the four
 // passes ahead of this one in the pipeline.
 //
-// Two things at once. As a POSITIVE it is the absorber on a kernel nobody wrote
-// for it: 2 `tensor.expand_shape` and 3 `tensor.collapse_shape`, all absorbed,
-// none surviving -- and the hardcoded absorber this replaced could not have taken
-// the two expands. As an OVER-INCLUSION check it carries zero
-// `tts.tensor_layout`, so the gate must stay shut over all five; a gate keyed on
-// the shape ops rather than on the path would refuse the whole kernel.
+// AbsorbForwardingGeneric on a kernel nobody wrote for it: 2
+// `tensor.expand_shape` and 3 `tensor.collapse_shape`, each made a forwarding
+// generic by CanonicalizeGenericOperands and all absorbed, none surviving.
 //
-// The RUN line needs the other three passes because they are what puts the shape
+// The RUN line needs the other four passes because they are what puts the shape
 // ops in front of generics: at the `ktir` stage the computes are still `arith.*`
 // on tensors and the broadcasts and reduces are still named linalg ops, and
 // fusion matches generic -> generic only.

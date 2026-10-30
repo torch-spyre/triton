@@ -307,7 +307,7 @@ func.func @one_compare_two_consumers(%x: tensor<4xf16>, %y: tensor<4xf16>) -> te
 //   - No rewrite: there is no float for `spyreop.select` to take, and inventing
 //     one would mean guessing how true is encoded.
 //   - No diagnostic: an `i1` block argument is the tensor form crossing a body
-//     boundary, which FuseComputeAndDataMovement removes, not this pass.
+//     boundary, which FuseGenerics reports, not this pass.
 //
 // The next case is the one that IS reported.
 #map = affine_map<(d0) -> (d0)>

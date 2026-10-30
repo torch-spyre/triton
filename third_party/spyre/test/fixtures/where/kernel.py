@@ -241,8 +241,8 @@ def where_scalar_stick_device(
     holding the scalar in every lane. The host fills it.
 
     The scalar comes from memory, not from ``tl.full``, because of what
-    ``dbo-opt`` accepts. A constant tensor operand is folded by upstream
-    ``FoldScalarOrSplatConstant`` (inside ``FuseComputeAndDataMovement``) into a
+    ``dbo-opt`` accepts. A constant tensor operand is folded by
+    ``SplatOperandToScalar`` (in ``CanonicalizeGenericOperands``) into a
     scalar captured by the compare's body. The device's vector compare then
     finds an ``f16`` where it requires a vector, and ``dbo-opt`` refuses it.
     Loaded from a stick, the scalar is an ordinary input of the compare. The
