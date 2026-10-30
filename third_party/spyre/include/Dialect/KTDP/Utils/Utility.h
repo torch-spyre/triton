@@ -92,6 +92,15 @@ void collectViewAccesses(Operation *memView,
 void collectAdjacentGenerics(ArrayRef<Operation *> memViews,
                              SmallVectorImpl<Operation *> &out);
 
+/// The `ktdp.construct_memory_view` a `ktdp.load` or `ktdp.store` goes through,
+/// or null.  The inverse of `collectViewAccesses` and the same two hops the other
+/// way: load/store -> its access tile, direct or indirect -> the tile's base.
+///
+/// Null for anything else at any step, which is the useful answer rather than an
+/// assertion: a caller asking this is asking whether a particular access reaches
+/// a view it can read something off, and "it does not" is a case.
+Operation *viewBehindAccess(Operation *loadOrStore);
+
 } // namespace mlir::triton::ktdp
 
 #endif // TRITON_SPYRE_DIALECT_KTDP_UTILS_UTILITY_H
