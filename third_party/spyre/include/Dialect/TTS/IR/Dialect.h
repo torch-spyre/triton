@@ -13,6 +13,11 @@
 // a kernel authors on a value, and the `tts.pin` attribute, which the lowered IR
 // carries on the op producing that value.
 //
+// And one intrinsic request, `tts.spyre_intrinsic`, in the same two spellings:
+// the op, which holds the fallback a kernel's request traces, and the
+// `tts.spyre_intrinsic` attribute, which the lowered IR carries on every op
+// that body was inlined into.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef TRITON_SPYRE_DIALECT_TTS_IR_DIALECT_H
@@ -37,6 +42,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 
 #include "Dialect/TTS/IR/Dialect.h.inc"
@@ -45,6 +51,58 @@
 #include "Dialect/TTS/IR/Ops.h.inc"
 
 namespace mlir::triton::tts {
+
+/// The `tts.spyre_intrinsic` `op` carries, or null when it carries none. The
+/// dialect's attribute verifier has already held the value to its spelling --
+/// a dictionary of a string `target`, an i64 `id`, a positive i64 `arity` and
+/// optionally an `operands` array -- so a non-null result has the three
+/// required entries. Two ops come from one call site exactly when their hints
+/// have one `id`; the dictionaries themselves differ, `operands` being per op.
+DictionaryAttr getSpyreIntrinsic(Operation *op);
+
+/// The op a hint returned by getSpyreIntrinsic names.
+StringRef getSpyreIntrinsicTarget(DictionaryAttr hint);
+
+/// The call-site id of a hint returned by getSpyreIntrinsic.
+int64_t getSpyreIntrinsicId(DictionaryAttr hint);
+
+/// The call site's operand count, from a hint returned by getSpyreIntrinsic.
+int64_t getSpyreIntrinsicArity(DictionaryAttr hint);
+
+/// Which call operand each operand of the hinted op is -- entry j for operand
+/// j, -1 for one that is not a call operand -- or null when the op reads no
+/// call operand directly. From a hint returned by getSpyreIntrinsic, so the
+/// array has one entry per operand of the op it was read off.
+DenseI64ArrayAttr getSpyreIntrinsicOperands(DictionaryAttr hint);
+
+/// The `tl.spyre_intrinsic` call site whose ops `body` holds: the hint of its
+/// first hinted op, when they all have one `id`, or null when `body` holds no
+/// hinted op or hinted ops of two call sites. What the result says about the
+/// call site is its `id`, `target` and `arity`; its `operands`, if any, are
+/// that one op's. With `<silu#0>` for the hint
+/// `{target = "spyreop.silu", id = 0}`:
+///
+///   {exp<silu#0>, addf<silu#0>}   -> silu#0
+///   {exp<silu#0>, cst}            -> silu#0
+///   {exp<silu#0>, mulf<gelu#1>}   -> null
+///
+/// Ops in nested regions count. A constant does not, hinted or not: passes
+/// create, merge and fold constants without regard to hints, so one says
+/// nothing about which call site a body belongs to. Two call sites are told
+/// apart by `id` alone; whether the ops of one `id` agree on `target` is
+/// FuseComputeAndDataMovement's post-check, not this.
+///
+/// A block and not a linalg.generic, though a generic's body is what every
+/// caller asks about: what a body is depends on no dialect, and the hint is
+/// carried on the body's ops rather than on the op owning it, because a pass
+/// rebuilding that op keeps the body's attributes and drops its own.
+DictionaryAttr getBodyCallSite(Block &body);
+
+/// Copies every `tts.*` discardable attribute of `from` onto `to`, overwriting
+/// one `to` already has. For a rewrite that replaces `from` with a new `to`
+/// computing the same value: the attributes are what the `ktir` stage's markers
+/// left on the op, and dropping one drops the request it records.
+void copyTTSAttrs(Operation *from, Operation *to);
 
 /// The coordinate op a `tts.tensor_layout`'s `phys_op[k]` names, by the
 /// attribute's own numbering.

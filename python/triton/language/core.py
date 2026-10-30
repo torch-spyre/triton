@@ -3908,4 +3908,43 @@ def spyre_pin(v, memory_space, offset=None, _semantic=None):
     Only valid on the ``spyre`` backend — raises on any other target.
     """
     return _semantic.spyre_pin(v, memory_space, offset)
+
+
+@builtin
+@requires_backend("spyre")
+def spyre_intrinsic(target, *args, _semantic=None, _generator=None):
+    """(Spyre only) Compute ``args`` with the device op ``target``.
+
+    ``tl.spyre_intrinsic("spyreop.gelu", x)`` asks that ``gelu(x)`` be done by the
+    device's own instruction for it. What is traced is the backend's FALLBACK for
+    that op --
+    the same computation in plain ``tl`` ops -- inside a ``tts.spyre_intrinsic``, so the
+    request means one thing at every stage: the ``ktir`` artifact holds the
+    fallback, which any KTIR reader runs, and the ``spyrecode`` stage replaces it
+    with the intrinsic.
+
+    The request is explicit, so it is never dropped silently: a request the
+    backend cannot select is a compile error naming the target, not the
+    fallback in its place.
+
+    Args:
+        target: A ``constexpr`` string naming a registered op in full. The Spyre
+              backend registers ``"spyreop.gelu"`` (fp16), ``"spyreop.silu"``
+              and ``"spyreop.sigmoid"`` (fp16, fp32); any other target, or any
+              other dtype, is refused here. Kernel authors cannot register
+              targets.
+        args: The operands, tensors of one shape, as many as the target takes
+              -- one for each of the three above -- in the order the target
+              takes them. The result has operand 0's type.
+
+    Only valid on the ``spyre`` backend — raises on any other target.
+    """
+    target = _unwrap_if_constexpr(target)
+    if not isinstance(target, str):
+        raise ValueError(f"tl.spyre_intrinsic: target must be a constexpr string, got {target!r}")
+
+    def call_fallback(fn, fn_args):
+        return _generator.call_JitFunction(fn, fn_args, kwargs={})
+
+    return _semantic.spyre_intrinsic(target, args, call_fallback)
 # --- END --- added for spyre

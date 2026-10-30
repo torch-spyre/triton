@@ -23,6 +23,11 @@ add_triton_library(TTSIR
 
   LINK_LIBS PUBLIC
   KTIR::KtdpDialect
+  # A dependent dialect: the ops a `tts.spyre_intrinsic` targets are spyreop's.
+  KTIR::SpyreOpDialect
   TritonIR
   MLIRIR
+  MLIRSideEffectInterfaces
+  MLIRCallInterfaces
+  MLIRTransformUtils
 )

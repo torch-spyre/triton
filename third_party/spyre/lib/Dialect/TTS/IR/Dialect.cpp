@@ -8,25 +8,95 @@
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/TTS/IR/Dialect.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
 #include "ktir/Dialect/KTDP/KTDP.h"
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Transforms/InliningUtils.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include "Dialect/TTS/IR/Dialect.cpp.inc"
 
 namespace mlir::triton::tts {
 
+namespace {
+
+/// Admits inlining INTO a `tts.spyre_intrinsic` body. Tracing reaches the
+/// registered fallback through a `tt.call` inside that body, and the `ttir`
+/// stage's inliner asks the dialect of the region's parent op whether a
+/// callee's body may land there; with no answer it keeps the call. Whether each
+/// inlined op may move is still asked of that op's own dialect.
+struct TTSInlinerInterface : public DialectInlinerInterface {
+  using DialectInlinerInterface::DialectInlinerInterface;
+
+  bool isLegalToInline(Region *dest, Region *src, bool wouldBeCloned,
+                       IRMapping &valueMapping) const final {
+    return isa<SpyreIntrinsicOp>(dest->getParentOp());
+  }
+};
+
+} // namespace
+
 void TTSDialect::initialize() {
-  // One op and nothing else: no types, no attribute types. Most of what the
-  // dialect is for is the attribute NAME and the verifier hook that name routes
-  // to, neither of which is registered here.
+  // Ops and nothing else: no types, no attribute types. Most of what the
+  // dialect is for is the attribute NAMES and the verifier hook those names
+  // route to, neither of which is registered here.
   addOperations<
 #define GET_OP_LIST
 #include "Dialect/TTS/IR/Ops.cpp.inc"
       >();
+  addInterfaces<TTSInlinerInterface>();
+}
+
+DictionaryAttr getSpyreIntrinsic(Operation *op) {
+  return dyn_cast_or_null<DictionaryAttr>(
+      op->getDiscardableAttr(TTSDialect::kSpyreIntrinsicAttrName));
+}
+
+StringRef getSpyreIntrinsicTarget(DictionaryAttr hint) {
+  return hint.getAs<StringAttr>(TTSDialect::kSpyreIntrinsicTargetKey)
+      .getValue();
+}
+
+int64_t getSpyreIntrinsicId(DictionaryAttr hint) {
+  return hint.getAs<IntegerAttr>(TTSDialect::kSpyreIntrinsicIdKey).getInt();
+}
+
+int64_t getSpyreIntrinsicArity(DictionaryAttr hint) {
+  return hint.getAs<IntegerAttr>(TTSDialect::kSpyreIntrinsicArityKey).getInt();
+}
+
+DenseI64ArrayAttr getSpyreIntrinsicOperands(DictionaryAttr hint) {
+  return hint.getAs<DenseI64ArrayAttr>(TTSDialect::kSpyreIntrinsicOperandsKey);
+}
+
+DictionaryAttr getBodyCallSite(Block &body) {
+  DictionaryAttr found;
+  WalkResult walked = body.walk([&](Operation *op) {
+    if (op->hasTrait<OpTrait::ConstantLike>())
+      return WalkResult::advance();
+    DictionaryAttr hint = getSpyreIntrinsic(op);
+    if (!hint)
+      return WalkResult::advance();
+    if (!found)
+      found = hint;
+    else if (getSpyreIntrinsicId(found) != getSpyreIntrinsicId(hint))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  return walked.wasInterrupted() ? DictionaryAttr() : found;
+}
+
+void copyTTSAttrs(Operation *from, Operation *to) {
+  StringRef prefix = TTSDialect::getDialectNamespace();
+  for (NamedAttribute attr : from->getDiscardableAttrs()) {
+    StringRef name = attr.getName().getValue();
+    if (name.starts_with(prefix) &&
+        name.drop_front(prefix.size()).starts_with("."))
+      to->setDiscardableAttr(attr.getName(), attr.getValue());
+  }
 }
 
 std::optional<CoordOp> symbolizeCoordOp(int64_t code) {
@@ -377,6 +447,72 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
   // exactly that reason. That reader belongs with that consumer.
   if (name == kPinAttrName)
     return success();
+
+  // The `tts.spyre_intrinsic` attribute is written by one pass,
+  // LowerTTSMarkers, and READ by two in `spyrecode` --
+  // FuseComputeAndDataMovement groups bodies by the hint's `id`, and
+  // LowerSpyreIntrinsicCalls builds the op its `target` names from the call
+  // operands its `operands` bind. So what one op can show is checked here,
+  // which is what lets getSpyreIntrinsic hand those readers a dictionary they
+  // need not re-check: the three required fields, each of its type, an optional
+  // `operands` of the op's own operand count with every entry a call operand
+  // index or -1, no other key, a `target` that is a registered op, and an op
+  // that is not a constant, which LowerTTSMarkers never hints. Nothing about
+  // other ops -- an `id` being unique, a call site being whole, its ops
+  // agreeing on `target` and `arity`, every call operand being bound -- is
+  // checkable from one op; FuseComputeAndDataMovement and
+  // LowerSpyreIntrinsicCalls check those.
+  if (name == kSpyreIntrinsicAttrName) {
+    auto hint = dyn_cast<DictionaryAttr>(attribute.getValue());
+    auto target =
+        hint ? hint.getAs<StringAttr>(kSpyreIntrinsicTargetKey) : StringAttr();
+    auto id =
+        hint ? hint.getAs<IntegerAttr>(kSpyreIntrinsicIdKey) : IntegerAttr();
+    auto arity =
+        hint ? hint.getAs<IntegerAttr>(kSpyreIntrinsicArityKey) : IntegerAttr();
+    Attribute operandsEntry =
+        hint ? hint.get(kSpyreIntrinsicOperandsKey) : nullptr;
+    auto operands = dyn_cast_or_null<DenseI64ArrayAttr>(operandsEntry);
+    size_t expected = operandsEntry ? 4 : 3;
+    if (!hint || hint.size() != expected || !target || !id ||
+        !id.getType().isInteger(64) || !arity ||
+        !arity.getType().isInteger(64) || (operandsEntry && !operands))
+      return op->emitError("'")
+             << kSpyreIntrinsicAttrName
+             << "' must be a dictionary of a string '"
+             << kSpyreIntrinsicTargetKey << "', an i64 '"
+             << kSpyreIntrinsicIdKey << "', an i64 '" << kSpyreIntrinsicArityKey
+             << "' and optionally an array<i64> '" << kSpyreIntrinsicOperandsKey
+             << "', and nothing else, got " << attribute.getValue();
+    if (!RegisteredOperationName::lookup(target.getValue(), getContext()))
+      return op->emitError("'")
+             << kSpyreIntrinsicAttrName << "' targets " << target
+             << ", which is not a registered op";
+    if (op->hasTrait<OpTrait::ConstantLike>())
+      return op->emitError("'")
+             << kSpyreIntrinsicAttrName << "' is not set on a constant";
+    int64_t n = arity.getInt();
+    if (n < 1)
+      return op->emitError("'")
+             << kSpyreIntrinsicAttrName << "' has " << kSpyreIntrinsicArityKey
+             << " " << n << ", and a call site has at least one operand";
+    if (!operands)
+      return success();
+    if (operands.size() != static_cast<int64_t>(op->getNumOperands()))
+      return op->emitError("'")
+             << kSpyreIntrinsicAttrName << "' has " << operands.size() << " '"
+             << kSpyreIntrinsicOperandsKey
+             << "' entries, one per operand of an op "
+             << "with " << op->getNumOperands();
+    for (auto [j, k] : llvm::enumerate(operands.asArrayRef()))
+      if (k < -1 || k >= n)
+        return op->emitError("'")
+               << kSpyreIntrinsicAttrName << "' binds operand " << j
+               << " to call operand " << k << ", and a call site of "
+               << kSpyreIntrinsicArityKey << " " << n << " has operands 0 to "
+               << n - 1 << ", or -1 for none";
+    return success();
+  }
 
   return op->emitError("attribute '")
          << name << "' is not one the tts dialect defines";

@@ -17,6 +17,7 @@ add_triton_library(SpyreTransforms
   NormalizeForDevice.cpp
   DropReductionInitFill.cpp
   FuseComputeAndDataMovement.cpp
+  LowerSpyreIntrinsicCalls.cpp
   LowerSpyreOps.cpp
   MaterializeBaseAddresses.cpp
 
@@ -38,6 +39,8 @@ add_triton_library(SpyreTransforms
   KTDPUtils
   TTSIR
   KTIR::KtdpDialect
+  # LowerSpyreIntrinsicCalls reads the `tts.spyre_intrinsic` attribute through
+  # TTSIR's accessors and builds the op it names, a spyreop op, by name.
   # LowerSpyreOps emits spyreop intrinsics -- the one dialect here that is a
   # TARGET rather than a subject.  Its rules match arith and math; it is KTIR ->
   # KTIR and reads no tt op, which is why it is here rather than in Conversion/.
