@@ -161,6 +161,16 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         - arith.addi (i32, inside linalg.generic) → spyreop.addi32toi32
         - arith.addi (i64, inside linalg.generic) → spyreop.addi64toi64
         - arith.muli (i32, inside linalg.generic) → spyreop.muli32toi32
+        - ktdp.gelu  (f16)                         → spyreop.gelu
+
+        That last one is a different FAMILY, not a different tier: ktdp.gelu
+        is a device-neutral request (from `tl.spyre_op("gelu", x)`, via
+        `tts.spyre_op` and [ConvertSpyreOpToKTDP]), not a transparent op the
+        compiler happened to recognize — but by the time it reaches this
+        pass it has scalarized into the same one-operand/one-result shape
+        math.sqrt has (ConvertElementwiseToLinalg already does this for
+        free, since the op's `Elementwise` trait is exactly what that pass
+        looks for), so the same template rule applies unchanged.
 
         Rules, a GROUP to one:
         - arith.cmpf + arith.uitofp     → spyreop.compare, carrying the predicate

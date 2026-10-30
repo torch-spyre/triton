@@ -2106,4 +2106,36 @@ class TritonSemantic(Generic[TensorTy]):
         from triton._C.libtriton import spyre
         spyre.ir_builders.create_pin(self.builder, v.handle, space, off)
         return tl.tensor(None, tl.void)
+
+    def spyre_op(self, op_name, x):
+        """Emit tts.spyre_op -- a request for the device-neutral compute
+        intrinsic `op_name`, carrying no region and no fallback body: the
+        request is 1:1, so there is nothing here to trace, only a name and
+        an operand to check and hand to the builder."""
+        # Restated here, matching tts.spyre_op's own verifier, so a typo or
+        # an unregistered name is reported at the kernel line rather than as
+        # an MLIR verifier failure after tracing -- the same split as
+        # spyre_pin's memory_space check, above, and for the same reason.
+        # Hard-coded, not a table lookup: there is exactly one registered
+        # intrinsic today.
+        name = tl._unwrap_if_constexpr(op_name)
+        if name != "gelu":
+            raise ValueError(
+                f"tl.spyre_op: {name!r} names no registered intrinsic; the "
+                "only one registered today is 'gelu'")
+
+        # gelu's real hardware op (spyreop.gelu) is f16-only -- no f32, no
+        # DF16 at this level either, since DF16 is not a real frontend type
+        # yet.
+        if x.dtype != tl.float16:
+            raise ValueError(
+                f"tl.spyre_op({name!r}, ...): operand must be float16, got "
+                f"{x.dtype}")
+
+        # The builder lives in the Spyre pybind module, not in ir.cc's, same
+        # reason as spyre_tensor_layout/spyre_pin above: the op is in our
+        # dialect and the dependency only points one way.
+        from triton._C.libtriton import spyre
+        handle = spyre.ir_builders.create_spyre_op(self.builder, name, x.handle)
+        return tl.tensor(handle, x.type)
     # --- END --- added for spyre

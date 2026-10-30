@@ -2,6 +2,7 @@
 #define TTS_OPS
 
 include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 include "Dialect/TTS/IR/TTSDialect.td"
 // For TT_TensorDescType. This is the one direction the dependency may point:
 // `tts` names a Triton type, Triton names nothing of ours. TritonTypes.td
@@ -126,6 +127,51 @@ def TTS_PinOp : TTS_Op<"pin", []> {
   );
 
   let assemblyFormat = "$value attr-dict `:` type($value)";
+  let hasVerifier = 1;
+}
+
+def TTS_SpyreOpOp : TTS_Op<"spyre_op", [Pure]> {
+  let summary = "Request one device-neutral compute intrinsic by name";
+
+  let description = [{
+    `tts.spyre_op` is the TTIR-level spelling of `tl.spyre_op(name, x)`: a
+    request that `x` be computed by the device-neutral intrinsic `name`
+    names. Unlike `tts.tensor_layout`/`tts.pin`, it is not a marker -- it
+    has a real result -- but it carries no region and no fallback body: the
+    request is 1:1, nothing about it is ever decomposed or regrouped, so
+    there is nothing to stage beyond the request itself.
+
+    It exists at all, rather than tracing straight to the `ktdp.*` op it
+    becomes, for one concrete reason: `_make_ttir`'s own stage is
+    documented as producing Triton IR, and `MLIR_ENABLE_DUMP`/
+    `TRITON_KERNEL_DUMP` let a user inspect that artifact specifically to
+    see Triton-level IR before any backend-specific lowering. Tracing
+    straight to a `ktdp.*` op would put a KTIR-dialect op in that dump
+    before `_make_ktir` has even run. `tts.spyre_op` keeps that dump
+    honest; `ConvertSpyreOpToKTDP` (in `_make_ktir`'s own pipeline, not at
+    trace time -- see the note on why `tts.pin`'s `memory_space` stays a
+    bare string, above, about the hazard of loading `ktdp` during tracing)
+    is the one place it is ever consumed, immediately, into `ktdp.<name>`.
+
+    `name` is checked against the one intrinsic this proposal supports
+    today ("gelu") by both this op's verifier and the frontend's own check
+    at the kernel line -- a hard-coded check, not a table, since there is
+    only one entry; it generalizes into a real intrinsic table (arity,
+    dtype, result-shape rules) once a second intrinsic exists.
+
+    Example:
+    ```mlir
+      %y = tts.spyre_op "gelu" (%x) : (tensor<128xf16>) -> tensor<128xf16>
+    ```
+  }];
+
+  let arguments = (ins StrAttr:$name, AnyRankedTensor:$input);
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat = [{
+    $name `(` $input `)` attr-dict `:` functional-type($input, $result)
+  }];
+
   let hasVerifier = 1;
 }
 

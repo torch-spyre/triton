@@ -3908,4 +3908,35 @@ def spyre_pin(v, memory_space, offset=None, _semantic=None):
     Only valid on the ``spyre`` backend — raises on any other target.
     """
     return _semantic.spyre_pin(v, memory_space, offset)
+
+
+@builtin
+@requires_backend("spyre")
+def spyre_op(op_name, x, _semantic=None):
+    """(Spyre only) Request the device-neutral compute intrinsic ``op_name``.
+
+    ``tl.spyre_op("gelu", x)`` traces to ``tts.spyre_op "gelu"``, which
+    ``_make_ktir``'s own pipeline converts, immediately, to the
+    device-neutral ``ktdp.gelu`` — the request's identity survives as a
+    real op all the way into the cached ``ktir`` artifact, not as metadata
+    scattered across decomposed generic code. The Spyre backend lowers
+    ``ktdp.gelu`` to the real hardware instruction, ``spyreop.gelu``; a
+    backend with no ``spyreop`` support (``ktir_cpu``) instead decomposes
+    it into a generic reference implementation. Neither lowering is
+    visible to the kernel author or to the other backend.
+
+    Args:
+        op_name: A ``constexpr`` string naming the intrinsic. Only
+                 ``"gelu"`` is registered today — a second intrinsic
+                 generalizes this into a real name-to-op table on both the
+                 frontend and `tts.spyre_op`'s own verifier, rather than
+                 the hard-coded check each has today.
+        x:       The tensor operand. ``"gelu"`` requires ``f16``, matching
+                 the real hardware op's own element-type constraint
+                 exactly (no ``f32``, no ``DF16`` — the latter is not a
+                 real frontend type yet).
+
+    Only valid on the ``spyre`` backend — raises on any other target.
+    """
+    return _semantic.spyre_op(op_name, x)
 # --- END --- added for spyre
