@@ -554,9 +554,10 @@ def MaterializeBaseAddresses
         retypes only !tt.ptr arguments to `index`, so after it runs the `index`
         arguments are exactly the base addresses. An interleaved signature such
         as `(%a: index, %n: i32, %b: index)` therefore assigns the two
-        addresses to %a and %b, never to the i32 runtime scalar %n. Argument
-        names and attributes are already gone by this point (ConvertFunctions
-        clones from the FunctionType), so position is the only available key.
+        addresses to %a and %b, never to the i32 runtime scalar %n. Position
+        is the only available key: the IR carries no parameter names (block
+        arguments are unnamed), and ConvertFunctions builds the func.func from
+        the tt.func's FunctionType alone, so `arg_attrs` does not survive it.
 
         Values are ELEMENT indices, not byte addresses: `$offset` on
         ktdp.construct_memory_view feeds MemRef.base_ptr, which ktir-cpu

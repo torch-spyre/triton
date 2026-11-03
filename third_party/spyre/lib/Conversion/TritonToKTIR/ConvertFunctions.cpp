@@ -206,6 +206,12 @@ private:
 
   /// tt.func -> func.func, preserving the body and the visibility marker.
   ///
+  /// Per-argument and per-result attributes (tt.func's `arg_attrs` and
+  /// `res_attrs`, e.g. `tt.divisibility`) are not copied: the func.func is built
+  /// from the FunctionType alone. Downstream passes therefore cannot key on an
+  /// argument attribute; MaterializeBaseAddresses keys on position instead.
+  /// Block-argument locations do survive, since the entry block is moved intact.
+  ///
   /// Reaches tt.func at any depth, not just the top-level module's direct
   /// children: tt.func only requires a ModuleOp parent, and a nested
   /// builtin.module satisfies that. Enumerating direct children alone would skip
