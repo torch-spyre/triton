@@ -29,9 +29,13 @@
 // `(%a: index, %n: i32, %b: index)` behave correctly — %a and %b get the two
 // addresses, and the i32 runtime scalar %n is never a candidate.
 //
-// Positional keying is the only option available: ConvertFunctions clones the
-// function from its FunctionType and copies only visibility, so argument names
-// and all argument attributes are already gone by the time this pass runs.
+// Positional keying is the only option available. The IR never carries
+// parameter names: block arguments are unnamed (`%p` is only the printer's
+// label), and Triton does not record the Python names anywhere else. Nor do
+// per-argument attributes survive: ConvertFunctions::convertFunctions builds the
+// func.func from the tt.func's FunctionType alone and never copies `arg_attrs`,
+// so per-argument attributes (e.g. `tt.divisibility`) are dropped before this
+// pass runs.
 //
 // Note that the address list is indexed by ordinal `i` among `index` args,
 // while getArgument/eraseArguments take a signature position `pos`. The two
