@@ -203,7 +203,7 @@ func.func @divf_nonsplat_numerator(%t: tensor<2xf16>) -> tensor<2xf16> {
 
 // An unsupported float width has no intrinsic, so BOTH rules decline and the
 // divide flows through to the backend as arith. The only case in this file where
-// no spyreop op appears at all -- see unsupported-types.mlir for the rest.
+// no spyreop op appears at all -- see pass-through.mlir for the rest.
 // CHECK-LABEL:   func.func @divf_f64_declined(
 // CHECK-NOT:       spyreop
 // CHECK:           arith.divf

@@ -7,6 +7,11 @@
 
 // RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | FileCheck %s
 
+// The one-to-one rules: an arith or math op that becomes one spyreop op on its
+// own, with no group. The unary float ops, arith.divf, and the integer add and
+// multiply inside a generic body. reciprocal.mlir holds the divide's numerator
+// cases; pass-through.mlir the types with no intrinsic, which flow through.
+
 // math.sqrt on a scalar f32 operand -> spyreop.sqrt.
 module {
 // CHECK-LABEL:   tt.func @sqrt_f32(

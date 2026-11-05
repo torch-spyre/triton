@@ -40,8 +40,8 @@
 //
 // The compare rule is the opposite case and is NOT covered here: it genuinely
 // needs FuseGenerics, because its group spans two tensor ops and arrives as two
-// generics. test/Transforms/LowerSpyreOps/compare.mlir names that pass in its
-// own RUN line for exactly that reason.
+// generics. test/Transforms/LowerSpyreOps/compare-from-tensor.mlir names that
+// pass in its own RUN line for exactly that reason.
 //
 // The kernel is the smallest thing carrying the shape: a 1-D reciprocal whose
 // numerator is a splat `arith.constant` beside the divide, which is how

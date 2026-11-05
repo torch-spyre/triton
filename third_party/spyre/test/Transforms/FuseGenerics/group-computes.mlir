@@ -6,7 +6,7 @@
 // arith.cmpf read by arith.uitofp (compare-cast) or by arith.select as its
 // condition (compare-select). A producer with another user is fused only when its
 // body is the anchor alone. The edges this pattern declines leave an i1 between
-// generics; those are in boolean-between-generics.mlir.
+// generics; those are in invalid.mlir.
 
 // -----
 

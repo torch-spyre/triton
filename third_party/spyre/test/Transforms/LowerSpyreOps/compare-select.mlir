@@ -1,6 +1,10 @@
-// RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file -verify-diagnostics | FileCheck %s
+// RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | FileCheck %s
 
 // Tests for the rule that turns `arith.cmpf` + `arith.select` into spyreop ops.
+//
+// Every case here lowers, or is left alone with no diagnostic. A compare-select
+// the pass reports instead is in invalid.mlir when the predicate has no device
+// counterpart, and in not-yet-lowered.mlir when a future rule could lower it.
 //
 // Background, in the order the tests need it.
 //
@@ -269,59 +273,6 @@ func.func @nonzero_constant_keeps_its_compare(%m: tensor<8xf32>, %p: tensor<8xf3
 
 // -----
 
-// PURPOSE: one comparison read by both a cast and a select is not lowered.
-//
-// A group takes exactly one reader, so the compare and both readers stay arith
-// and the `i1` is reported. The in-body form of boolean-between-generics.mlir's
-// @both_readers. Pins the decline: one `spyreop.compare` mask could serve both
-// readers, a possible extension noted at SelectCompareGroup.
-#map = affine_map<(d0) -> (d0)>
-func.func @one_compare_two_consumers(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
-  %init = tensor.empty() : tensor<4xf16>
-  %0 = linalg.generic {indexing_maps = [#map, #map, #map],
-                       iterator_types = ["parallel"]}
-      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-  ^bb0(%a: f16, %b: f16, %out: f16):
-    // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{the predicate 'oeq' does have a spyreop.compare counterpart}}
-    %c = arith.cmpf oeq, %a, %b : f16
-    // expected-note @below {{read here, by 'arith.uitofp'}}
-    %f = arith.uitofp %c : i1 to f16
-    // expected-note @below {{read here, by 'arith.select'}}
-    %s = arith.select %c, %f, %b : f16
-    linalg.yield %s : f16
-  } -> tensor<4xf16>
-  return %0 : tensor<4xf16>
-}
-
-// -----
-
-// PURPOSE: one comparison read by two selects is not lowered.
-//
-// A group takes exactly one reader, so the compare and both selects stay arith
-// and the `i1` is reported. Pins the decline: one `spyreop.compare` could feed
-// both `spyreop.select`s, a possible extension noted at SelectCompareGroup.
-#map = affine_map<(d0) -> (d0)>
-func.func @one_compare_two_selects(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
-  %init = tensor.empty() : tensor<4xf16>
-  %0 = linalg.generic {indexing_maps = [#map, #map, #map],
-                       iterator_types = ["parallel"]}
-      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-  ^bb0(%a: f16, %b: f16, %out: f16):
-    // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{but the compare is read by 2 ops, and a compare is lowered only together with exactly one reader}}
-    %c = arith.cmpf ogt, %a, %b : f16
-    // expected-note @below {{read here, by 'arith.select'}}
-    %s0 = arith.select %c, %a, %b : f16
-    // expected-note @below {{read here, by 'arith.select'}}
-    %s1 = arith.select %c, %b, %s0 : f16
-    linalg.yield %s1 : f16
-  } -> tensor<4xf16>
-  return %0 : tensor<4xf16>
-}
-
-// -----
-
 // PURPOSE: a comparison that is also yielded is not lowered.
 //
 // The `linalg.yield` is a reader no shape covers, so the select stays arith and
@@ -375,34 +326,6 @@ func.func @condition_from_outside_is_left_alone(%c: tensor<8xi1>, %p: tensor<8xf
     linalg.yield %s : f32
   } -> tensor<8xf32>
   return %0 : tensor<8xf32>
-}
-
-// -----
-
-// PURPOSE: an integer ternary is refused rather than mislowered.
-//
-// `spyreop.select` exists only for floats, so the rule declines an i32 select.
-// This differs from the previous case:
-//   - previous: the `i1` is a block argument -> quiet decline;
-//   - here: the `i1` is made by an `arith.cmpf` in this body and read in it
-//     -> reported by rejectSurvivingBooleans.
-#map = affine_map<(d0) -> (d0)>
-func.func @integer_values_are_refused(%a: tensor<8xf32>, %b: tensor<8xf32>,
-                                      %p: tensor<8xi32>, %q: tensor<8xi32>) -> tensor<8xi32> {
-  %init = tensor.empty() : tensor<8xi32>
-  %0 = linalg.generic {indexing_maps = [#map, #map, #map, #map, #map],
-                       iterator_types = ["parallel"]}
-      ins(%a, %b, %p, %q : tensor<8xf32>, tensor<8xf32>, tensor<8xi32>, tensor<8xi32>)
-      outs(%init : tensor<8xi32>) {
-  ^bb0(%x: f32, %y: f32, %t: i32, %f: i32, %o: i32):
-    // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{the predicate 'ogt' does have a spyreop.compare counterpart}}
-    %c = arith.cmpf ogt, %x, %y : f32
-    // expected-note @below {{read here, by 'arith.select'}}
-    %s = arith.select %c, %t, %f : i32
-    linalg.yield %s : i32
-  } -> tensor<8xi32>
-  return %0 : tensor<8xi32>
 }
 
 // -----
@@ -774,97 +697,3 @@ func.func @ule_two_inputs_select(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tenso
   return %r : tensor<4xf32>
 }
 
-// -----
-
-// A comparison cannot supply a numeric mask at a different selected width.
-#map = affine_map<(d0) -> (d0)>
-func.func @select_width_mismatch(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tensor<4xf16>, %q: tensor<4xf16>) -> tensor<4xf16> {
-  %init = tensor.empty() : tensor<4xf16>
-  %r = linalg.generic {indexing_maps = [#map, #map, #map, #map, #map], iterator_types = ["parallel"]}
-      ins(%a, %b, %p, %q : tensor<4xf32>, tensor<4xf32>, tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-    ^bb0(%x: f32, %y: f32, %t: f16, %f: f16, %out: f16):
-      // expected-error @below {{an i1 value survives inside a compute body}}
-      // expected-note @below {{the predicate 'oeq' does have a spyreop.compare counterpart}}
-      %c = arith.cmpf oeq, %x, %y : f32
-      // expected-note @below {{read here, by 'arith.select'}}
-      %v = arith.select %c, %t, %f : f16
-      linalg.yield %v : f16
-  } -> tensor<4xf16>
-  return %r : tensor<4xf16>
-}
-
-// -----
-
-// NaN classification has no numeric device comparison counterpart.
-#map = affine_map<(d0) -> (d0)>
-func.func @ord_select_is_refused(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tensor<4xf32>, %q: tensor<4xf32>) -> tensor<4xf32> {
-  %init = tensor.empty() : tensor<4xf32>
-  %r = linalg.generic {indexing_maps = [#map, #map, #map, #map, #map], iterator_types = ["parallel"]}
-      ins(%a, %b, %p, %q : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) outs(%init : tensor<4xf32>) {
-    ^bb0(%x: f32, %y: f32, %t: f32, %f: f32, %out: f32):
-      // expected-error @below {{an i1 value survives inside a compute body}}
-      // expected-note @below {{the predicate 'ord' has no spyreop.compare counterpart}}
-      %c = arith.cmpf ord, %x, %y : f32
-      // expected-note @below {{read here, by 'arith.select'}}
-      %v = arith.select %c, %t, %f : f32
-      linalg.yield %v : f32
-  } -> tensor<4xf32>
-  return %r : tensor<4xf32>
-}
-
-// -----
-
-// NaN classification has no numeric device comparison counterpart.
-#map = affine_map<(d0) -> (d0)>
-func.func @uno_select_is_refused(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tensor<4xf32>, %q: tensor<4xf32>) -> tensor<4xf32> {
-  %init = tensor.empty() : tensor<4xf32>
-  %r = linalg.generic {indexing_maps = [#map, #map, #map, #map, #map], iterator_types = ["parallel"]}
-      ins(%a, %b, %p, %q : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) outs(%init : tensor<4xf32>) {
-    ^bb0(%x: f32, %y: f32, %t: f32, %f: f32, %out: f32):
-      // expected-error @below {{an i1 value survives inside a compute body}}
-      // expected-note @below {{the predicate 'uno' has no spyreop.compare counterpart}}
-      %c = arith.cmpf uno, %x, %y : f32
-      // expected-note @below {{read here, by 'arith.select'}}
-      %v = arith.select %c, %t, %f : f32
-      linalg.yield %v : f32
-  } -> tensor<4xf32>
-  return %r : tensor<4xf32>
-}
-
-// -----
-
-// Constant predicates left in a body have no device comparison counterpart.
-#map = affine_map<(d0) -> (d0)>
-func.func @false_select_is_refused(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tensor<4xf32>, %q: tensor<4xf32>) -> tensor<4xf32> {
-  %init = tensor.empty() : tensor<4xf32>
-  %r = linalg.generic {indexing_maps = [#map, #map, #map, #map, #map], iterator_types = ["parallel"]}
-      ins(%a, %b, %p, %q : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) outs(%init : tensor<4xf32>) {
-    ^bb0(%x: f32, %y: f32, %t: f32, %f: f32, %out: f32):
-      // expected-error @below {{an i1 value survives inside a compute body}}
-      // expected-note @below {{the predicate 'false' has no spyreop.compare counterpart}}
-      %c = arith.cmpf false, %x, %y : f32
-      // expected-note @below {{read here, by 'arith.select'}}
-      %v = arith.select %c, %t, %f : f32
-      linalg.yield %v : f32
-  } -> tensor<4xf32>
-  return %r : tensor<4xf32>
-}
-
-// -----
-
-// Constant predicates left in a body have no device comparison counterpart.
-#map = affine_map<(d0) -> (d0)>
-func.func @true_select_is_refused(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tensor<4xf32>, %q: tensor<4xf32>) -> tensor<4xf32> {
-  %init = tensor.empty() : tensor<4xf32>
-  %r = linalg.generic {indexing_maps = [#map, #map, #map, #map, #map], iterator_types = ["parallel"]}
-      ins(%a, %b, %p, %q : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) outs(%init : tensor<4xf32>) {
-    ^bb0(%x: f32, %y: f32, %t: f32, %f: f32, %out: f32):
-      // expected-error @below {{an i1 value survives inside a compute body}}
-      // expected-note @below {{the predicate 'true' has no spyreop.compare counterpart}}
-      %c = arith.cmpf true, %x, %y : f32
-      // expected-note @below {{read here, by 'arith.select'}}
-      %v = arith.select %c, %t, %f : f32
-      linalg.yield %v : f32
-  } -> tensor<4xf32>
-  return %r : tensor<4xf32>
-}

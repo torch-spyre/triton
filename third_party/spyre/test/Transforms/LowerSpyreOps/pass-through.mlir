@@ -10,7 +10,8 @@
 // that had to agree about the device's op set.
 //
 // So these cases are not "invalid" inputs. They are inputs this pass has nothing
-// to say about, and the test is that it says nothing.
+// to say about, and the test is that it says nothing. What the pass does report,
+// an `i1` left in a body, is in invalid.mlir and not-yet-lowered.mlir.
 
 // CHECK-LABEL:   tt.func @sqrt_f64(
 // CHECK-NOT:       spyreop
