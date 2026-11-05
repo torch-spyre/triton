@@ -2,8 +2,9 @@
 
 // After CanonicalizeGenericOperands and FuseGenerics,
 // RewriteDescriptorLayoutGeneric rewrites every annotated descriptor and
-// refuses nothing. Both inputs
-// are the pass input of a device fixture, verbatim.
+// refuses nothing. The first two inputs are the pass input of a device
+// fixture, verbatim; the last two hold a reshape ReshapeToGeneric leaves a
+// tensor op.
 
 // An annotated statistic chain, the `reduce__stat_chain_off_stick` shape. The
 // broadcast generic in front of the subtract is absorbed into its operand map,
@@ -132,6 +133,89 @@ module {
     %34 = arith.index_cast %8 : i32 to index
     %35 = ktdp.construct_access_tile %7[%34] {access_tile_order = #map, access_tile_set = #set} : memref<128xf16> -> !ktdp.access_tile<128xindex>
     ktdp.store %33, %35 : tensor<128xf16>, <128xindex>
+    return
+  }
+}
+
+// -----
+
+// A projected reshape with a user that is not a linalg.generic ins, a store,
+// on an operand with no layout. ReshapeToGeneric leaves it a tensor op, so the
+// generic reads it as a tensor.expand_shape result. The layout pass restates the
+// generic over %a's split and leaves the reshape and its store as they are: the
+// reshape reads loop dim 0, which no layout splits.
+//
+// CHECK-LABEL: func.func @reshape_with_a_store_user
+// CHECK:         %[[EXP:.*]] = tensor.expand_shape %{{.*}} {{\[\[}}0, 1]] output_shape [64, 1] : tensor<64xf16> into tensor<64x1xf16>
+// CHECK:         ktdp.store %[[EXP]], %{{.*}} : tensor<64x1xf16>, <64x1xindex>
+// CHECK:         linalg.generic {indexing_maps = [#map, #map3, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%{{.*}}, %[[EXP]] : tensor<2x64x64xf16>, tensor<64x1xf16>)
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#row = affine_map<(d0, d1) -> (d0, 0)>
+#rowl = affine_map<(d0, d1) -> (d0)>
+#map2 = affine_map<(d0) -> (d0)>
+#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#set64 = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+#setc = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 == 0)>
+#set88 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 7 >= 0)>
+module {
+  func.func @reshape_with_a_store_user(%arg0: index, %arg1: index, %arg2: index, %arg3: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %0 = ktdp.construct_memory_view %arg0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>, tts.tensor_layout = {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>}} : memref<64x128xf16>
+    %1 = ktdp.construct_memory_view %arg1, sizes: [64], strides: [1] {coordinate_set = #set64, memory_space = #ktdp.memory_space<global>} : memref<64xf16>
+    %2 = ktdp.construct_memory_view %arg2, sizes: [64, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>, tts.tensor_layout = {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>}} : memref<64x128xf16>
+    %3 = ktdp.construct_memory_view %arg3, sizes: [64, 1], strides: [1, 1] {coordinate_set = #setc, memory_space = #ktdp.memory_space<global>} : memref<64x1xf16>
+    %4 = ktdp.construct_access_tile %0[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+    %5 = ktdp.load %4 : <64x128xindex> -> tensor<64x128xf16>
+    %6 = ktdp.construct_access_tile %1[%c0] {access_tile_order = #map2, access_tile_set = #set64} : memref<64xf16> -> !ktdp.access_tile<64xindex>
+    %7 = ktdp.load %6 : <64xindex> -> tensor<64xf16>
+    %8 = tensor.expand_shape %7 [[0, 1]] output_shape [64, 1] : tensor<64xf16> into tensor<64x1xf16>
+    %9 = ktdp.construct_access_tile %3[%c0, %c0] {access_tile_order = #map, access_tile_set = #setc} : memref<64x1xf16> -> !ktdp.access_tile<64x1xindex>
+    ktdp.store %8, %9 : tensor<64x1xf16>, <64x1xindex>
+    %10 = tensor.empty() : tensor<64x128xf16>
+    %11 = linalg.generic {indexing_maps = [#map, #row, #map], iterator_types = ["parallel", "parallel"]} ins(%5, %8 : tensor<64x128xf16>, tensor<64x1xf16>) outs(%10 : tensor<64x128xf16>) {
+    ^bb0(%in: f16, %in_0: f16, %out: f16):
+      %13 = arith.subf %in, %in_0 : f16
+      linalg.yield %13 : f16
+    } -> tensor<64x128xf16>
+    %12 = ktdp.construct_access_tile %2[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+    ktdp.store %11, %12 : tensor<64x128xf16>, <64x128xindex>
+    return
+  }
+}
+
+// -----
+
+// A linearizing reshape, `[32,2] -> [64]`, read along loop dim 0, which no
+// layout splits. ReshapeToGeneric leaves it a tensor op. The layout pass
+// restates the generic over %a's split of loop dim 1 and reads the reshape at
+// the dim that stays logical.
+//
+// CHECK-LABEL: func.func @linearizing_reshape_along_unsplit_dim
+// CHECK:         %[[COL:.*]] = tensor.collapse_shape %{{.*}} {{\[\[}}0, 1]] : tensor<32x2xf16> into tensor<64xf16>
+// CHECK:         linalg.generic {indexing_maps = [#map, #map2, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%{{.*}}, %[[COL]] : tensor<2x64x64xf16>, tensor<64xf16>)
+#map = affine_map<(d0, d1) -> (d0, d1)>
+#rowl = affine_map<(d0, d1) -> (d0)>
+#set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#set2 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 1 >= 0)>
+module {
+  func.func @linearizing_reshape_along_unsplit_dim(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %0 = ktdp.construct_memory_view %arg0, sizes: [64, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>, tts.tensor_layout = {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>}} : memref<64x128xf16>
+    %1 = ktdp.construct_memory_view %arg1, sizes: [32, 2], strides: [2, 1] {coordinate_set = #set2, memory_space = #ktdp.memory_space<global>} : memref<32x2xf16>
+    %2 = ktdp.construct_memory_view %arg2, sizes: [64, 128], strides: [128, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>, tts.tensor_layout = {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>}} : memref<64x128xf16>
+    %3 = ktdp.construct_access_tile %0[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+    %4 = ktdp.load %3 : <64x128xindex> -> tensor<64x128xf16>
+    %5 = ktdp.construct_access_tile %1[%c0, %c0] {access_tile_order = #map, access_tile_set = #set2} : memref<32x2xf16> -> !ktdp.access_tile<32x2xindex>
+    %6 = ktdp.load %5 : <32x2xindex> -> tensor<32x2xf16>
+    %7 = tensor.collapse_shape %6 [[0, 1]] : tensor<32x2xf16> into tensor<64xf16>
+    %8 = tensor.empty() : tensor<64x128xf16>
+    %9 = linalg.generic {indexing_maps = [#map, #rowl, #map], iterator_types = ["parallel", "parallel"]} ins(%4, %7 : tensor<64x128xf16>, tensor<64xf16>) outs(%8 : tensor<64x128xf16>) {
+    ^bb0(%in: f16, %in_0: f16, %out: f16):
+      %11 = arith.subf %in, %in_0 : f16
+      linalg.yield %11 : f16
+    } -> tensor<64x128xf16>
+    %10 = ktdp.construct_access_tile %2[%c0, %c0] {access_tile_order = #map, access_tile_set = #set} : memref<64x128xf16> -> !ktdp.access_tile<64x128xindex>
+    ktdp.store %9, %10 : tensor<64x128xf16>, <64x128xindex>
     return
   }
 }
