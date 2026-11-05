@@ -3,10 +3,11 @@
 // A prefix of its own, with nothing but NOT directives, so it scans the whole
 // output rather than the span between two positive checks.
 // RUN: spyre-triton-opt %s --spyre-ttir-to-ktir --spyre-prepare-spyrecode | FileCheck %s --check-prefix=NOIMM
-// The same stage with FuseComputeAndDataMovement taken OUT of it, spelled as the
-// stage's pass list minus that one pass since a registered pipeline cannot have a
-// pass removed from the CLI. It is checked with the same prefixes as the full
-// stage, which is the claim: removing that pass changes nothing here.
+// The same stage with CanonicalizeGenericOperands and FuseGenerics taken OUT of
+// it, spelled as the stage's pass list minus those two passes since a registered
+// pipeline cannot have a pass removed from the CLI. It is checked with the same
+// prefixes as the full stage, which is the claim: removing them changes nothing
+// here.
 // RUN: spyre-triton-opt %s --spyre-ttir-to-ktir | spyre-triton-opt --normalize-for-device --drop-reduction-init-fill --convert-elementwise-to-linalg --linalg-generalize-named-ops --unalias-linalg-outs --lower-spyre-ops | FileCheck %s --check-prefix=PHYS
 // RUN: spyre-triton-opt %s --spyre-ttir-to-ktir | spyre-triton-opt --normalize-for-device --drop-reduction-init-fill --convert-elementwise-to-linalg --linalg-generalize-named-ops --unalias-linalg-outs --lower-spyre-ops | FileCheck %s --check-prefix=NOIMM
 
@@ -26,18 +27,20 @@
 // failure. `reduce/softmax_on_stick` is the kernel that depends on it; this file is
 // the same claim at a size a lit test can read.
 //
-// THE LAST TWO RUN LINES ARE THE INTERESTING ONES. They assert a NON-dependency,
-// and only for this rule: the reciprocal reads its numerator through the generic's
-// body, so a splat `ins` and a folded-in scalar constant answer the same question,
-// and dropping FuseComputeAndDataMovement leaves the result identical. Matching on the body
-// value instead would make that pass load-bearing here -- it is the only thing in
-// the pipeline that folds a splat constant into a body -- and the failure would
-// surface as a numerical answer rather than as a diff. The two prefixes are reused
-// rather than given negated twins precisely so the two spellings cannot drift.
+// THE LAST TWO RUN LINES ARE THE INTERESTING ONES. They assert a
+// NON-dependency, and only for this rule: the reciprocal reads its numerator
+// through the generic's body, so a splat `ins` and a folded-in scalar constant
+// answer the same question, and dropping CanonicalizeGenericOperands leaves the
+// result identical. Matching on the body value instead would make that pass
+// load-bearing here -- its SplatOperandToScalar is the only thing in the
+// pipeline that folds a splat constant into a body -- and the failure would
+// surface as a numerical answer rather than as a diff. The two prefixes are
+// reused rather than given negated twins precisely so the two spellings cannot
+// drift.
 //
 // The compare rule is the opposite case and is NOT covered here: it genuinely
-// needs FuseComputeAndDataMovement, because its group spans two tensor ops and arrives as
-// two generics. test/Transforms/LowerSpyreOps/compare.mlir names that pass in its
+// needs FuseGenerics, because its group spans two tensor ops and arrives as two
+// generics. test/Transforms/LowerSpyreOps/compare.mlir names that pass in its
 // own RUN line for exactly that reason.
 //
 // The kernel is the smallest thing carrying the shape: a 1-D reciprocal whose

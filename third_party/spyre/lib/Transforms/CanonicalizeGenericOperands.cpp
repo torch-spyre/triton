@@ -1,0 +1,263 @@
+//===- CanonicalizeGenericOperands.cpp - Generic operands in generic terms ===//
+//
+// States two kinds of linalg.generic operand in the generic's own terms, so
+// that FuseGenerics, after it, only meets generics as producers. One generic in,
+// one generic out, or a reshape replaced by a generic: nothing is fused here.
+//
+//   ReshapeToGeneric       a static tensor.collapse_shape / tensor.expand_shape
+//                          whose every user is a generic `ins`, and whose
+//                          result -> source map is projected, becomes one
+//                          forwarding generic with that map as its input map
+//   SplatOperandToScalar   a splat dense constant `ins` becomes a scalar
+//                          arith.constant read in the body
+//
+// HOW TO ADD A PATTERN. A pattern is rooted on, and matches, one kind of
+// PRODUCER: the op that defines the operand. Never the operand's type, nor
+// anything downstream of the generic. A new pattern names a producer kind no
+// existing pattern matches; one whose kind overlaps an existing pattern's is a
+// new case of that pattern. Its lit file feeds it the other patterns'
+// producers and checks that it does not fire.
+//
+// `--debug-only=canonicalize-generic-operands` traces each rewrite and each
+// reshape left alone, with the reason.
+//
+//===----------------------------------------------------------------------===//
+
+#include "Transforms/Passes.h"
+#include "Utils/GenericOperands.h"
+
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+
+#define DEBUG_TYPE "canonicalize-generic-operands"
+
+using namespace mlir;
+
+namespace mlir::triton::spyre {
+#define GEN_PASS_DEF_CANONICALIZEGENERICOPERANDS
+#include "Transforms/Passes.h.inc"
+} // namespace mlir::triton::spyre
+
+namespace {
+
+//===----------------------------------------------------------------------===//
+// ReshapeToGeneric
+//===----------------------------------------------------------------------===//
+
+/// The dims of `group` whose extent in `shape` is not 1.
+SmallVector<int64_t> nonUnitDims(ArrayRef<int64_t> shape,
+                                 ArrayRef<int64_t> group) {
+  SmallVector<int64_t> out;
+  for (int64_t d : group)
+    if (shape[d] != 1)
+      out.push_back(d);
+  return out;
+}
+
+/// The result -> source map of a static tensor.collapse_shape, or failure when
+/// a reassociation group merges more than one non-unit source dim. Each group
+/// lists the source dims one result dim merged: its one non-unit dim reads that
+/// result dim, and every other source dim, including one in no group (a rank-0
+/// result), reads 0. For example `[64,1] -> [64]` gives `(d0) -> (d0, 0)` and
+/// `[1,1] -> []` gives `() -> (0, 0)`.
+FailureOr<AffineMap> collapseResultToSource(tensor::CollapseShapeOp op) {
+  MLIRContext *ctx = op.getContext();
+  ArrayRef<int64_t> srcShape = op.getSrcType().getShape();
+  SmallVector<AffineExpr> results(srcShape.size(),
+                                  getAffineConstantExpr(0, ctx));
+  for (auto [g, group] : llvm::enumerate(op.getReassociationIndices())) {
+    SmallVector<int64_t> nonUnit = nonUnitDims(srcShape, group);
+    if (nonUnit.size() > 1)
+      return failure();
+    if (!nonUnit.empty())
+      results[nonUnit.front()] = getAffineDimExpr(g, ctx);
+  }
+  return AffineMap::get(op.getResultType().getRank(), /*symbolCount=*/0,
+                        results, ctx);
+}
+
+/// The result -> source map of a static tensor.expand_shape, or failure when a
+/// reassociation group splits a source dim into more than one non-unit result
+/// dim. Each group lists the result dims one source dim was split into: the
+/// source dim reads its one non-unit result dim, or 0 when there is none. For
+/// example `[4] -> [4,1]` gives `(d0, d1) -> (d0)` and `[] -> [1]` gives
+/// `(d0) -> ()`.
+FailureOr<AffineMap> expandResultToSource(tensor::ExpandShapeOp op) {
+  MLIRContext *ctx = op.getContext();
+  ArrayRef<int64_t> resultShape = op.getResultType().getShape();
+  SmallVector<AffineExpr> results;
+  for (ArrayRef<int64_t> group : op.getReassociationIndices()) {
+    SmallVector<int64_t> nonUnit = nonUnitDims(resultShape, group);
+    if (nonUnit.size() > 1)
+      return failure();
+    results.push_back(nonUnit.empty()
+                          ? getAffineConstantExpr(0, ctx)
+                          : getAffineDimExpr(nonUnit.front(), ctx));
+  }
+  return AffineMap::get(resultShape.size(), /*symbolCount=*/0, results, ctx);
+}
+
+/// Replaces a reshape that feeds only generics with a forwarding generic.
+///
+/// Before:
+///
+///   %c = tensor.collapse_shape %s [[0, 1]] : tensor<64x1xf16> into tensor<64xf16>
+///
+/// After:
+///
+///   %c = linalg.generic {indexing_maps = [(d0) -> (d0, 0), (d0) -> (d0)],
+///                        iterator_types = ["parallel"]}
+///          ins(%s : tensor<64x1xf16>) outs(%e : tensor<64xf16>) {
+///     ^bb0(%in: f16, %out: f16): linalg.yield %in : f16 }
+///
+/// Conditions, for a tensor.collapse_shape or tensor.expand_shape:
+///
+///   - every extent of its source and result is static;
+///   - it has at least one user, and every user is an `ins` operand of a
+///     linalg.generic;
+///   - no reassociation group has more than one non-unit dim, so its
+///     result -> source map has every result a bare dim or a constant.
+///
+/// Rewrite: a tensor.empty of the result's shape and one all-parallel
+/// linalg.generic over it, reading the source under the result -> source map,
+/// writing the result under the identity, and yielding its input.
+template <typename ReshapeOp>
+struct ReshapeToGeneric : OpRewritePattern<ReshapeOp> {
+  using OpRewritePattern<ReshapeOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ReshapeOp op,
+                                PatternRewriter &rewriter) const override {
+    auto leave = [&](const char *why) {
+      LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] ReshapeToGeneric: left "
+                              << op->getName() << " at " << op->getLoc()
+                              << ": " << why << "\n");
+      return failure();
+    };
+    RankedTensorType srcType = op.getSrcType();
+    RankedTensorType resultType = op.getResultType();
+    if (!srcType.hasStaticShape() || !resultType.hasStaticShape())
+      return leave("a dynamic extent");
+    if (op->use_empty())
+      return leave("it has no users");
+    for (OpOperand &use : op->getUses()) {
+      auto generic = dyn_cast<linalg::GenericOp>(use.getOwner());
+      if (!generic || !generic.isDpsInput(&use))
+        return leave("a user is not a linalg.generic ins");
+    }
+
+    FailureOr<AffineMap> resultToSource;
+    if constexpr (std::is_same_v<ReshapeOp, tensor::CollapseShapeOp>)
+      resultToSource = collapseResultToSource(op);
+    else
+      resultToSource = expandResultToSource(op);
+    if (failed(resultToSource))
+      return leave("a linearizing reshape: a group has more than one non-unit "
+                   "dim");
+    unsigned rank = resultType.getRank();
+    SmallVector<AffineMap> maps = {
+        *resultToSource,
+        AffineMap::getMultiDimIdentityMap(rank, op.getContext())};
+    SmallVector<utils::IteratorType> iterators(rank,
+                                               utils::IteratorType::parallel);
+
+    Location loc = op.getLoc();
+    Value init = tensor::EmptyOp::create(rewriter, loc, resultType.getShape(),
+                                         resultType.getElementType());
+    auto generic = linalg::GenericOp::create(
+        rewriter, loc, resultType, ValueRange{op.getSrc()}, ValueRange{init},
+        maps, iterators, [](OpBuilder &b, Location l, ValueRange args) {
+          linalg::YieldOp::create(b, l, args[0]);
+        });
+    LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] ReshapeToGeneric: "
+                            << op->getName() << " at " << loc
+                            << " -> forwarding generic, input map "
+                            << *resultToSource << "\n");
+    rewriter.replaceOp(op, generic->getResults());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// SplatOperandToScalar
+//===----------------------------------------------------------------------===//
+
+/// Replaces a splat constant `ins` operand of a generic with a scalar constant
+/// read in the body.
+///
+/// Before:
+///
+///   %z = arith.constant dense<0.0> : tensor<64xf16>
+///   %r = linalg.generic ... ins(%m, %z : tensor<64xf16>, tensor<64xf16>) {
+///     ^bb0(%a: f16, %b: f16, %o: f16):
+///       %0 = arith.cmpf une, %a, %b : f16 ... }
+///
+/// After:
+///
+///   %cst = arith.constant 0.0 : f16
+///   %r = linalg.generic ... ins(%m : tensor<64xf16>) {
+///     ^bb0(%a: f16, %o: f16):
+///       %0 = arith.cmpf une, %a, %cst : f16 ... }
+///
+/// Conditions, for an `ins` operand of a linalg.generic with tensor semantics:
+///
+///   - it is defined by an arith.constant of a splat dense int-or-float tensor;
+///   - once its map is removed, every loop dim is still named by some operand
+///     map.
+///
+/// Rewrite: foldSplatConstantOperand, which builds the scalar arith.constant
+/// above the generic and erases the operand, its map and its block argument.
+struct SplatOperandToScalar : OpRewritePattern<linalg::GenericOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!op.hasPureTensorSemantics())
+      return failure();
+    for (OpOperand *operand : op.getDpsInputOperands()) {
+      unsigned number = operand->getOperandNumber();
+      if (succeeded(
+              triton::spyre::foldSplatConstantOperand(rewriter, op, operand))) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[" DEBUG_TYPE "] SplatOperandToScalar: operand "
+                   << number << " of generic at " << op.getLoc()
+                   << " -> a scalar in the body\n");
+        return success();
+      }
+    }
+    return failure();
+  }
+};
+
+struct CanonicalizeGenericOperandsPass
+    : public mlir::triton::spyre::impl::CanonicalizeGenericOperandsBase<
+          CanonicalizeGenericOperandsPass> {
+  void runOnOperation() override {
+    MLIRContext *ctx = &getContext();
+    RewritePatternSet patterns(ctx);
+    patterns.add<ReshapeToGeneric<tensor::CollapseShapeOp>,
+                 ReshapeToGeneric<tensor::ExpandShapeOp>, SplatOperandToScalar>(
+        ctx);
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
+      signalPassFailure();
+  }
+};
+
+} // namespace
+
+namespace mlir::triton::spyre {
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createCanonicalizeGenericOperandsPass() {
+  return std::make_unique<CanonicalizeGenericOperandsPass>();
+}
+
+} // namespace mlir::triton::spyre
