@@ -12,8 +12,9 @@
 //
 // EVERY CASE HERE IS HAND-BUILT INTO ONE BODY, so what is under test is a rule's
 // own decision rather than whether fusion happened. compare-from-tensor.mlir drives
-// the shape the pipeline actually produces; compare-invalid.mlir holds every way of
-// failing to select the pair, each of which leaves an `i1` behind and is refused.
+// the shape the pipeline actually produces. Every way of failing to select the
+// pair leaves an `i1` behind and is refused: invalid.mlir holds the ones that can
+// never lower, and not-yet-lowered.mlir the ones a future rule could lower.
 
 //===----------------------------------------------------------------------===//
 // Single-body inputs: one decision per case, fusion taken as read

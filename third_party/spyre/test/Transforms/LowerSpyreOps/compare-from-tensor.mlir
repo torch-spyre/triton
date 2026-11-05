@@ -24,8 +24,9 @@
 // out" and a -NOT directive asserting that cannot be scoped to one module in a
 // -split-input-file run: it would scan on into the next.
 //
-// compare.mlir hand-builds the fused body instead, isolating each rule decision
-// from whether fusion happened; compare-invalid.mlir holds the refusals.
+// compare-cast.mlir hand-builds the fused body instead, isolating each rule
+// decision from whether fusion happened; invalid.mlir and not-yet-lowered.mlir
+// hold the refusals.
 
 // Two tensor ops, and therefore two generics with a `tensor<4xi1>` between them
 // until the fusion pass fuses across the `i1`. Out comes ONE generic holding one
