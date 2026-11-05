@@ -25,11 +25,9 @@
 // the consumer's operand list as it would be after the rewrite, before mutating
 // anything (checkOperandRewrite):
 //
+//   - every result of every operand map is a bare dim or a constant;
 //   - every loop dim of the consumer is named by some operand map;
 //   - no value is both an `ins` and an `outs` of the consumer.
-//
-// Every producer map has every result a bare dim or a constant, and composing
-// such maps through a permutation keeps that, so no map is checked for it.
 //
 // HOW TO ADD A PATTERN. A pattern matches on its PRODUCER'S KIND: the op that
 // defines the operand, or what the producer's body computes for it. Never on
@@ -159,6 +157,8 @@ void traceSkip(StringRef pattern, OpOperand *operand, const llvm::Twine &why) {
 ///   - `P` yields, for `r`, one of its own `ins` block arguments, `x`;
 ///   - `P` has no reduction loop;
 ///   - `P`'s indexing map for `r`, `R`, is a permutation;
+///   - after the rewrite, every result of every operand map is a bare dim or
+///     a constant;
 ///   - after the rewrite, every loop dim of the consumer is named by some
 ///     operand map;
 ///   - after the rewrite, no value is both an `ins` and an `outs` of the
@@ -275,6 +275,8 @@ struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
 ///     (matchLowerableGroup);
 ///   - when `P` has a user other than the consumer, every non-terminator op in
 ///     `P`'s body is one of the producer ops the group consumes;
+///   - after the rewrite, every result of every operand map is a bare dim or
+///     a constant;
 ///   - after the rewrite, every loop dim of the consumer is named by some
 ///     operand map;
 ///   - after the rewrite, no value is both an `ins` and an `outs` of the

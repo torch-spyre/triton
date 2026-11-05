@@ -7,7 +7,8 @@
 // collapse_shape and expand_shape, and a tensor op for a linearizing one. The
 // declines are: the producer has a reduction loop; a loop dim of the consumer
 // is named by no operand map; a value would be both an ins and an outs of the
-// consumer; a non-permutation result map; and the other pattern's producers (a
+// consumer; a non-permutation result map; a composed map with a result that is
+// neither a bare dim nor a constant; and the other pattern's producers (a
 // generic yielding an op result, a tensor op).
 
 // -----
@@ -1024,6 +1025,59 @@ func.func @no_fuse_two_computes(%x: tensor<64x128xf16>, %y: tensor<64x128xf16>)
     } ins(%p, %y : tensor<64x128xf16>, tensor<64x128xf16>) outs(%o : tensor<64x128xf16>) {
   ^bb0(%a: f16, %b: f16, %out: f16):
     %v = arith.mulf %a, %b : f16
+    linalg.yield %v : f16
+  } -> tensor<64x128xf16>
+  return %r : tensor<64x128xf16>
+}
+}
+
+// -----
+
+// CHECK: #[[$ATTR_52:.+]] = affine_map<(d0) -> (d0 floordiv 2, d0 mod 2)>
+// CHECK: #[[$ATTR_53:.+]] = affine_map<(d0) -> (d0)>
+// CHECK: #[[$ATTR_54:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK: #[[$ATTR_55:.+]] = affine_map<(d0, d1) -> (d1)>
+
+// A forwarding generic whose input map is linearizing, written by hand:
+// CanonicalizeGenericOperands leaves a linearizing reshape a tensor op. The
+// composed map, (d0, d1) -> (d1 floordiv 2, d1 mod 2), has results that are
+// neither a bare dim nor a constant, so the producer stays.
+module {
+// CHECK-LABEL:   func.func @linearizing_forwarding_generic(
+// CHECK-SAME:  %[[VAL_0:.*]]: tensor<64x128xf16>, %[[VAL_1:.*]]: tensor<64x2xf16>) -> tensor<64x128xf16> {
+// CHECK:           %[[VAL_2:.*]] = tensor.empty() : tensor<128xf16>
+// CHECK:           %[[VAL_3:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_52]], #[[$ATTR_53]]], iterator_types = ["parallel"]} ins(%[[VAL_1]] : tensor<64x2xf16>) outs(%[[VAL_2]] : tensor<128xf16>) {
+// CHECK:           ^bb0(%[[VAL_4:.*]]: f16, %[[VAL_5:.*]]: f16):
+// CHECK:             linalg.yield %[[VAL_4]] : f16
+// CHECK:           } -> tensor<128xf16>
+// CHECK:           %[[VAL_6:.*]] = tensor.empty() : tensor<64x128xf16>
+// CHECK:           %[[VAL_7:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_54]], #[[$ATTR_55]], #[[$ATTR_54]]], iterator_types = ["parallel", "parallel"]} ins(%[[VAL_0]], %[[VAL_3]] : tensor<64x128xf16>, tensor<128xf16>) outs(%[[VAL_6]] : tensor<64x128xf16>) {
+// CHECK:           ^bb0(%[[VAL_8:.*]]: f16, %[[VAL_9:.*]]: f16, %[[VAL_10:.*]]: f16):
+// CHECK:             %[[VAL_11:.*]] = arith.subf %[[VAL_8]], %[[VAL_9]] : f16
+// CHECK:             linalg.yield %[[VAL_11]] : f16
+// CHECK:           } -> tensor<64x128xf16>
+// CHECK:           return %[[VAL_7]] : tensor<64x128xf16>
+// CHECK:         }
+func.func @linearizing_forwarding_generic(%x: tensor<64x128xf16>, %s: tensor<64x2xf16>)
+    -> tensor<64x128xf16> {
+  %e1 = tensor.empty() : tensor<128xf16>
+  %f = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0 floordiv 2, d0 mod 2)>,
+                       affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]
+    } ins(%s : tensor<64x2xf16>) outs(%e1 : tensor<128xf16>) {
+  ^bb0(%in: f16, %out: f16):
+    linalg.yield %in : f16
+  } -> tensor<128xf16>
+  %e = tensor.empty() : tensor<64x128xf16>
+  %r = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                       affine_map<(d0, d1) -> (d1)>,
+                       affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%x, %f : tensor<64x128xf16>, tensor<128xf16>) outs(%e : tensor<64x128xf16>) {
+  ^bb0(%a: f16, %b: f16, %out: f16):
+    %v = arith.subf %a, %b : f16
     linalg.yield %v : f16
   } -> tensor<64x128xf16>
   return %r : tensor<64x128xf16>

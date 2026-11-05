@@ -404,10 +404,9 @@ def CanonicalizeGenericOperands
             `ins`.
 
         Nothing is fused. Every forwarding generic this pass emits has
-        projected maps, so FuseGenerics, which composes them through a
-        permutation, only ever composes projected maps. A linearizing reshape
-        stays a tensor op and reaches RewriteDescriptorLayoutGeneric as one,
-        which refuses it on a physicalized path.
+        projected maps. A linearizing reshape stays a tensor op and reaches
+        RewriteDescriptorLayoutGeneric as one, which refuses it on a
+        physicalized path.
 
         HOW TO ADD A PATTERN: a pattern is rooted on, and matches, one kind of
         producer — the op that defines the operand — never the operand's type,
@@ -486,13 +485,10 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         check the consumer's operand list as it would be after the rewrite,
         before mutating anything (`checkOperandRewrite`,
         Utils/GenericOperands), and decline when:
+          - an operand map has a result that is neither a bare dim nor a
+            constant;
           - a loop dim of the consumer is named by no operand map;
           - a value would be both an `ins` and an `outs` of the consumer.
-        No map is checked for being projected (every result a bare dim or a
-        constant). Every generic reaching this pass has projected maps, since
-        CanonicalizeGenericOperands emits a forwarding generic only for a
-        reshape with a projected map, and composing projected maps through a
-        permutation keeps every result a bare dim or a constant.
 
         Anything else is left alone: two computes that form no group, a
         reduction producer, an `outs` operand, any tensor op.

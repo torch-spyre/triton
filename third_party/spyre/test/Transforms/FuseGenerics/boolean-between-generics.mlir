@@ -11,8 +11,9 @@
 //   2c  the producer has another user and its body is more than the anchor
 //   and a reader that forms no group with a compare: a width mismatch, a
 //   predicate with no spyreop.compare counterpart, arith.sitofp; readers that
-//   form two different shapes, which no one shape covers; and a value that
-//   would be both an ins and an outs of the consumer.
+//   form two different shapes, which no one shape covers; a value that would
+//   be both an ins and an outs of the consumer; and a fused map with a result
+//   that is neither a bare dim nor a constant.
 
 // 2a: the producer yields an arith.andi of two compares, which forms no group.
 func.func @andi_chain(%x: tensor<8xf16>, %y: tensor<8xf16>, %p: tensor<8xf16>, %q: tensor<8xf16>) -> tensor<8xf16> {
@@ -227,4 +228,30 @@ func.func @d4_fusion(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
     linalg.yield %f : f16
   } -> tensor<8xf16>
   return %r : tensor<8xf16>
+}
+
+// -----
+
+// The producer reads an input under a linearizing map, written by hand:
+// CanonicalizeGenericOperands leaves a linearizing reshape a tensor op. The
+// fused op's map for that input, (d0) -> (d0 floordiv 2, d0 mod 2), has
+// results that are neither a bare dim nor a constant.
+func.func @linearizing_producer_input(%s: tensor<64x2xf16>, %t: tensor<128xf16>) -> tensor<128xf16> {
+  %e1 = tensor.empty() : tensor<128xi1>
+  %c = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0 floordiv 2, d0 mod 2)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%s, %t : tensor<64x2xf16>, tensor<128xf16>) outs(%e1 : tensor<128xi1>) {
+  ^bb0(%a: f16, %b: f16, %out: i1):
+    // expected-note @below {{made here, by 'arith.cmpf'}}
+    %v = arith.cmpf ogt, %a, %b : f16
+    linalg.yield %v : i1
+  } -> tensor<128xi1>
+  %e = tensor.empty() : tensor<128xf16>
+  // expected-error @below {{fuse-generics: operand 0 is an i1 tensor passed from one linalg.generic to another; no spyreop op produces or}}
+  // expected-note @below {{LowerSpyreOps lowers an i1 only within a group}}
+  %m = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%c : tensor<128xi1>) outs(%e : tensor<128xf16>) {
+  ^bb0(%in: i1, %out: f16):
+    // expected-note @below {{read here, by 'arith.uitofp'}}
+    %f = arith.uitofp %in : i1 to f16
+    linalg.yield %f : f16
+  } -> tensor<128xf16>
+  return %m : tensor<128xf16>
 }

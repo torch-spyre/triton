@@ -486,11 +486,13 @@ tt.func @reshape_behind_extract_slice(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %o: !t
 // Case 11 -- a linearizing reshape, as the forwarding generic in front of the
 // consumer.
 //
-// CanonicalizeGenericOperands makes a `[64,2] -> [128]` collapse a forwarding
-// generic with input map `(d0) -> (d0 floordiv 2, d0 mod 2)`, and FuseGenerics
-// does not absorb it, since the composed map is not projected. Its result reaches
-// the consumer on no layout and reads loop dim 1 whole, which %a's layout
-// splits, so the pass refuses it like case 7 and points at that generic.
+// The forwarding generic, with input map `(d0) -> (d0 floordiv 2, d0 mod 2)`,
+// is written by hand: CanonicalizeGenericOperands leaves a linearizing
+// `[64,2] -> [128]` collapse a tensor op and never emits it, and FuseGenerics
+// declines to absorb it, since the composed map has results that are neither
+// a bare dim nor a constant. Its result reaches the consumer on no layout and
+// reads loop dim 1 whole, which %a's layout splits, so the pass refuses it like
+// case 7 and points at that generic.
 
 #id = affine_map<(d0, d1) -> (d0, d1)>
 #d1 = affine_map<(d0, d1) -> (d1)>

@@ -18,10 +18,11 @@ namespace mlir::triton::spyre {
 /// Checks a consumer's operand list as it would be after a rewrite, `ins` and
 /// `outs` each paired with its indexing map, over `numLoops` loops:
 ///
+///   - every result of every operand map is a bare dim or a constant;
 ///   - every loop dim is named, as a bare dim, by some operand map;
 ///   - no value is both an `ins` and an `outs`.
 ///
-/// Returns success when both hold, and failure with `why` set to the first
+/// Returns success when all three hold, and failure with `why` set to the first
 /// that does not.
 LogicalResult checkOperandRewrite(ArrayRef<std::pair<Value, AffineMap>> ins,
                                   ArrayRef<std::pair<Value, AffineMap>> outs,

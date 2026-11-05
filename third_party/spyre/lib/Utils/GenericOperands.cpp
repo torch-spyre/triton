@@ -10,6 +10,7 @@
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
 
@@ -19,6 +20,21 @@ LogicalResult checkOperandRewrite(ArrayRef<std::pair<Value, AffineMap>> ins,
                                   ArrayRef<std::pair<Value, AffineMap>> outs,
                                   unsigned numLoops, std::string &why) {
   auto all = llvm::concat<const std::pair<Value, AffineMap>>(ins, outs);
+
+  // Every result of every map is a bare dim or a constant.
+  for (auto [position, entry] : llvm::enumerate(all)) {
+    AffineMap map = entry.second;
+    if (llvm::all_of(map.getResults(), [](AffineExpr r) {
+          return isa<AffineDimExpr, AffineConstantExpr>(r);
+        }))
+      continue;
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    os << map;
+    why = "operand " + std::to_string(position) + "'s map, " + text +
+          ", has a result that is neither a bare dim nor a constant";
+    return failure();
+  }
 
   // Every loop dim is named, as a bare dim, by some map.
   SmallVector<bool> named(numLoops, false);
