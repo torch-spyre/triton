@@ -77,16 +77,16 @@ def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
         consumer is a compose that consumes it by erasing the marker.
 
         Running last costs nothing, because nothing in this stage READS an
-        annotation — every consumer is in `spyrecode`, and the pin's own consumer
-        runs at the head of that stage, so no DCE runs between the write and the
+        annotation — every consumer is in `spyrecode`, and the first pass there
+        is MaterializePinnedBuffers, so no DCE runs between the write and the
         honouring.
 
         Output: no `tts` marker op remains anywhere in the module, which is also
         what lets the stage's artifact be parsed by a consumer that does not load
         this dialect. The annotations they carried are attributes — the layout on
         a ktdp op, which is the form [RewriteDescriptorLayoutGeneric] reads, and
-        the pin on a compute op, for which no consumer is written yet. IR carrying
-        no marker is returned unchanged.
+        the pin on a compute op, which MaterializePinnedBuffers honours. IR
+        carrying no marker is returned unchanged.
     }];
 
     // No dependentDialects: this pass constructs no op and no dialect
