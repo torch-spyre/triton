@@ -245,3 +245,42 @@ func.func @i1_through_broadcast(%x: tensor<8xf16>, %y: tensor<8xf16>, %p: tensor
   return %r : tensor<8x4xf16>
 }
 }
+
+// -----
+
+// CHECK: #[[$ATTR_7:.+]] = affine_map<(d0) -> (d0)>
+
+// The producer has another user, so fuseElementwiseOps keeps its outs, %init,
+// on the fused op until deduplicateOperandsAndRemoveDeadResults removes it.
+// The consumer also reads %init as an ins. The fused op keeps neither: it
+// reads only the producer's ins, and the producer stays for its other user.
+// CHECK-LABEL:   func.func @kept_producer_outs_read_by_consumer(
+// CHECK-SAME:  %[[VAL_0:.*]]: tensor<8xf16>, %[[VAL_1:.*]]: tensor<8xf16>, %[[VAL_2:.*]]: tensor<8xi1>) -> (tensor<8xi1>, tensor<8xf16>) {
+// CHECK:           %[[VAL_3:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_7]], #[[$ATTR_7]], #[[$ATTR_7]]], iterator_types = ["parallel"]} ins(%[[VAL_0]], %[[VAL_1]] : tensor<8xf16>, tensor<8xf16>) outs(%[[VAL_2]] : tensor<8xi1>) {
+// CHECK:           ^bb0(%[[VAL_4:.*]]: f16, %[[VAL_5:.*]]: f16, %[[VAL_6:.*]]: i1):
+// CHECK:             %[[VAL_7:.*]] = arith.cmpf ogt, %[[VAL_4]], %[[VAL_5]] : f16
+// CHECK:             linalg.yield %[[VAL_7]] : i1
+// CHECK:           } -> tensor<8xi1>
+// CHECK:           %[[VAL_8:.*]] = tensor.empty() : tensor<8xf16>
+// CHECK:           %[[VAL_9:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_7]], #[[$ATTR_7]], #[[$ATTR_7]]], iterator_types = ["parallel"]} ins(%[[VAL_0]], %[[VAL_1]] : tensor<8xf16>, tensor<8xf16>) outs(%[[VAL_8]] : tensor<8xf16>) {
+// CHECK:           ^bb0(%[[VAL_10:.*]]: f16, %[[VAL_11:.*]]: f16, %[[VAL_12:.*]]: f16):
+// CHECK:             %[[VAL_13:.*]] = arith.cmpf ogt, %[[VAL_10]], %[[VAL_11]] : f16
+// CHECK:             %[[VAL_14:.*]] = arith.uitofp %[[VAL_13]] : i1 to f16
+// CHECK:             linalg.yield %[[VAL_14]] : f16
+// CHECK:           } -> tensor<8xf16>
+// CHECK:           return %[[VAL_3]], %[[VAL_9]] : tensor<8xi1>, tensor<8xf16>
+// CHECK:         }
+func.func @kept_producer_outs_read_by_consumer(%x: tensor<8xf16>, %y: tensor<8xf16>, %init: tensor<8xi1>) -> (tensor<8xi1>, tensor<8xf16>) {
+  %c = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%x, %y : tensor<8xf16>, tensor<8xf16>) outs(%init : tensor<8xi1>) {
+  ^bb0(%a: f16, %b: f16, %out: i1):
+    %v = arith.cmpf ogt, %a, %b : f16
+    linalg.yield %v : i1
+  } -> tensor<8xi1>
+  %e = tensor.empty() : tensor<8xf16>
+  %m = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%c, %init : tensor<8xi1>, tensor<8xi1>) outs(%e : tensor<8xf16>) {
+  ^bb0(%in: i1, %unused: i1, %out: f16):
+    %f = arith.uitofp %in : i1 to f16
+    linalg.yield %f : f16
+  } -> tensor<8xf16>
+  return %c, %m : tensor<8xi1>, tensor<8xf16>
+}

@@ -112,6 +112,20 @@ bool isAllParallel(linalg::GenericOp op) {
   return op.getNumParallelLoops() == op.getNumLoops();
 }
 
+/// Returns the map of `producerOperand`, an operand of `producer`, in the loops
+/// of the consumer whose `ins` `consumerOperand` reads `producerResult`:
+/// `A.compose(inversePermutation(R)).compose(C)`, where `A` is
+/// `producerOperand`'s map, `R` the producer's map for `producerResult` and `C`
+/// the consumer's map for `consumerOperand`. `R` must be a permutation.
+AffineMap toConsumerLoops(linalg::GenericOp producer, OpOperand *producerOperand,
+                          OpResult producerResult, linalg::GenericOp consumer,
+                          OpOperand *consumerOperand) {
+  return producer.getMatchingIndexingMap(producerOperand)
+      .compose(inversePermutation(
+          producer.getIndexingMapMatchingResult(producerResult)))
+      .compose(consumer.getMatchingIndexingMap(consumerOperand));
+}
+
 /// Traces, under `--debug-only=fuse-generics`, that `pattern` declined
 /// `operand` because of `why`.
 void traceDecline(StringRef pattern, OpOperand *operand, const llvm::Twine &why) {
@@ -203,10 +217,8 @@ struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
         continue;
       }
       OpOperand *x = producer.getDpsInputOperand(arg.getArgNumber());
-      AffineMap c = consumer.getMatchingIndexingMap(operand);
-      AffineMap composed = producer.getMatchingIndexingMap(x)
-                               .compose(inversePermutation(r))
-                               .compose(c);
+      AffineMap composed =
+          toConsumerLoops(producer, x, result, consumer, operand);
 
       OperandList ins, outs;
       operandLists(consumer, ins, outs);
@@ -348,18 +360,18 @@ private:
       return failure();
     }
 
-    // The fused op's ins: the consumer's other ins, and each producer ins
-    // under A o R^-1 o C, the composition fuseElementwiseOps writes.
+    // The fused op's operands once groupOperand is done: the consumer's other
+    // ins, each producer ins under toConsumerLoops, and the consumer's outs.
+    // The producer outs fuseElementwiseOps keeps for the producer's other
+    // users are not listed: their results are read by nothing on the fused
+    // op, and deduplicateOperandsAndRemoveDeadResults removes them.
+    auto result = cast<OpResult>(operand->get());
     OperandList ins, outs;
     operandLists(consumer, ins, outs);
     ins.erase(ins.begin() + operand->getOperandNumber());
-    AffineMap toProducerLoops =
-        inversePermutation(producer.getIndexingMapMatchingResult(
-                               cast<OpResult>(operand->get())))
-            .compose(consumer.getMatchingIndexingMap(operand));
     for (OpOperand *in : producer.getDpsInputOperands())
-      ins.emplace_back(in->get(), producer.getMatchingIndexingMap(in).compose(
-                                      toProducerLoops));
+      ins.emplace_back(in->get(), toConsumerLoops(producer, in, result,
+                                                  consumer, operand));
     return triton::spyre::checkOperandRewrite(ins, outs,
                                               consumer.getNumLoops(), why);
   }
