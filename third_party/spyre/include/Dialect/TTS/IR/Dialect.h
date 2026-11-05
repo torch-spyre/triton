@@ -251,52 +251,23 @@ LogicalResult readTensorLayoutArrays(
     ArrayRef<int64_t> &physArg,
     llvm::function_ref<InFlightDiagnostic()> emitError);
 
-/// Builds the real, SCALAR `spyreop.<name>` op `operands`/`extraAttrs` ask
-/// for, and verifies it -- the one place `tts.spyre_op`'s own verifier and
-/// the `tl.spyre_op` frontend builder (`triton_spyre.cc`) both resolve a
-/// request against the real op, so neither restates its arity, its
-/// attribute names or their types as a parallel table.
+/// Builds and verifies the real, scalar `spyreop.<name>` op `operands`
+/// (tensors; checked by element type) and `extraAttrs` ask for -- the one
+/// place `tts.spyre_op`'s verifier and the `tl.spyre_op` frontend builder
+/// both resolve a request against the real op, rather than restating its
+/// arity/attributes as a parallel table. `name` is the bare intrinsic name
+/// (`"gelu"`). `axis`, the reduce dimension for a reduction-shaped
+/// intrinsic (`"exx2"`, see `isReductionShapedIntrinsic`), is lowering-only
+/// and never forwarded to the real op.
 ///
-/// `operands` are TENSORS, as `tts.spyre_op` itself deals in -- every
-/// `spyreop.*` op in scope is scalar-typed, so this checks each operand's
-/// ELEMENT type against the real op, not the tensor type itself (see the
-/// note in the implementation for why, and the worked example in
-/// spyreop-frontend-api.md this mirrors: `spyreop.gelu %in : f16` inside a
-/// `linalg.generic`, not `spyreop.gelu %x : tensor<...xf16>`).
+/// Fails, via `emitError`, on an unregistered `name`, an `extraAttrs` entry
+/// the real op doesn't declare, a present/absent/out-of-range `axis`, or
+/// the real op's own build+verify failing (type/arity mismatch, a confined
+/// attribute like `softplus`'s non-zero `beta`).
 ///
-/// `name` is the intrinsic name alone (`"gelu"`), not `"spyreop.gelu"`.
-/// `extraAttrs` may be null, read as an empty dictionary; it carries only
-/// attributes that belong to the REAL op (`beta`/`threshold` for
-/// `"softplus"`). `axis`, separately, is the tensor dimension to reduce for
-/// a reduction-shaped intrinsic (`"exx2"`, today's only one) -- it belongs
-/// to the LOWERING, never to the real op (confirmed against SpyreOp.td: no
-/// op in scope declares one), so it is never checked against the real op's
-/// attributes and never forwarded into it. `axis` must be present for a
-/// reduction-shaped intrinsic and absent otherwise; which intrinsics are
-/// reduction-shaped is not inferred from the real op (nothing about its own
-/// definition says so) -- see `isReductionShapedIntrinsic` in Ops.cpp.
-///
-/// Four ways this fails, each diagnosed through `emitError`:
-///   - `name` names no registered `spyreop.*` op (a typo, or `"topk"`, which
-///     `third_party/spyre/ktir-mlir-frontend`'s SpyreOp.td does not define);
-///   - an entry of `extraAttrs` is not one of the real op's own attribute
-///     names (`RegisteredOperationName::getAttributeNames()`) -- caught here
-///     because the real op's own `mlir::verify()` never looks at an attribute
-///     it does not itself declare, so an unknown one would otherwise pass
-///     through silently;
-///   - `axis` is present but `name` is not reduction-shaped, or absent but it
-///     is, or (when present) is out of range for the first operand's rank;
-///   - building and verifying the real (scalar) op fails -- a type mismatch,
-///     an arity mismatch, or a confined-attribute predicate the real op's
-///     ODS states (`softplus`'s non-zero `beta`, for one).
-///
-/// On success, returns `tts.spyre_op`'s own (tensor) result types: the real
-/// op's scalar result types, inferred through its `InferTypeOpInterface`
-/// (which every op in scope has -- tablegen derives it automatically from
-/// `SameOperandsAndResultType` with non-variadic results, see
-/// `Operator::populateTypeInferenceInfo` upstream), lifted back onto the
-/// first operand's shape with `axis` dropped if reduction-shaped, or kept
-/// whole if elementwise.
+/// On success, returns `tts.spyre_op`'s tensor result types: the real op's
+/// inferred scalar result types lifted onto the first operand's shape,
+/// with `axis` dropped if reduction-shaped.
 FailureOr<SmallVector<Type>> verifySpyreIntrinsicCall(
     StringRef name, ValueRange operands, DictionaryAttr extraAttrs,
     std::optional<int64_t> axis, Location loc,
