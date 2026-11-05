@@ -62,9 +62,10 @@ module {
 // -----
 
 // A `tl.where(mask != zero, ...)` whose zero is a `tl.full` splat, the
-// `where__select` shape. FoldSplatConstant drops the splat for a scalar the body
-// reads, which the layout pass accepts; left as an `ins` with no layout, the
-// layout pass refuses it as needing a linearizing map.
+// `where__select` shape. CanonicalizeGenericOperands' SplatOperandToScalar
+// drops the splat for a scalar the body reads, which the layout pass accepts;
+// left as an `ins` with no layout, the layout pass refuses it as needing a
+// linearizing map.
 //
 // CHECK-LABEL: func.func @where_1d_device
 // CHECK:         %[[ZERO:.*]] = arith.constant 0.000000e+00 : f16

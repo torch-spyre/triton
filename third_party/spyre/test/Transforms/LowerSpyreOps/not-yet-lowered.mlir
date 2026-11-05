@@ -19,7 +19,6 @@
 // compare and both casts stay arith and the i1 is reported. Pins the decline:
 // one spyreop.compare could replace both casts, a possible extension noted at
 // SelectCompareGroup.
-// Tracked by #254.
 func.func @one_compare_two_casts(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
   %0 = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
@@ -47,7 +46,6 @@ func.func @one_compare_two_casts(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor
 // A group takes exactly one reader, so the compare and both selects stay arith
 // and the `i1` is reported. Pins the decline: one `spyreop.compare` could feed
 // both `spyreop.select`s, a possible extension noted at SelectCompareGroup.
-// Tracked by #254.
 #map = affine_map<(d0) -> (d0)>
 func.func @one_compare_two_selects(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
@@ -75,7 +73,6 @@ func.func @one_compare_two_selects(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tens
 // and the `i1` is reported. The in-body form of FuseGenerics/invalid.mlir's
 // @both_readers. Pins the decline: one `spyreop.compare` mask could serve both
 // readers, a possible extension noted at SelectCompareGroup.
-// Tracked by #254.
 #map = affine_map<(d0) -> (d0)>
 func.func @one_compare_two_consumers(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>

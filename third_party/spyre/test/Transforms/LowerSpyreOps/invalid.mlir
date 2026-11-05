@@ -215,11 +215,9 @@ func.func @true_select_is_refused(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tens
 //===----------------------------------------------------------------------===//
 
 // Never lowerable: an i1 read as signed is 0 or -1, so `arith.sitofp` gives -1.0
-// where the predicate holds, which no spyreop.compare result is.
-// `sitofp` rather than `uitofp`: an `i1` read as SIGNED is 0 or -1, so this gives
-// -1.0 where the predicate holds. A different computation, so the pair is not one
-// intrinsic -- and the note points at the reader, since the predicate is not what
-// needs changing.
+// where the predicate holds, which no spyreop.compare result is. The pair is not
+// one intrinsic, and the note points at the reader, since the predicate is not
+// what needs changing.
 func.func @sitofp_reader(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
   %0 = linalg.generic {
@@ -244,11 +242,10 @@ func.func @sitofp_reader(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> 
 // The compare and its reader are at different widths
 //===----------------------------------------------------------------------===//
 
-// Never lowerable: spyreop.compare takes one type for its operands and result,
-// and spyreop has no float-width conversion.
-// A compare at one width cast to another. `spyreop.compare` has
-// SameOperandsAndResultType, so it cannot compare f32 and answer in f16 -- the
-// note's "at that same width" is the actionable part.
+// Never lowerable: a compare at one width cast to another. spyreop.compare has
+// SameOperandsAndResultType, so it cannot compare f32 and answer in f16, and
+// spyreop has no float-width conversion. The note's "at that same width" is the
+// actionable part.
 func.func @width_change(%x: tensor<4xf32>, %y: tensor<4xf32>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
   %0 = linalg.generic {
@@ -270,8 +267,8 @@ func.func @width_change(%x: tensor<4xf32>, %y: tensor<4xf32>) -> tensor<4xf16> {
 // -----
 
 // Never lowerable: spyreop.select takes one type for its condition and values,
-// and spyreop has no float-width conversion.
-// A comparison cannot supply a numeric mask at a different selected width.
+// and spyreop has no float-width conversion, so a comparison cannot supply a
+// numeric mask at a different selected width.
 #map = affine_map<(d0) -> (d0)>
 func.func @select_width_mismatch(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tensor<4xf16>, %q: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
@@ -294,11 +291,9 @@ func.func @select_width_mismatch(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tenso
 // A select of a type spyreop.select does not take
 //===----------------------------------------------------------------------===//
 
-// Never lowerable: spyreop.select is float-only, and spyreop has no integer
-// select.
-// PURPOSE: an integer ternary is refused rather than mislowered.
-//
-// `spyreop.select` exists only for floats, so the rule declines an i32 select.
+// Never lowerable: spyreop.select exists only for floats and spyreop has no
+// integer select, so the rule declines an i32 select and the pass refuses it
+// rather than mislowering it.
 // This differs from compare-select.mlir's @condition_from_outside_is_left_alone:
 //   - there: the `i1` is a block argument -> quiet decline;
 //   - here: the `i1` is made by an `arith.cmpf` in this body and read in it

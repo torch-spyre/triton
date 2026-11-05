@@ -2,12 +2,9 @@
 
 // AN OP WITH NO DEVICE FORM FLOWS THROUGH, unchanged and unreported.
 //
-// This file replaces an invalid.mlir that asserted the opposite. The pass used to
-// be a dialect conversion which marked every scalar math op illegal, so an f64
-// operand was reported here; it is a greedy rewrite now, and the rule is that
-// selection claims what it can and leaves the rest alone. Whether an f64 divide is
-// compilable is the backend's judgement, and duplicating it here meant two places
-// that had to agree about the device's op set.
+// The pass is a greedy rewrite: selection claims what it can and leaves the rest
+// alone. Whether an f64 divide is compilable is the backend's judgement, so the
+// pass does not duplicate it.
 //
 // So these cases are not "invalid" inputs. They are inputs this pass has nothing
 // to say about, and the test is that it says nothing. What the pass does report,

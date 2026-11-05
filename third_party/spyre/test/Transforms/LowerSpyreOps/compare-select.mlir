@@ -308,7 +308,8 @@ func.func @compare_also_yielded(%x: tensor<4xf16>, %y: tensor<4xf16>) -> (tensor
 //   - No diagnostic: an `i1` block argument is the tensor form crossing a body
 //     boundary, which FuseGenerics reports, not this pass.
 //
-// The next case is the one that IS reported.
+// An i1 made by a compare in the body and read there, with no group to lower
+// it, IS reported: @integer_values_are_refused in invalid.mlir.
 #map = affine_map<(d0) -> (d0)>
 // CHECK-LABEL:   func.func @condition_from_outside_is_left_alone(
 // CHECK:           ^bb0(%[[C:.*]]: i1, %[[P:.*]]: f32, %[[Q:.*]]: f32, %{{.*}}: f32):

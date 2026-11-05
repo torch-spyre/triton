@@ -4,7 +4,7 @@
 // tensor passed from one linalg.generic to another is an error at the
 // consumer. Its notes name the op that made the i1, each reader, and the group
 // shapes LowerSpyreOps lowers an i1 in. Every edge GroupComputes declines leaves
-// such an i1, so its negatives are here, in four sections:
+// such an i1, so its negatives are here, in three sections:
 //
 //   1  never lowerable: the anchor, its predicate or its reader has no device
 //      form;
@@ -45,7 +45,7 @@ func.func @andi_chain(%x: tensor<8xf16>, %y: tensor<8xf16>, %p: tensor<8xf16>, %
 
 // -----
 
-// A reader that is not selectable: `ord` has no spyreop.compare counterpart.
+// Never lowerable: the predicate `ord` has no spyreop.compare counterpart.
 func.func @ord_uitofp(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
   %e1 = tensor.empty() : tensor<8xi1>
   %c = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%x, %y : tensor<8xf16>, tensor<8xf16>) outs(%e1 : tensor<8xi1>) {
@@ -68,9 +68,8 @@ func.func @ord_uitofp(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
 
 // -----
 
-// Never lowerable: spyreop.select takes one type for its condition and values,
-// and spyreop has no float-width conversion.
-// A reader that is not selectable: an f32 compare read by an f16 select.
+// Never lowerable: an f32 compare read by an f16 select. spyreop.select takes one
+// type for its condition and values, and spyreop has no float-width conversion.
 func.func @width_mismatch(%x: tensor<8xf32>, %y: tensor<8xf32>, %p: tensor<8xf16>, %q: tensor<8xf16>) -> tensor<8xf16> {
   %e1 = tensor.empty() : tensor<8xi1>
   %c = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%x, %y : tensor<8xf32>, tensor<8xf32>) outs(%e1 : tensor<8xi1>) {
@@ -94,9 +93,8 @@ func.func @width_mismatch(%x: tensor<8xf32>, %y: tensor<8xf32>, %p: tensor<8xf16
 // -----
 
 // Never lowerable: an i1 read as signed is 0 or -1, so `arith.sitofp` gives -1.0
-// where the predicate holds, which no spyreop.compare result is.
-// A reader that is not selectable: arith.sitofp, where compare-cast takes
-// arith.uitofp.
+// where the predicate holds, which no spyreop.compare result is. compare-cast
+// takes arith.uitofp.
 func.func @sitofp(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
   %e1 = tensor.empty() : tensor<8xi1>
   %c = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%x, %y : tensor<8xf16>, tensor<8xf16>) outs(%e1 : tensor<8xi1>) {
@@ -127,7 +125,6 @@ func.func @sitofp(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
 // exactly one reader, so the edge is not grouped. Pins the decline; LowerSpyreOps'
 // SelectCompareGroup notes sharing one `spyreop.compare` mask between such
 // readers as a possible extension.
-// Tracked by #254.
 func.func @both_readers(%x: tensor<8xf16>, %y: tensor<8xf16>, %p: tensor<8xf16>) -> tensor<8xf16> {
   %e1 = tensor.empty() : tensor<8xi1>
   %c = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%x, %y : tensor<8xf16>, tensor<8xf16>) outs(%e1 : tensor<8xi1>) {
