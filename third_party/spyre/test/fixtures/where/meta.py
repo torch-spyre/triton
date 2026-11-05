@@ -186,6 +186,31 @@ def make_where_scalar_oracle(OP):
     return run_where_scalar
 
 
+def make_where_const_inputs(n_elements, C, DTYPE="fp32", **_unused) -> dict:
+    """Inputs for ``spilled_const``: ``x`` is ``C`` minus ``_Y_MINUS_X``,
+    cycled lane by lane, so the constant is below, equal to and above ``x`` in
+    turn, as ``make_where_scalar_inputs`` arranges for its scalar."""
+    np_dtype = DTYPE_MAP[DTYPE]
+    x = C - np.resize(np.asarray(_Y_MINUS_X), n_elements)
+    return {"x_ptr": x.astype(np_dtype), **_branch_inputs(n_elements, np_dtype),
+            "mask_ptr": np.zeros(n_elements, dtype=np_dtype),
+            "output_ptr": np.zeros(n_elements, dtype=np_dtype)}
+
+
+def make_where_const_oracle(OP, C, T, F):
+    """-> the ``spilled_const`` oracle for comparison *OP* against *C*, its
+    true branch ``p`` or the constant *T*, its false branch ``q`` or the
+    constant *F*."""
+    compare = _NUMPY_COMPARISONS[OP]
+
+    def run_where_const(inputs) -> np.ndarray:
+        x = inputs["x_ptr"]
+        true = inputs["p_ptr"] if T == "p" else np.asarray(T, dtype=x.dtype)
+        false = inputs["q_ptr"] if F == "q" else np.asarray(F, dtype=x.dtype)
+        return np.where(compare(x, np.asarray(C, dtype=x.dtype)), true, false)
+    return run_where_const
+
+
 def make_compare_oracle(OP):
     """-> the ``compare`` oracle for comparison *OP*: its mask, 1.0 where true
     and 0.0 where false."""
@@ -199,6 +224,21 @@ def make_compare_oracle(OP):
 
 def run_select(inputs) -> np.ndarray:
     return np.where(inputs["mask_ptr"] != 0, inputs["p_ptr"], inputs["q_ptr"])
+
+
+def make_select_const_inputs(n_elements, DTYPE="fp32", **_unused) -> dict:
+    """``make_select_inputs`` without ``q_ptr``, which the kernel does not take."""
+    inputs = make_select_inputs(n_elements, DTYPE)
+    del inputs["q_ptr"]
+    return inputs
+
+
+def make_select_const_oracle(C):
+    """-> the ``select_const`` oracle, its false branch *C*."""
+    def run_select_const(inputs) -> np.ndarray:
+        p = inputs["p_ptr"]
+        return np.where(inputs["mask_ptr"] != 0, p, np.asarray(C, dtype=p.dtype))
+    return run_select_const
 
 
 def make_where_oracle(OP):
@@ -260,6 +300,31 @@ class WhereComparing(Where):
 
     def reference(self, OP, **_):
         return self.oracle(OP)
+
+
+@dataclass(frozen=True)
+class WhereConst(Where):
+    """Factory for ``select_const``: ``select`` with the false branch the
+    swept ``C``."""
+
+    def signature(self, DTYPE, **_):
+        return {**super().signature(DTYPE), "C": "constexpr"}
+
+    def reference(self, C, **_):
+        return make_select_const_oracle(C)
+
+
+@dataclass(frozen=True)
+class WhereComparingConst(WhereComparing):
+    """Factory for ``spilled_const``: ``spilled`` compared against the swept
+    ``C`` rather than a loaded ``y``, its branches the swept ``T`` and ``F``."""
+
+    def signature(self, DTYPE, OP, **_):
+        return {**super().signature(DTYPE, OP), "C": "constexpr",
+                "T": "constexpr", "F": "constexpr"}
+
+    def reference(self, OP, C, T, F, **_):
+        return self.oracle(OP, C, T, F)
 
 
 @dataclass(frozen=True)
@@ -428,6 +493,75 @@ VARIANTS = {
         "compiles_to_binary": True,
         "inputs":       make_select_inputs,
         "reference":    run_select,
+        "output_key":   "output_ptr",
+        "rtol":         0.0,
+        "atol":         0.0,
+    },
+
+    # -----------------------------------------------------------------------
+    # ``select`` with the false branch a bare Python float, not a loaded tensor.
+    # -----------------------------------------------------------------------
+    "select_const": {
+        "base": None,
+        "tags": _TAGS,
+        "summary": (
+            "1D fp32 where(mask != 0, p, C) over a host-written mask, the false "
+            "branch a compile-time constant; single tile, no distribution loop."
+        ),
+        "kernel_fn":    kernel.select_const_1d_device,
+        "factory":      WhereConst(ptrs=("mask_ptr", "p_ptr", "output_ptr")),
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "C"],
+        "params": {
+            ("DTYPE", "LAYOUT"): [
+                ("fp32", _stick_1d("fp32")),
+            ],
+            "n_elements": [_N_ELEMENTS],
+            "BLOCK_SIZE": [_N_ELEMENTS],
+            "C": [-1.5],
+        },
+        "grid":         [1],
+        "compiles_to_binary": True,
+        "inputs":       make_select_const_inputs,
+        "output_key":   "output_ptr",
+        "rtol":         0.0,
+        "atol":         0.0,
+    },
+
+    # -----------------------------------------------------------------------
+    # ``spilled`` with ``y`` a bare Python float, not a loaded tensor, and each
+    # branch loaded or a bare Python float too: one distinct from C and from
+    # every value of p and q, or (false branch) C itself, so that one constant
+    # is read by both the compare and the select.
+    # -----------------------------------------------------------------------
+    "spilled_const": {
+        "base": None,
+        "tags": _TAGS,
+        "summary": (
+            "1D fp32 where(x OP C, T, F) in one kernel, C a compile-time "
+            "constant, T the loaded p or a constant and F the loaded q or a "
+            "constant, the mask spilled to its own buffer between compare and "
+            "select. Sweeps every OP."
+        ),
+        "kernel_fn":    kernel.where_const_1d_device,
+        "factory":      WhereComparingConst(ptrs=("x_ptr", "p_ptr", "q_ptr",
+                                                  "mask_ptr", "output_ptr"),
+                                            oracle=make_where_const_oracle),
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "OP", "C", "T",
+                         "F"],
+        "params": {
+            ("DTYPE", "LAYOUT"): [
+                ("fp32", _stick_1d("fp32")),
+            ],
+            "n_elements": [_N_ELEMENTS],
+            "BLOCK_SIZE": [_N_ELEMENTS],
+            "OP": _OPS,
+            "C": [1.5],
+            "T": ["p", 7.25],
+            "F": ["q", -3.75, 1.5],
+        },
+        "grid":         [1],
+        "compiles_to_binary": True,
+        "inputs":       make_where_const_inputs,
         "output_key":   "output_ptr",
         "rtol":         0.0,
         "atol":         0.0,
