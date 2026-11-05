@@ -1,11 +1,11 @@
 // RUN: spyre-triton-opt %s --canonicalize-generic-operands --fuse-generics --lower-spyre-ops -split-input-file | FileCheck %s
 
-// After FuseGenerics, LowerSpyreOps selects each compare with the reader
-// GroupComputes grouped it with (SelectCompare, SelectWhere), and no i1 is
+// After FuseGenerics, LowerSpyreOps selects each compare with the readers
+// GroupComputes grouped it with (compare-cast, compare-select), and no i1 is
 // left.
 
 // A `where` with a `!= 0` mask comes out as one generic holding spyreop.select
-// alone (SelectWhere).
+// alone (compare-select).
 //
 // CHECK-LABEL: func.func @where_zero_test
 // CHECK-NOT:     arith.cmpf
@@ -34,7 +34,7 @@ func.func @where_zero_test(%x: tensor<8xf16>, %p: tensor<8xf16>, %q: tensor<8xf1
 
 // -----
 
-// cmpf + uitofp comes out as spyreop.compare (SelectCompare).
+// cmpf + uitofp comes out as spyreop.compare (compare-cast).
 //
 // CHECK-LABEL: func.func @mask_compare
 // CHECK:         linalg.generic

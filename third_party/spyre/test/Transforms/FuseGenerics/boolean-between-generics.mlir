@@ -158,7 +158,7 @@ func.func @ord_uitofp(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
 
 // -----
 
-// A reader that is not selectable: arith.sitofp, where SelectCompare takes
+// A reader that is not selectable: arith.sitofp, where compare-cast takes
 // arith.uitofp.
 func.func @sitofp(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
   %e1 = tensor.empty() : tensor<8xi1>
@@ -182,9 +182,10 @@ func.func @sitofp(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
 
 // -----
 
-// A compare read by both an arith.uitofp and an arith.select: the readers form
-// two different shapes, compare-cast and compare-select, and no shape covers
-// both, so the edge is not grouped.
+// A compare read by both an arith.uitofp and an arith.select: a group takes
+// exactly one reader, so the edge is not grouped. Pins the decline; LowerSpyreOps'
+// SelectCompareGroup notes sharing one `spyreop.compare` mask between such
+// readers as a possible extension.
 func.func @both_readers(%x: tensor<8xf16>, %y: tensor<8xf16>, %p: tensor<8xf16>) -> tensor<8xf16> {
   %e1 = tensor.empty() : tensor<8xi1>
   %c = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%x, %y : tensor<8xf16>, tensor<8xf16>) outs(%e1 : tensor<8xi1>) {

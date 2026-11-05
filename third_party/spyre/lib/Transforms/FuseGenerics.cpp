@@ -8,13 +8,13 @@
 //                            block arguments. The consumer's operand is
 //                            repointed at that input, under the composed map.
 //   GroupComputes            an op, the anchor: the producer is fused into the
-//                            consumer when one group shape LowerSpyreOps
-//                            lowers as one intrinsic covers the anchor and
-//                            every reader of it (matchLowerableGroup).
+//                            consumer when a group shape LowerSpyreOps lowers
+//                            covers the anchor and its one reader
+//                            (matchLowerableGroup).
 //
-// One shape covers every reader of the producer's result. A result whose
-// readers form different shapes is not grouped: the `i1` stays between the two
-// generics, and legalizeAfterFusion reports it.
+// A group has exactly one reader. A result read by more than one op in the
+// consumer is not grouped: the `i1` stays between the two generics, and
+// legalizeAfterFusion reports it.
 //
 // After the greedy driver converges, a separate step, legalizeAfterFusion,
 // checks what the patterns left. Today its one check,
@@ -36,9 +36,8 @@
 // existing pattern's is a new case of that pattern. Its lit file feeds it the
 // other patterns' producers and checks that it does not fire. A new group shape
 // is not a pattern here: it is one match function in LowerSpyreOps plus one
-// entry in its kGroupShapes list, which matchLowerableGroup then tries. The
-// match function receives every reader of the producer's result, and matches
-// only when it covers every one of them.
+// entry in its kGroupShapes list, which matchLowerableGroup then tries for a
+// producer result with exactly one reader.
 //
 // `--debug-only=fuse-generics` traces, one line per decision, each operand
 // skipped before any check, each decline with the check that declined it, each
@@ -252,10 +251,10 @@ struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
 // GroupComputes
 //===----------------------------------------------------------------------===//
 
-/// Fuses a producer generic into its consumer when one group shape
-/// LowerSpyreOps lowers as one intrinsic covers the op the producer yields and
-/// every consumer op that reads it. Readers that form different shapes are not
-/// grouped; legalizeAfterFusion reports the `i1` left between the generics.
+/// Fuses a producer generic into its consumer when a group shape LowerSpyreOps
+/// lowers covers the op the producer yields and the one consumer op that reads
+/// it. A result read by more than one consumer op is not grouped;
+/// legalizeAfterFusion reports the `i1` left between the generics.
 ///
 /// Before:
 ///
@@ -330,7 +329,7 @@ private:
     }
 
     triton::spyre::GroupCandidate candidate{
-        producer, cast<OpResult>(operand->get()), consumer,
+        anchor, producer,
         llvm::to_vector(consumer.getMatchingBlockArgument(operand).getUsers())};
     std::string reason;
     FailureOr<triton::spyre::GroupMatch> match =
@@ -476,7 +475,7 @@ LogicalResult checkNoBooleanBetweenGenerics(ModuleOp mod) {
       diag.attachNote()
           << "LowerSpyreOps lowers an i1 only within a group: an arith.cmpf "
              "read by arith.uitofp, or by arith.select, at the compared width "
-             "(SelectCompare, SelectWhere)";
+             "(compare-cast, compare-select)";
     }
   });
   return result;

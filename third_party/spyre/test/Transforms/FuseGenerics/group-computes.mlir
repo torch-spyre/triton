@@ -1,16 +1,16 @@
 // RUN: spyre-triton-opt %s --fuse-generics -split-input-file | FileCheck %s
 
 // GroupComputes: a consumer ins whose producer generic yields an op result, the
-// anchor, is fused when every reader of it in the consumer forms, with the
-// anchor, a group LowerSpyreOps lowers as one intrinsic. Today that is an
-// arith.cmpf read by arith.uitofp (SelectCompare) or by arith.select as its
-// condition (SelectWhere). A producer with another user is fused only when its
+// anchor, is fused when its one reader in the consumer forms, with the
+// anchor, a group LowerSpyreOps lowers. Today that is an
+// arith.cmpf read by arith.uitofp (compare-cast) or by arith.select as its
+// condition (compare-select). A producer with another user is fused only when its
 // body is the anchor alone. The edges this pattern declines leave an i1 between
 // generics; those are in boolean-between-generics.mlir.
 
 // -----
 
-// cmpf then uitofp: one body, for SelectCompare.
+// cmpf then uitofp: one body, the compare-cast group.
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0) -> (d0)>
 module {
 // CHECK-LABEL:   func.func @cmpf_uitofp(
@@ -45,7 +45,7 @@ func.func @cmpf_uitofp(%x: tensor<8xf16>, %y: tensor<8xf16>) -> tensor<8xf16> {
 
 // CHECK: #[[$ATTR_1:.+]] = affine_map<(d0) -> (d0)>
 
-// cmpf then select: one body, for SelectWhere.
+// cmpf then select: one body, the compare-select group.
 module {
 // CHECK-LABEL:   func.func @cmpf_select(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<8xf16>, %[[VAL_1:.*]]: tensor<8xf16>, %[[VAL_2:.*]]: tensor<8xf16>, %[[VAL_3:.*]]: tensor<8xf16>) -> tensor<8xf16> {
@@ -164,7 +164,7 @@ func.func @lone_compare_two_readers(%x: tensor<8xf16>, %y: tensor<8xf16>, %p: te
 // CHECK: #[[$ATTR_4:.+]] = affine_map<(d0) -> (d0)>
 
 // The general where: an ogt compare read by a select as its condition is a
-// group (SelectWhere lowers it to spyreop.compare feeding spyreop.select), so
+// group (compare-select, lowered to spyreop.compare feeding spyreop.select), so
 // it is fused even though the compare is not a zero test.
 // CHECK-LABEL:   func.func @general_where_two_readers(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<8xf16>, %[[VAL_1:.*]]: tensor<8xf16>, %[[VAL_2:.*]]: tensor<8xf16>, %[[VAL_3:.*]]: tensor<8xf16>) -> (tensor<8xf16>, tensor<8xf16>) {

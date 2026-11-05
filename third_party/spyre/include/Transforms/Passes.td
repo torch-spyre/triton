@@ -152,7 +152,8 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         criterion is a `tt` source dialect.
 
         A RULE HOST. Adding a case is one pattern plus one line in the pass — no
-        change here, no CMake change, no pipeline change.
+        change here, no CMake change, no pipeline change. A group shape is one
+        entry in kGroupShapes instead, with no new pattern.
 
         Rules, one op to one:
         - math.sqrt  (f16 or f32)                 → spyreop.sqrt
@@ -164,7 +165,9 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         - arith.addi (i64, inside linalg.generic) → spyreop.addi64toi64
         - arith.muli (i32, inside linalg.generic) → spyreop.muli32toi32
 
-        Rules, a GROUP to one:
+        Rules, a GROUP to one, one pattern rooted on the arith.cmpf that
+        lowers it with its one reader as the shape covering the pair; a cmpf
+        read by more than one op is not lowered:
         - arith.cmpf + arith.uitofp     → spyreop.compare, carrying the predicate
         - arith.cmpf + arith.select     → spyreop.select, fed by a spyreop.compare
                                           unless the cmpf is a zero test the
@@ -239,13 +242,14 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         of its own — so a group spanning two tensor ops arrives spread over two
         generics unless something fused them. FuseGenerics' GroupComputes does,
         and only for a group this pass lowers: it asks `matchLowerableGroup`
-        (include/Transforms/LowerSpyreOps.h), which SelectCompare and
-        SelectWhere ask too, so the two passes cannot disagree on what a group
-        is. Each group shape is one match function in kGroupShapes, and
-        matchLowerableGroup tries each in turn. One shape covers every reader of
-        the producer's result: a shape matches only when it covers every reader,
-        and a result whose readers form different shapes is not grouped, so
-        FuseGenerics reports the `i1` left between the generics. The
+        (include/Transforms/LowerSpyreOps.h), which this pass's group pattern
+        asks too, with the same candidate: an anchor and every op reading it.
+        So the two passes cannot disagree on what a group is. Each group shape
+        is one entry in kGroupShapes, a match function and its rewrite, and
+        matchLowerableGroup tries each in turn. A group has exactly one reader:
+        an anchor read by more than one op is not grouped, so FuseGenerics
+        reports the `i1` left between the generics, and in one body this pass
+        leaves it and reports it. The
         reciprocal's constant is a scalar in the body because
         CanonicalizeGenericOperands' SplatOperandToScalar put it there. A
         contract between adjacent passes rather than an accident — and the
@@ -439,7 +443,7 @@ def CanonicalizeGenericOperands
 def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
     let summary = "Combine a producer linalg.generic into its consumer: absorb "
                   "a forwarding generic into an operand map, or group the ops "
-                  "LowerSpyreOps lowers as one intrinsic into one body.";
+                  "LowerSpyreOps lowers together into one body.";
     let description = [{
         Input: IR in which every compute op is a `linalg.generic` and every
         reshape or splat constant operand has been stated as a generic by
@@ -462,24 +466,23 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
           forwarded result of a multi-result generic. `P` is erased once
           dead.
         - GroupComputes: `P` yields an op result, the anchor. When `P` is
-          all-parallel, `linalg::areElementwiseOpsFusable` holds, and one
-          group shape LowerSpyreOps lowers as one intrinsic covers the anchor
-          and every use of the matching block argument in the consumer, its
-          readers (`matchLowerableGroup`, include/Transforms/LowerSpyreOps.h)
+          all-parallel, `linalg::areElementwiseOpsFusable` holds, and a group
+          shape LowerSpyreOps lowers covers the anchor and the one op in the
+          consumer using the matching block argument, its reader
+          (`matchLowerableGroup`, include/Transforms/LowerSpyreOps.h)
           → `P` is fused into the consumer by `linalg::fuseElementwiseOps`,
           and the fused op's dead results and duplicate operands are removed
           by `linalg::deduplicateOperandsAndRemoveDeadResults`. When `P` has a
           user other than the consumer, it is fused only if every
           non-terminator op in its body is a producer op the group consumes,
           so nothing outside the group is copied. The groups today are an
-          `arith.cmpf` read by `arith.uitofp` (SelectCompare) or by
-          `arith.select` as its condition (SelectWhere), at the compared
+          `arith.cmpf` read by `arith.uitofp` (compare-cast) or by
+          `arith.select` as its condition (compare-select), at the compared
           width; the group shapes are owned by LowerSpyreOps, and a new one
-          there is groupable here with no change. One shape covers every
-          reader of the producer's result. Readers that form different shapes,
-          e.g. one compare read by both an `arith.uitofp` and an
-          `arith.select`, are not grouped: no shape covers every reader, and
-          legalization reports the `i1`.
+          there is groupable here with no change. A group has exactly one
+          reader: a result read by more than one op in the consumer, e.g. one
+          compare read by two `arith.select`s, or by an `arith.uitofp` and an
+          `arith.select`, is not grouped, and legalization reports the `i1`.
 
         Both patterns decline a producer that has a reduction loop. Both then
         check the consumer's operand list as it would be after the rewrite,
