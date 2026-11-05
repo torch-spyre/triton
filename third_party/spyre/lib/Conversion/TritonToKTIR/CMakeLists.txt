@@ -38,6 +38,9 @@ add_triton_library(TritonToKTIR
   # (neither reads it and neither writes the attribute).
   TTSIR
   KTIR::KtdpDialect
+  # LowerComputeOps's Group D builds the real spyreop.* op Dialect/TTS/IR's
+  # verifier already validated the request against.
+  KTIR::SpyreOpDialect
   TritonIR
   MLIRIR
   MLIRPass

@@ -89,3 +89,23 @@ tt.func @dot_rank_4_rejected(%a: tensor<2x4x16x32xf32>, %b: tensor<2x4x32x8xf32>
       : tensor<2x4x16x32xf32> * tensor<2x4x32x8xf32> -> tensor<2x4x16x8xf32>
   tt.return %0 : tensor<2x4x16x8xf32>
 }
+
+// -----
+// A tts.spyre_op naming an unregistered intrinsic -- the same typo
+// spyre-op-op-verifier.mlir pins at the dialect level -- fails at PARSE time,
+// like the rank-4 dot above, not inside --lower-compute-ops. tts.spyre_op's
+// own verifier (Dialect/TTS/IR/Ops.cpp's SpyreOpOp::verify, delegating to
+// verifySpyreIntrinsicCall) already confirms the name, arity, attributes and
+// result types against the real spyreop.* op before any pass runs, so Group
+// D's two conversion patterns (ConvertSpyreOpElementwise,
+// ConvertSpyreOpReduction) never have to reject a call themselves -- by the
+// time either pattern's matchAndRewrite runs, the op it is given is already
+// known-good, which is why neither pattern returns failure() for a bad
+// request the way ConvertTTReduce does for a combiner with no neutral
+// element.
+
+tt.func @spyre_op_unknown_name_rejected_at_parse(%x: tensor<128xf16>) -> tensor<128xf16> {
+  // expected-error @below {{'gleu' does not name a registered spyreop intrinsic}}
+  %y = tts.spyre_op {name = "gleu"} (%x) : (tensor<128xf16>) -> tensor<128xf16>
+  tt.return %y : tensor<128xf16>
+}

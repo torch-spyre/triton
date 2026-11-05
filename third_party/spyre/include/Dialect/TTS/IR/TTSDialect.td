@@ -10,6 +10,17 @@ def TTS_Dialect : Dialect {
 
   let summary = "Triton-to-Spyre authoring annotations";
 
+  let dependentDialects = [
+    // tts.spyre_op's verifier looks up the real spyreop.<name> op it names
+    // via RegisteredOperationName::lookup, which only finds ops of a LOADED
+    // dialect -- so spyreop has to be loaded wherever tts is, not merely
+    // registered. Safe to load eagerly, unlike ktdp (see TTSOps.td's note on
+    // tts.pin): SpyreOpDialect.td declares no dependent dialects of its own,
+    // so nothing here drags in `func` or the Inliner-abort bug that pin's
+    // memory_space field works around.
+    "::mlir::spyreop::SpyreOpDialect"
+  ];
+
   let description = [{
     `tts` owns the annotations the Spyre backend authors on its way from Triton
     IR to KTIR — the things a kernel says about how it wants to be laid out,
