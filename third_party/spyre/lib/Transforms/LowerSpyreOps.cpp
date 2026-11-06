@@ -1,10 +1,10 @@
 //===- LowerSpyreOps.cpp - Select spyreop intrinsics from compute bodies --===//
 //
 // INSTRUCTION SELECTION for the Spyre device: arith and math ops become the
-// spyreop intrinsic that does the same thing. A RULE HOST -- adding a case is
-// one pattern plus one line in the pass and one lit case; a group shape is one
-// entry in kGroupShapes in SpyreOpLoweringRules.cpp instead, with no
-// new pattern.
+// spyreop intrinsic that does the same thing. A RULE HOST -- every rule is one
+// entry in kSpyreOpLoweringRules in SpyreOpLoweringRules.cpp, and this
+// pass registers one LowerByRule pattern per entry, so adding a case is one
+// entry and one lit case, with no new pattern.
 //
 // KTIR -> KTIR, which is why this sits in Transforms/ rather than in
 // Conversion/TritonToKTIR/: that directory's criterion is a `tt` source
@@ -14,15 +14,16 @@
 //
 // ONE PASS FOR ALL SELECTION, and the two kinds of rule are not two tiers:
 //
-//   one op to one   math.sqrt -> spyreop.sqrt, and so on. `arith.divf`
-//                   picks its target from the numerator: `1.0 / x` ->
-//                   spyreop.reciprocal, anything else -> spyreop.realdiv.
+//   one op to one   math.sqrt -> spyreop.sqrt, and so on. `arith.divf` has
+//                   two rules: `1.0 / x` -> spyreop.reciprocal, tried first,
+//                   and anything else -> spyreop.realdiv.
 //   a GROUP to one  a compare and a cast -> spyreop.compare. The group is what
 //                   is selectable: no member of it could have been selected
 //                   alone.
 //
-// They share one greedy pattern set, and no two rules are rooted on the same
-// op, so no rule has to win over another and no order is declared anywhere.
+// They share one greedy pattern set. The rules rooted on one op are tried in
+// the order of their benefits, declared in the table, and no op is both a
+// rule's reader and the anchor of a rule without readers.
 // Splitting these across two passes is what an earlier shape did, and it
 // bought a standing question -- which pass claims this op -- for nothing.
 //
@@ -40,8 +41,9 @@
 // -- so a group spanning two tensor ops arrives spread over two generics unless
 // something fused them. FuseGenerics' GroupComputes is that something, and it
 // fuses only when matchLowerableGroup -- in SpyreOpLoweringRules.h,
-// which the group pattern calls too, rooted on the compare and with every
-// reader of it -- finds a shape covering the anchor and its one reader. An
+// which asks the rules with a reader in the same table this pass registers,
+// on the same candidate: an anchor and every reader of it -- finds a rule
+// covering the anchor and its one reader. An
 // anchor read by more than one op is not grouped, and FuseGenerics reports the
 // `i1` left between the generics. The reciprocal's constant is a scalar in the
 // body because CanonicalizeGenericOperands folded the splat in. Stated as a
@@ -50,13 +52,15 @@
 // for that rule the dependency is about whether it FIRES, never about whether
 // it is correct.
 //
-// THE GENERIC BODY IS THE SCOPE for a group rule, and not a predicate. Every
-// compute reaches this pass as a linalg.generic, so "inside a body" is not a
-// guess about whether an op is compute -- it is where the compute is. A rule
-// rooted in a body never asks: an `arith.addi` on an element type in a body is
-// compute, and the addi of a loop index or a tile address is not in a body at
-// all. The integer 1:1 rules use the same test as a per-op PREDICATE, which is
-// a proxy and is known to be one; see isInsideLinalgGeneric.
+// THE GENERIC BODY IS THE SCOPE for a rule with a reader, and not a predicate.
+// Every compute reaches this pass as a linalg.generic, so "inside a body" is
+// not a guess about whether an op is compute -- it is where the compute is. A
+// rule rooted in a body never asks: an `arith.addi` on an element type in a
+// body is compute, and the addi of a loop index or a tile address is not in a
+// body at all. The integer rules use the same test as a per-op PREDICATE, at
+// any depth, which is a proxy and is known to be one; see
+// isInsideLinalgGeneric. The float rules without a reader check no placement
+// at all.
 //
 // NO NaN REACHES A COMPUTE BODY. Every rule assumes it, which lets the pass:
 //
@@ -98,10 +102,11 @@
 //   body, so each is the exception above rather than a pass-through --
 //   rejectSurvivingBooleans reports it here, naming the predicate.
 //
-// `--debug-only=lower-spyre-ops` traces the group rules' decisions rather than
-// the control flow: one line per candidate looked at and what came of it, with
-// the operand form named when a match was declined. The 1:1 rules say nothing
-// -- there is one per op, and the output IR shows whether it fired.
+// `--debug-only=lower-spyre-ops` traces the decisions of the rules with a
+// reader rather than the control flow: one line per candidate looked at and
+// what came of it, with each rule's reason when none matched. The rules
+// without readers say nothing, save the reciprocal when it fires -- the output
+// IR shows whether one did.
 //
 //===----------------------------------------------------------------------===//
 
@@ -117,7 +122,6 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -137,139 +141,31 @@ namespace mlir::triton::spyre {
 } // namespace mlir::triton::spyre
 
 using mlir::triton::spyre::GroupCandidate;
-using mlir::triton::spyre::GroupMatch;
-using mlir::triton::spyre::isSpyreOpScalarType;
-using mlir::triton::spyre::resolveThroughBody;
+using mlir::triton::spyre::SpyreOpLoweringRule;
 using mlir::triton::spyre::spyrePredicateFor;
 
 namespace {
 
 //===----------------------------------------------------------------------===//
-// Shared questions
+// One pattern per rule
 //===----------------------------------------------------------------------===//
 
-/// The bit width of `type` if it is a scalar integer, or 0 otherwise -- e.g.
-/// for a not-yet-scalarized tensor of integers.
-unsigned getScalarIntBitWidth(Type type) {
-  auto intTy = dyn_cast<IntegerType>(type);
-  return intTy ? intTy.getWidth() : 0;
-}
-
-/// Whether this op is (transitively) inside a linalg.generic body.
+/// Lowers by one rule of kSpyreOpLoweringRules, rooted on the rule's anchor op
+/// at the rule's benefit, so the driver tries the rules on one op in benefit
+/// order.
 ///
-/// A PROXY, used only by the integer 1:1 rules, which have no better test:
-/// plain scalar integer add and mul are also loop indices, offsets and tile
-/// addressing, and there is no exact test separating those from scalarized
-/// integer compute. The proxy over-claims -- `tl.arange(0, N) * stride` is an
-/// `arith.muli` that will be inside a body once scalarized -- and it holds
-/// today only because the tensor-of-pointers `tt.load` path is unimplemented.
-/// Stated rather than glossed. The group rules use the enclosing generic as a
-/// SCOPE instead, requiring the generic to be their immediate parent.
-bool isInsideLinalgGeneric(Operation *op) {
-  return op->getParentOfType<linalg::GenericOp>() != nullptr;
-}
-
-void traceDecline(Operation *root, const llvm::Twine &why) {
-  LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << root->getName() << " at "
-                          << root->getLoc() << ": no group match (" << why
-                          << ")\n");
-}
-
-void traceMatch(Operation *root, const llvm::Twine &what) {
-  LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << root->getName() << " at "
-                          << root->getLoc() << ": " << what << "\n");
-}
-
-//===----------------------------------------------------------------------===//
-// One op to one: the unary float math ops
-//===----------------------------------------------------------------------===//
-
-/// math.sqrt/exp/rsqrt -> the matching spyreop intrinsic.
+/// The candidate is the root, the generic that is its immediate parent if any,
+/// and every op reading the root, each once though it may read the root more
+/// than once. When the rule matches, its build runs at the rule's last op --
+/// its reader, or the root when it lists none -- on the root's operands
+/// followed by the reader's, the value it returns replaces that op, and a
+/// root left without users is erased.
 ///
-/// No body scope and no discriminator: these ops only ever appear in real
-/// floating-point compute, never in address or index arithmetic, so every
-/// scalar occurrence is one to select, inside a generic body or not. An operand
-/// type with no intrinsic does not match and flows through.
-template <typename Source, typename Target>
-struct SelectUnaryFloat : public OpRewritePattern<Source> {
-  using OpRewritePattern<Source>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(Source op,
-                                PatternRewriter &rewriter) const override {
-    if (!isSpyreOpScalarType(op.getType()))
-      return failure();
-    rewriter.template replaceOpWithNewOp<Target>(op, op.getType(),
-                                                 op.getOperand());
-    return success();
-  }
-};
-
-//===----------------------------------------------------------------------===//
-// One op to one: arith.divf -> spyreop.reciprocal or spyreop.realdiv
-//===----------------------------------------------------------------------===//
-
-/// `1.0 / x` -> `spyreop.reciprocal x`; any other `a / b` ->
-/// `spyreop.realdiv a, b`.
-///
-/// The numerator is read through the enclosing body when there is one, so a
-/// one passed in as a splat `ins` operand matches as well as a scalar
-/// constant. Its unused block argument is then erased upstream.
-struct SelectArithDivF : public OpRewritePattern<arith::DivFOp> {
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(arith::DivFOp op,
-                                PatternRewriter &rewriter) const override {
-    if (!isSpyreOpScalarType(op.getType()))
-      return failure();
-
-    Value numerator = op.getLhs();
-    if (linalg::GenericOp generic = dyn_cast<linalg::GenericOp>(op->getParentOp()))
-      numerator = resolveThroughBody(generic, numerator);
-    if (matchPattern(numerator, m_OneFloat())) {
-      traceMatch(op, "numerator is 1.0 -> spyreop.reciprocal");
-      rewriter.replaceOpWithNewOp<spyreop::Reciprocal>(op, op.getType(),
-                                                       op.getRhs());
-      return success();
-    }
-
-    rewriter.replaceOpWithNewOp<spyreop::RealDiv>(op, op.getType(), op.getLhs(),
-                                                  op.getRhs());
-    return success();
-  }
-};
-
-//===----------------------------------------------------------------------===//
-// A group to one: arith.cmpf and its readers -> spyreop.compare / select
-//===----------------------------------------------------------------------===//
-
-/// Lowers an `arith.cmpf` in one generic body together with the one op that
-/// reads it, as the group shape that covers the pair:
-///
-///   - compare-cast: the reader is an `arith.uitofp`, e.g. `(m != 0)` used
-///     multiplicatively -> `spyreop.compare`;
-///   - compare-select: the reader is an `arith.select` taking it as its
-///     condition, e.g. `tl.where(a > b, p, q)` -> `spyreop.select`, fed by a
-///     `spyreop.compare` unless selectFromZeroTest finds a zero test the select
-///     performs itself.
-///
-/// `arith.cmpf` alone produces an `i1`, a type no spyreop op produces, so the
-/// compare is not selected on its own: its reader decides the device op
-/// (matchLowerableGroup). `spyreop.compare` gives its answer "in the width
-/// compared rather than as a boolean", which is compare-then-cast; `uitofp` and
-/// not `sitofp`, since an `i1` read as signed is 0 or -1 and `sitofp` gives
-/// -1.0 where the predicate holds.
-///
-/// Rooted on the compare, so the candidate holds every user of it, as
-/// GroupComputes' does. The reader is rewritten, then the compare is erased.
-/// Declines, leaving the arith ops, when:
-///
-///   - the compare has more than one user, e.g. two `arith.select`s, an
-///     `arith.uitofp` and an `arith.select`, or a reader and the
-///     `linalg.yield` of a compare that leaves the body;
-///   - the reader is of no shape, e.g. `arith.sitofp`;
-///   - the selected or cast type has no intrinsic, e.g. i32 or f64;
-///   - the compared and result widths differ, e.g. f32 compared, f16 picked;
-///   - a kept compare has no counterpart, e.g. `ord`.
+/// A candidate in a body that no rule with a reader lowers is traced once, by
+/// the last such rule on its anchor in the table, with every rule's reason
+/// (matchLowerableGroup). The driver tries every pattern on an op before giving
+/// up on it, so that rule runs whenever all of them decline. A rule without
+/// readers says nothing -- the output IR shows whether it fired.
 ///
 /// A declined compare read in the body is then reported by
 /// rejectSurvivingBooleans.
@@ -279,71 +175,62 @@ struct SelectArithDivF : public OpRewritePattern<arith::DivFOp> {
 /// that mask, a `select` becomes `spyreop.select` on it, a zero test needs no
 /// compare. A reader that leaves the body, a `linalg.yield`, still needs the
 /// `i1` and would still decline.
-struct SelectCompareGroup : public OpRewritePattern<arith::CmpFOp> {
-  using OpRewritePattern::OpRewritePattern;
+struct LowerByRule : public RewritePattern {
+  LowerByRule(const SpyreOpLoweringRule &rule, MLIRContext *ctx)
+      : RewritePattern(rule.anchor, rule.benefit, ctx), rule(rule),
+        tracesDeclines(isLastRuleWithReaders(rule)) {
+    setDebugName(rule.name);
+  }
 
-  LogicalResult matchAndRewrite(arith::CmpFOp cmp,
+  LogicalResult matchAndRewrite(Operation *root,
                                 PatternRewriter &rewriter) const override {
-    auto generic = dyn_cast<linalg::GenericOp>(cmp->getParentOp());
-    if (!generic)
-      return failure();
-    // Each reader once, though it may read the compare more than once.
-    llvm::SetVector<Operation *> readers(cmp->user_begin(), cmp->user_end());
-    GroupCandidate candidate{cmp, generic, readers.takeVector()};
+    llvm::SetVector<Operation *> readers(root->user_begin(), root->user_end());
+    GroupCandidate candidate{
+        root, dyn_cast<linalg::GenericOp>(root->getParentOp()),
+        readers.takeVector()};
     std::string why;
-    FailureOr<GroupMatch> match =
-        triton::spyre::matchLowerableGroup(candidate, &why);
-    if (failed(match)) {
-      traceDecline(cmp, why);
+    if (!triton::spyre::ruleMatches(rule, candidate, why)) {
+      LLVM_DEBUG({
+        if (tracesDeclines && candidate.anchorBody &&
+            failed(triton::spyre::matchLowerableGroup(candidate, &why)))
+          traceDecline(root, why);
+      });
       return failure();
     }
-    triton::spyre::rewriteLowerableGroup(rewriter, candidate, *match);
-    rewriter.eraseOp(cmp);
+
+    Operation *last = rule.readers.empty() ? root : candidate.readers.front();
+    SmallVector<Value> operands(root->getOperands());
+    if (!rule.readers.empty())
+      llvm::append_range(operands, last->getOperands());
+    rewriter.setInsertionPoint(last);
+    Value replacement = rule.build(rewriter, candidate, operands);
+    rewriter.replaceOp(last, replacement);
+    if (root != last && root->use_empty())
+      rewriter.eraseOp(root);
     return success();
   }
-};
 
-//===----------------------------------------------------------------------===//
-// One op to one: the integer ops
-//===----------------------------------------------------------------------===//
-
-/// arith.addi -> spyreop.addi32toi32 / addi64toi64, inside a generic body only.
-///
-/// The body test here is the PROXY described at isInsideLinalgGeneric, not the
-/// exact scope the group rules use. A width with no intrinsic flows through.
-struct SelectArithAddI : public OpRewritePattern<arith::AddIOp> {
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(arith::AddIOp op,
-                                PatternRewriter &rewriter) const override {
-    if (!isInsideLinalgGeneric(op))
-      return failure();
-    unsigned width = getScalarIntBitWidth(op.getType());
-    if (width == 32)
-      rewriter.replaceOpWithNewOp<spyreop::AddI32ToI32>(
-          op, op.getType(), op.getLhs(), op.getRhs());
-    else if (width == 64)
-      rewriter.replaceOpWithNewOp<spyreop::AddI64ToI64>(
-          op, op.getType(), op.getLhs(), op.getRhs());
-    else
-      return failure();
-    return success();
+private:
+  /// Whether `rule` lists readers and no later rule in the table with readers
+  /// has the same anchor.
+  static bool isLastRuleWithReaders(const SpyreOpLoweringRule &rule) {
+    if (rule.readers.empty())
+      return false;
+    ArrayRef<SpyreOpLoweringRule> rules = triton::spyre::spyreOpLoweringRules();
+    auto later = rules.drop_front(&rule - rules.data() + 1);
+    return llvm::none_of(later, [&](const SpyreOpLoweringRule &other) {
+      return !other.readers.empty() && other.anchor == rule.anchor;
+    });
   }
-};
 
-/// arith.muli -> spyreop.muli32toi32, inside a generic body only. Same proxy,
-/// and only one width has an intrinsic.
-struct SelectArithMulI : public OpRewritePattern<arith::MulIOp> {
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(arith::MulIOp op,
-                                PatternRewriter &rewriter) const override {
-    if (!isInsideLinalgGeneric(op) || getScalarIntBitWidth(op.getType()) != 32)
-      return failure();
-    rewriter.replaceOpWithNewOp<spyreop::MulI32ToI32>(op, op.getType(),
-                                                      op.getLhs(), op.getRhs());
-    return success();
+  static void traceDecline(Operation *root, const llvm::Twine &why) {
+    LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << root->getName() << " at "
+                            << root->getLoc() << ": no group match (" << why
+                            << ")\n");
   }
+
+  const SpyreOpLoweringRule &rule;
+  bool tracesDeclines;
 };
 
 //===----------------------------------------------------------------------===//
@@ -442,13 +329,11 @@ struct LowerSpyreOpsPass
     MLIRContext *ctx = &getContext();
 
     RewritePatternSet patterns(ctx);
-    // One line per rule, group rules and 1:1 rules in one set, each rooted on
-    // a different op. See ONE PASS FOR ALL SELECTION in the header.
-    patterns.add<SelectCompareGroup>(ctx);
-    patterns.add<SelectArithDivF, SelectArithAddI, SelectArithMulI>(ctx);
-    patterns.add<SelectUnaryFloat<math::SqrtOp, spyreop::Sqrt>,
-                 SelectUnaryFloat<math::ExpOp, spyreop::Exp>,
-                 SelectUnaryFloat<math::RsqrtOp, spyreop::RSqrt>>(ctx);
+    // One pattern per rule, rules with and without readers in one set. See
+    // ONE PASS FOR ALL SELECTION in the header.
+    for (const SpyreOpLoweringRule &rule :
+         triton::spyre::spyreOpLoweringRules())
+      patterns.add<LowerByRule>(rule, ctx);
 
     // Upstream's, and load-bearing rather than tidying: a group rule that stops
     // reading a block argument leaves an `ins` operand, that argument and its

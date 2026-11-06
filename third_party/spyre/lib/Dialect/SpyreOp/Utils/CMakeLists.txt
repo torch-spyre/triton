@@ -1,5 +1,5 @@
-# The spyreop lowering rules: the group shapes, and the questions they share
-# with LowerSpyreOps' one-op patterns. A library of its own because two passes
+# The spyreop lowering rules, kSpyreOpLoweringRules, and the questions they
+# share with LowerSpyreOps' diagnostics. A library of its own because two passes
 # read it -- LowerSpyreOps lowers by it, and FuseGenerics fuses only what it
 # would lower -- so neither pass includes the other's code. Sits below
 # SpyreTransforms, and links no pass library.
@@ -12,11 +12,12 @@ add_triton_library(SpyreOpUtils
   SpyreOpLoweringRules.cpp
 
   LINK_LIBS PUBLIC
-  # spyreop.compare and spyreop.select, which the group shapes build.
+  # The spyreop ops the rules build.
   KTIR::SpyreOpDialect
   MLIRIR
-  # arith.cmpf, arith.uitofp and arith.select, which the group shapes match.
+  # The arith and math ops the rules match.
   MLIRArithDialect
-  # linalg.generic, the body a group's anchor is read through.
+  MLIRMathDialect
+  # linalg.generic, the body a rule's anchor is read through.
   MLIRLinalgDialect
 )
