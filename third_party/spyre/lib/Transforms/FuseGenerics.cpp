@@ -8,7 +8,7 @@
 //                            block arguments. The consumer's operand is
 //                            repointed at that input, under the composed map.
 //   GroupComputes            an op, the anchor: the producer is fused into the
-//                            consumer when a group shape LowerSpyreOps lowers
+//                            consumer when a rule LowerSpyreOps lowers by
 //                            covers the anchor and its one reader
 //                            (matchLowerableGroup).
 //
@@ -34,10 +34,10 @@
 // the operand's type, nor on anything downstream. A new pattern names a
 // producer kind no existing pattern matches; one whose kind overlaps an
 // existing pattern's is a new case of that pattern. Its lit file feeds it the
-// other patterns' producers and checks that it does not fire. A new group shape
-// is not a pattern here: it is one match function in SpyreOpLoweringRules plus
-// one entry in its kGroupShapes list, which matchLowerableGroup then tries for
-// a producer result with exactly one reader.
+// other patterns' producers and checks that it does not fire. A new group is
+// not a pattern here: it is one rule with a reader in SpyreOpLoweringRules'
+// kSpyreOpLoweringRules, which matchLowerableGroup then tries for a producer
+// result with exactly one reader.
 //
 // `--debug-only=fuse-generics` traces, one line per decision, each operand
 // skipped before any check, each decline with the check that declined it, each
@@ -251,9 +251,9 @@ struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
 // GroupComputes
 //===----------------------------------------------------------------------===//
 
-/// Fuses a producer generic into its consumer when a group shape LowerSpyreOps
-/// lowers covers the op the producer yields and the one consumer op that reads
-/// it. A result read by more than one consumer op is not grouped;
+/// Fuses a producer generic into its consumer when a rule LowerSpyreOps
+/// lowers by covers the op the producer yields and the one consumer op that
+/// reads it. A result read by more than one consumer op is not grouped;
 /// legalizeAfterFusion reports the `i1` left between the generics.
 ///
 /// Before:
@@ -282,7 +282,7 @@ struct AbsorbForwardingGeneric : OpRewritePattern<linalg::GenericOp> {
 ///   - `P` has no reduction loop;
 ///   - linalg::areElementwiseOpsFusable holds for the operand;
 ///   - the consumer reads the operand's block argument at least once, and one
-///     group shape covers the anchor and every op reading it
+///     rule with a reader covers the anchor and every op reading it
 ///     (matchLowerableGroup);
 ///   - when `P` has a user other than the consumer, every non-terminator op in
 ///     `P`'s body is one of the producer ops the group consumes;
@@ -435,7 +435,7 @@ private:
 /// Reports, as an error at the consumer, every `ins` of element type i1 that a
 /// linalg.generic defines. The notes name the op that made the i1 in the
 /// producer, or the operand the producer forwards; each op reading it in the
-/// consumer; and the group shapes LowerSpyreOps lowers an i1 in. Returns
+/// consumer; and the rules LowerSpyreOps lowers an i1 by. Returns
 /// failure when it reported anything.
 LogicalResult checkNoBooleanBetweenGenerics(ModuleOp mod) {
   LogicalResult result = success();
