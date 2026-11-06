@@ -81,7 +81,7 @@
 //     - anything still tensor-typed, which only ConvertElementwiseToLinalg not
 //       having run can produce
 //
-//   A group rule declines and its members stay as they were:
+//   A rule with a condition declines and its ops stay as they were:
 //     - a divide whose numerator is not a constant one, or whose constant is
 //       the denominator: the realdiv rule takes it, which is right
 //     - a numerator that is a block argument, even one fed by a splat 1.0
@@ -96,7 +96,7 @@
 //
 //   The compare declines are the ones to know: each leaves an `i1` inside a
 //   body, so each is the exception above rather than a pass-through --
-//   rejectSurvivingBooleans reports it here, naming the predicate.
+//   rejectSurvivingBooleans reports it here, with each rule's reason.
 //
 // `--debug-only=lower-spyre-ops` traces the decisions rather than the control
 // flow: one line per rule that fires, and for the rules with a reader, one
@@ -109,7 +109,6 @@
 #include "Dialect/SpyreOp/Utils/SpyreOpTypeProbe.h"
 #include "Transforms/Passes.h"
 
-#include "ktir/Dialect/SpyreOp/SpyreOp.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -137,7 +136,6 @@ namespace mlir::triton::spyre {
 
 using mlir::triton::spyre::GroupCandidate;
 using mlir::triton::spyre::SpyreOpLoweringRule;
-using mlir::triton::spyre::spyrePredicateFor;
 
 namespace {
 
@@ -241,7 +239,8 @@ private:
 /// Reports an `i1` that selection left in a compute body, because no spyreop
 /// op takes that type, so the backend would refuse it without naming the
 /// predicate. Runs after the fixpoint, since until then such an `i1` is what
-/// the group rules match.
+/// the group rules match. A note at the op that made it gives the reason of
+/// each rule with a reader on that op, by rule name (matchLowerableGroup).
 ///
 /// Reported, when made and read in the same body without being yielded:
 ///
@@ -286,37 +285,15 @@ LogicalResult rejectSurvivingBooleans(ModuleOp mod) {
       SmallVector<Operation *> readers =
           triton::spyre::distinctReaders(v.getUsers());
 
-      // Name the predicate: it is what an author can change.
-      if (auto cmp = v.getDefiningOp<arith::CmpFOp>()) {
-        StringRef pred = arith::stringifyCmpFPredicate(cmp.getPredicate());
-        if (spyrePredicateFor(cmp.getPredicate()) && readers.size() > 1)
-          diag.attachNote(cmp.getLoc())
-              << "the predicate '" << pred
-              << "' does have a spyreop.compare counterpart, but the compare "
-                 "is read by "
-              << readers.size()
-              << " ops, and a compare is lowered only together with exactly "
-                 "one reader";
-        else if (spyrePredicateFor(cmp.getPredicate())) {
-          // The rules' own reasons, the type probe's among them, say what
-          // about the reader they refused.
-          std::string why;
-          (void)triton::spyre::matchLowerableGroup(
-              GroupCandidate{cmp, generic, readers}, &why);
-          diag.attachNote(cmp.getLoc())
-              << "the predicate '" << pred
-              << "' does have a spyreop.compare counterpart, so this compare "
-                 "was selectable and something about its READER was not: the "
-                 "reader must be an arith.uitofp to, or an arith.select of, "
-                 "the width compared, at a type the spyreop op takes; the "
-                 "rules with a reader declined because "
-              << why;
-        } else
-          diag.attachNote(cmp.getLoc())
-              << "the predicate '" << pred
-              << "' has no spyreop.compare counterpart: `ord` and `uno` "
-                 "ask whether an operand is NaN, and `false`/`true` ask "
-                 "nothing, while that intrinsic only compares two values";
+      // The rules' own reasons, which name the predicate, the reader or the
+      // types they refused.
+      if (Operation *maker = v.getDefiningOp()) {
+        std::string why;
+        (void)triton::spyre::matchLowerableGroup(
+            GroupCandidate{maker, generic, readers}, &why);
+        diag.attachNote(maker->getLoc())
+            << "no rule lowers this '" << maker->getName()
+            << "' together with its readers: " << why;
       }
 
       for (Operation *user : readers)

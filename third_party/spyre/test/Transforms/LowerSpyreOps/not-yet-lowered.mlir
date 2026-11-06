@@ -4,7 +4,7 @@
 //
 // Each case leaves an `i1` in a compute body, so rejectSurvivingBooleans reports
 // it, as in invalid.mlir. Unlike invalid.mlir's cases, each compare has a
-// spyreop.compare counterpart and each reader a group shape: what declines is
+// spyreop.compare counterpart and each reader is one some rule names: what declines is
 // that the compare has more than one reader. A case moves out of this file, into
 // compare-cast.mlir or compare-select.mlir, when a rule lowers it.
 
@@ -17,8 +17,7 @@
 
 // One comparison read by two casts. A group takes exactly one reader, so the
 // compare and both casts stay arith and the i1 is reported. Pins the decline:
-// one spyreop.compare could replace both casts, a possible extension noted at
-// SelectCompareGroup.
+// one spyreop.compare could replace both casts.
 func.func @one_compare_two_casts(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
   %0 = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
@@ -27,7 +26,7 @@ func.func @one_compare_two_casts(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor
       ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
   ^bb0(%a: f16, %b: f16, %out: f16):
     // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{but the compare is read by 2 ops, and a compare is lowered only together with exactly one reader}}
+    // expected-note @below {{no rule lowers this 'arith.cmpf' together with its readers: compare-cast, compare-select-zero-test, compare-select: the 'arith.cmpf' is read by 2 ops, and is lowered only together with exactly one reader}}
     %c = arith.cmpf olt, %a, %b : f16
     // expected-note @below {{read here, by 'arith.uitofp'}}
     %f0 = arith.uitofp %c : i1 to f16
@@ -45,7 +44,7 @@ func.func @one_compare_two_casts(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor
 //
 // A group takes exactly one reader, so the compare and both selects stay arith
 // and the `i1` is reported. Pins the decline: one `spyreop.compare` could feed
-// both `spyreop.select`s, a possible extension noted at SelectCompareGroup.
+// both `spyreop.select`s.
 #map = affine_map<(d0) -> (d0)>
 func.func @one_compare_two_selects(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
@@ -54,7 +53,7 @@ func.func @one_compare_two_selects(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tens
       ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
   ^bb0(%a: f16, %b: f16, %out: f16):
     // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{but the compare is read by 2 ops, and a compare is lowered only together with exactly one reader}}
+    // expected-note @below {{no rule lowers this 'arith.cmpf' together with its readers: compare-cast, compare-select-zero-test, compare-select: the 'arith.cmpf' is read by 2 ops, and is lowered only together with exactly one reader}}
     %c = arith.cmpf ogt, %a, %b : f16
     // expected-note @below {{read here, by 'arith.select'}}
     %s0 = arith.select %c, %a, %b : f16
@@ -72,7 +71,7 @@ func.func @one_compare_two_selects(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tens
 // A group takes exactly one reader, so the compare and both readers stay arith
 // and the `i1` is reported. The in-body form of FuseGenerics/invalid.mlir's
 // @both_readers. Pins the decline: one `spyreop.compare` mask could serve both
-// readers, a possible extension noted at SelectCompareGroup.
+// readers.
 #map = affine_map<(d0) -> (d0)>
 func.func @one_compare_two_consumers(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
@@ -81,7 +80,7 @@ func.func @one_compare_two_consumers(%x: tensor<4xf16>, %y: tensor<4xf16>) -> te
       ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
   ^bb0(%a: f16, %b: f16, %out: f16):
     // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{the predicate 'oeq' does have a spyreop.compare counterpart}}
+    // expected-note @below {{the 'arith.cmpf' is read by 2 ops, and is lowered only together with exactly one reader}}
     %c = arith.cmpf oeq, %a, %b : f16
     // expected-note @below {{read here, by 'arith.uitofp'}}
     %f = arith.uitofp %c : i1 to f16

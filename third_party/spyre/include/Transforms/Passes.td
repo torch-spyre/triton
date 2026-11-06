@@ -286,7 +286,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         - anything still tensor-typed, which only ConvertElementwiseToLinalg not
           having run can produce
 
-        A group rule declines and its members stay as they were:
+        A rule with a condition declines and its ops stay as they were:
         - a divide whose numerator is not a constant one, or whose constant is
           the denominator: the realdiv rule takes it, which is the right answer
         - a numerator that is a block argument, even one fed by a splat 1.0
@@ -302,11 +302,11 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
 
         Each of the compare declines leaves an `i1` INSIDE a body, so each is
         REFUSED by the check above rather than passed through — they are the
-        exception, not the rule. The diagnostic names the predicate and says
-        which kind of decline it was: one with no counterpart at all, or one whose
-        predicate was fine and whose READER was the problem, with each rule's
-        reason, the verifier's among them. That distinction is what an author
-        can act on.
+        exception, not the rule. The diagnostic gives the reason of each rule
+        with a reader on the op that made the `i1`, by rule name, the
+        verifier's among them: a predicate with no counterpart, a reader the
+        rule does not name, more than one reader, or types the spyreop op does
+        not take. That is what an author can act on.
 
         Ordering: after the passes that make every compute a linalg.generic,
         after [CanonicalizeGenericOperands] and after [FuseGenerics], per the
@@ -502,11 +502,9 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
           by `linalg::deduplicateOperandsAndRemoveDeadResults`. When `P` has a
           user other than the consumer, it is fused only if every
           non-terminator op in its body is a producer op the group consumes,
-          so nothing outside the group is copied. The groups today are an
-          `arith.cmpf` read by `arith.uitofp` (compare-cast) or by
-          `arith.select` as its condition (compare-select), at the compared
-          width; the rules are kSpyreOpLoweringRules, and a new one with a
-          reader is groupable here with no change. A group has exactly one
+          so nothing outside the group is copied. The groups are the rules
+          with a reader in kSpyreOpLoweringRules, and a new one is groupable
+          here with no change. A group has exactly one
           reader: a result read by more than one op in the consumer, e.g. one
           compare read by two `arith.select`s, or by an `arith.uitofp` and an
           `arith.select`, is not grouped, and legalization reports the `i1`.
@@ -527,7 +525,8 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         (`legalizeAfterFusion`). It rewrites nothing, and runs one check: an
         `ins` of element type `i1` defined by a `linalg.generic` is an error
         at the consumer, with notes naming the op that made it, each reader,
-        and the groups LowerSpyreOps lowers an `i1` in. No spyreop op produces
+        and the groups LowerSpyreOps lowers an `i1` in, listed from the rules
+        with a reader in kSpyreOpLoweringRules. No spyreop op produces
         or consumes `i1`, so it has no device form on any path. LowerSpyreOps' rejectSurvivingBooleans reports the other
         form, an `i1` made and read inside one body.
 
