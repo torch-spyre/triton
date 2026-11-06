@@ -35,9 +35,9 @@
 // producer kind no existing pattern matches; one whose kind overlaps an
 // existing pattern's is a new case of that pattern. Its lit file feeds it the
 // other patterns' producers and checks that it does not fire. A new group shape
-// is not a pattern here: it is one match function in LowerSpyreOps plus one
-// entry in its kGroupShapes list, which matchLowerableGroup then tries for a
-// producer result with exactly one reader.
+// is not a pattern here: it is one match function in SpyreOpLoweringRules plus
+// one entry in its kGroupShapes list, which matchLowerableGroup then tries for
+// a producer result with exactly one reader.
 //
 // `--debug-only=fuse-generics` traces, one line per decision, each operand
 // skipped before any check, each decline with the check that declined it, each
@@ -45,7 +45,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Transforms/LowerSpyreOps.h"
+#include "Dialect/SpyreOp/Utils/SpyreOpLoweringRules.h"
 #include "Transforms/Passes.h"
 #include "Utils/GenericOperands.h"
 
