@@ -28,7 +28,7 @@ add_triton_library(SpyreTransforms
   LINK_LIBS PUBLIC
   # For createEmptyTensor in UnaliasLinalgOuts, and GenericOperands.
   SpyreUtils
-  # The group shapes and shared questions LowerSpyreOps lowers by and
+  # The lowering rules LowerSpyreOps registers a pattern for and
   # FuseGenerics' GroupComputes asks.
   SpyreOpUtils
   # LowerSpyreOps emits spyreop intrinsics -- the one dialect here that is a
