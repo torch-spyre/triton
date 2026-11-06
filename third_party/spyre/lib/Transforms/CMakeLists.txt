@@ -28,6 +28,9 @@ add_triton_library(SpyreTransforms
   LINK_LIBS PUBLIC
   # For createEmptyTensor in UnaliasLinalgOuts, and GenericOperands.
   SpyreUtils
+  # The group shapes and shared questions LowerSpyreOps lowers by and
+  # FuseGenerics' GroupComputes asks.
+  SpyreOpUtils
   # LowerSpyreOps emits spyreop intrinsics -- the one dialect here that is a
   # TARGET rather than a subject.  Its rules match arith and math; it is KTIR ->
   # KTIR and reads no tt op, which is why it is here rather than in Conversion/.
