@@ -378,17 +378,17 @@ func.func @oeq_left_zero_f16_scalar(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: te
 // Uniform zero is recognized on either side; the selected condition remains
 // the input element and equality exchanges the values. Negative zero is zero.
 #map = affine_map<(d0) -> (d0)>
-// CHECK-LABEL: func.func @one_right_zero_f16_input(
+// CHECK-LABEL: func.func @one_right_zero_f16_scalar(
 // CHECK: ^bb0(%[[M:.*]]: f16, %[[P:.*]]: f16, %[[Q:.*]]: f16, %{{.*}}: f16):
 // CHECK-NEXT: %[[S:.*]] = spyreop.select %[[M]], %[[P]], %[[Q]] : f16
 // CHECK-NEXT: linalg.yield %[[S]] : f16
-func.func @one_right_zero_f16_input(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: tensor<4xf16>) -> tensor<4xf16> {
-    %zero = arith.constant dense<0.0> : tensor<4xf16>
+func.func @one_right_zero_f16_scalar(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: tensor<4xf16>) -> tensor<4xf16> {
+    %zero = arith.constant 0.0 : f16
     %init = tensor.empty() : tensor<4xf16>
-    %r = linalg.generic {indexing_maps = [#map, #map, #map, #map, #map], iterator_types = ["parallel"]}
-        ins(%m, %p, %q, %zero : tensor<4xf16>, tensor<4xf16>, tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-      ^bb0(%mask: f16, %t: f16, %f: f16, %z: f16, %out: f16):
-        %c = arith.cmpf one, %mask, %z : f16
+    %r = linalg.generic {indexing_maps = [#map, #map, #map, #map], iterator_types = ["parallel"]}
+        ins(%m, %p, %q : tensor<4xf16>, tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
+      ^bb0(%mask: f16, %t: f16, %f: f16, %out: f16):
+        %c = arith.cmpf one, %mask, %zero : f16
         %s = arith.select %c, %t, %f : f16
         linalg.yield %s : f16
     } -> tensor<4xf16>
@@ -400,17 +400,17 @@ func.func @one_right_zero_f16_input(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: te
 // Uniform zero is recognized on either side; the selected condition remains
 // the input element and equality exchanges the values. Negative zero is zero.
 #map = affine_map<(d0) -> (d0)>
-// CHECK-LABEL: func.func @ueq_left_zero_f32_input(
+// CHECK-LABEL: func.func @ueq_left_zero_f32_scalar(
 // CHECK: ^bb0(%[[M:.*]]: f32, %[[P:.*]]: f32, %[[Q:.*]]: f32, %{{.*}}: f32):
 // CHECK-NEXT: %[[S:.*]] = spyreop.select %[[M]], %[[Q]], %[[P]] : f32
 // CHECK-NEXT: linalg.yield %[[S]] : f32
-func.func @ueq_left_zero_f32_input(%m: tensor<4xf32>, %p: tensor<4xf32>, %q: tensor<4xf32>) -> tensor<4xf32> {
-    %zero = arith.constant dense<-0.0> : tensor<4xf32>
+func.func @ueq_left_zero_f32_scalar(%m: tensor<4xf32>, %p: tensor<4xf32>, %q: tensor<4xf32>) -> tensor<4xf32> {
+    %zero = arith.constant -0.0 : f32
     %init = tensor.empty() : tensor<4xf32>
-    %r = linalg.generic {indexing_maps = [#map, #map, #map, #map, #map], iterator_types = ["parallel"]}
-        ins(%m, %p, %q, %zero : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) outs(%init : tensor<4xf32>) {
-      ^bb0(%mask: f32, %t: f32, %f: f32, %z: f32, %out: f32):
-        %c = arith.cmpf ueq, %z, %mask : f32
+    %r = linalg.generic {indexing_maps = [#map, #map, #map, #map], iterator_types = ["parallel"]}
+        ins(%m, %p, %q : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) outs(%init : tensor<4xf32>) {
+      ^bb0(%mask: f32, %t: f32, %f: f32, %out: f32):
+        %c = arith.cmpf ueq, %zero, %mask : f32
         %s = arith.select %c, %t, %f : f32
         linalg.yield %s : f32
     } -> tensor<4xf32>

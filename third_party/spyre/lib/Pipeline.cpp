@@ -225,17 +225,16 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // one-op-to-one rules and the group rules share a pattern set, each rooted on
   // a different op.
   //
-  // Needs every compute to be a linalg.generic, which the passes above make it: a
-  // group rule's SCOPE is the generic body, and the 1:1 rules leave a tensor-typed
-  // op alone.
+  // Needs every compute to be a linalg.generic, which the passes above make it:
+  // every rule's SCOPE is the generic body, and an op outside one is left alone.
   //
   // And it needs FuseGenerics to have run, which it has, well above. A rule
   // matches ops in ONE body while ConvertElementwiseToLinalg gives every
   // tensor-level op a body of its own, so a group spanning two tensor ops is
   // two generics until something fuses them -- FuseGenerics' GroupComputes is
-  // what does, and the compare rule fires only because of it. The reciprocal is
-  // the softer case: it reads its numerator through the body, so it fires
-  // either way.
+  // what does, and the compare rule fires only because of it. The rules read a
+  // constant only as a scalar in the body, which CanonicalizeGenericOperands,
+  // also well above, makes every splat constant `ins` into.
   //
   // Nothing is reported here. An op with no device form flows through to dbo-opt,
   // which is the component that knows what it can take.
