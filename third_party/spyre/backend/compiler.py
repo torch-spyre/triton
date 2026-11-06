@@ -126,10 +126,16 @@ _MLIR_ELEM_BITS = re.compile(r"^(?:bf|[fiu])(\d+)")
 # it, keyed by the op's name in triton.language.math and served through the
 # `extra_math_dtypes` codegen hook.
 #
-# These are the math-dialect ops LowerSpyreOps converts, whose
-# isSpyreOpScalarType is isa<Float16Type, Float32Type>. Its other patterns are
-# arith, which no @_check_dtype-decorated op reaches. That pass is the authority;
-# test_frontend_guards.py pins the two together.
+# These are the math-dialect ops LowerSpyreOps lowers: math.exp, math.sqrt and
+# math.rsqrt in a compute body, to spyreop.exp, spyreop.sqrt and spyreop.rsqrt.
+# Which dtypes lower is decided by those spyreop ops' own definitions: a rule
+# fires only when the op it builds passes that op's verifier on the operand
+# types, which for these three admits f16 and f32. fp32 is already on upstream's
+# allowlist, so fp16 is what is added here. The pass's other rules anchor on
+# arith ops, which no @_check_dtype-decorated op reaches.
+#
+# The table is written out by hand, not read from those definitions;
+# test_frontend_guards.py pins it to the ops named above.
 #
 # bf16 is excluded: standard.py's _promote_bfloat16_to_float32 widens bf16
 # reduces, so admitting it would claim support the frontend lacks.
@@ -528,9 +534,10 @@ class SpyreBackend(BaseBackend):
         matching AMD and the interpreter. Revisit this if a future
         KTIR matmul path needs a minimum.
 
-        ``extra_math_dtypes(op_name)`` returns the dtype names this
-        target's intrinsic for that ``tl.*`` math op covers beyond the
-        allowlist upstream declares on it. See ``_EXTRA_MATH_DTYPES``.
+        ``extra_math_dtypes(op_name)`` returns the dtype names the spyreop
+        intrinsic for that ``tl.*`` math op takes, by its own definition,
+        beyond the allowlist upstream declares on it. See
+        ``_EXTRA_MATH_DTYPES``.
         Unlike ``min_dot_size`` the frontend treats it as optional, so a
         backend that omits it keeps upstream's allowlists unchanged.
         """

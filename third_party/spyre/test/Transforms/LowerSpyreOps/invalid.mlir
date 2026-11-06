@@ -309,8 +309,10 @@ func.func @integer_values_are_refused(%a: tensor<8xf32>, %b: tensor<8xf32>,
       ins(%a, %b, %p, %q : tensor<8xf32>, tensor<8xf32>, tensor<8xi32>, tensor<8xi32>)
       outs(%init : tensor<8xi32>) {
   ^bb0(%x: f32, %y: f32, %t: i32, %f: i32, %o: i32):
+    // The reason is the probe's: the verifier of the spyreop.compare the rule
+    // would build says its result must be a float, and not 'i32'.
     // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{the predicate 'ogt' does have a spyreop.compare counterpart}}
+    // expected-note @below {{'spyreop.compare' does not take these types: 'spyreop.compare' op result #0 must be 16-bit float or IBM df16 float or 32-bit float, but got 'i32'}}
     %c = arith.cmpf ogt, %x, %y : f32
     // expected-note @below {{read here, by 'arith.select'}}
     %s = arith.select %c, %t, %f : i32
