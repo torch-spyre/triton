@@ -20,30 +20,26 @@
 // Single-body inputs: one decision per case, fusion taken as read
 //===----------------------------------------------------------------------===//
 
-// `m != 0` as a float mask, ordered.
-//
-// Hand-built into one body and driven WITHOUT the fusion pass, so the splat zero is
-// still an `ins` operand and the body reads it as a block argument. The rule does
-// not care: it reads the compare's operands as the body holds them.
+// `m != 0` as a float mask, ordered. The zero is a scalar constant the body
+// reads, which is how CanonicalizeGenericOperands delivers a splat constant.
 // CHECK-LABEL:   func.func @mask_notequal_f16(
 // CHECK-SAME:  %[[M:.*]]: tensor<4xf16>) -> tensor<4xf16> {
 // CHECK-NOT:       arith.cmpf
 // CHECK-NOT:       arith.uitofp
-// CHECK:           %[[Z:.*]] = arith.constant dense<0.000000e+00> : tensor<4xf16>
-// CHECK:           linalg.generic {{.*}} ins(%[[M]], %[[Z]] :
-// CHECK:           ^bb0(%[[A:.*]]: f16, %[[ZS:.*]]: f16, %[[OUT:.*]]: f16):
-// CHECK:             %[[R:.*]] = spyreop.compare <notequal> %[[A]], %[[ZS]] : f16
+// CHECK:           %[[Z:.*]] = arith.constant 0.000000e+00 : f16
+// CHECK:           linalg.generic {{.*}} ins(%[[M]] :
+// CHECK:           ^bb0(%[[A:.*]]: f16, %[[OUT:.*]]: f16):
+// CHECK:             %[[R:.*]] = spyreop.compare <notequal> %[[A]], %[[Z]] : f16
 // CHECK:             linalg.yield %[[R]] : f16
 func.func @mask_notequal_f16(%m: tensor<4xf16>) -> tensor<4xf16> {
-  %zero = arith.constant dense<0.0> : tensor<4xf16>
+  %zero = arith.constant 0.0 : f16
   %init = tensor.empty() : tensor<4xf16>
   %0 = linalg.generic {
-      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
-                       affine_map<(d0) -> (d0)>],
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
       iterator_types = ["parallel"]}
-      ins(%m, %zero : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-  ^bb0(%a: f16, %z: f16, %out: f16):
-    %c = arith.cmpf one, %a, %z : f16
+      ins(%m : tensor<4xf16>) outs(%init : tensor<4xf16>) {
+  ^bb0(%a: f16, %out: f16):
+    %c = arith.cmpf one, %a, %zero : f16
     %f = arith.uitofp %c : i1 to f16
     linalg.yield %f : f16
   } -> tensor<4xf16>
@@ -57,15 +53,14 @@ func.func @mask_notequal_f16(%m: tensor<4xf16>) -> tensor<4xf16> {
 // CHECK-NOT:       arith.cmpf
 // CHECK:             spyreop.compare <equal> {{.*}} : f32
 func.func @mask_equal_f32(%m: tensor<4xf32>) -> tensor<4xf32> {
-  %zero = arith.constant dense<0.0> : tensor<4xf32>
+  %zero = arith.constant 0.0 : f32
   %init = tensor.empty() : tensor<4xf32>
   %0 = linalg.generic {
-      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
-                       affine_map<(d0) -> (d0)>],
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
       iterator_types = ["parallel"]}
-      ins(%m, %zero : tensor<4xf32>, tensor<4xf32>) outs(%init : tensor<4xf32>) {
-  ^bb0(%a: f32, %z: f32, %out: f32):
-    %c = arith.cmpf oeq, %a, %z : f32
+      ins(%m : tensor<4xf32>) outs(%init : tensor<4xf32>) {
+  ^bb0(%a: f32, %out: f32):
+    %c = arith.cmpf oeq, %a, %zero : f32
     %f = arith.uitofp %c : i1 to f32
     linalg.yield %f : f32
   } -> tensor<4xf32>

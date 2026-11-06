@@ -9,14 +9,16 @@
 
 // The one-to-one rules: an arith or math op that becomes one spyreop op on its
 // own, with no group. The unary float ops, arith.divf, and the integer add and
-// multiply inside a generic body. reciprocal.mlir holds the divide's numerator
-// cases; pass-through.mlir the types with no intrinsic, which flow through.
+// multiply. Every rule applies only to an op whose immediate parent is a
+// linalg.generic; the scalar cases at function level pin that each op stays as
+// it is there. reciprocal.mlir holds the divide's numerator cases;
+// pass-through.mlir the types with no intrinsic, which flow through.
 
-// math.sqrt on a scalar f32 operand -> spyreop.sqrt.
+// math.sqrt on a scalar f32 operand outside any generic body is left as it is.
 module {
 // CHECK-LABEL:   tt.func @sqrt_f32(
 // CHECK-SAME:  %[[VAL_0:.*]]: f32) -> f32 {
-// CHECK:           %[[VAL_1:.*]] = spyreop.sqrt %[[VAL_0]] : f32
+// CHECK:           %[[VAL_1:.*]] = math.sqrt %[[VAL_0]] : f32
 // CHECK:           tt.return %[[VAL_1]] : f32
 // CHECK:         }
 tt.func @sqrt_f32(%s: f32) -> f32 {
@@ -27,11 +29,11 @@ tt.func @sqrt_f32(%s: f32) -> f32 {
 
 // -----
 
-// math.sqrt on a scalar f16 operand -> spyreop.sqrt.
+// math.sqrt on a scalar f16 operand outside any generic body is left as it is.
 module {
 // CHECK-LABEL:   tt.func @sqrt_f16(
 // CHECK-SAME:  %[[VAL_0:.*]]: f16) -> f16 {
-// CHECK:           %[[VAL_1:.*]] = spyreop.sqrt %[[VAL_0]] : f16
+// CHECK:           %[[VAL_1:.*]] = math.sqrt %[[VAL_0]] : f16
 // CHECK:           tt.return %[[VAL_1]] : f16
 // CHECK:         }
 tt.func @sqrt_f16(%s: f16) -> f16 {
@@ -58,11 +60,11 @@ tt.func @sqrt_tensor_survives(%t: tensor<4xf32>) -> tensor<4xf32> {
 
 // -----
 
-// math.exp on a scalar f32 operand -> spyreop.exp.
+// math.exp on a scalar f32 operand outside any generic body is left as it is.
 module {
 // CHECK-LABEL:   tt.func @exp_f32(
 // CHECK-SAME:  %[[VAL_0:.*]]: f32) -> f32 {
-// CHECK:           %[[VAL_1:.*]] = spyreop.exp %[[VAL_0]] : f32
+// CHECK:           %[[VAL_1:.*]] = math.exp %[[VAL_0]] : f32
 // CHECK:           tt.return %[[VAL_1]] : f32
 // CHECK:         }
 tt.func @exp_f32(%s: f32) -> f32 {
@@ -73,11 +75,11 @@ tt.func @exp_f32(%s: f32) -> f32 {
 
 // -----
 
-// math.rsqrt on a scalar f32 operand -> spyreop.rsqrt.
+// math.rsqrt on a scalar f32 operand outside any generic body is left as it is.
 module {
 // CHECK-LABEL:   tt.func @rsqrt_f32(
 // CHECK-SAME:  %[[VAL_0:.*]]: f32) -> f32 {
-// CHECK:           %[[VAL_1:.*]] = spyreop.rsqrt %[[VAL_0]] : f32
+// CHECK:           %[[VAL_1:.*]] = math.rsqrt %[[VAL_0]] : f32
 // CHECK:           tt.return %[[VAL_1]] : f32
 // CHECK:         }
 tt.func @rsqrt_f32(%s: f32) -> f32 {
@@ -88,11 +90,11 @@ tt.func @rsqrt_f32(%s: f32) -> f32 {
 
 // -----
 
-// arith.divf on scalar f32 operands -> spyreop.realdiv.
+// arith.divf on scalar f32 operands outside any generic body is left as it is.
 module {
 // CHECK-LABEL:   tt.func @divf_f32(
 // CHECK-SAME:  %[[VAL_0:.*]]: f32, %[[VAL_1:.*]]: f32) -> f32 {
-// CHECK:           %[[VAL_2:.*]] = spyreop.realdiv %[[VAL_0]], %[[VAL_1]] : f32
+// CHECK:           %[[VAL_2:.*]] = arith.divf %[[VAL_0]], %[[VAL_1]] : f32
 // CHECK:           tt.return %[[VAL_2]] : f32
 // CHECK:         }
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0) -> (d0)>
@@ -104,10 +106,10 @@ tt.func @divf_f32(%a: f32, %b: f32) -> f32 {
 
 // -----
 
-// arith.addi is also plain index/address arithmetic, so it is only matched
-// inside a linalg.generic body -- the structural signal (left behind by
-// ConvertElementwiseToLinalg) that this is scalarized elementwise compute,
-// not address math. i32 -> spyreop.addi32toi32.
+// arith.addi is also plain index/address arithmetic, and like every rule it is
+// only matched inside a linalg.generic body -- the structural signal (left
+// behind by ConvertElementwiseToLinalg) that this is scalarized elementwise
+// compute, not address math. i32 -> spyreop.addi32toi32.
 module {
 // CHECK-LABEL:   tt.func @addi_i32_inside_generic(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<4xi32>) -> tensor<4xi32> {
@@ -283,8 +285,8 @@ tt.func @muli_i32_outside_generic_survives(%a: i32, %b: i32) -> i32 {
 
 // -----
 
-// arith.divf with a constant 1.0 numerator, outside any generic body ->
-// spyreop.reciprocal; the constant is dead.
+// arith.divf with a constant 1.0 numerator, outside any generic body, is left
+// as it is, constant and all: the reciprocal rule applies only in a body too.
 //
 // Last in the file rather than beside @divf_f32 on purpose: the generated checks
 // capture each module's affine_map definitions at the END of the preceding
@@ -293,9 +295,8 @@ tt.func @muli_i32_outside_generic_survives(%a: i32, %b: i32) -> i32 {
 module {
 // CHECK-LABEL:   tt.func @divf_one_over_x_f32(
 // CHECK-SAME:  %[[VAL_0:.*]]: f32) -> f32 {
-// CHECK-NOT:       arith.constant
-// CHECK-NOT:       spyreop.realdiv
-// CHECK:           %[[VAL_1:.*]] = spyreop.reciprocal %[[VAL_0]] : f32
+// CHECK:           %[[ONE:.*]] = arith.constant 1.000000e+00 : f32
+// CHECK:           %[[VAL_1:.*]] = arith.divf %[[ONE]], %[[VAL_0]] : f32
 // CHECK:           tt.return %[[VAL_1]] : f32
 // CHECK:         }
 tt.func @divf_one_over_x_f32(%x: f32) -> f32 {

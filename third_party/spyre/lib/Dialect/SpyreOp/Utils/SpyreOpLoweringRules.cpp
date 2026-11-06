@@ -44,14 +44,6 @@ bool isSpyreOpScalarType(Type type) {
   return isa<Float16Type, Float32Type>(type);
 }
 
-Value resolveThroughBody(linalg::GenericOp generic, Value v) {
-  auto arg = dyn_cast<BlockArgument>(v);
-  if (!arg || arg.getOwner() != generic.getBlock())
-    return v;
-  OpOperand *operand = generic.getMatchingOpOperand(arg);
-  return generic.isDpsInput(operand) ? operand->get() : v;
-}
-
 std::optional<spyreop::ComparePredicate>
 spyrePredicateFor(arith::CmpFPredicate p) {
   switch (p) {
@@ -100,24 +92,8 @@ unsigned getScalarIntBitWidth(Type type) {
   return intTy ? intTy.getWidth() : 0;
 }
 
-/// Whether this op is (transitively) inside a linalg.generic body.
-///
-/// A PROXY, used only by the integer rules, which have no better test: plain
-/// scalar integer add and mul are also loop indices, offsets and tile
-/// addressing, and there is no exact test separating those from scalarized
-/// integer compute. The proxy over-claims -- `tl.arange(0, N) * stride` is an
-/// `arith.muli` that will be inside a body once scalarized -- and it holds
-/// today only because the tensor-of-pointers `tt.load` path is unimplemented.
-/// The rules with a reader use the enclosing generic as a SCOPE instead,
-/// requiring the generic to be the anchor's immediate parent.
-bool isInsideLinalgGeneric(Operation *op) {
-  return op->getParentOfType<linalg::GenericOp>() != nullptr;
-}
-
 /// The unary float rules and realdiv: the result type has a spyreop float
-/// intrinsic. No placement check: these ops only ever appear in real
-/// floating-point compute, never in address or index arithmetic, so every
-/// scalar occurrence is one to lower, inside a generic body or not.
+/// intrinsic.
 bool guardFloatResult(const GroupCandidate &candidate, std::string &why) {
   if (isSpyreOpScalarType(candidate.anchor->getResult(0).getType()))
     return true;
@@ -125,29 +101,21 @@ bool guardFloatResult(const GroupCandidate &candidate, std::string &why) {
   return false;
 }
 
-/// The reciprocal: guardFloatResult, and the numerator is a 1.0, read through
-/// `anchorBody` when there is one, so a one passed in as a splat `ins` operand
-/// matches as well as a scalar constant.
+/// The reciprocal: guardFloatResult, and the numerator is a scalar constant
+/// 1.0.
 bool guardReciprocal(const GroupCandidate &candidate, std::string &why) {
   if (!guardFloatResult(candidate, why))
     return false;
-  Value numerator = cast<arith::DivFOp>(candidate.anchor).getLhs();
-  if (candidate.anchorBody)
-    numerator = resolveThroughBody(candidate.anchorBody, numerator);
-  if (matchPattern(numerator, m_OneFloat()))
+  if (matchPattern(cast<arith::DivFOp>(candidate.anchor).getLhs(),
+                   m_OneFloat()))
     return true;
   why = "the numerator is not 1.0";
   return false;
 }
 
-/// The integer rules: the anchor is inside a generic body (the proxy at
-/// isInsideLinalgGeneric) and its result is an integer of `Width` bits.
+/// The integer rules: the result is an integer of `Width` bits.
 template <unsigned Width>
-bool guardIntegerInBody(const GroupCandidate &candidate, std::string &why) {
-  if (!isInsideLinalgGeneric(candidate.anchor)) {
-    why = "not inside a linalg.generic body";
-    return false;
-  }
+bool guardIntegerWidth(const GroupCandidate &candidate, std::string &why) {
   if (getScalarIntBitWidth(candidate.anchor->getResult(0).getType()) != Width) {
     why = "the result is not an i" + std::to_string(Width);
     return false;
@@ -155,14 +123,10 @@ bool guardIntegerInBody(const GroupCandidate &candidate, std::string &why) {
   return true;
 }
 
-/// The checks every compare rule makes: the anchor's immediate parent is a
-/// generic, the reader's result type has a spyreop intrinsic, and the compared
-/// type is that same type. Records the first that fails in `why`.
+/// The checks every compare rule makes: the reader's result type has a spyreop
+/// intrinsic, and the compared type is that same type. Records the first that
+/// fails in `why`.
 bool readsAtComparedWidth(const GroupCandidate &candidate, std::string &why) {
-  if (!candidate.anchorBody) {
-    why = "the anchor's parent is not a linalg.generic";
-    return false;
-  }
   auto cmp = cast<arith::CmpFOp>(candidate.anchor);
   Type resultType = candidate.readers.front()->getResult(0).getType();
   if (!isSpyreOpScalarType(resultType)) {
@@ -209,16 +173,14 @@ struct ZeroTestSelect {
 ///
 ///   - `m != 0` (`one`/`une`) -> condition `m`, values in order;
 ///   - `m == 0` (`oeq`/`ueq`) -> condition `m`, values exchanged;
-///   - zero on either side, as a scalar or a uniform input tensor, and -0.0,
-///     e.g. `0 != m`, or `%z` fed by `dense<0.0>`.
+///   - zero, a scalar constant, on either side, and -0.0, e.g. `0 != m`.
 ///
 /// Returns nothing for the rest, which keep their compare:
 ///
 ///   - an ordering, e.g. `m > 0` is false for a negative `m` that "not zero"
 ///     calls true;
-///   - a non-uniform constant, e.g. `dense<[0.0, 1.0]>`.
-std::optional<ZeroTestSelect> selectFromZeroTest(linalg::GenericOp generic,
-                                                 arith::CmpFOp cmp) {
+///   - an operand that is not a scalar constant zero, e.g. a block argument.
+std::optional<ZeroTestSelect> selectFromZeroTest(arith::CmpFOp cmp) {
   bool exchangeValues;
   switch (cmp.getPredicate()) {
   case arith::CmpFPredicate::ONE:
@@ -232,21 +194,19 @@ std::optional<ZeroTestSelect> selectFromZeroTest(linalg::GenericOp generic,
   default:
     return std::nullopt;
   }
-  if (matchPattern(resolveThroughBody(generic, cmp.getRhs()), m_AnyZeroFloat()))
+  if (matchPattern(cmp.getRhs(), m_AnyZeroFloat()))
     return ZeroTestSelect{0, exchangeValues};
-  if (matchPattern(resolveThroughBody(generic, cmp.getLhs()), m_AnyZeroFloat()))
+  if (matchPattern(cmp.getLhs(), m_AnyZeroFloat()))
     return ZeroTestSelect{1, exchangeValues};
   return std::nullopt;
 }
 
 /// compare-select-zero-test: readsAtComparedWidth, and the compare is a zero
-/// test spyreop.select performs itself (selectFromZeroTest, its operands
-/// resolved through `anchorBody`).
+/// test spyreop.select performs itself (selectFromZeroTest).
 bool guardZeroTest(const GroupCandidate &candidate, std::string &why) {
   if (!readsAtComparedWidth(candidate, why))
     return false;
-  if (selectFromZeroTest(candidate.anchorBody,
-                         cast<arith::CmpFOp>(candidate.anchor)))
+  if (selectFromZeroTest(cast<arith::CmpFOp>(candidate.anchor)))
     return true;
   why = "the compare is not a zero test spyreop.select performs itself";
   return false;
@@ -311,7 +271,7 @@ Value buildZeroTestSelect(OpBuilder &b, const GroupCandidate &candidate,
                           ValueRange operands) {
   auto cmp = cast<arith::CmpFOp>(candidate.anchor);
   Operation *select = candidate.readers.front();
-  ZeroTestSelect zeroTest = *selectFromZeroTest(candidate.anchorBody, cmp);
+  ZeroTestSelect zeroTest = *selectFromZeroTest(cmp);
   traceMatch(cmp, llvm::Twine("arith.cmpf '") +
                       arith::stringifyCmpFPredicate(cmp.getPredicate()) +
                       "' tests against zero, which spyreop.select does to "
@@ -376,12 +336,13 @@ const SpyreOpLoweringRule kSpyreOpLoweringRules[] = {
      buildReciprocal},
     {"realdiv", opName<arith::DivFOp>(), {}, 1, guardFloatResult,
      buildBinary<spyreop::RealDiv>},
-    // The integer rules over-claim: see isInsideLinalgGeneric.
-    {"addi32", opName<arith::AddIOp>(), {}, 1, guardIntegerInBody<32>,
+    // Every i32 or i64 add or multiply in a body, whatever its result is used
+    // for: see "THE GENERIC BODY IS THE SCOPE" in Passes.td.
+    {"addi32", opName<arith::AddIOp>(), {}, 1, guardIntegerWidth<32>,
      buildBinary<spyreop::AddI32ToI32>},
-    {"addi64", opName<arith::AddIOp>(), {}, 1, guardIntegerInBody<64>,
+    {"addi64", opName<arith::AddIOp>(), {}, 1, guardIntegerWidth<64>,
      buildBinary<spyreop::AddI64ToI64>},
-    {"muli32", opName<arith::MulIOp>(), {}, 1, guardIntegerInBody<32>,
+    {"muli32", opName<arith::MulIOp>(), {}, 1, guardIntegerWidth<32>,
      buildBinary<spyreop::MulI32ToI32>},
     {"compare-cast", opName<arith::CmpFOp>(), kUIToFPReader, 1, guardCompare,
      buildCompareCast},
