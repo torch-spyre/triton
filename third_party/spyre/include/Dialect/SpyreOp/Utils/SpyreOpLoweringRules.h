@@ -26,6 +26,10 @@
 // The probe takes the ShapeCheckedRule that ruleShapeMatches makes, so it
 // cannot be asked about a candidate whose shape the rule does not lower.
 //
+// An op no rule lowers is left for the backend, unless a rule says that
+// leaving it is illegal (SpyreOpLoweringRule::legal); LowerSpyreOps asks the
+// rules once it converges.
+//
 // The passes' diagnostics about a group are made from the table: the rules
 // with a reader, by name, anchor and readers (describeRulesWithReaders), and
 // each rule's reason for declining a candidate (matchLowerableGroup).
@@ -106,6 +110,15 @@ struct SpyreOpLoweringRule {
   /// attributes, its operands only from `operands`, and returns a value of the
   /// replaced op's type. probeSpyreOpRule checks this.
   Value (*build)(OpBuilder &, const GroupCandidate &, ValueRange operands);
+  /// Whether it is legal to leave the anchor as it is, asked once selection has
+  /// converged and no rule lowered it; null when it always is. An op the
+  /// rules do not lower is normally legal: it reaches the backend, which
+  /// knows what the device can take. It is not when its result has a type no
+  /// spyreop op produces or consumes, because then no rule anyone could add
+  /// would ever remove it, and the program is unlowerable, not merely
+  /// unsupported. Returns false for that, with `why` the reason. Never about
+  /// whether some rule could lower the anchor: that is `guard` and the probe.
+  bool (*legal)(const GroupCandidate &, std::string &why);
 };
 
 /// Every rule, kSpyreOpLoweringRules. The table is checked by
@@ -173,6 +186,11 @@ struct GroupMatch {
   /// The anchor body's ops the group consumes.
   SmallVector<Operation *> producerOps;
 };
+
+/// Whether it is legal to leave `candidate`'s anchor as it is: every rule
+/// anchored on its op that has a `legal` check agrees. Asked once selection has
+/// converged. Sets `why` to the first such rule's reason when it is not.
+bool isLegalToLeave(const GroupCandidate &candidate, std::string &why);
 
 /// The rule with a reader that lowers `candidate`: the first in
 /// kSpyreOpLoweringRules for which ruleShapeMatches and probeSpyreOpRule both

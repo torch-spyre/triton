@@ -299,7 +299,7 @@ func.func @select_width_mismatch(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tenso
 // This differs from compare-select.mlir's @condition_from_outside_is_left_alone:
 //   - there: the `i1` is a block argument -> quiet decline;
 //   - here: the `i1` is made by an `arith.cmpf` in this body and read in it
-//     -> reported by rejectSurvivingBooleans.
+//     -> reported by checkLegality.
 #map = affine_map<(d0) -> (d0)>
 func.func @integer_values_are_refused(%a: tensor<8xf32>, %b: tensor<8xf32>,
                                       %p: tensor<8xi32>, %q: tensor<8xi32>) -> tensor<8xi32> {

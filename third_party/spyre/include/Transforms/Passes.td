@@ -231,22 +231,33 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         leaves the rest as it found it. That is a change from when it was a
         dialect conversion, where an unsupported float width was reported here.
 
-        The exception is an `i1`, and it is a different kind of thing rather than
-        a carve-out. Flows-through is about a CAPABILITY gap: an f64 math.sqrt is
-        valid IR that a future device or a future rule may do. An `i1` in a
-        compute body is UNREPRESENTABLE — no spyreop intrinsic produces or
-        consumes that type, so no rule anyone could add would ever remove it. That
-        is a property of the dialect, not of a device generation, and it makes the
-        program unlowerable rather than unsupported. It is reported HERE because
-        this is the only place that still knows the PREDICATE; by the time the
-        backend sees it, the failure names an op several lowerings below the one
-        the author wrote.
+        The exception is an op a rule says is ILLEGAL TO LEAVE, and it is a
+        different kind of thing rather than a carve-out. Flows-through is about
+        a CAPABILITY gap: an f64 math.sqrt is valid IR that a future device or a
+        future rule may do. An `i1` in a compute body is UNREPRESENTABLE — no
+        spyreop intrinsic produces or consumes that type, so no rule anyone
+        could add would ever remove it. That is a property of the dialect, not
+        of a device generation, and it makes the program unlowerable rather than
+        unsupported. It is reported HERE because this is the only place that
+        still knows the PREDICATE; by the time the backend sees it, the failure
+        names an op several lowerings below the one the author wrote.
 
-        WHAT THE i1 CHECK REFUSES, precisely, because the scope is narrower than
-        "any i1 in a body". It reads op RESULTS only and skips one that is
-        yielded, so what it refuses is an i1 this pass produced and KEPT: made
-        inside one body and read inside the same body. That is exactly a group it
-        had the chance to select and did not.
+        THE RULES SAY WHAT IS ILLEGAL. Each rule may carry a `legal` check
+        beside its `guard` and `build` (SpyreOpLoweringRule::legal), asked about
+        its anchor once the fixpoint has converged and no rule lowered it. The
+        pass then walks every compute body and asks the rules anchored on each
+        op (`isLegalToLeave`); it names no type itself. Until the fixpoint
+        converges nothing is asked, because an `i1` is exactly what the group
+        rules match. Today the three compare rules carry the check, so a new
+        rule that leaves its own unrepresentable result adds a `legal` and
+        changes nothing here.
+
+        WHAT IT REFUSES, precisely, because the scope is narrower than "any i1
+        in a body". A compare is asked, and a compare whose `i1` is yielded is
+        legal, so what is refused is an `i1` this pass produced and KEPT: made
+        inside one body and read inside the same body. That is exactly a group
+        it had the chance to select and did not. An `i1` made by an op no rule
+        is anchored on is not asked, and flows through to the backend.
 
         An i1 crossing a generic BOUNDARY is the other pass's finding. It is the
         tensor form, and [FuseGenerics]' legalization step reports it; before
@@ -527,7 +538,8 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         at the consumer, with notes naming the op that made it, each reader,
         and the groups LowerSpyreOps lowers an `i1` in, listed from the rules
         with a reader in kSpyreOpLoweringRules. No spyreop op produces
-        or consumes `i1`, so it has no device form on any path. LowerSpyreOps' rejectSurvivingBooleans reports the other
+        or consumes `i1`, so it has no device form on any path. LowerSpyreOps'
+        legality check (`checkLegality`) reports the other
         form, an `i1` made and read inside one body.
 
         A general `where(x > y, p, q)` forms a group and is fused; LowerSpyreOps

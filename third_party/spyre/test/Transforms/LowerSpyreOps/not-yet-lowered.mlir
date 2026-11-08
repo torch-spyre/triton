@@ -2,7 +2,7 @@
 
 // REFUSED TODAY, WHERE A FUTURE RULE COULD LOWER IT.
 //
-// Each case leaves an `i1` in a compute body, so rejectSurvivingBooleans reports
+// Each case leaves an `i1` in a compute body, so checkLegality reports
 // it, as in invalid.mlir. Unlike invalid.mlir's cases, each compare has a
 // spyreop.compare counterpart and each reader is one some rule names: what declines is
 // that the compare has more than one reader. A case moves out of this file, into
