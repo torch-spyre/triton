@@ -33,8 +33,9 @@
 // leaves the rest exactly as it found it. A type or a predicate this file does
 // not handle is a silent pass-through by design; see WHAT IS NOT SELECTED below
 // for the list and what each one costs. The exception is an op a rule says is
-// illegal to leave (SpyreOpLoweringRule::legal): today an `i1` left inside a
-// compute body, which checkLegality reports once selection has converged.
+// illegal after selection (SpyreOpLoweringRule::legal): today an `i1` left
+// inside a compute body, which checkLegality reports once selection has
+// converged.
 //
 // WHAT THIS PASS RELIES ON ITS PREDECESSOR FOR. A rule matches ops in ONE body,
 // and ConvertElementwiseToLinalg gives every tensor-level op a body of its own
@@ -237,9 +238,9 @@ private:
 // After selection: what the rules left
 //===----------------------------------------------------------------------===//
 
-/// Reports every op in a compute body that is illegal to leave as it is,
-/// according to the rules anchored on it (isLegalToLeave). Runs after the
-/// fixpoint, since until then an op a rule would still lower is not yet a
+/// Reports every op in a compute body that is illegal after selection,
+/// according to the rules anchored on it (isLegalAfterSelection). Runs after
+/// the fixpoint, since until then an op a rule would still lower is not yet a
 /// finding: for the compare rules, an `i1` is exactly what the group rules
 /// match.
 ///
@@ -273,7 +274,7 @@ LogicalResult checkLegality(ModuleOp mod) {
       GroupCandidate candidate{&op, generic,
                                triton::spyre::distinctReaders(op.getUsers())};
       std::string why;
-      if (triton::spyre::isLegalToLeave(candidate, why))
+      if (triton::spyre::isLegalAfterSelection(candidate, why))
         continue;
       result = failure();
 
@@ -330,9 +331,10 @@ struct LowerSpyreOpsPass
       return;
     }
 
-    // Selection has converged. Each rule says whether leaving its anchor is
-    // legal (SpyreOpLoweringRule::legal); an op the device merely cannot do
-    // is, and is left to the backend. See EVERYTHING UNMATCHED FLOWS THROUGH.
+    // Selection has converged. Each rule says whether its anchor is legal
+    // after selection (SpyreOpLoweringRule::legal); an op the device merely
+    // cannot do is, and flows to the backend. See EVERYTHING UNMATCHED FLOWS
+    // THROUGH.
     if (failed(checkLegality(module)))
       signalPassFailure();
   }

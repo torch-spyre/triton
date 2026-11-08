@@ -167,15 +167,15 @@ bool guardZeroTest(const GroupCandidate &candidate, std::string &why) {
 // Legality
 //===----------------------------------------------------------------------===//
 
-/// compare-cast, compare-select-zero-test and compare-select: a compare left
-/// as it is, read in its own body and not yielded, is illegal. Its result is an
+/// compare-cast, compare-select-zero-test and compare-select: a compare no rule
+/// lowered, read in its own body and not yielded, is illegal. Its result is an
 /// `i1`, and no spyreop intrinsic produces or consumes that type, so what is
 /// left is a group the rules had the chance to select and did not, and no rule
 /// anyone could add would remove it.
 ///
 /// A compare whose `i1` is yielded is legal here: that is the tensor form
 /// leaving the body, which FuseGenerics' legalization reports.
-bool legalCompare(const GroupCandidate &candidate, std::string &why) {
+bool isLegalCompare(const GroupCandidate &candidate, std::string &why) {
   if (llvm::any_of(candidate.anchor->getUsers(), [](Operation *user) {
         return isa<linalg::YieldOp>(user);
       }))
@@ -307,11 +307,11 @@ const SpyreOpLoweringRule kSpyreOpLoweringRules[] = {
     {"muli32", opName<arith::MulIOp>(), {}, 1, nullptr,
      buildBinary<spyreop::MulI32ToI32>},
     {"compare-cast", opName<arith::CmpFOp>(), kUIToFPReader, 1, guardCompare,
-     buildCompareCast, legalCompare},
+     buildCompareCast, isLegalCompare},
     {"compare-select-zero-test", opName<arith::CmpFOp>(), kSelectReader, 2,
-     guardZeroTest, buildZeroTestSelect, legalCompare},
+     guardZeroTest, buildZeroTestSelect, isLegalCompare},
     {"compare-select", opName<arith::CmpFOp>(), kSelectReader, 1, guardCompare,
-     buildCompareSelect, legalCompare},
+     buildCompareSelect, isLegalCompare},
 };
 
 } // namespace
@@ -433,7 +433,7 @@ void addName(NamesByKey &names, std::string key, StringRef name) {
 
 } // namespace
 
-bool isLegalToLeave(const GroupCandidate &candidate, std::string &why) {
+bool isLegalAfterSelection(const GroupCandidate &candidate, std::string &why) {
   StringRef anchorName = candidate.anchor->getName().getStringRef();
   for (const SpyreOpLoweringRule &rule : kSpyreOpLoweringRules)
     if (rule.legal && rule.anchor == anchorName &&

@@ -231,8 +231,8 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         leaves the rest as it found it. That is a change from when it was a
         dialect conversion, where an unsupported float width was reported here.
 
-        The exception is an op a rule says is ILLEGAL TO LEAVE, and it is a
-        different kind of thing rather than a carve-out. Flows-through is about
+        The exception is an op a rule says is ILLEGAL AFTER SELECTION, and it
+        is a different kind of thing rather than a carve-out. Flows-through is about
         a CAPABILITY gap: an f64 math.sqrt is valid IR that a future device or a
         future rule may do. An `i1` in a compute body is UNREPRESENTABLE — no
         spyreop intrinsic produces or consumes that type, so no rule anyone
@@ -246,8 +246,8 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         beside its `guard` and `build` (SpyreOpLoweringRule::legal), asked about
         its anchor once the fixpoint has converged and no rule lowered it. The
         pass then walks every compute body and asks the rules anchored on each
-        op (`isLegalToLeave`); it names no type itself. Until the fixpoint
-        converges nothing is asked, because an `i1` is exactly what the group
+        op (`isLegalAfterSelection`); it names no type itself. Until the
+        fixpoint converges nothing is asked, because an `i1` is exactly what the group
         rules match. Today the three compare rules carry the check, so a new
         rule that leaves its own unrepresentable result adds a `legal` and
         changes nothing here.
