@@ -224,6 +224,23 @@ class Elementwise(conftest.VariantFactory):
                                  nonzero_y=True)
 
 
+@dataclass(frozen=True)
+class ElementwiseConst(conftest.VariantFactory):
+    """Factory for ``1d_device_const``: one input pointer, and an oracle that
+    applies the swept ``OP`` with the swept ``C`` at the swept ``DTYPE``."""
+
+    def signature(self, DTYPE, **_):
+        return {"x_ptr": _PTR[DTYPE], "output_ptr": _PTR[DTYPE],
+                "n_elements": "i32", "BLOCK_SIZE": "i32",
+                "LAYOUT": "constexpr", "OP": "constexpr", "C": "constexpr"}
+
+    def reference(self, OP, C, **_):
+        def oracle(inputs):
+            x = inputs["x_ptr"]
+            return _NUMPY_OPS[OP](x, np.asarray(C, dtype=x.dtype))
+        return oracle
+
+
 # ---------------------------------------------------------------------------
 # SIGNATURE — dtype per @triton.jit arg. Purely types; values live in the
 # variant's ``params`` dict and ``constexpr`` list selects which of them
@@ -976,6 +993,35 @@ VARIANTS = {
         "compiles_to_binary": True,
         "reference":    run_dag,
         "inputs":       make_inputs_dag_buffers,
+        "output_key":   "output_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+    },
+
+    "1d_device_const": {
+        # A compile-time constant as an operand of the compute, rather than a
+        # loaded tensor.
+        "base": None,
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "1D fp32 `out = x OP C` over a single tile, `C` a compile-time "
+            "float. Sweeps add/sub/mul."
+        ),
+        "kernel_fn":    kernel.elementwise_const_1d_device,
+        "factory":      ElementwiseConst(),
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "OP", "C"],
+        "params": {
+            ("DTYPE", "LAYOUT"): [("fp32", _stick_1d("fp32"))],
+            "OP": ["add", "sub", "mul"],
+            "n_elements": [128], "BLOCK_SIZE": [128],
+            "C": [10.0],
+        },
+        "grid":         [1],
+        "compiles_to_binary": True,
+        "inputs":       make_inputs_unary,
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
