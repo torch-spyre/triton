@@ -153,7 +153,8 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
 
         A RULE HOST. Adding a case is one pattern plus one line in the pass — no
         change here, no CMake change, no pipeline change. A group shape is one
-        entry in kGroupShapes instead, with no new pattern.
+        entry in kGroupShapes (SpyreOpLoweringRules.cpp) instead,
+        with no new pattern.
 
         Rules, one op to one:
         - math.sqrt  (f16 or f32)                 → spyreop.sqrt
@@ -242,7 +243,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         of its own — so a group spanning two tensor ops arrives spread over two
         generics unless something fused them. FuseGenerics' GroupComputes does,
         and only for a group this pass lowers: it asks `matchLowerableGroup`
-        (include/Transforms/LowerSpyreOps.h), which this pass's group pattern
+        (SpyreOpLoweringRules.h), which this pass's group pattern
         asks too, with the same candidate: an anchor and every op reading it.
         So the two passes cannot disagree on what a group is. Each group shape
         is one entry in kGroupShapes, a match function and its rewrite, and
@@ -469,7 +470,7 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
           all-parallel, `linalg::areElementwiseOpsFusable` holds, and a group
           shape LowerSpyreOps lowers covers the anchor and the one op in the
           consumer using the matching block argument, its reader
-          (`matchLowerableGroup`, include/Transforms/LowerSpyreOps.h)
+          (`matchLowerableGroup`, SpyreOpLoweringRules.h)
           → `P` is fused into the consumer by `linalg::fuseElementwiseOps`,
           and the fused op's dead results and duplicate operands are removed
           by `linalg::deduplicateOperandsAndRemoveDeadResults`. When `P` has a
