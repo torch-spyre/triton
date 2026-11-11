@@ -151,28 +151,31 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         is why the pass is here and not in Conversion/TritonToKTIR/, whose
         criterion is a `tt` source dialect.
 
-        A RULE HOST. Adding a case is one pattern plus one line in the pass — no
-        change here, no CMake change, no pipeline change. A group shape is one
-        entry in kGroupShapes (SpyreOpLoweringRules.cpp) instead,
-        with no new pattern.
+        A RULE HOST. Every rule is one entry in kSpyreOpLoweringRules
+        (SpyreOpLoweringRules.cpp), and the pass registers one
+        LowerByRule pattern per entry, rooted on the rule's anchor at the rule's
+        benefit. Adding a case is one entry — no new pattern, no change here,
+        no CMake change, no pipeline change.
 
         Rules, one op to one:
         - math.sqrt  (f16 or f32)                 → spyreop.sqrt
         - math.exp   (f16 or f32)                 → spyreop.exp
         - math.rsqrt (f16 or f32)                 → spyreop.rsqrt
-        - arith.divf (f16 or f32), numerator 1.0  → spyreop.reciprocal
+        - arith.divf (f16 or f32), numerator 1.0  → spyreop.reciprocal (tried
+                                                    first)
         - arith.divf (f16 or f32), otherwise      → spyreop.realdiv
         - arith.addi (i32, inside linalg.generic) → spyreop.addi32toi32
         - arith.addi (i64, inside linalg.generic) → spyreop.addi64toi64
         - arith.muli (i32, inside linalg.generic) → spyreop.muli32toi32
 
-        Rules, a GROUP to one, one pattern rooted on the arith.cmpf that
-        lowers it with its one reader as the shape covering the pair; a cmpf
-        read by more than one op is not lowered:
+        Rules, a GROUP to one, each rooted on the arith.cmpf and lowering it
+        with its one reader, its immediate parent a linalg.generic; a cmpf read
+        by more than one op is not lowered:
         - arith.cmpf + arith.uitofp     → spyreop.compare, carrying the predicate
+        - arith.cmpf + arith.select,    → spyreop.select on the nonzero operand
+          a zero test the select          (tried first)
+          performs itself
         - arith.cmpf + arith.select     → spyreop.select, fed by a spyreop.compare
-                                          unless the cmpf is a zero test the
-                                          select performs itself
 
         NO NaN REACHES A COMPUTE BODY. Every rule assumes it. Under it, each
         unordered cmpf predicate computes what its ordered counterpart does
@@ -182,8 +185,10 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         the NaN lanes.
 
         ONE PASS FOR ALL SELECTION, and the two kinds are not two tiers. They
-        share one greedy pattern set, and no two rules are rooted on the same
-        op, so no order is declared anywhere.
+        share one greedy pattern set, and the rules rooted on one op are tried
+        in the order of their benefits, declared in the table. No op is both a
+        rule's reader and the anchor of a rule without readers, so no order
+        across ops is needed.
 
         A GROUP IS WHAT IS SELECTABLE when no member of it could have been
         selected alone — the criterion, and not the op count. `arith.cmpf`
@@ -230,10 +235,10 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         is. An `arith.addi` on an element type in a body is compute, and the addi
         of a loop index or a tile address is not in a body at all.
 
-        The integer 1:1 rules use the same test as a per-op PREDICATE, which is a
-        PROXY and is known to be one: plain scalar integer add and mul are also
-        loop indices, offsets and tile addressing, and no exact test separates
-        those from scalarized integer compute. It over-claims —
+        The integer 1:1 rules use the same test as a per-op PREDICATE, at any
+        depth, which is a PROXY and is known to be one: plain scalar integer
+        add and mul are also loop indices, offsets and tile addressing, and no
+        exact test separates those from scalarized integer compute. It over-claims —
         `tl.arange(0, N) * stride` is an arith.muli that will be inside a body
         once scalarized — and holds today only because the tensor-of-pointers
         tt.load path is unimplemented.
@@ -243,11 +248,11 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         of its own — so a group spanning two tensor ops arrives spread over two
         generics unless something fused them. FuseGenerics' GroupComputes does,
         and only for a group this pass lowers: it asks `matchLowerableGroup`
-        (SpyreOpLoweringRules.h), which this pass's group pattern
-        asks too, with the same candidate: an anchor and every op reading it.
-        So the two passes cannot disagree on what a group is. Each group shape
-        is one entry in kGroupShapes, a match function and its rewrite, and
-        matchLowerableGroup tries each in turn. A group has exactly one reader:
+        (SpyreOpLoweringRules.h), which tries the rules with a
+        reader in kSpyreOpLoweringRules, the table this pass registers its
+        patterns from, on the same candidate: an anchor and every op reading
+        it. So the two passes cannot disagree on what a group is. A group has
+        exactly one reader:
         an anchor read by more than one op is not grouped, so FuseGenerics
         reports the `i1` left between the generics, and in one body this pass
         leaves it and reports it. The
@@ -467,8 +472,8 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
           forwarded result of a multi-result generic. `P` is erased once
           dead.
         - GroupComputes: `P` yields an op result, the anchor. When `P` is
-          all-parallel, `linalg::areElementwiseOpsFusable` holds, and a group
-          shape LowerSpyreOps lowers covers the anchor and the one op in the
+          all-parallel, `linalg::areElementwiseOpsFusable` holds, and a rule
+          LowerSpyreOps lowers by covers the anchor and the one op in the
           consumer using the matching block argument, its reader
           (`matchLowerableGroup`, SpyreOpLoweringRules.h)
           → `P` is fused into the consumer by `linalg::fuseElementwiseOps`,
@@ -479,8 +484,8 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
           so nothing outside the group is copied. The groups today are an
           `arith.cmpf` read by `arith.uitofp` (compare-cast) or by
           `arith.select` as its condition (compare-select), at the compared
-          width; the group shapes are owned by LowerSpyreOps, and a new one
-          there is groupable here with no change. A group has exactly one
+          width; the rules are kSpyreOpLoweringRules, and a new one with a
+          reader is groupable here with no change. A group has exactly one
           reader: a result read by more than one op in the consumer, e.g. one
           compare read by two `arith.select`s, or by an `arith.uitofp` and an
           `arith.select`, is not grouped, and legalization reports the `i1`.
@@ -519,8 +524,8 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         names a producer kind no existing pattern matches; one whose kind
         overlaps an existing pattern's is a new case of that pattern. Its lit
         file feeds it the other patterns' producers and checks that it does not
-        fire. A new group shape is a match function in LowerSpyreOps, not a
-        pattern here.
+        fire. A new group is a rule in kSpyreOpLoweringRules, not a pattern
+        here.
 
         `--debug-only=fuse-generics` traces each rewrite and each decline, with
         the check that declined it.
