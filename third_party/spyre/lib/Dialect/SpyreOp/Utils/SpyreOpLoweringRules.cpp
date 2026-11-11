@@ -27,6 +27,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "lower-spyre-ops"
@@ -355,13 +356,15 @@ constexpr StringLiteral kSelectReader[] = {opName<arith::SelectOp>()};
 /// Every rule LowerSpyreOps lowers by, the rules lowering one op first, then
 /// the rules with a reader. Among the rules on one anchor a higher benefit is
 /// tried first, and rules of equal benefit on one anchor never both match one
-/// candidate. The rules with a reader are also tried in this order by
+/// candidate: a guard tells them apart, as guardIntegerInBody does addi32 and
+/// addi64. The rules with a reader are also tried in this order by
 /// matchLowerableGroup, so rules with the same anchor and the same readers are
 /// listed by descending benefit.
 ///
-/// No op is both a rule's reader and the anchor of a rule without readers:
-/// benefit orders only patterns rooted on the same op, so such an overlap
-/// would be decided by the order the driver visits ops.
+/// A rule lists at most one reader, and no op is both a rule's reader and the
+/// anchor of a rule without readers: benefit orders only patterns rooted on the
+/// same op, so the order the driver visits ops would decide whether the group
+/// or the lone op is lowered. verifySpyreOpLoweringRules checks both.
 const SpyreOpLoweringRule kSpyreOpLoweringRules[] = {
     {"sqrt", opName<math::SqrtOp>(), {}, 1, guardFloatResult,
      buildUnary<spyreop::Sqrt>},
@@ -390,7 +393,38 @@ const SpyreOpLoweringRule kSpyreOpLoweringRules[] = {
 
 } // namespace
 
+bool verifySpyreOpLoweringRules(ArrayRef<SpyreOpLoweringRule> rules,
+                                std::string &why) {
+  for (const SpyreOpLoweringRule &rule : rules)
+    if (rule.readers.size() > 1) {
+      why = ("the rule '" + rule.name + "' lists " +
+             std::to_string(rule.readers.size()) +
+             " readers, and a rule takes at most one")
+                .str();
+      return false;
+    }
+  for (const SpyreOpLoweringRule &rule : rules)
+    for (StringLiteral reader : rule.readers)
+      for (const SpyreOpLoweringRule &other : rules)
+        if (other.readers.empty() && other.anchor == reader) {
+          why = ("'" + reader + "' is the reader of the rule '" + rule.name +
+                 "' and the anchor of the rule '" + other.name +
+                 "', which has no readers")
+                    .str();
+          return false;
+        }
+  return true;
+}
+
 ArrayRef<SpyreOpLoweringRule> spyreOpLoweringRules() {
+  // The table is constant, so it is checked once.
+  static const bool verified = [] {
+    std::string why;
+    if (!verifySpyreOpLoweringRules(kSpyreOpLoweringRules, why))
+      llvm::report_fatal_error("SpyreOpLoweringRules: " + llvm::Twine(why));
+    return true;
+  }();
+  (void)verified;
   return kSpyreOpLoweringRules;
 }
 
@@ -427,7 +461,7 @@ FailureOr<GroupMatch> matchLowerableGroup(const GroupCandidate &candidate,
   // Each distinct reason once: the rules on one reader count, or on one
   // anchor op, decline for the same one.
   SmallVector<std::string> reasons;
-  for (const SpyreOpLoweringRule &rule : kSpyreOpLoweringRules) {
+  for (const SpyreOpLoweringRule &rule : spyreOpLoweringRules()) {
     if (rule.readers.empty())
       continue;
     std::string reason;

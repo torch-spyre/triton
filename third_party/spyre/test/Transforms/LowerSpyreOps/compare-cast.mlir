@@ -160,6 +160,35 @@ func.func @all_unordered_predicates(%x: tensor<4xf16>, %y: tensor<4xf16>) -> ten
 
 // -----
 
+// A reader with no compare in front of it is not lowered by itself.
+// `arith.uitofp` is the reader of the compare-cast rule and the anchor of no
+// rule, so a cast of an `i1` the body is handed stays as it is, and so does the
+// cast of any other value. Nothing is reported: an `i1` block argument is the
+// tensor form crossing a body boundary, which FuseGenerics reports.
+//
+// The same holds for `arith.select`: compare-select.mlir's
+// @condition_from_outside_is_left_alone. A rule without readers anchored on
+// either op would be tried against the group rules in the order the driver
+// visits ops, which verifySpyreOpLoweringRules refuses.
+#map = affine_map<(d0) -> (d0)>
+// CHECK-LABEL:   func.func @cast_of_outside_condition_is_left_alone(
+// CHECK:           ^bb0(%[[C:.*]]: i1, %{{.*}}: f16):
+// CHECK-NEXT:        %[[F:.*]] = arith.uitofp %[[C]] : i1 to f16
+// CHECK-NEXT:        linalg.yield %[[F]] : f16
+func.func @cast_of_outside_condition_is_left_alone(%c: tensor<4xi1>) -> tensor<4xf16> {
+  %init = tensor.empty() : tensor<4xf16>
+  %0 = linalg.generic {indexing_maps = [#map, #map],
+                       iterator_types = ["parallel"]}
+      ins(%c : tensor<4xi1>) outs(%init : tensor<4xf16>) {
+  ^bb0(%cond: i1, %o: f16):
+    %f = arith.uitofp %cond : i1 to f16
+    linalg.yield %f : f16
+  } -> tensor<4xf16>
+  return %0 : tensor<4xf16>
+}
+
+// -----
+
 // THE SCOPE, and it is the scope of the DIAGNOSTIC too. The same pair outside any
 // generic body is not matched -- the body is where compute is -- and it is not
 // refused either, because the `i1` check walks generic bodies and nothing else. An

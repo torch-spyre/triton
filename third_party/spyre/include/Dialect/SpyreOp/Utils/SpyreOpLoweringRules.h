@@ -72,7 +72,9 @@ struct SpyreOpLoweringRule {
   /// The anchor's op name, taken from the op class.
   StringLiteral anchor;
   /// The readers' op names, taken from the op classes; empty for a rule that
-  /// lowers the anchor alone.
+  /// lowers the anchor alone, and otherwise one op, since LowerByRule and the
+  /// builds read and replace only the first reader
+  /// (verifySpyreOpLoweringRules).
   ArrayRef<StringLiteral> readers;
   /// The order among the rules on one anchor: a higher benefit is tried first.
   PatternBenefit benefit;
@@ -86,8 +88,19 @@ struct SpyreOpLoweringRule {
   Value (*build)(OpBuilder &, const GroupCandidate &, ValueRange operands);
 };
 
-/// Every rule, kSpyreOpLoweringRules.
+/// Every rule, kSpyreOpLoweringRules. The table is checked by
+/// verifySpyreOpLoweringRules the first time any caller reads it, and the
+/// process aborts, naming the rule, when it fails.
 ArrayRef<SpyreOpLoweringRule> spyreOpLoweringRules();
+
+/// Whether `rules` obeys what the passes rely on, with `why` set to the first
+/// violation when it does not:
+///
+///   - a rule lists at most one reader;
+///   - no op is both a rule's reader and the anchor of a rule without
+///     readers, because benefit orders only patterns rooted on the same op.
+bool verifySpyreOpLoweringRules(ArrayRef<SpyreOpLoweringRule> rules,
+                                std::string &why);
 
 /// Whether `rule` lowers `candidate`: its anchor is the rule's anchor op, its
 /// readers match the rule's one for one, and the guard holds. Sets `why` when
