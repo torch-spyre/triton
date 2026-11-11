@@ -435,7 +435,7 @@ void addName(NamesByKey &names, std::string key, StringRef name) {
 
 bool isLegalAfterSelection(const GroupCandidate &candidate, std::string &why) {
   StringRef anchorName = candidate.anchor->getName().getStringRef();
-  for (const SpyreOpLoweringRule &rule : kSpyreOpLoweringRules)
+  for (const SpyreOpLoweringRule &rule : spyreOpLoweringRules())
     if (rule.legal && rule.anchor == anchorName &&
         !rule.legal(candidate, why))
       return false;
