@@ -122,7 +122,7 @@ run = _oracle("sum")
 # factory and reaches both from there.
 # ---------------------------------------------------------------------------
 
-def _make_inputs_stat_chain(M, N, DTYPE="fp16", *, axis) -> dict:
+def _make_inputs_stat_chain(M, N, DTYPE="fp16", *, axis, pinned=False) -> dict:
     """``[M, N]`` in, an ``[M]`` or ``[N]`` statistic, an ``[M, N]`` out.
 
     The statistic's extent is the one the reduce leaves, so no variant states it
@@ -144,16 +144,21 @@ def _make_inputs_stat_chain(M, N, DTYPE="fp16", *, axis) -> dict:
     np_dtype = DTYPE_MAP[DTYPE]
     rng = np.random.default_rng(seed=0)
     x = rng.standard_normal((M, N)).astype(np_dtype)
+    out = np.zeros((M, N), dtype=np_dtype)
+    # *pinned*: the statistic is held in the scratchpad, so there is no buffer
+    # for it here.
+    if pinned:
+        return {"x_ptr": x, "out_ptr": out}
     stat_extent = N if axis == 0 else M
     return {"x_ptr":    x,
             "stat_ptr": np.zeros(stat_extent, dtype=np_dtype),
-            "out_ptr":  np.zeros((M, N), dtype=np_dtype)}
+            "out_ptr":  out}
 
 
-def _stat_chain_inputs(axis):
+def _stat_chain_inputs(axis, pinned=False):
     """The input maker for a chain folding *axis*, as the framework calls it."""
     def make(M, N, DTYPE="fp16", **_unused) -> dict:
-        return _make_inputs_stat_chain(M, N, DTYPE, axis=axis)
+        return _make_inputs_stat_chain(M, N, DTYPE, axis=axis, pinned=pinned)
     return make
 
 
@@ -220,6 +225,22 @@ def make_inputs_softmax(M, N, DTYPE="fp16", **_unused) -> dict:
             "out_ptr":   np.zeros((M, N), dtype=np_dtype)}
 
 
+def make_inputs_max_shift_exp_pinned(M, N, DTYPE="fp16", **_unused) -> dict:
+    """:func:`make_inputs_max_shift_exp` without ``diff``, which the pinned
+    kernel holds in the scratchpad."""
+    bufs = make_inputs_max_shift_exp(M, N, DTYPE)
+    del bufs["diff_ptr"]
+    return bufs
+
+
+def make_inputs_softmax_pinned(M, N, DTYPE="fp16", **_unused) -> dict:
+    """:func:`make_inputs_softmax` without ``diff`` and ``exp``, which the pinned
+    kernel holds in the scratchpad -- five buffers rather than seven."""
+    bufs = make_inputs_softmax(M, N, DTYPE)
+    del bufs["diff_ptr"], bufs["exp_ptr"]
+    return bufs
+
+
 def max_shift_exp_reference(inputs) -> np.ndarray:
     """``exp(x - max(x, axis=1))``, in the input's own dtype -- softmax's
     numerator, shifted by the row maximum so every argument to the exponential is
@@ -284,14 +305,22 @@ SIGNATURE = _signature("2d", "fp32")
 _SIG_3D = _signature("3d", "fp32")
 
 
-def _signature_stat_chain(dtype: str) -> dict:
+def _signature_stat_chain(dtype: str, pinned: bool = False) -> dict:
     """A statistic chain's arg list -- three pointers over three buffers. Both
     arms share it.
 
     Order matters and is the kernels' declaration order: the pointer ordinals are
     what ``device_layouts`` is keyed by, so a signature listing them differently
     would pair a recorded layout with the wrong buffer.
+
+    *pinned* is the off-stick arm with its statistic in the scratchpad
+    (:func:`kernel.stat_chain_off_stick_pinned`): no statistic pointer and no
+    ``STAT_LAYOUT``, and a ``PIN_OFFSET`` last.
     """
+    if pinned:
+        return {"x_ptr": f"*{dtype}", "out_ptr": f"*{dtype}",
+                "M": "i32", "N": "i32",
+                "STICK_LAYOUT": "constexpr", "PIN_OFFSET": "constexpr"}
     return {"x_ptr": f"*{dtype}", "stat_ptr": f"*{dtype}", "out_ptr": f"*{dtype}",
             "M": "i32", "N": "i32",
             "STICK_LAYOUT": "constexpr", "STAT_LAYOUT": "constexpr"}
@@ -483,18 +512,51 @@ class StatChain(conftest.VariantFactory):
     beside a ``kernel_fn`` that already implies it would be a second place to get
     it wrong. From here it reaches the oracle (which axis it sums) and the input
     maker (which extent the statistic gets), so they agree by construction.
+
+    ``pinned`` holds the statistic in the scratchpad rather than HBM: the
+    signature and the inputs drop ``stat_ptr``, and the oracle is unchanged.
     """
     axis: int = 0
+    pinned: bool = False
 
     def signature(self, DTYPE, **_):
-        return _signature_stat_chain(DTYPE)
+        return _signature_stat_chain(DTYPE, self.pinned)
 
     def reference(self, **_):
         return _stat_chain_oracle(self.axis)
 
     def inputs(self, **_):
-        return _stat_chain_inputs(self.axis)
+        return _stat_chain_inputs(self.axis, self.pinned)
 
+
+
+# ---------------------------------------------------------------------------
+# The pinned producer -- inputs and oracle
+#
+# ``out = sum(x * y, axis=0)``, the product held in the scratchpad between the
+# two groups. Two inputs and the ``[N]`` a fold of axis 0 leaves.
+# ---------------------------------------------------------------------------
+
+def make_inputs_pinned_mul_sum(M, N, DTYPE="fp16", **_unused) -> dict:
+    """``x``, ``y`` uniform in ``[0, 1)`` and a zeroed ``[N]`` out.
+
+    Uniform rather than normal: every product is positive, so the column sums sit
+    well away from zero and an absolute bound sized in ulp of the sum is the whole
+    story.
+    """
+    np_dtype = DTYPE_MAP[DTYPE]
+    rng = np.random.default_rng(seed=0)
+    return {"x_ptr": rng.random((M, N)).astype(np_dtype),
+            "y_ptr": rng.random((M, N)).astype(np_dtype),
+            "out_ptr": np.zeros(N, dtype=np_dtype)}
+
+
+def pinned_mul_sum_reference(inputs):
+    """``sum(x * y, axis=0)``: the product rounded to the input dtype, as the
+    scratchpad holds it, then summed in fp32 and rounded once."""
+    x, y = inputs["x_ptr"], inputs["y_ptr"]
+    prod = (x * y).astype(x.dtype).astype(np.float32)
+    return prod.sum(axis=0).astype(x.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -1048,6 +1110,34 @@ VARIANTS = {
         "atol":        3e-5,
     },
 
+    # The off-stick arm with its statistic in the scratchpad: the sibling's two
+    # groups, with the statistic pinned at element 0 of ``ct_local`` rather than
+    # written to ``stat_ptr`` and read back. Everything else -- shape, tile
+    # layout, oracle, bounds -- is the sibling's. The statistic's own layout is
+    # gone with its descriptor: the pin's buffer takes its layout from its
+    # neighbours, so the row is ``_stick_on_n_row``'s without ``STAT_LAYOUT``.
+    "stat_chain_off_stick_pinned": {
+        "base": "stat_chain_off_stick",
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "simplified:no-loop", "spyre-tensor-layout", "spyre-pin"],
+        "summary": (
+            "out[m, n] = x[m, n] - sum(x[:, n]) with the statistic pinned to the "
+            "scratchpad: a non-stick-axis reduce, then a second compute group "
+            "loading it from ct_local and applying it down every row."
+        ),
+        "kernel_fn":  kernel.stat_chain_off_stick_pinned,
+        "factory":    StatChain(axis=0, pinned=True),
+        "constexpr":  ["M", "N", "STICK_LAYOUT", "PIN_OFFSET"],
+        "params": {
+            ("DTYPE", "N", "STICK_LAYOUT"): [
+                _stick_on_n_row("fp16", n_sticks=2)[:3],
+            ],
+            # M = 64, N = 128, as in the sibling. The statistic is N elements,
+            # from element PIN_OFFSET.
+            "M": [64], "PIN_OFFSET": [0],
+        },
+    },
+
     # Folds N, the STICK axis, so the statistic SPLATS: one whole stick per row,
     # written across the stick and read back at lane 0.
     "stat_chain_on_stick": {
@@ -1157,6 +1247,34 @@ VARIANTS = {
         "atol":        0.0,
     },
 
+    # The numerator with the shifted tile in the scratchpad: ``diff`` is pinned at
+    # element 0 of ``ct_local`` instead of written to HBM and read back, so G3
+    # loads it from there. The max statistic stays in HBM, through the sibling's
+    # rank-1 descriptor. Three buffers; everything else is the sibling's.
+    "max_shift_exp_on_stick_pinned": {
+        "base": "max_shift_exp_on_stick",
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "simplified:no-loop", "spyre-tensor-layout", "hbm-round-trip",
+                 "spyre-pin"],
+        "summary": (
+            "out[m, n] = exp(x[m, n] - max(x[m, :])) with the shifted tile pinned "
+            "to the scratchpad and the max statistic through HBM."
+        ),
+        "kernel_fn":  kernel.max_shift_exp_on_stick_pinned,
+        "SIGNATURE":  {**_signature_softmax_chain("fp16", "max_ptr"),
+                       "PIN_OFFSET": "constexpr"},
+        "constexpr":  ["M", "N", "STICK_LAYOUT", "STAT_LAYOUT", "PIN_OFFSET"],
+        "params": {
+            ("DTYPE", "N", "STICK_LAYOUT", "STAT_LAYOUT"): [
+                _stick_on_n_row_splat("fp16", n_sticks=2),
+            ],
+            # M = 64 rows, two whole sticks of N. The shift is M * N = 8192
+            # elements, from element PIN_OFFSET.
+            "M": [64], "PIN_OFFSET": [0],
+        },
+        "inputs":      make_inputs_max_shift_exp_pinned,
+    },
+
     # The whole thing: a row softmax in six compute groups over all seven base
     # addresses, and group for group it is the hand-written reference chain. All
     # three statistics -- max, sum and the reciprocal -- are rank-1 and splat.
@@ -1203,5 +1321,86 @@ VARIANTS = {
         # Neither is a reason to widen this further.
         "rtol":        4e-2,
         "atol":        0.0,
+    },
+
+    # The whole softmax with both full-tile intermediates in the scratchpad:
+    # ``diff`` at element 0 and ``exp`` at element 8192 of ``ct_local``. Each is
+    # [64, 128] fp16, 8192 elements, so the second starts where the first ends and
+    # the two do not overlap. The three statistics stay in HBM, each through the
+    # sibling's rank-1 descriptor. Five buffers where the sibling has seven;
+    # everything else is the sibling's.
+    "softmax_on_stick_pinned": {
+        "base": "softmax_on_stick",
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "simplified:no-loop", "spyre-tensor-layout", "hbm-round-trip",
+                 "spyre-pin"],
+        "summary": (
+            "A whole row softmax over the stick axis with the shift and the "
+            "exponentials pinned to the scratchpad and the statistics through HBM."
+        ),
+        "kernel_fn":  kernel.softmax_on_stick_pinned,
+        "SIGNATURE":  {**_signature_softmax_chain(
+                           "fp16", "max_ptr", "sum_ptr", "recip_ptr"),
+                       "DIFF_OFFSET": "constexpr", "EXP_OFFSET": "constexpr"},
+        "constexpr":  ["M", "N", "STICK_LAYOUT", "STAT_LAYOUT",
+                       "DIFF_OFFSET", "EXP_OFFSET"],
+        "params": {
+            ("DTYPE", "N", "STICK_LAYOUT", "STAT_LAYOUT"): [
+                _stick_on_n_row_splat("fp16", n_sticks=2),
+            ],
+            # M = 64 rows, two whole sticks of N: each tile is 8192 elements.
+            "M": [64], "DIFF_OFFSET": [0], "EXP_OFFSET": [8192],
+        },
+        "inputs":      make_inputs_softmax_pinned,
+    },
+
+    # -----------------------------------------------------------------------
+    # The reduce's PRODUCER, through the scratchpad
+    #
+    # ``sum(x * y, axis=0)`` with the product pinned in front of the reduce. The
+    # statistic chains above hand a value AFTER the reduce through HBM, with a
+    # descriptor the kernel owns; this hands one BEFORE it through ``ct_local``,
+    # with none -- the pin names where an anonymous intermediate goes, and is also
+    # what splits the product from the reduce into a group of its own.
+    #
+    # The pin's buffer inherits the stick-on-N layout from its neighbours, and
+    # MaterializePinnedBuffers builds it at the head of ``spyrecode`` -- ktir_cpu
+    # runs the ``ktir`` artifact, where the pin is an attribute and the two groups
+    # are still one.
+    # -----------------------------------------------------------------------
+    # ``(x * y).sum(dim=0)`` over two [256, 128] fp16 inputs, the product in
+    # ``ct_local`` at offset 0: the smallest kernel whose one intermediate is a
+    # whole tile handed from an elementwise group to a reduce group through the
+    # scratchpad.
+    "pinned_mul_sum": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "simplified:no-loop", "spyre-tensor-layout", "spyre-pin"],
+        "summary": (
+            "sum(x * y, axis=0) over [256, 128] fp16 with the product pinned to "
+            "the scratchpad -- the shape of the hand-written LX hand-off KTIR."
+        ),
+        "kernel_fn":  kernel.pinned_mul_sum,
+        "SIGNATURE":  {"x_ptr": "*fp16", "y_ptr": "*fp16", "out_ptr": "*fp16",
+                       "M": "i32", "N": "i32",
+                       "IN_LAYOUT": "constexpr", "OUT_LAYOUT": "constexpr",
+                       "PIN_OFFSET": "constexpr"},
+        "constexpr":  ["M", "N", "IN_LAYOUT", "OUT_LAYOUT", "PIN_OFFSET"],
+        "params": {
+            ("DTYPE", "N", "IN_LAYOUT", "OUT_LAYOUT"): [
+                _stick_on_n_row("fp16", n_sticks=2),
+            ],
+            "M": [256], "PIN_OFFSET": [0],
+        },
+        "grid":        [1],
+        "compiles_to_binary": True,
+        "reference":   pinned_mul_sum_reference,
+        "inputs":      make_inputs_pinned_mul_sum,
+        "output_key":  "out_ptr",
+        # An absolute bound against an fp32 sum. The sums reach about 73, where
+        # fp16 ulp is 0.0625, so 1.0 is 16 ulp: a 256-term reordering predicts
+        # sqrt(256) = 16.
+        "rtol":        0.0,
+        "atol":        1.0,
     },
 }
