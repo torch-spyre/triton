@@ -10,23 +10,56 @@
 #include "Dialect/TTS/IR/Dialect.h"
 
 #include "ktir/Dialect/KTDP/KTDP.h"
+// For the generated constructor's loadDialect<SpyreOpDialect>() call --
+// dependentDialects in TTSDialect.td expands to that call inline, so the
+// full type has to be visible before Dialect.cpp.inc below, not merely
+// declared.
+#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Transforms/InliningUtils.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include "Dialect/TTS/IR/Dialect.cpp.inc"
 
 namespace mlir::triton::tts {
 
+namespace {
+/// Every `tts` op is `Pure` (tts.spyre_op) or a pre-lowering marker
+/// (tts.tensor_layout, tts.pin) with no region or call semantics of its
+/// own -- there is nothing here an inliner needs to refuse, rewrite, or
+/// even look at. Without this, `_make_ttir`'s Inliner pass
+/// (`add_inliner`) aborts the compile the first time any `tts` op ends up
+/// inside an inlined call: `InlinerInterface::isLegalToInline` returns
+/// `false` for an op whose dialect has no `DialectInlinerInterface` at
+/// all, independent of what the op itself is. See the `TritonInlinerInterface`
+/// precedent (`lib/Dialect/Triton/IR/Dialect.cpp`) for the same shape, with
+/// real refusal logic this dialect does not need.
+struct TTSInlinerInterface : public DialectInlinerInterface {
+  using DialectInlinerInterface::DialectInlinerInterface;
+
+  bool isLegalToInline(Operation *, Operation *, bool) const final {
+    return true;
+  }
+  bool isLegalToInline(Region *, Region *, bool, IRMapping &) const final {
+    return true;
+  }
+  bool isLegalToInline(Operation *, Region *, bool, IRMapping &) const final {
+    return true;
+  }
+};
+} // namespace
+
 void TTSDialect::initialize() {
-  // One op and nothing else: no types, no attribute types. Most of what the
+  // Three ops now: tts.tensor_layout, tts.pin, tts.spyre_op. Most of what the
   // dialect is for is the attribute NAME and the verifier hook that name routes
   // to, neither of which is registered here.
   addOperations<
 #define GET_OP_LIST
 #include "Dialect/TTS/IR/Ops.cpp.inc"
       >();
+  addInterfaces<TTSInlinerInterface>();
 }
 
 std::optional<CoordOp> symbolizeCoordOp(int64_t code) {

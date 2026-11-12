@@ -2,6 +2,7 @@
 #define TTS_OPS
 
 include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 include "Dialect/TTS/IR/TTSDialect.td"
 // For TT_TensorDescType. This is the one direction the dependency may point:
 // `tts` names a Triton type, Triton names nothing of ours. TritonTypes.td
@@ -126,6 +127,72 @@ def TTS_PinOp : TTS_Op<"pin", []> {
   );
 
   let assemblyFormat = "$value attr-dict `:` type($value)";
+  let hasVerifier = 1;
+}
+
+def TTS_SpyreOpOp : TTS_Op<"spyre_op", [Pure]> {
+  let summary = "Request one Spyre hardware intrinsic by name";
+
+  let description = [{
+    `tts.spyre_op` is the TTIR representation of a kernel author's
+    `tl.spyre_op(name, *args, **attrs)` call: a request for the real
+    `spyreop.<name>` hardware intrinsic, carried intact until
+    `LowerComputeOps` (the TTIR→KTIR conversion) converts it directly
+    into `linalg.generic { spyreop.<name> } }` -- no decomposition into
+    `arith`/`math`, no tagging, no later re-matching pass. See
+    `third_party/spyre/docs/spyreop-frontend-api.md` for the full design.
+
+    One generic op serves every intrinsic in the operation set: nothing
+    about an unknown or future intrinsic needs its own TTIR op. `name`
+    identifies which `spyreop.*` op is requested; `operands` are its
+    TENSOR operands, in call order -- the real `spyreop.<name>` op this
+    names is always scalar-typed, so `operands`' ELEMENT types are what
+    get checked against it, not the tensor types themselves: a call
+    names a request over a whole tensor, and `LowerComputeOps`'s Group D1
+    is what actually puts a scalar of each element type into the real
+    op's body, inside a `linalg.generic`. `extra_attrs` carries whatever
+    has to be a compile-time constant and belongs to the REAL op itself
+    (`beta`/`threshold` for `"softplus"`) as one dictionary rather than
+    named fields, so adding a future intrinsic with a new attribute name
+    never changes this op's own ODS shape.
+
+    `axis`, separately, is NOT one of the real op's own attributes for
+    any intrinsic in scope (confirmed directly against SpyreOp.td: no
+    `spyreop.*` op this design covers declares one) -- it belongs to the
+    LOWERING, not to the request: for `"exx2"`, it is which tensor
+    dimension Group D2's `linalg.generic` reduces over, the same role
+    `tt.reduce`'s own `axis` attribute plays for `ConvertTTReduce`. An
+    elementwise intrinsic ignores it; naming it on one is refused, the
+    same way an unknown attribute in `extra_attrs` is.
+
+    The op's arity, operand/result ELEMENT types and `extra_attrs` names
+    are NOT restated here as a parallel table -- they come from the real
+    `spyreop.<name>` op's own definition, read through
+    `RegisteredOperationName::lookup` and `InferTypeOpInterface`, which
+    every op this is scoped to cover has (`SameOperandsAndResultType`
+    with non-variadic results is enough for ODS to derive it
+    automatically -- see `Operator::populateTypeInferenceInfo` upstream).
+    The verifier below is what holds a `tts.spyre_op` to that real
+    definition; nothing about this op's own ODS constrains arity beyond
+    "variadic operands, variadic results."
+
+    `Pure`, matching every `spyreop.*` op being `Pure` too -- a request
+    with no uses is as dead as the hardware op it names would be.
+  }];
+
+  let arguments = (ins
+    StrAttr:$name,
+    Variadic<AnyRankedTensor>:$operands,
+    OptionalAttr<DictionaryAttr>:$extra_attrs,
+    OptionalAttr<I32Attr>:$axis
+  );
+
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+
+  let assemblyFormat = [{
+    attr-dict `(` $operands `)` `:` functional-type($operands, $results)
+  }];
+
   let hasVerifier = 1;
 }
 
