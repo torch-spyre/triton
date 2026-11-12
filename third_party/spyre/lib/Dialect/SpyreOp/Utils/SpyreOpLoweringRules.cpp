@@ -306,11 +306,11 @@ bool verifySpyreOpLoweringRules(ArrayRef<SpyreOpLoweringRule> rules,
   return true;
 }
 
-SmallVector<Value> ruleOperands(const SpyreOpLoweringRule &rule,
-                                const GroupCandidate &candidate) {
-  SmallVector<Value> operands(candidate.anchor->getOperands());
-  if (!rule.readers.empty())
-    llvm::append_range(operands, candidate.readers.front()->getOperands());
+SmallVector<Value> ShapeMatch::operands() const {
+  SmallVector<Value> operands(matchedCandidate->anchor->getOperands());
+  if (!matchedRule->readers.empty())
+    llvm::append_range(operands,
+                       matchedCandidate->readers.front()->getOperands());
   return operands;
 }
 
@@ -326,8 +326,10 @@ ArrayRef<SpyreOpLoweringRule> spyreOpLoweringRules() {
   return kSpyreOpLoweringRules;
 }
 
-bool ruleShapeMatches(const SpyreOpLoweringRule &rule,
-                      const GroupCandidate &candidate, std::string &why) {
+namespace {
+
+bool shapeHolds(const SpyreOpLoweringRule &rule,
+                const GroupCandidate &candidate, std::string &why) {
   // A rule with readers asks for them one for one; a rule without asks
   // nothing of them.
   if (!rule.readers.empty() &&
@@ -362,6 +364,16 @@ bool ruleShapeMatches(const SpyreOpLoweringRule &rule,
   return !rule.guard || rule.guard(candidate, why);
 }
 
+} // namespace
+
+std::optional<ShapeMatch> ruleShapeMatches(const SpyreOpLoweringRule &rule,
+                                           const GroupCandidate &candidate,
+                                           std::string &why) {
+  if (!shapeHolds(rule, candidate, why))
+    return std::nullopt;
+  return ShapeMatch(rule, candidate);
+}
+
 FailureOr<GroupMatch> matchLowerableGroup(const GroupCandidate &candidate,
                                           std::string *why) {
   // Each distinct reason once: the rules on one reader count, or on one
@@ -371,8 +383,8 @@ FailureOr<GroupMatch> matchLowerableGroup(const GroupCandidate &candidate,
     if (rule.readers.empty())
       continue;
     std::string reason;
-    if (ruleShapeMatches(rule, candidate, reason) &&
-        probeSpyreOpRule(rule, candidate, reason))
+    std::optional<ShapeMatch> shape = ruleShapeMatches(rule, candidate, reason);
+    if (shape && probeSpyreOpRule(*shape, reason))
       return GroupMatch{rule.name, {candidate.anchor}};
     if (!llvm::is_contained(reasons, reason))
       reasons.push_back(reason);

@@ -535,8 +535,8 @@ class SpyreBackend(BaseBackend):
         KTIR matmul path needs a minimum.
 
         ``extra_math_dtypes(op_name)`` returns the dtype names the spyreop
-        intrinsic for that ``tl.*`` math op takes, by its own definition,
-        beyond the allowlist upstream declares on it. See
+        intrinsic for that ``tl.*`` math op takes, beyond the allowlist
+        upstream declares on it. See
         ``_EXTRA_MATH_DTYPES``.
         Unlike ``min_dot_size`` the frontend treats it as optional, so a
         backend that omits it keeps upstream's allowlists unchanged.

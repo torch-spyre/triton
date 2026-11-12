@@ -23,6 +23,8 @@
 // by every caller: ruleShapeMatches (the ops, their count, the guard), then
 // probeSpyreOpRule (SpyreOpTypeProbe.h), which asks the spyreop ops the rule
 // builds whether they take the candidate's types. No rule states a type itself.
+// The probe takes the ShapeMatch that ruleShapeMatches makes, so it cannot be
+// asked about a candidate whose shape the rule does not lower.
 //
 // The remaining export is the question the rules share with LowerSpyreOps'
 // diagnostics: which spyreop predicate a cmpf predicate maps to.
@@ -42,6 +44,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <optional>
 #include <optional>
 #include <string>
 
@@ -122,17 +125,39 @@ ArrayRef<SpyreOpLoweringRule> spyreOpLoweringRules();
 bool verifySpyreOpLoweringRules(ArrayRef<SpyreOpLoweringRule> rules,
                                 std::string &why);
 
-/// Whether `candidate` has the shape `rule` lowers: its anchor is the rule's
-/// anchor op, its readers match the rule's one for one and are directly in the
-/// group's generic, and the guard holds. Says nothing of types: that is
-/// probeSpyreOpRule's. Sets `why` when it does not match.
-bool ruleShapeMatches(const SpyreOpLoweringRule &rule,
-                      const GroupCandidate &candidate, std::string &why);
+/// A candidate that has the shape a rule lowers. Only ruleShapeMatches makes
+/// one, so whatever takes a ShapeMatch may rely on the shape: the rule's build
+/// casts the anchor and readers to the ops the rule names.
+///
+/// It refers to the rule and the candidate, which must outlive it.
+class ShapeMatch {
+public:
+  const SpyreOpLoweringRule &rule() const { return *matchedRule; }
+  const GroupCandidate &candidate() const { return *matchedCandidate; }
 
-/// The values `rule.build` takes for `candidate`: the anchor's operands, then
-/// its reader's when the rule lists one.
-SmallVector<Value> ruleOperands(const SpyreOpLoweringRule &rule,
-                                const GroupCandidate &candidate);
+  /// The values `rule().build` takes: the anchor's operands, then its reader's
+  /// when the rule lists one.
+  SmallVector<Value> operands() const;
+
+private:
+  ShapeMatch(const SpyreOpLoweringRule &rule, const GroupCandidate &candidate)
+      : matchedRule(&rule), matchedCandidate(&candidate) {}
+  friend std::optional<ShapeMatch>
+  ruleShapeMatches(const SpyreOpLoweringRule &, const GroupCandidate &,
+                   std::string &);
+
+  const SpyreOpLoweringRule *matchedRule;
+  const GroupCandidate *matchedCandidate;
+};
+
+/// The ShapeMatch of `candidate` with `rule`, when it has the shape the rule
+/// lowers: its anchor is the rule's anchor op, its readers match the rule's one
+/// for one and are directly in the group's generic, and the guard holds. Says
+/// nothing of types: that is probeSpyreOpRule's. Sets `why` when it does not
+/// match.
+std::optional<ShapeMatch> ruleShapeMatches(const SpyreOpLoweringRule &rule,
+                                           const GroupCandidate &candidate,
+                                           std::string &why);
 
 /// What matchLowerableGroup found: the rule, and which ops of the anchor's
 /// body the group consumes.

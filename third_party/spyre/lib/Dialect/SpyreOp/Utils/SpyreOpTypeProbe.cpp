@@ -12,17 +12,19 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir;
 
 namespace mlir::triton::spyre {
 
-bool probeSpyreOpRule(const SpyreOpLoweringRule &rule,
-                      const GroupCandidate &candidate, std::string &why) {
+bool probeSpyreOpRule(const ShapeMatch &shape, std::string &why) {
+  const SpyreOpLoweringRule &rule = shape.rule();
+  const GroupCandidate &candidate = shape.candidate();
   MLIRContext *ctx = candidate.anchor->getContext();
 
   // The handler goes first, so nothing the build or the verifiers emit reaches
-  // the context's own. The first diagnostic is the reason.
+  // the context's own. The reason is the first the verifiers emit.
   std::string diagnostic;
   ScopedDiagnosticHandler handler(ctx, [&](Diagnostic &diag) {
     if (diagnostic.empty())
@@ -33,7 +35,7 @@ bool probeSpyreOpRule(const SpyreOpLoweringRule &rule,
   // The scratch block's arguments stand for the operands, in order. A bare
   // OpBuilder: a rewriter's would record the ops it creates.
   Block scratch;
-  for (Value operand : ruleOperands(rule, candidate))
+  for (Value operand : shape.operands())
     scratch.addArgument(operand.getType(), operand.getLoc());
   OpBuilder builder(ctx);
   builder.setInsertionPointToEnd(&scratch);
@@ -42,7 +44,8 @@ bool probeSpyreOpRule(const SpyreOpLoweringRule &rule,
   // The contract on build: it reaches nothing outside the scratch block, and
   // returns a value of the type of the op it replaces. Checked here because a
   // violation would otherwise verify against the wrong types, or fail only
-  // after LowerByRule has committed.
+  // after LowerByRule has committed. A broken rule is a compiler bug, so it
+  // aborts rather than declining, which would stop the rule lowering silently.
   auto insideScratch = [&](Value v) { return v.getParentBlock() == &scratch; };
   bool reachesOutside = llvm::any_of(scratch, [&](Operation &op) {
     return !llvm::all_of(op.getOperands(), insideScratch);
@@ -51,15 +54,14 @@ bool probeSpyreOpRule(const SpyreOpLoweringRule &rule,
       rule.readers.empty() ? candidate.anchor : candidate.readers.front();
   bool wrongResult = !result || !insideScratch(result) ||
                      result.getType() != replaced->getResult(0).getType();
-  assert(!reachesOutside && !wrongResult &&
-         "a rule's build must read only its operands and return the replaced "
-         "op's type");
-  if (reachesOutside || wrongResult) {
-    why = "the rule '" + rule.name.str() +
-          "' breaks the contract on its build (SpyreOpTypeProbe.h)";
-    return false;
-  }
+  if (reachesOutside || wrongResult)
+    llvm::report_fatal_error(
+        "SpyreOpTypeProbe: the rule '" + rule.name +
+        "' breaks the contract on its build: it must read only its operands "
+        "and return the replaced op's type (SpyreOpTypeProbe.h)");
 
+  // Only the verifiers' diagnostics give the reason.
+  diagnostic.clear();
   for (Operation &op : scratch)
     if (failed(verify(&op, /*verifyRecursively=*/false))) {
       why = "'" + op.getName().getStringRef().str() +

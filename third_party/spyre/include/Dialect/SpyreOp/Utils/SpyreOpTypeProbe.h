@@ -29,8 +29,9 @@
 // it is given, and the candidate only for types and attributes. The probe
 // checks this rather than trusting it: a build that reaches a value outside the
 // scratch block, or returns a value of another type than the op it replaces,
-// does not match. That is a bug in the rule, and trips an assert in builds that
-// have them.
+// aborts, naming the rule. That is a bug in the rule, and a broken rule table is
+// a compiler bug rather than input, as in verifySpyreOpLoweringRules. A
+// diagnostic the build itself emits is dropped: the reason is a verifier's.
 //
 // WHAT IT DOES NOT SEE. A verifier knows types and op-local invariants. It does
 // not know that a reciprocal's numerator must be 1.0 or that a predicate has a
@@ -39,8 +40,9 @@
 //
 // WHERE IT RUNS. After ruleShapeMatches, at both places that ask whether a rule
 // lowers a candidate: LowerByRule before it lowers, and matchLowerableGroup
-// before FuseGenerics fuses. Both call the two steps by name, so neither can
-// skip the probe or probe a rule whose shape does not match.
+// before FuseGenerics fuses. Both call the two steps by name. The probe takes
+// the ShapeMatch that ruleShapeMatches makes, so it is never asked about a rule
+// whose shape the candidate does not have.
 //
 //===----------------------------------------------------------------------===//
 
@@ -53,19 +55,15 @@
 
 namespace mlir::triton::spyre {
 
-/// Whether every op `rule.build` makes for `candidate` passes its own
-/// verifier, on operands of the types ruleOperands(rule, candidate) has.
+/// Whether every op `shape.rule().build` makes for `shape.candidate()` passes
+/// its own verifier, on operands of the types `shape.operands()` has.
 ///
 /// The build runs into a detached block whose arguments stand for the
 /// operands, through a builder that notifies no rewriter, so no real IR is
 /// touched; the block and everything in it are destroyed before returning. The
 /// verifiers' diagnostics are caught by a handler scoped to the call, so
 /// nothing is reported, and the first becomes `why`.
-///
-/// Call it only for a rule whose ruleShapeMatches holds: the build casts the
-/// anchor and readers to the ops the rule names.
-bool probeSpyreOpRule(const SpyreOpLoweringRule &rule,
-                      const GroupCandidate &candidate, std::string &why);
+bool probeSpyreOpRule(const ShapeMatch &shape, std::string &why);
 
 } // namespace mlir::triton::spyre
 

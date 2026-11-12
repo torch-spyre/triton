@@ -183,8 +183,9 @@ struct LowerByRule : public RewritePattern {
     // which builds the rule's ops into a scratch block and asks their verifiers
     // (SpyreOpTypeProbe.h).
     std::string why;
-    if (!triton::spyre::ruleShapeMatches(rule, candidate, why) ||
-        !triton::spyre::probeSpyreOpRule(rule, candidate, why)) {
+    std::optional<triton::spyre::ShapeMatch> shape =
+        triton::spyre::ruleShapeMatches(rule, candidate, why);
+    if (!shape || !triton::spyre::probeSpyreOpRule(*shape, why)) {
       LLVM_DEBUG({
         if (tracesDeclines &&
             failed(triton::spyre::matchLowerableGroup(candidate, &why)))
@@ -197,7 +198,7 @@ struct LowerByRule : public RewritePattern {
     // root for a one-op rule. The spyreop ops are built just before it, on the
     // root's operands followed by the reader's, and replace it.
     Operation *last = rule.readers.empty() ? root : candidate.readers.front();
-    SmallVector<Value> operands = triton::spyre::ruleOperands(rule, candidate);
+    SmallVector<Value> operands = shape->operands();
     LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << root->getName() << " at "
                             << root->getLoc() << ": lowered by the "
                             << rule.name << " rule\n");
