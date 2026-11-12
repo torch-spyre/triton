@@ -225,8 +225,7 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // one-op-to-one rules and the group rules share a pattern set, each rooted on
   // a different op.
   //
-  // Needs every compute to be a linalg.generic, which the passes above make it:
-  // every rule's SCOPE is the generic body, and an op outside one is left alone.
+  // Needs every compute to be a linalg.generic, which the passes above make it.
   //
   // And it needs FuseGenerics to have run, which it has, well above. A rule
   // matches ops in ONE body while ConvertElementwiseToLinalg gives every

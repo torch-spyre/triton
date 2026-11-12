@@ -157,10 +157,15 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         benefit. Adding a case is one entry — no new pattern, no change here,
         no CMake change, no pipeline change.
 
-        EVERY RULE APPLIES ONLY IN A COMPUTE BODY: the op it is rooted on has
-        a linalg.generic as its immediate parent, and a group's reader is in
-        that same body. An op anywhere else is left as it is, whatever its
-        type — a scalar math.sqrt at function level stays math.sqrt.
+        THE GENERIC BODY IS THE SCOPE of every rule, and not a predicate.
+        Every compute reaches this pass as a linalg.generic, so "inside a body"
+        is not a guess about whether an op is compute — it is where the compute
+        is. A rule applies to an op whose immediate parent is a linalg.generic,
+        and a group's reader must be directly in that same body. An op anywhere
+        else, or a reader nested deeper in a region of the body, is left as it
+        is, whatever its type: an `arith.addi` on an element type in a body is
+        compute, the addi of a loop index or a tile address is not in a body at
+        all, and a scalar math.sqrt at function level stays math.sqrt.
 
         CONSTANTS ARE SCALARS IN THE BODY. A rule that asks for a constant
         operand — the reciprocal's 1.0, a zero test's 0.0 — matches a scalar
@@ -239,12 +244,6 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         meant to reshape, while naming the wrong cause. The two
         shapes are indistinguishable at this point, which is why the line is drawn
         by where the value lives rather than by how it got there.
-
-        THE GENERIC BODY IS THE SCOPE of every rule, and not a predicate.
-        Every compute reaches this pass as a linalg.generic, so "inside a body"
-        is not a guess about whether an op is compute — it is where the compute
-        is. An `arith.addi` on an element type in a body is compute, and the addi
-        of a loop index or a tile address is not in a body at all.
 
         The integer rules match every i32 or i64 `arith.addi` / `arith.muli` in
         a body, whatever the value is used for. A body holds element compute

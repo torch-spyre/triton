@@ -305,3 +305,34 @@ tt.func @divf_one_over_x_f32(%x: f32) -> f32 {
   tt.return %0 : f32
 }
 }
+
+// -----
+
+// A rule applies to an op whose immediate parent is the generic. An arith.addi
+// nested deeper, in an scf.if inside the body, is left as it is. Last in the
+// file, for the reason above.
+module {
+// CHECK-LABEL:   tt.func @addi_nested_in_scf_if(
+// CHECK:           linalg.generic
+// CHECK:             scf.if
+// CHECK:               %[[SUM:.*]] = arith.addi
+// CHECK-NOT:           spyreop
+// CHECK:               scf.yield %[[SUM]] : i32
+tt.func @addi_nested_in_scf_if(%t: tensor<4xi32>, %flag: i1) -> tensor<4xi32> {
+  %init = tensor.empty() : tensor<4xi32>
+  %0 = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]}
+      ins(%t : tensor<4xi32>) outs(%init : tensor<4xi32>) {
+  ^bb0(%in: i32, %out: i32):
+    %r = scf.if %flag -> i32 {
+      %1 = arith.addi %in, %in : i32
+      scf.yield %1 : i32
+    } else {
+      scf.yield %in : i32
+    }
+    linalg.yield %r : i32
+  } -> tensor<4xi32>
+  tt.return %0 : tensor<4xi32>
+}
+}

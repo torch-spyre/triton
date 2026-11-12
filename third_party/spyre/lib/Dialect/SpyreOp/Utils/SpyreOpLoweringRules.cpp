@@ -337,7 +337,7 @@ const SpyreOpLoweringRule kSpyreOpLoweringRules[] = {
     {"realdiv", opName<arith::DivFOp>(), {}, 1, guardFloatResult,
      buildBinary<spyreop::RealDiv>},
     // Every i32 or i64 add or multiply in a body, whatever its result is used
-    // for: see "THE GENERIC BODY IS THE SCOPE" in Passes.td.
+    // for.
     {"addi32", opName<arith::AddIOp>(), {}, 1, guardIntegerWidth<32>,
      buildBinary<spyreop::AddI32ToI32>},
     {"addi64", opName<arith::AddIOp>(), {}, 1, guardIntegerWidth<64>,
@@ -414,6 +414,14 @@ bool ruleMatches(const SpyreOpLoweringRule &rule,
             "', is not an " + name.str();
       return false;
     }
+  Operation *group = candidate.groupGeneric;
+  if (!rule.readers.empty())
+    for (Operation *reader : candidate.readers)
+      if (reader->getParentOp() != group) {
+        why = "the reader, '" + reader->getName().getStringRef().str() +
+              "', is not directly in the group's generic body";
+        return false;
+      }
   return !rule.guard || rule.guard(candidate, why);
 }
 

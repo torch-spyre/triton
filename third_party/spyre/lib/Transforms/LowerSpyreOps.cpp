@@ -23,9 +23,8 @@
 //
 // They share one greedy pattern set. The rules rooted on one op are tried in
 // the order of their benefits, declared in the table, and no op is both a
-// rule's reader and the anchor of a rule without readers.
-// Splitting these across two passes is what an earlier shape did, and it
-// bought a standing question -- which pass claims this op -- for nothing.
+// rule's reader and the anchor of a rule without readers, so no question of
+// which pass, or which kind of rule, claims an op arises.
 //
 // EVERYTHING UNMATCHED FLOWS THROUGH, WITH ONE EXCEPTION. There is no
 // conversion target: an op with no device form reaches the backend, which is
@@ -54,13 +53,9 @@
 // splat still passed as an `ins` reaches a rule as a block argument and matches
 // nothing.
 //
-// THE GENERIC BODY IS THE SCOPE of every rule. Every compute reaches this pass
-// as a linalg.generic, so "inside a body" is not a guess about whether an op is
-// compute -- it is where the compute is. LowerByRule checks it once for every
-// rule: the root's immediate parent is a linalg.generic, and a rule's reader is
-// in the same body. An `arith.addi` on an element type in a body is compute,
-// and the addi of a loop index or a tile address is not in a body at all; a
-// scalar `math.sqrt` outside a body is left as it is.
+// THE GENERIC BODY IS THE SCOPE of every rule: see the pass description in
+// Passes.td. LowerByRule checks the root's placement once for every rule, and
+// ruleMatches the readers'.
 //
 // NO NaN REACHES A COMPUTE BODY. Every rule assumes it, which lets the pass:
 //
@@ -155,10 +150,6 @@ namespace {
 /// at the rule's benefit, so the driver tries the rules on one op in benefit
 /// order.
 ///
-/// Every rule applies only in a compute body: the root's immediate parent is a
-/// linalg.generic, and a rule's reader is in that same body. A root elsewhere
-/// is left as it is, whatever its type.
-///
 /// The candidate is the root, that generic, and every op reading the root,
 /// each once though it may read the root more than once. When the rule
 /// matches, its build runs at the rule's last op -- its reader, or the root
@@ -182,24 +173,15 @@ struct LowerByRule : public RewritePattern {
 
   LogicalResult matchAndRewrite(Operation *root,
                                 PatternRewriter &rewriter) const override {
-    // Placement: the root's immediate parent is a linalg.generic. An op at
-    // function level, or nested deeper inside a body, is left as it is.
+    // The root's immediate parent must be a linalg.generic.
     auto body = dyn_cast<linalg::GenericOp>(root->getParentOp());
     if (!body)
       return failure();
     // The ops reading the root, each once even if it reads the root twice.
     llvm::SetVector<Operation *> readers(root->user_begin(), root->user_end());
-    // A rule with readers lowers the root and its reader together, so every
-    // reader is in the same body: one in another generic, or a yield's user
-    // outside the body, is not part of this group.
-    if (!rule.readers.empty() &&
-        llvm::any_of(readers, [&](Operation *reader) {
-          return reader->getParentOp() != body.getOperation();
-        }))
-      return failure();
     GroupCandidate candidate{root, body, readers.takeVector()};
-    // The rule's own checks: the anchor and reader op names, the reader count,
-    // then its guard.
+    // The rule's own checks: the anchor and reader op names, the reader count
+    // and placement, then its guard.
     std::string why;
     if (!triton::spyre::ruleMatches(rule, candidate, why)) {
       LLVM_DEBUG({

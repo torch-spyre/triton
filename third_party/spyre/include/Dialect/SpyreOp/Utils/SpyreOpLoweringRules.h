@@ -48,11 +48,13 @@ struct GroupCandidate {
   /// The op whose result the group consumes: in the producer generic when the
   /// group spans two generics, in the one generic when it does not.
   Operation *anchor;
-  /// The generic whose body holds `anchor` directly.
-  linalg::GenericOp anchorBody;
-  /// The ops that read `anchor`'s result, wherever they are: in `anchorBody`
-  /// when the group is in one body, in the consumer's body when it spans two
-  /// generics.
+  /// The linalg.generic the group is in, or will be in once fused: the
+  /// anchor's own generic when the group is in one, the consumer when it spans
+  /// two. A rule with a reader needs every reader directly in its body
+  /// (ruleMatches). The anchor's own generic is `anchor->getParentOp()`.
+  linalg::GenericOp groupGeneric;
+  /// Every op that reads `anchor`'s result, each once. There may be several: a
+  /// rule takes exactly the readers it lists.
   SmallVector<Operation *> readers;
 };
 
@@ -100,8 +102,8 @@ bool verifySpyreOpLoweringRules(ArrayRef<SpyreOpLoweringRule> rules,
                                 std::string &why);
 
 /// Whether `rule` lowers `candidate`: its anchor is the rule's anchor op, its
-/// readers match the rule's one for one, and the guard holds. Sets `why` when
-/// it does not.
+/// readers match the rule's one for one and are directly in the group's
+/// generic, and the guard holds. Sets `why` when it does not.
 bool ruleMatches(const SpyreOpLoweringRule &rule,
                  const GroupCandidate &candidate, std::string &why);
 

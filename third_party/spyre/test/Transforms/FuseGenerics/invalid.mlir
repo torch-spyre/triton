@@ -271,3 +271,35 @@ func.func @linearizing_producer_input(%s: tensor<64x2xf16>, %t: tensor<128xf16>)
   } -> tensor<128xf16>
   return %m : tensor<128xf16>
 }
+
+// -----
+
+// A reader nested in a region of the consumer's body is not directly in the
+// group's generic, so the edge is not grouped: the select, inside an scf.if,
+// would be refused by LowerSpyreOps once fused, and FuseGenerics asks the same
+// question before it fuses.
+func.func @reader_nested_in_scf_if(%x: tensor<8xf16>, %y: tensor<8xf16>, %p: tensor<8xf16>, %flag: i1) -> tensor<8xf16> {
+  %e1 = tensor.empty() : tensor<8xi1>
+  %c = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%x, %y : tensor<8xf16>, tensor<8xf16>) outs(%e1 : tensor<8xi1>) {
+  ^bb0(%a: f16, %b: f16, %out: i1):
+    // expected-note @below {{made here, by 'arith.cmpf'}}
+    %v = arith.cmpf olt, %a, %b : f16
+    linalg.yield %v : i1
+  } -> tensor<8xi1>
+  %e = tensor.empty() : tensor<8xf16>
+  // expected-error @below {{fuse-generics: operand 0 is an i1 tensor passed from one linalg.generic to another; no spyreop op produces or}}
+  // expected-note @below {{LowerSpyreOps lowers an i1 only within a group}}
+  %r = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"]} ins(%c, %p : tensor<8xi1>, tensor<8xf16>) outs(%e : tensor<8xf16>) {
+  ^bb0(%m: i1, %a: f16, %out: f16):
+    %n = arith.negf %a : f16
+    %s = scf.if %flag -> f16 {
+      // expected-note @below {{read here, by 'arith.select'}}
+      %t = arith.select %m, %a, %n : f16
+      scf.yield %t : f16
+    } else {
+      scf.yield %a : f16
+    }
+    linalg.yield %s : f16
+  } -> tensor<8xf16>
+  return %r : tensor<8xf16>
+}

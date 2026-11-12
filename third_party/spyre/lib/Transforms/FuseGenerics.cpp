@@ -329,7 +329,7 @@ private:
     }
 
     triton::spyre::GroupCandidate candidate{
-        anchor, producer,
+        anchor, consumer,
         llvm::to_vector(consumer.getMatchingBlockArgument(operand).getUsers())};
     std::string reason;
     FailureOr<triton::spyre::GroupMatch> match =
