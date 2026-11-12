@@ -121,7 +121,6 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -177,9 +176,8 @@ struct LowerByRule : public RewritePattern {
     auto body = dyn_cast<linalg::GenericOp>(root->getParentOp());
     if (!body)
       return failure();
-    // The ops reading the root, each once even if it reads the root twice.
-    llvm::SetVector<Operation *> readers(root->user_begin(), root->user_end());
-    GroupCandidate candidate{root, body, readers.takeVector()};
+    GroupCandidate candidate{root, body,
+                             triton::spyre::distinctReaders(root->getUsers())};
     // The rule's own checks: the anchor and reader op names, the reader count
     // and placement, then its guard.
     std::string why;
@@ -280,10 +278,12 @@ LogicalResult rejectSurvivingBooleans(ModuleOp mod) {
               "intrinsic produces or consumes that type, so no selection rule "
               "can ever remove it";
 
+      SmallVector<Operation *> readers =
+          triton::spyre::distinctReaders(v.getUsers());
+
       // Name the predicate: it is what an author can change.
       if (auto cmp = v.getDefiningOp<arith::CmpFOp>()) {
         StringRef pred = arith::stringifyCmpFPredicate(cmp.getPredicate());
-        llvm::SetVector<Operation *> readers(v.user_begin(), v.user_end());
         if (spyrePredicateFor(cmp.getPredicate()) && readers.size() > 1)
           diag.attachNote(cmp.getLoc())
               << "the predicate '" << pred
@@ -307,7 +307,7 @@ LogicalResult rejectSurvivingBooleans(ModuleOp mod) {
                  "nothing, while that intrinsic only compares two values";
       }
 
-      for (Operation *user : v.getUsers())
+      for (Operation *user : readers)
         diag.attachNote(user->getLoc())
             << "read here, by '" << user->getName() << "'";
     }

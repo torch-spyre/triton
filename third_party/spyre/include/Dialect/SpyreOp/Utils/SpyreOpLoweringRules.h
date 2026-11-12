@@ -34,6 +34,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -53,17 +54,27 @@ struct GroupCandidate {
   /// two. A rule with a reader needs every reader directly in its body
   /// (ruleMatches). The anchor's own generic is `anchor->getParentOp()`.
   linalg::GenericOp groupGeneric;
-  /// Every op that reads `anchor`'s result, each once. There may be several: a
-  /// rule takes exactly the readers it lists.
+  /// Every op that reads `anchor`'s result, each once (distinctReaders). There
+  /// may be several: a rule takes exactly the readers it lists.
   SmallVector<Operation *> readers;
 };
+
+/// The ops that read a value, each once, in use order. An op that reads the
+/// value in more than one operand is one reader, though it is in the value's
+/// users once per operand. `users` is a value's or an op's getUsers().
+template <typename UserRange>
+SmallVector<Operation *> distinctReaders(UserRange &&users) {
+  llvm::SetVector<Operation *> readers(users.begin(), users.end());
+  return readers.takeVector();
+}
 
 /// One way to lower an anchor op, together with the readers it lists, to
 /// spyreop ops.
 ///
 /// A rule matches a candidate (ruleMatches) when the anchor is the `anchor`
-/// op, the candidate's readers match `readers` one for one -- any readers at
-/// all when `readers` is empty -- and `guard` holds.
+/// op, the candidate's readers match `readers` one for one and are directly in
+/// the group's generic -- any readers at all when `readers` is empty -- and
+/// `guard` holds.
 struct SpyreOpLoweringRule {
   /// The rule's name, e.g. "reciprocal" or "compare-select-zero-test": the
   /// pattern's debug name, and what a trace reports.

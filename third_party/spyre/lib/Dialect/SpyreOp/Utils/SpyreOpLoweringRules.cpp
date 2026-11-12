@@ -316,7 +316,7 @@ constexpr StringLiteral kSelectReader[] = {opName<arith::SelectOp>()};
 /// Every rule LowerSpyreOps lowers by, the rules lowering one op first, then
 /// the rules with a reader. Among the rules on one anchor a higher benefit is
 /// tried first, and rules of equal benefit on one anchor never both match one
-/// candidate: a guard tells them apart, as guardIntegerInBody does addi32 and
+/// candidate: a guard tells them apart, as guardIntegerWidth does addi32 and
 /// addi64. The rules with a reader are also tried in this order by
 /// matchLowerableGroup, so rules with the same anchor and the same readers are
 /// listed by descending benefit.
