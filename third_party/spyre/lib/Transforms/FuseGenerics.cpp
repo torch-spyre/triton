@@ -328,6 +328,8 @@ private:
       return failure();
     }
 
+    // The group's generic is the consumer: the producer is fused into it, so
+    // the readers are checked against the body they will be in.
     triton::spyre::GroupCandidate candidate{
         anchor, consumer,
         llvm::to_vector(consumer.getMatchingBlockArgument(operand).getUsers())};

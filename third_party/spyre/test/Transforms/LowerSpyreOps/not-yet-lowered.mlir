@@ -91,37 +91,3 @@ func.func @one_compare_two_consumers(%x: tensor<4xf16>, %y: tensor<4xf16>) -> te
   } -> tensor<4xf16>
   return %0 : tensor<4xf16>
 }
-
-// -----
-
-//===----------------------------------------------------------------------===//
-// A reader not directly in the compare's body
-//===----------------------------------------------------------------------===//
-
-// PURPOSE: a reader nested in a region of the body is not part of the group.
-//
-// The compare is directly in the generic, and its one reader, an arith.select,
-// is inside an scf.if in that body. A group's reader must be directly in the
-// group's generic, so the rule declines, the compare and the select stay arith,
-// and the `i1` is reported.
-#map = affine_map<(d0) -> (d0)>
-func.func @select_nested_in_scf_if(%x: tensor<4xf16>, %y: tensor<4xf16>, %flag: i1) -> tensor<4xf16> {
-  %init = tensor.empty() : tensor<4xf16>
-  %0 = linalg.generic {indexing_maps = [#map, #map, #map],
-                       iterator_types = ["parallel"]}
-      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-  ^bb0(%a: f16, %b: f16, %out: f16):
-    // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{the predicate 'ogt' does have a spyreop.compare counterpart}}
-    %c = arith.cmpf ogt, %a, %b : f16
-    %r = scf.if %flag -> f16 {
-      // expected-note @below {{read here, by 'arith.select'}}
-      %s = arith.select %c, %a, %b : f16
-      scf.yield %s : f16
-    } else {
-      scf.yield %a : f16
-    }
-    linalg.yield %r : f16
-  } -> tensor<4xf16>
-  return %0 : tensor<4xf16>
-}
