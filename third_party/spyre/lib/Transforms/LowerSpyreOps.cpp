@@ -23,9 +23,8 @@
 //
 // They share one greedy pattern set. The rules rooted on one op are tried in
 // the order of their benefits, declared in the table, and no op is both a
-// rule's reader and the anchor of a rule without readers.
-// Splitting these across two passes is what an earlier shape did, and it
-// bought a standing question -- which pass claims this op -- for nothing.
+// rule's reader and the anchor of a rule without readers, so no question of
+// which pass, or which kind of rule, claims an op arises.
 //
 // EVERYTHING UNMATCHED FLOWS THROUGH, WITH ONE EXCEPTION. There is no
 // conversion target: an op with no device form reaches the backend, which is
@@ -45,22 +44,18 @@
 // on the same candidate: an anchor and every reader of it -- finds a rule
 // covering the anchor and its one reader. An
 // anchor read by more than one op is not grouped, and FuseGenerics reports the
-// `i1` left between the generics. The reciprocal's constant is a scalar in the
-// body because CanonicalizeGenericOperands folded the splat in. Stated as a
-// contract between adjacent passes rather than left to be discovered -- and
-// `resolveThroughBody` keeps the reciprocal working on the unfused form too, so
-// for that rule the dependency is about whether it FIRES, never about whether
-// it is correct.
+// `i1` left between the generics.
 //
-// THE GENERIC BODY IS THE SCOPE for a rule with a reader, and not a predicate.
-// Every compute reaches this pass as a linalg.generic, so "inside a body" is
-// not a guess about whether an op is compute -- it is where the compute is. A
-// rule rooted in a body never asks: an `arith.addi` on an element type in a
-// body is compute, and the addi of a loop index or a tile address is not in a
-// body at all. The integer rules use the same test as a per-op PREDICATE, at
-// any depth, which is a proxy and is known to be one; see
-// isInsideLinalgGeneric. The float rules without a reader check no placement
-// at all.
+// CONSTANTS ARRIVE AS SCALARS IN THE BODY. The reciprocal's 1.0 and a zero
+// test's 0.0 are matched as scalar constants the body reads, never through a
+// splat `ins` operand: CanonicalizeGenericOperands' SplatOperandToScalar, which
+// runs first, is what puts a splat constant `ins` into the body as a scalar. A
+// splat still passed as an `ins` reaches a rule as a block argument and matches
+// nothing.
+//
+// THE GENERIC BODY IS THE SCOPE of every rule: see the pass description in
+// Passes.td. LowerByRule checks the root's placement once for every rule, and
+// ruleMatches the readers'.
 //
 // NO NaN REACHES A COMPUTE BODY. Every rule assumes it, which lets the pass:
 //
@@ -80,16 +75,17 @@
 // with the reasoning and this is the short form.
 //
 //   A 1:1 rule does not fire and the op goes to the backend as arith:
+//     - any op outside a generic body
 //     - a float width with no intrinsic (f64, bf16)
-//     - an integer width with no intrinsic, or integer add/mul outside a body
+//     - an integer width with no intrinsic
 //     - anything still tensor-typed, which only ConvertElementwiseToLinalg not
 //       having run can produce
 //
 //   A group rule declines and its members stay as they were:
 //     - a divide whose numerator is not a constant one, or whose constant is
 //       the denominator: the realdiv rule takes it, which is right
-//     - a numerator resolving to a NON-SPLAT constant tensor: reading an
-//       operand through the body is sound only for a uniform value
+//     - a numerator that is a block argument, even one fed by a splat 1.0
+//       constant `ins`: the rule reads the body, not the operands
 //     - `ord`/`uno` and the constant predicates `false`/`true`: no
 //       counterpart. They ask about NaN-ness or about nothing, not about an
 //       ordering
@@ -125,7 +121,6 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -154,12 +149,11 @@ namespace {
 /// at the rule's benefit, so the driver tries the rules on one op in benefit
 /// order.
 ///
-/// The candidate is the root, the generic that is its immediate parent if any,
-/// and every op reading the root, each once though it may read the root more
-/// than once. When the rule matches, its build runs at the rule's last op --
-/// its reader, or the root when it lists none -- on the root's operands
-/// followed by the reader's, the value it returns replaces that op, and a
-/// root left without users is erased.
+/// The candidate is the root, that generic, and every op reading the root,
+/// each once though it may read the root more than once. When the rule
+/// matches, its build runs at the rule's last op -- its reader, or the root
+/// when it lists none -- on the root's operands followed by the reader's, the
+/// value it returns replaces that op, and a root left without users is erased.
 ///
 /// A candidate in a body that no rule with a reader lowers is traced once, by
 /// the last such rule on its anchor in the table, with every rule's reason
@@ -169,12 +163,6 @@ namespace {
 ///
 /// A declined compare read in the body is then reported by
 /// rejectSurvivingBooleans.
-///
-/// A compare with several readers is a possible extension, not done here: one
-/// `spyreop.compare` at the compare, read by every reader -- a `uitofp` becomes
-/// that mask, a `select` becomes `spyreop.select` on it, a zero test needs no
-/// compare. A reader that leaves the body, a `linalg.yield`, still needs the
-/// `i1` and would still decline.
 struct LowerByRule : public RewritePattern {
   LowerByRule(const SpyreOpLoweringRule &rule, MLIRContext *ctx)
       : RewritePattern(rule.anchor, rule.benefit, ctx), rule(rule),
@@ -184,20 +172,27 @@ struct LowerByRule : public RewritePattern {
 
   LogicalResult matchAndRewrite(Operation *root,
                                 PatternRewriter &rewriter) const override {
-    llvm::SetVector<Operation *> readers(root->user_begin(), root->user_end());
-    GroupCandidate candidate{
-        root, dyn_cast<linalg::GenericOp>(root->getParentOp()),
-        readers.takeVector()};
+    // The root's immediate parent must be a linalg.generic.
+    auto body = dyn_cast<linalg::GenericOp>(root->getParentOp());
+    if (!body)
+      return failure();
+    GroupCandidate candidate{root, body,
+                             triton::spyre::distinctReaders(root->getUsers())};
+    // The rule's own checks: the anchor and reader op names, the reader count
+    // and placement, then its guard.
     std::string why;
     if (!triton::spyre::ruleMatches(rule, candidate, why)) {
       LLVM_DEBUG({
-        if (tracesDeclines && candidate.anchorBody &&
+        if (tracesDeclines &&
             failed(triton::spyre::matchLowerableGroup(candidate, &why)))
           traceDecline(root, why);
       });
       return failure();
     }
 
+    // The op whose result the group produces: the reader for a group, the
+    // root for a one-op rule. The spyreop ops are built just before it, on the
+    // root's operands followed by the reader's, and replace it.
     Operation *last = rule.readers.empty() ? root : candidate.readers.front();
     SmallVector<Value> operands(root->getOperands());
     if (!rule.readers.empty())
@@ -205,6 +200,7 @@ struct LowerByRule : public RewritePattern {
     rewriter.setInsertionPoint(last);
     Value replacement = rule.build(rewriter, candidate, operands);
     rewriter.replaceOp(last, replacement);
+    // A group's root, its only reader now replaced, is dead.
     if (root != last && root->use_empty())
       rewriter.eraseOp(root);
     return success();
@@ -282,10 +278,12 @@ LogicalResult rejectSurvivingBooleans(ModuleOp mod) {
               "intrinsic produces or consumes that type, so no selection rule "
               "can ever remove it";
 
+      SmallVector<Operation *> readers =
+          triton::spyre::distinctReaders(v.getUsers());
+
       // Name the predicate: it is what an author can change.
       if (auto cmp = v.getDefiningOp<arith::CmpFOp>()) {
         StringRef pred = arith::stringifyCmpFPredicate(cmp.getPredicate());
-        llvm::SetVector<Operation *> readers(v.user_begin(), v.user_end());
         if (spyrePredicateFor(cmp.getPredicate()) && readers.size() > 1)
           diag.attachNote(cmp.getLoc())
               << "the predicate '" << pred
@@ -309,7 +307,7 @@ LogicalResult rejectSurvivingBooleans(ModuleOp mod) {
                  "nothing, while that intrinsic only compares two values";
       }
 
-      for (Operation *user : v.getUsers())
+      for (Operation *user : readers)
         diag.attachNote(user->getLoc())
             << "read here, by '" << user->getName() << "'";
     }

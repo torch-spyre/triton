@@ -20,9 +20,8 @@
 // holds it.
 //
 // The remaining exports are the questions the rules share with LowerSpyreOps'
-// diagnostics: which scalar types the float intrinsics take, which spyreop
-// predicate a cmpf predicate maps to, and what a body value names from outside
-// the body.
+// diagnostics: which scalar types the float intrinsics take, and which spyreop
+// predicate a cmpf predicate maps to.
 //
 //===----------------------------------------------------------------------===//
 
@@ -35,6 +34,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -49,22 +49,32 @@ struct GroupCandidate {
   /// The op whose result the group consumes: in the producer generic when the
   /// group spans two generics, in the one generic when it does not.
   Operation *anchor;
-  /// The generic whose body holds `anchor` directly, or null when `anchor`'s
-  /// parent is not a generic. A compare operand that is one of its block
-  /// arguments is looked up through it.
-  linalg::GenericOp anchorBody;
-  /// The ops that read `anchor`'s result, wherever they are: in `anchorBody`
-  /// when the group is in one body, in the consumer's body when it spans two
-  /// generics.
+  /// The linalg.generic the group is in, or will be in once fused: the
+  /// anchor's own generic when the group is in one, the consumer when it spans
+  /// two. A rule with a reader needs every reader directly in its body
+  /// (ruleMatches). The anchor's own generic is `anchor->getParentOp()`.
+  linalg::GenericOp groupGeneric;
+  /// Every op that reads `anchor`'s result, each once (distinctReaders). There
+  /// may be several: a rule takes exactly the readers it lists.
   SmallVector<Operation *> readers;
 };
+
+/// The ops that read a value, each once, in use order. An op that reads the
+/// value in more than one operand is one reader, though it is in the value's
+/// users once per operand. `users` is a value's or an op's getUsers().
+template <typename UserRange>
+SmallVector<Operation *> distinctReaders(UserRange &&users) {
+  llvm::SetVector<Operation *> readers(users.begin(), users.end());
+  return readers.takeVector();
+}
 
 /// One way to lower an anchor op, together with the readers it lists, to
 /// spyreop ops.
 ///
 /// A rule matches a candidate (ruleMatches) when the anchor is the `anchor`
-/// op, the candidate's readers match `readers` one for one -- any readers at
-/// all when `readers` is empty -- and `guard` holds.
+/// op, the candidate's readers match `readers` one for one and are directly in
+/// the group's generic -- any readers at all when `readers` is empty -- and
+/// `guard` holds.
 struct SpyreOpLoweringRule {
   /// The rule's name, e.g. "reciprocal" or "compare-select-zero-test": the
   /// pattern's debug name, and what a trace reports.
@@ -103,8 +113,8 @@ bool verifySpyreOpLoweringRules(ArrayRef<SpyreOpLoweringRule> rules,
                                 std::string &why);
 
 /// Whether `rule` lowers `candidate`: its anchor is the rule's anchor op, its
-/// readers match the rule's one for one, and the guard holds. Sets `why` when
-/// it does not.
+/// readers match the rule's one for one and are directly in the group's
+/// generic, and the guard holds. Sets `why` when it does not.
 bool ruleMatches(const SpyreOpLoweringRule &rule,
                  const GroupCandidate &candidate, std::string &why);
 
@@ -134,28 +144,6 @@ bool isSpyreOpScalarType(Type type);
 ///     no counterpart.
 std::optional<spyreop::ComparePredicate>
 spyrePredicateFor(arith::CmpFPredicate p);
-
-/// What `v` names from OUTSIDE `generic`'s body: the matching `ins` operand
-/// when `v` is one of the body's input block arguments, and `v` itself
-/// otherwise.
-///
-/// This is what lets a rule ask about an operand's DEFINITION without caring
-/// how the value reached the body. The same `1.0` is a scalar `arith.constant`
-/// above the generic once CanonicalizeGenericOperands has folded the splat in,
-/// and a splat `ins` operand if that pass has not run; resolved, both answer
-/// the same question.
-///
-/// SOUND ONLY BECAUSE OF WHAT CALLERS ASK. A body value corresponds to the same
-/// tensor element only for a value uniform across the operand, so a caller may
-/// ask a resolved value whether it is a SPLAT or a scalar constant -- which is
-/// exactly what `m_OneFloat` tests -- and may not ask it anything about a
-/// particular element. A non-splat constant tensor resolves here too and
-/// correctly matches nothing.
-///
-/// The `outs` block arguments are deliberately not resolved: an `outs` of a
-/// `tensor.empty` has no defined value to name, so forwarding it would invite a
-/// rule to read one.
-Value resolveThroughBody(linalg::GenericOp generic, Value v);
 
 } // namespace mlir::triton::spyre
 

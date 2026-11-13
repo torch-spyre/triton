@@ -328,9 +328,12 @@ private:
       return failure();
     }
 
+    // The group's generic is the consumer: the producer is fused into it, so
+    // the readers are checked against the body they will be in.
     triton::spyre::GroupCandidate candidate{
-        anchor, producer,
-        llvm::to_vector(consumer.getMatchingBlockArgument(operand).getUsers())};
+        anchor, consumer,
+        triton::spyre::distinctReaders(
+            consumer.getMatchingBlockArgument(operand).getUsers())};
     std::string reason;
     FailureOr<triton::spyre::GroupMatch> match =
         triton::spyre::matchLowerableGroup(candidate, &reason);
@@ -468,8 +471,8 @@ LogicalResult checkNoBooleanBetweenGenerics(ModuleOp mod) {
         diag.attachNote(producer.getLoc())
             << "forwarded by this linalg.generic from its operand "
             << producer.getMatchingOpOperand(arg)->getOperandNumber();
-      for (Operation *reader :
-           consumer.getMatchingBlockArgument(operand).getUsers())
+      for (Operation *reader : triton::spyre::distinctReaders(
+               consumer.getMatchingBlockArgument(operand).getUsers()))
         diag.attachNote(reader->getLoc())
             << "read here, by '" << reader->getName() << "'";
       diag.attachNote()

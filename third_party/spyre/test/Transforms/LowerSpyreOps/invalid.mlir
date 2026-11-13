@@ -6,8 +6,10 @@
 // THIS FILE HOLDS WHAT CAN NEVER LOWER, each case for a reason in the spyreop
 // dialect itself: a predicate with no spyreop.compare counterpart, a reader that
 // computes something else, a compare and reader at different widths, or a select
-// of a type spyreop.select does not take. not-yet-lowered.mlir holds the refusals
-// a future rule could remove: a compare with more than one reader.
+// of a type spyreop.select does not take. The last section is the one exception:
+// a reader outside the group's generic body, which is the scope and not the
+// dialect. not-yet-lowered.mlir holds the refusals a future rule could remove: a
+// compare with more than one reader.
 //
 // Everything else unmatched flows through, because it is a CAPABILITY gap -- an
 // f64 `math.sqrt` is valid IR that a future device or a future rule may do, so the
@@ -315,4 +317,36 @@ func.func @integer_values_are_refused(%a: tensor<8xf32>, %b: tensor<8xf32>,
     linalg.yield %s : i32
   } -> tensor<8xi32>
   return %0 : tensor<8xi32>
+}
+
+// -----
+
+//===----------------------------------------------------------------------===//
+// Outside the scope
+//===----------------------------------------------------------------------===//
+
+// A reader nested in a region of the body is not part of the group, however
+// well it fits: a group's reader must be directly in the group's generic. The
+// compare and the select stay arith and the `i1` is reported. This is the scope,
+// not a missing rule.
+#map = affine_map<(d0) -> (d0)>
+func.func @reader_nested_in_scf_if(%x: tensor<4xf16>, %y: tensor<4xf16>, %flag: i1) -> tensor<4xf16> {
+  %init = tensor.empty() : tensor<4xf16>
+  %0 = linalg.generic {indexing_maps = [#map, #map, #map],
+                       iterator_types = ["parallel"]}
+      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
+  ^bb0(%a: f16, %b: f16, %out: f16):
+    // expected-error @below {{an i1 value survives inside a compute body}}
+    // expected-note @below {{the predicate 'ogt' does have a spyreop.compare counterpart}}
+    %c = arith.cmpf ogt, %a, %b : f16
+    %r = scf.if %flag -> f16 {
+      // expected-note @below {{read here, by 'arith.select'}}
+      %s = arith.select %c, %a, %b : f16
+      scf.yield %s : f16
+    } else {
+      scf.yield %a : f16
+    }
+    linalg.yield %r : f16
+  } -> tensor<4xf16>
+  return %0 : tensor<4xf16>
 }

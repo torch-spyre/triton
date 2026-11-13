@@ -157,20 +157,36 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         benefit. Adding a case is one entry — no new pattern, no change here,
         no CMake change, no pipeline change.
 
+        THE GENERIC BODY IS THE SCOPE of every rule, and not a predicate.
+        Every compute reaches this pass as a linalg.generic, so "inside a body"
+        is not a guess about whether an op is compute — it is where the compute
+        is. A rule applies to an op whose immediate parent is a linalg.generic,
+        and a group's reader must be directly in that same body. An op anywhere
+        else, or a reader nested deeper in a region of the body, is left as it
+        is, whatever its type: an `arith.addi` on an element type in a body is
+        compute, the addi of a loop index or a tile address is not in a body at
+        all, and a scalar math.sqrt at function level stays math.sqrt.
+
+        CONSTANTS ARE SCALARS IN THE BODY. A rule that asks for a constant
+        operand — the reciprocal's 1.0, a zero test's 0.0 — matches a scalar
+        `arith.constant` the body reads, never a splat `ins` operand through
+        its block argument. [CanonicalizeGenericOperands]' SplatOperandToScalar,
+        which runs first, is what puts every splat constant `ins` into the
+        body as a scalar; that is the contract between the two passes.
+
         Rules, one op to one:
         - math.sqrt  (f16 or f32)                 → spyreop.sqrt
         - math.exp   (f16 or f32)                 → spyreop.exp
         - math.rsqrt (f16 or f32)                 → spyreop.rsqrt
-        - arith.divf (f16 or f32), numerator 1.0  → spyreop.reciprocal (tried
-                                                    first)
+        - arith.divf (f16 or f32), numerator a    → spyreop.reciprocal (tried
+          scalar 1.0                                first)
         - arith.divf (f16 or f32), otherwise      → spyreop.realdiv
-        - arith.addi (i32, inside linalg.generic) → spyreop.addi32toi32
-        - arith.addi (i64, inside linalg.generic) → spyreop.addi64toi64
-        - arith.muli (i32, inside linalg.generic) → spyreop.muli32toi32
+        - arith.addi (i32)                        → spyreop.addi32toi32
+        - arith.addi (i64)                        → spyreop.addi64toi64
+        - arith.muli (i32)                        → spyreop.muli32toi32
 
         Rules, a GROUP to one, each rooted on the arith.cmpf and lowering it
-        with its one reader, its immediate parent a linalg.generic; a cmpf read
-        by more than one op is not lowered:
+        with its one reader; a cmpf read by more than one op is not lowered:
         - arith.cmpf + arith.uitofp     → spyreop.compare, carrying the predicate
         - arith.cmpf + arith.select,    → spyreop.select on the nonzero operand
           a zero test the select          (tried first)
@@ -229,19 +245,11 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         shapes are indistinguishable at this point, which is why the line is drawn
         by where the value lives rather than by how it got there.
 
-        THE GENERIC BODY IS THE SCOPE for a group rule, and not a predicate.
-        Every compute reaches this pass as a linalg.generic, so "inside a body"
-        is not a guess about whether an op is compute — it is where the compute
-        is. An `arith.addi` on an element type in a body is compute, and the addi
-        of a loop index or a tile address is not in a body at all.
-
-        The integer 1:1 rules use the same test as a per-op PREDICATE, at any
-        depth, which is a PROXY and is known to be one: plain scalar integer
-        add and mul are also loop indices, offsets and tile addressing, and no
-        exact test separates those from scalarized integer compute. It over-claims —
-        `tl.arange(0, N) * stride` is an arith.muli that will be inside a body
-        once scalarized — and holds today only because the tensor-of-pointers
-        tt.load path is unimplemented.
+        The integer rules match every i32 or i64 `arith.addi` / `arith.muli` in
+        a body, whatever the value is used for. A body holds element compute
+        only: the tensor-of-pointers `tt.load` path, which would scalarize
+        address arithmetic such as `tl.arange(0, N) * stride` into a body, is
+        not lowered.
 
         WHAT THIS PASS RELIES ON [FuseGenerics] FOR. A rule matches ops in ONE
         body, and ConvertElementwiseToLinalg gives every tensor-level op a body
@@ -255,29 +263,24 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         exactly one reader:
         an anchor read by more than one op is not grouped, so FuseGenerics
         reports the `i1` left between the generics, and in one body this pass
-        leaves it and reports it. The
-        reciprocal's constant is a scalar in the body because
-        CanonicalizeGenericOperands' SplatOperandToScalar put it there. A
-        contract between adjacent passes rather than an accident — and the
-        reciprocal reads its numerator THROUGH the body, so for that rule the
-        dependency is about whether it FIRES, never about whether it is correct.
+        leaves it and reports it.
 
         WHAT IS NOT SELECTED, and what each costs. None is a diagnostic, per
         EVERYTHING UNMATCHED FLOWS THROUGH above.
 
         A 1:1 rule does not fire and the op goes to the backend as arith:
+        - any op outside a generic body
         - a float width with no intrinsic (f64, bf16)
-        - an integer width with no intrinsic, or integer add/mul outside a body
+        - an integer width with no intrinsic
         - anything still tensor-typed, which only ConvertElementwiseToLinalg not
           having run can produce
 
         A group rule declines and its members stay as they were:
         - a divide whose numerator is not a constant one, or whose constant is
           the denominator: the realdiv rule takes it, which is the right answer
-        - a numerator resolving to a NON-SPLAT constant tensor. Reading an
-          operand through the body is sound only for a value uniform across it,
-          so a mixed constant matches nothing — without that, element 0 being 1.0
-          would be taken for the whole tensor
+        - a numerator that is a block argument, even one fed by a splat 1.0
+          constant `ins`: the rule reads the body, not the operands, per
+          CONSTANTS ARE SCALARS IN THE BODY above
         - `ord` and `uno`, which ask about NaN-ness rather than an ordering, and
           the constant predicates, which ask nothing. No counterpart exists.
         - arith.sitofp where uitofp was wanted: an `i1` read as signed is 0 or
@@ -292,8 +295,9 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         predicate was fine and whose READER was the problem. That distinction is
         what an author can act on.
 
-        Ordering: after the passes that make every compute a linalg.generic, and
-        after [FuseGenerics] per the contract above.
+        Ordering: after the passes that make every compute a linalg.generic,
+        after [CanonicalizeGenericOperands] and after [FuseGenerics], per the
+        contracts above.
 
         Output: the selected ops replaced by their intrinsics. Everything else
         unchanged.
@@ -398,7 +402,10 @@ def CanonicalizeGenericOperands
           above the generic, read in the body; the operand, its indexing map
           and its block argument are erased. A reduced port of upstream
           linalg's FoldScalarOrSplatConstant (foldSplatConstantOperand in
-          Utils/GenericOperands).
+          Utils/GenericOperands). [LowerSpyreOps] relies on it: its rules read
+          a constant — the reciprocal's 1.0, a zero test's 0.0 — only as a
+          scalar in the body, so this is what lets a splat constant written as
+          a tensor, e.g. `tl.full([M, S], 1.0)`, be matched at all.
         - Left alone:
           - a reshape with any user that is not a generic `ins`, e.g. one
             feeding a `ktdp.store`;
@@ -431,7 +438,8 @@ def CanonicalizeGenericOperands
         each reshape left alone.
 
         Ordering: after UnaliasLinalgOuts and before FuseGenerics, whose
-        AbsorbForwardingGeneric absorbs the forwarding generics this emits.
+        AbsorbForwardingGeneric absorbs the forwarding generics this emits;
+        and before LowerSpyreOps, per SplatOperandToScalar above.
 
         Output: no static `tensor.collapse_shape` / `tensor.expand_shape` whose
         only users are generic `ins`, and no splat dense constant `ins` that
