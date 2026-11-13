@@ -45,7 +45,6 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <optional>
-#include <optional>
 #include <string>
 
 namespace mlir::triton::spyre {
