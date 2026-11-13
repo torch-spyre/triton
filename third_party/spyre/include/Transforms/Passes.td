@@ -232,25 +232,26 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         dialect conversion, where an unsupported float width was reported here.
 
         The exception is an op a rule says is ILLEGAL AFTER SELECTION, and it
-        is a different kind of thing rather than a carve-out. Flows-through is about
-        a CAPABILITY gap: an f64 math.sqrt is valid IR that a future device or a
-        future rule may do. An `i1` in a compute body is UNREPRESENTABLE — no
-        spyreop intrinsic produces or consumes that type, so no rule anyone
-        could add would ever remove it. That is a property of the dialect, not
-        of a device generation, and it makes the program unlowerable rather than
-        unsupported. It is reported HERE because this is the only place that
-        still knows the PREDICATE; by the time the backend sees it, the failure
-        names an op several lowerings below the one the author wrote.
+        is a different kind of thing rather than a carve-out. Flows-through is
+        about a CAPABILITY gap: an f64 math.sqrt is valid IR that a future
+        device or a future rule may do. An `i1` in a compute body is
+        UNREPRESENTABLE — no spyreop intrinsic produces or consumes that type,
+        so no rule anyone could add would ever remove it. That is a property of
+        the dialect, not of a device generation, and it makes the program
+        unlowerable rather than unsupported. It is reported HERE because this is
+        the only place that still knows the PREDICATE; by the time the backend
+        sees it, the failure names an op several lowerings below the one the
+        author wrote.
 
         THE RULES SAY WHAT IS ILLEGAL. Each rule may carry a `legal` check
         beside its `guard` and `build` (SpyreOpLoweringRule::legal), asked about
         its anchor once the fixpoint has converged and no rule lowered it. The
         pass then walks every compute body and asks the rules anchored on each
         op (`isLegalAfterSelection`); it names no type itself. Until the
-        fixpoint converges nothing is asked, because an `i1` is exactly what the group
-        rules match. Today the three compare rules carry the check, so a new
-        rule that leaves its own unrepresentable result adds a `legal` and
-        changes nothing here.
+        fixpoint converges nothing is asked, because an `i1` is exactly what
+        the group rules match. Today the three compare rules carry the check,
+        so a new rule that leaves its own unrepresentable result adds a `legal`
+        and changes nothing here.
 
         WHAT IT REFUSES, precisely, because the scope is narrower than "any i1
         in a body". A compare is asked, and a compare whose `i1` is yielded is
