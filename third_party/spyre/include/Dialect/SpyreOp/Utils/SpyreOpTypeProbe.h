@@ -18,19 +18,19 @@
 // for it; the pieces are standard (a detached Block, mlir::verify, a scoped
 // diagnostic handler).
 //
-// WHAT IT COSTS. A few ops are created and destroyed per rule tried. LowerSpyreOps
-// tries a rule per op, and FuseGenerics tries the rules with a reader per
-// compare-and-reader pair it considers, so the cost is bounded by the number of
-// such pairs. Memoizing on (rule, operand types, attributes) is possible if it
-// ever shows in a profile.
+// WHAT IT COSTS. A few ops are created and destroyed per rule tried.
+// LowerSpyreOps tries a rule per op, and FuseGenerics tries the rules with a
+// reader per compare-and-reader pair it considers, so the cost is bounded by
+// the number of such pairs. Memoizing on (rule, operand types, attributes) is
+// possible if it ever shows in a profile.
 //
 // WHAT IT REQUIRES OF A RULE. The probe runs `SpyreOpLoweringRule::build` into
 // a scratch block, so `build` must read its operands only from the `operands`
 // it is given, and the candidate only for types and attributes. The probe
 // checks this rather than trusting it: a build that reaches a value outside the
 // scratch block, or returns a value of another type than the op it replaces,
-// aborts, naming the rule. That is a bug in the rule, and a broken rule table is
-// a compiler bug rather than input, as in verifySpyreOpLoweringRules. A
+// aborts, naming the rule. That is a bug in the rule, and a broken rule table
+// is a compiler bug rather than input, as in verifySpyreOpLoweringRules. A
 // diagnostic the build itself emits is dropped: the reason is a verifier's.
 //
 // WHAT IT DOES NOT SEE. A verifier knows types and op-local invariants. It does
