@@ -10,6 +10,7 @@
 # LINK_LIBS derived from what this file (and its header) include.
 add_triton_library(SpyreOpUtils
   SpyreOpLoweringRules.cpp
+  SpyreOpTypeProbe.cpp
 
   LINK_LIBS PUBLIC
   # The spyreop ops the rules build.

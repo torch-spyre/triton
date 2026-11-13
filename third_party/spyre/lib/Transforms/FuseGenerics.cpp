@@ -49,6 +49,8 @@
 #include "Transforms/Passes.h"
 #include "Utils/GenericOperands.h"
 
+#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"

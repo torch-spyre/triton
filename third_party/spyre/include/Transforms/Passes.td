@@ -174,6 +174,17 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         which runs first, is what puts every splat constant `ins` into the
         body as a scalar; that is the contract between the two passes.
 
+        NO RULE STATES A TYPE. A rule fires only when every spyreop op it
+        would build passes that op's own verifier on the operands' types: the
+        rule builds its ops in a detached scratch block, verifies each, and
+        erases them, with the verifier's diagnostics caught rather than
+        reported. So the types a rule lowers are the ones its spyreop ops'
+        definitions accept, and the types below are read off those
+        definitions — f16 or f32 for the float intrinsics as arith reaches
+        them, i32 or i64 for the integer ones. Two rules on one anchor that
+        build ops of different types, addi32 and addi64, are told apart by
+        that check alone.
+
         Rules, one op to one:
         - math.sqrt  (f16 or f32)                 → spyreop.sqrt
         - math.exp   (f16 or f32)                 → spyreop.exp
@@ -286,14 +297,16 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         - arith.sitofp where uitofp was wanted: an `i1` read as signed is 0 or
           -1, so the cast gives -1.0 where the predicate holds
         - a compare at one width whose result is cast to another.
-          spyreop.compare has SameOperandsAndResultType and cannot do both
+          spyreop.compare has SameOperandsAndResultType and cannot do both,
+          so its verifier refuses the op the rule would build
 
         Each of the compare declines leaves an `i1` INSIDE a body, so each is
         REFUSED by the check above rather than passed through — they are the
         exception, not the rule. The diagnostic names the predicate and says
         which kind of decline it was: one with no counterpart at all, or one whose
-        predicate was fine and whose READER was the problem. That distinction is
-        what an author can act on.
+        predicate was fine and whose READER was the problem, with each rule's
+        reason, the verifier's among them. That distinction is what an author
+        can act on.
 
         Ordering: after the passes that make every compute a linalg.generic,
         after [CanonicalizeGenericOperands] and after [FuseGenerics], per the
@@ -554,7 +567,10 @@ def FuseGenerics : Pass<"fuse-generics", "mlir::ModuleOp"> {
         linearizing map on a physicalized path; anything else reaches dbo-opt.
     }];
 
+    // spyreop: asking a rule whether it lowers a group builds the spyreop ops
+    // it would make, to verify them.
     let dependentDialects = [
+        "mlir::spyreop::SpyreOpDialect",
         "mlir::linalg::LinalgDialect",
         "mlir::tensor::TensorDialect"
     ];
