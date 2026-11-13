@@ -336,6 +336,17 @@ bool verifySpyreOpLoweringRules(ArrayRef<SpyreOpLoweringRule> rules,
                     .str();
           return false;
         }
+  // Whether an anchor is legal after selection is one question about the op,
+  // however many rules lower it, so its rules declare the same answer to it.
+  for (const SpyreOpLoweringRule &rule : rules)
+    for (const SpyreOpLoweringRule &other : rules)
+      if (other.anchor == rule.anchor && other.legal != rule.legal) {
+        why = ("the rules '" + rule.name + "' and '" + other.name +
+               "' are anchored on '" + rule.anchor +
+               "' and declare different legality checks")
+                  .str();
+        return false;
+      }
   return true;
 }
 
@@ -435,10 +446,11 @@ void addName(NamesByKey &names, std::string key, StringRef name) {
 
 bool isLegalAfterSelection(const GroupCandidate &candidate, std::string &why) {
   StringRef anchorName = candidate.anchor->getName().getStringRef();
+  // The rules on one anchor declare the same check
+  // (verifySpyreOpLoweringRules), so the first one speaks for them all.
   for (const SpyreOpLoweringRule &rule : spyreOpLoweringRules())
-    if (rule.legal && rule.anchor == anchorName &&
-        !rule.legal(candidate, why))
-      return false;
+    if (rule.anchor == anchorName)
+      return !rule.legal || rule.legal(candidate, why);
   return true;
 }
 
@@ -452,6 +464,8 @@ FailureOr<GroupMatch> matchLowerableGroup(const GroupCandidate &candidate,
     if (rule.readers.empty() || rule.anchor != anchorName)
       continue;
     std::string reason;
+    // Asked here only to sort the reasons: those of the rules that name the
+    // candidate's ops are the ones worth giving. ruleShapeMatches asks again.
     if (!opsMatch(rule, candidate, reason)) {
       addName(onOthers, std::move(reason), rule.name);
       continue;

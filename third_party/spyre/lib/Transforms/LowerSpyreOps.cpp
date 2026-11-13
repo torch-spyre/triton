@@ -33,8 +33,8 @@
 // leaves the rest exactly as it found it. A type or a predicate this file does
 // not handle is a silent pass-through by design; see WHAT IS NOT SELECTED below
 // for the list and what each one costs. The exception is an op a rule says is
-// illegal after selection (SpyreOpLoweringRule::legal): today an `i1` left
-// inside a compute body, which checkLegality reports once selection has
+// illegal after selection (SpyreOpLoweringRule::legal): today an `i1` a compare
+// left inside a compute body, which checkLegality reports once selection has
 // converged.
 //
 // WHAT THIS PASS RELIES ON ITS PREDECESSOR FOR. A rule matches ops in ONE body,
@@ -263,7 +263,8 @@ private:
 ///   - an `i1` that is yielded, e.g. `linalg.yield %c : i1`.
 ///
 /// An op no rule is anchored on is not asked, whatever its type: it flows
-/// through to the backend like any op with no device form.
+/// through to the backend like any op with no device form. An `arith.cmpi`'s
+/// `i1`, read in the same body, is such a case.
 LogicalResult checkLegality(ModuleOp mod) {
   LogicalResult result = success();
   mod.walk([&](linalg::GenericOp generic) {

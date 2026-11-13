@@ -107,3 +107,31 @@ tt.func @addi_nested_in_scf_if(%t: tensor<4xi32>, %flag: i1) -> tensor<4xi32> {
   } -> tensor<4xi32>
   tt.return %0 : tensor<4xi32>
 }
+
+// -----
+
+// An `i1` made by an op no rule is anchored on is not refused: only the rules
+// anchored on an op say it is illegal after selection, and the compare rules
+// are the ones that do. The integer compare and its select, in one body, stay
+// as they are for the backend to judge. FuseGenerics still reports such an `i1`
+// between two generics, whatever op made it.
+// CHECK-LABEL:   func.func @cmpi_select_in_one_body(
+// CHECK-NOT:       spyreop
+// CHECK:           arith.cmpi
+// CHECK:           arith.select
+func.func @cmpi_select_in_one_body(%x: tensor<4xi32>, %y: tensor<4xi32>, %p: tensor<4xi32>, %q: tensor<4xi32>) -> tensor<4xi32> {
+  %init = tensor.empty() : tensor<4xi32>
+  %0 = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
+                       affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
+                       affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]}
+      ins(%x, %y, %p, %q : tensor<4xi32>, tensor<4xi32>, tensor<4xi32>, tensor<4xi32>)
+      outs(%init : tensor<4xi32>) {
+  ^bb0(%a: i32, %b: i32, %t: i32, %f: i32, %out: i32):
+    %c = arith.cmpi slt, %a, %b : i32
+    %s = arith.select %c, %t, %f : i32
+    linalg.yield %s : i32
+  } -> tensor<4xi32>
+  return %0 : tensor<4xi32>
+}

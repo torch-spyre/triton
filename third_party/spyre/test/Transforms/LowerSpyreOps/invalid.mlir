@@ -1,7 +1,7 @@
 // RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file -verify-diagnostics
 
-// AN i1 LEFT IN A COMPUTE BODY IS REFUSED, and it is the one thing this pass
-// reports.
+// AN i1 A COMPARE LEFT IN A COMPUTE BODY IS REFUSED, and it is the one thing
+// this pass reports.
 //
 // THIS FILE HOLDS WHAT CAN NEVER LOWER, each case for a reason in the spyreop
 // dialect itself: a predicate with no spyreop.compare counterpart, a reader that
@@ -29,10 +29,15 @@
 // not-yet-lowered.mlir). The note gives each rule's reason, by rule name, because
 // that is what an author can act on.
 //
-// THE SCOPE IS NARROWER THAN "any i1 in a body", and deliberately. The check reads
-// op RESULTS only, and skips one that is yielded -- so what it refuses is an i1
-// this pass produced and KEPT, made inside one body and read inside the same body.
-// That is exactly a group it had the chance to select and did not.
+// THE SCOPE IS WHAT THE RULES SAY, narrower than "any i1 in a body", and
+// deliberately. Once selection has converged the pass asks the rules anchored
+// on each op whether it is legal (SpyreOpLoweringRule::legal). Today the
+// compare rules say a compare read in its own body and not yielded is not, so
+// what is refused is an i1 a compare made and the pass KEPT, read inside the
+// same body.
+// That is exactly a group it had the chance to select and did not. An i1 made
+// by an op no rule is anchored on is not asked and flows through to the
+// backend: pass-through.mlir's @cmpi_select_in_one_body.
 //
 // An i1 crossing a generic boundary is the other pass's finding, not this one's: it
 // is the TENSOR form, FuseGenerics reports it,

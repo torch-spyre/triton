@@ -238,10 +238,11 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         UNREPRESENTABLE — no spyreop intrinsic produces or consumes that type,
         so no rule anyone could add would ever remove it. That is a property of
         the dialect, not of a device generation, and it makes the program
-        unlowerable rather than unsupported. It is reported HERE because this is
-        the only place that still knows the PREDICATE; by the time the backend
-        sees it, the failure names an op several lowerings below the one the
-        author wrote.
+        unlowerable rather than unsupported. That is a fact about the type, so
+        it holds of any `i1`; what is reported is narrower (WHAT IT REFUSES
+        below). It is reported HERE because this is the only place that still
+        knows the PREDICATE; by the time the backend sees it, the failure names
+        an op several lowerings below the one the author wrote.
 
         THE RULES SAY WHAT IS ILLEGAL. Each rule may carry a `legal` check
         beside its `guard` and `build` (SpyreOpLoweringRule::legal), asked about

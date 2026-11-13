@@ -117,7 +117,9 @@ struct SpyreOpLoweringRule {
   /// consumes, because then no rule anyone could add would ever remove it, and
   /// the program is unlowerable, not merely unsupported. Returns false for
   /// that, with `why` the reason. Never about whether some rule could lower
-  /// the anchor: that is `guard` and the probe.
+  /// the anchor: that is `guard` and the probe. It is a question about the
+  /// anchor, so the rules on one anchor declare the same check, or all none
+  /// (verifySpyreOpLoweringRules).
   bool (*legal)(const GroupCandidate &, std::string &why);
 };
 
@@ -131,7 +133,9 @@ ArrayRef<SpyreOpLoweringRule> spyreOpLoweringRules();
 ///
 ///   - a rule lists at most one reader;
 ///   - no op is both a rule's reader and the anchor of a rule without
-///     readers, because benefit orders only patterns rooted on the same op.
+///     readers, because benefit orders only patterns rooted on the same op;
+///   - the rules on one anchor declare the same `legal`, since whether an
+///     anchor is legal after selection is asked of the op, not of one rule.
 bool verifySpyreOpLoweringRules(ArrayRef<SpyreOpLoweringRule> rules,
                                 std::string &why);
 
@@ -188,8 +192,8 @@ struct GroupMatch {
 };
 
 /// Whether `candidate`'s anchor is legal once selection has converged and no
-/// rule lowered it: every rule anchored on its op that has a `legal` check
-/// agrees. Sets `why` to the first such rule's reason when it is not.
+/// rule lowered it, by the `legal` check the rules anchored on its op share.
+/// Sets `why` to the check's reason when it is not.
 bool isLegalAfterSelection(const GroupCandidate &candidate, std::string &why);
 
 /// The rule with a reader that lowers `candidate`: the first in
