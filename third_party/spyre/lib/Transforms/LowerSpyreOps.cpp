@@ -183,7 +183,7 @@ struct LowerByRule : public RewritePattern {
     // which builds the rule's ops into a scratch block and asks their verifiers
     // (SpyreOpTypeProbe.h).
     std::string why;
-    std::optional<triton::spyre::ShapeMatch> shape =
+    std::optional<triton::spyre::ShapeCheckedRule> shape =
         triton::spyre::ruleShapeMatches(rule, candidate, why);
     if (!shape || !triton::spyre::probeSpyreOpRule(*shape, why)) {
       LLVM_DEBUG({

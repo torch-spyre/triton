@@ -23,8 +23,8 @@
 // by every caller: ruleShapeMatches (the ops, their count, the guard), then
 // probeSpyreOpRule (SpyreOpTypeProbe.h), which asks the spyreop ops the rule
 // builds whether they take the candidate's types. No rule states a type itself.
-// The probe takes the ShapeMatch that ruleShapeMatches makes, so it cannot be
-// asked about a candidate whose shape the rule does not lower.
+// The probe takes the ShapeCheckedRule that ruleShapeMatches makes, so it
+// cannot be asked about a candidate whose shape the rule does not lower.
 //
 // The remaining export is the question the rules share with LowerSpyreOps'
 // diagnostics: which spyreop predicate a cmpf predicate maps to.
@@ -125,12 +125,18 @@ ArrayRef<SpyreOpLoweringRule> spyreOpLoweringRules();
 bool verifySpyreOpLoweringRules(ArrayRef<SpyreOpLoweringRule> rules,
                                 std::string &why);
 
-/// A candidate that has the shape a rule lowers. Only ruleShapeMatches makes
-/// one, so whatever takes a ShapeMatch may rely on the shape: the rule's build
-/// casts the anchor and readers to the ops the rule names.
+/// A rule and a candidate that has the shape the rule lowers, its types not yet
+/// asked. Only ruleShapeMatches makes one, so whatever takes a ShapeCheckedRule
+/// may rely on the shape: the rule's build casts the anchor and readers to the
+/// ops the rule names.
+///
+/// It is one rule's answer for one candidate, not the candidate's shape: a
+/// candidate can pass the shape check of several rules, e.g. a compare read by
+/// a select passes for the compare-select rules. The rule that lowers it is
+/// found among them by the probe (GroupMatch).
 ///
 /// It refers to the rule and the candidate, which must outlive it.
-class ShapeMatch {
+class ShapeCheckedRule {
 public:
   const SpyreOpLoweringRule &rule() const { return *matchedRule; }
   const GroupCandidate &candidate() const { return *matchedCandidate; }
@@ -140,9 +146,10 @@ public:
   SmallVector<Value> operands() const;
 
 private:
-  ShapeMatch(const SpyreOpLoweringRule &rule, const GroupCandidate &candidate)
+  ShapeCheckedRule(const SpyreOpLoweringRule &rule,
+                   const GroupCandidate &candidate)
       : matchedRule(&rule), matchedCandidate(&candidate) {}
-  friend std::optional<ShapeMatch>
+  friend std::optional<ShapeCheckedRule>
   ruleShapeMatches(const SpyreOpLoweringRule &, const GroupCandidate &,
                    std::string &);
 
@@ -150,17 +157,19 @@ private:
   const GroupCandidate *matchedCandidate;
 };
 
-/// The ShapeMatch of `candidate` with `rule`, when it has the shape the rule
-/// lowers: its anchor is the rule's anchor op, its readers match the rule's one
-/// for one and are directly in the group's generic, and the guard holds. Says
-/// nothing of types: that is probeSpyreOpRule's. Sets `why` when it does not
-/// match.
-std::optional<ShapeMatch> ruleShapeMatches(const SpyreOpLoweringRule &rule,
-                                           const GroupCandidate &candidate,
-                                           std::string &why);
+/// The ShapeCheckedRule of `rule` and `candidate`, when the candidate has the
+/// shape the rule lowers: its anchor is the rule's anchor op, its readers match
+/// the rule's one for one and are directly in the group's generic, and the
+/// guard holds. Says nothing of types: that is probeSpyreOpRule's. Sets `why`
+/// when it does not match.
+std::optional<ShapeCheckedRule>
+ruleShapeMatches(const SpyreOpLoweringRule &rule,
+                 const GroupCandidate &candidate, std::string &why);
 
-/// What matchLowerableGroup found: the rule, and which ops of the anchor's
-/// body the group consumes.
+/// What matchLowerableGroup found for one candidate: the rule that lowers it,
+/// and which ops of the anchor's body the group consumes. It is the final
+/// answer across the rules, where a ShapeCheckedRule is one rule's step toward
+/// it.
 struct GroupMatch {
   /// The rule's name, for the trace.
   StringRef shape;
@@ -170,8 +179,8 @@ struct GroupMatch {
 
 /// The rule with a reader that lowers `candidate`: the first in
 /// kSpyreOpLoweringRules for which ruleShapeMatches and probeSpyreOpRule both
-/// hold. Failure when none does, with `why`, when non-null, set to each such
-/// rule's reason.
+/// hold, tried in turn on this one candidate. Failure when none does, with
+/// `why`, when non-null, set to each such rule's reason.
 FailureOr<GroupMatch> matchLowerableGroup(const GroupCandidate &candidate,
                                           std::string *why = nullptr);
 

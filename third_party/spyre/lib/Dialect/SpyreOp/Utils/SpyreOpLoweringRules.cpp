@@ -306,7 +306,7 @@ bool verifySpyreOpLoweringRules(ArrayRef<SpyreOpLoweringRule> rules,
   return true;
 }
 
-SmallVector<Value> ShapeMatch::operands() const {
+SmallVector<Value> ShapeCheckedRule::operands() const {
   SmallVector<Value> operands(matchedCandidate->anchor->getOperands());
   if (!matchedRule->readers.empty())
     llvm::append_range(operands,
@@ -326,10 +326,9 @@ ArrayRef<SpyreOpLoweringRule> spyreOpLoweringRules() {
   return kSpyreOpLoweringRules;
 }
 
-namespace {
-
-bool shapeHolds(const SpyreOpLoweringRule &rule,
-                const GroupCandidate &candidate, std::string &why) {
+std::optional<ShapeCheckedRule>
+ruleShapeMatches(const SpyreOpLoweringRule &rule,
+                 const GroupCandidate &candidate, std::string &why) {
   // A rule with readers asks for them one for one; a rule without asks
   // nothing of them.
   if (!rule.readers.empty() &&
@@ -341,17 +340,17 @@ bool shapeHolds(const SpyreOpLoweringRule &rule,
                     (rule.readers.size() == 1
                          ? std::string("one")
                          : std::to_string(rule.readers.size()));
-    return false;
+    return std::nullopt;
   }
   if (candidate.anchor->getName().getStringRef() != rule.anchor) {
     why = ("the anchor is not an " + rule.anchor).str();
-    return false;
+    return std::nullopt;
   }
   for (auto [reader, name] : llvm::zip(candidate.readers, rule.readers))
     if (reader->getName().getStringRef() != name) {
       why = "the reader, '" + reader->getName().getStringRef().str() +
             "', is not an " + name.str();
-      return false;
+      return std::nullopt;
     }
   Operation *group = candidate.groupGeneric;
   if (!rule.readers.empty())
@@ -359,19 +358,11 @@ bool shapeHolds(const SpyreOpLoweringRule &rule,
       if (reader->getParentOp() != group) {
         why = "the reader, '" + reader->getName().getStringRef().str() +
               "', is not directly in the group's generic body";
-        return false;
+        return std::nullopt;
       }
-  return !rule.guard || rule.guard(candidate, why);
-}
-
-} // namespace
-
-std::optional<ShapeMatch> ruleShapeMatches(const SpyreOpLoweringRule &rule,
-                                           const GroupCandidate &candidate,
-                                           std::string &why) {
-  if (!shapeHolds(rule, candidate, why))
+  if (rule.guard && !rule.guard(candidate, why))
     return std::nullopt;
-  return ShapeMatch(rule, candidate);
+  return ShapeCheckedRule(rule, candidate);
 }
 
 FailureOr<GroupMatch> matchLowerableGroup(const GroupCandidate &candidate,
@@ -383,7 +374,8 @@ FailureOr<GroupMatch> matchLowerableGroup(const GroupCandidate &candidate,
     if (rule.readers.empty())
       continue;
     std::string reason;
-    std::optional<ShapeMatch> shape = ruleShapeMatches(rule, candidate, reason);
+    std::optional<ShapeCheckedRule> shape =
+        ruleShapeMatches(rule, candidate, reason);
     if (shape && probeSpyreOpRule(*shape, reason))
       return GroupMatch{rule.name, {candidate.anchor}};
     if (!llvm::is_contained(reasons, reason))

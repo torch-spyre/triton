@@ -18,7 +18,7 @@ using namespace mlir;
 
 namespace mlir::triton::spyre {
 
-bool probeSpyreOpRule(const ShapeMatch &shape, std::string &why) {
+bool probeSpyreOpRule(const ShapeCheckedRule &shape, std::string &why) {
   const SpyreOpLoweringRule &rule = shape.rule();
   const GroupCandidate &candidate = shape.candidate();
   MLIRContext *ctx = candidate.anchor->getContext();

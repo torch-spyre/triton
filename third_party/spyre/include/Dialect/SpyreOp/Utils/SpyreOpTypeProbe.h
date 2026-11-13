@@ -41,8 +41,8 @@
 // WHERE IT RUNS. After ruleShapeMatches, at both places that ask whether a rule
 // lowers a candidate: LowerByRule before it lowers, and matchLowerableGroup
 // before FuseGenerics fuses. Both call the two steps by name. The probe takes
-// the ShapeMatch that ruleShapeMatches makes, so it is never asked about a rule
-// whose shape the candidate does not have.
+// the ShapeCheckedRule that ruleShapeMatches makes, so it is never asked about
+// a rule whose shape the candidate does not have.
 //
 //===----------------------------------------------------------------------===//
 
@@ -63,7 +63,7 @@ namespace mlir::triton::spyre {
 /// touched; the block and everything in it are destroyed before returning. The
 /// verifiers' diagnostics are caught by a handler scoped to the call, so
 /// nothing is reported, and the first becomes `why`.
-bool probeSpyreOpRule(const ShapeMatch &shape, std::string &why);
+bool probeSpyreOpRule(const ShapeCheckedRule &shape, std::string &why);
 
 } // namespace mlir::triton::spyre
 
