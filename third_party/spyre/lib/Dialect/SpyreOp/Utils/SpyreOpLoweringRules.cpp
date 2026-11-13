@@ -27,6 +27,9 @@
 #include "Dialect/SpyreOp/Utils/SpyreOpLoweringRules.h"
 #include "Dialect/SpyreOp/Utils/SpyreOpTypeProbe.h"
 
+#include "ktir/Dialect/SpyreOp/SpyreOp.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/STLExtras.h"
@@ -34,14 +37,24 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/ErrorHandling.h"
 
+#include <optional>
+
 using namespace mlir;
 
 namespace mlir::triton::spyre {
 
-//===----------------------------------------------------------------------===//
-// Shared questions
-//===----------------------------------------------------------------------===//
+namespace {
 
+template <typename OpT> constexpr StringLiteral opName() {
+  return OpT::getOperationName();
+}
+
+/// The spyreop predicate computing the same thing as `p`, or nothing:
+///
+///   - an ordering maps from both spellings, e.g. `oeq` and `ueq` -> `equal`
+///     (they differ only on NaN, and no NaN reaches a compute body);
+///   - `ord`/`uno` ask about NaN and `false`/`true` about nothing, so they have
+///     no counterpart.
 std::optional<spyreop::ComparePredicate>
 spyrePredicateFor(arith::CmpFPredicate p) {
   switch (p) {
@@ -68,12 +81,6 @@ spyrePredicateFor(arith::CmpFPredicate p) {
   }
 }
 
-namespace {
-
-template <typename OpT> constexpr StringLiteral opName() {
-  return OpT::getOperationName();
-}
-
 //===----------------------------------------------------------------------===//
 // Guards
 //===----------------------------------------------------------------------===//
@@ -88,8 +95,11 @@ bool guardReciprocal(const GroupCandidate &candidate, std::string &why) {
 }
 
 std::string noCounterpart(arith::CmpFOp cmp) {
-  return (llvm::Twine("spyreop.compare has no counterpart for predicate '") +
-          arith::stringifyCmpFPredicate(cmp.getPredicate()) + "'")
+  return (llvm::Twine("the predicate '") +
+          arith::stringifyCmpFPredicate(cmp.getPredicate()) +
+          "' has no spyreop.compare counterpart (`ord` and `uno` ask whether "
+          "an operand is NaN, and `false`/`true` ask nothing, while that "
+          "intrinsic only compares two values)")
       .str();
 }
 
@@ -150,6 +160,29 @@ bool guardZeroTest(const GroupCandidate &candidate, std::string &why) {
   if (selectFromZeroTest(cast<arith::CmpFOp>(candidate.anchor)))
     return true;
   why = "the compare is not a zero test spyreop.select performs itself";
+  return false;
+}
+
+//===----------------------------------------------------------------------===//
+// Legality
+//===----------------------------------------------------------------------===//
+
+/// compare-cast, compare-select-zero-test and compare-select: a compare no rule
+/// lowered, read in its own body and not yielded, is illegal. Its result is an
+/// `i1`, and no spyreop intrinsic produces or consumes that type, so what is
+/// left is a group the rules had the chance to select and did not, and no rule
+/// anyone could add would remove it.
+///
+/// A compare whose `i1` is yielded is legal here: that is the tensor form
+/// leaving the body, which FuseGenerics' legalization reports.
+bool isLegalCompare(const GroupCandidate &candidate, std::string &why) {
+  if (llvm::any_of(candidate.anchor->getUsers(), [](Operation *user) {
+        return isa<linalg::YieldOp>(user);
+      }))
+    return true;
+  why = "an i1 value survives inside a compute body, which the Spyre device "
+        "has no form for at all -- no spyreop intrinsic produces or consumes "
+        "that type, so no selection rule can ever remove it";
   return false;
 }
 
@@ -274,11 +307,11 @@ const SpyreOpLoweringRule kSpyreOpLoweringRules[] = {
     {"muli32", opName<arith::MulIOp>(), {}, 1, nullptr,
      buildBinary<spyreop::MulI32ToI32>},
     {"compare-cast", opName<arith::CmpFOp>(), kUIToFPReader, 1, guardCompare,
-     buildCompareCast},
+     buildCompareCast, isLegalCompare},
     {"compare-select-zero-test", opName<arith::CmpFOp>(), kSelectReader, 2,
-     guardZeroTest, buildZeroTestSelect},
+     guardZeroTest, buildZeroTestSelect, isLegalCompare},
     {"compare-select", opName<arith::CmpFOp>(), kSelectReader, 1, guardCompare,
-     buildCompareSelect},
+     buildCompareSelect, isLegalCompare},
 };
 
 } // namespace
@@ -326,64 +359,135 @@ ArrayRef<SpyreOpLoweringRule> spyreOpLoweringRules() {
   return kSpyreOpLoweringRules;
 }
 
-std::optional<ShapeCheckedRule>
-ruleShapeMatches(const SpyreOpLoweringRule &rule,
-                 const GroupCandidate &candidate, std::string &why) {
-  // A rule with readers asks for them one for one; a rule without asks
-  // nothing of them.
-  if (!rule.readers.empty() &&
-      candidate.readers.size() != rule.readers.size()) {
-    why = candidate.readers.empty()
-              ? std::string("nothing reads the anchor")
-              : "the anchor has " + std::to_string(candidate.readers.size()) +
-                    " readers, and a group takes exactly " +
-                    (rule.readers.size() == 1
-                         ? std::string("one")
-                         : std::to_string(rule.readers.size()));
-    return std::nullopt;
+namespace {
+
+/// Whether `candidate`'s ops are the ones `rule` names: its anchor is the
+/// rule's anchor op and, when the rule lists readers, its readers match them
+/// one for one and are directly in the group's generic. Sets `why` when they
+/// are not.
+bool opsMatch(const SpyreOpLoweringRule &rule, const GroupCandidate &candidate,
+              std::string &why) {
+  StringRef anchorName = candidate.anchor->getName().getStringRef();
+  if (anchorName != rule.anchor) {
+    why = ("the anchor is '" + anchorName + "', not '" + rule.anchor + "'")
+              .str();
+    return false;
   }
-  if (candidate.anchor->getName().getStringRef() != rule.anchor) {
-    why = ("the anchor is not an " + rule.anchor).str();
-    return std::nullopt;
+  if (rule.readers.empty())
+    return true;
+  if (candidate.readers.size() != rule.readers.size()) {
+    why = candidate.readers.empty()
+              ? "nothing reads the '" + anchorName.str() + "'"
+              : "the '" + anchorName.str() + "' is read by " +
+                    std::to_string(candidate.readers.size()) +
+                    " ops, and is lowered only together with exactly " +
+                    (rule.readers.size() == 1
+                         ? std::string("one reader")
+                         : std::to_string(rule.readers.size()) + " readers");
+    return false;
   }
   for (auto [reader, name] : llvm::zip(candidate.readers, rule.readers))
     if (reader->getName().getStringRef() != name) {
-      why = "the reader, '" + reader->getName().getStringRef().str() +
-            "', is not an " + name.str();
-      return std::nullopt;
+      why = ("the reader is '" + reader->getName().getStringRef() +
+             "', not '" + name + "'")
+                .str();
+      return false;
     }
   Operation *group = candidate.groupGeneric;
-  if (!rule.readers.empty())
-    for (Operation *reader : candidate.readers)
-      if (reader->getParentOp() != group) {
-        why = "the reader, '" + reader->getName().getStringRef().str() +
-              "', is not directly in the group's generic body";
-        return std::nullopt;
-      }
-  if (rule.guard && !rule.guard(candidate, why))
+  for (Operation *reader : candidate.readers)
+    if (reader->getParentOp() != group) {
+      why = ("the reader is '" + reader->getName().getStringRef() +
+             "', which is not directly in the group's generic body")
+                .str();
+      return false;
+    }
+  return true;
+}
+
+} // namespace
+
+std::optional<ShapeCheckedRule>
+ruleShapeMatches(const SpyreOpLoweringRule &rule,
+                 const GroupCandidate &candidate, std::string &why) {
+  if (!opsMatch(rule, candidate, why) ||
+      (rule.guard && !rule.guard(candidate, why)))
     return std::nullopt;
   return ShapeCheckedRule(rule, candidate);
 }
 
+namespace {
+
+/// Rule names, each list under the one string its rules share, in the order
+/// each string first appears in the table.
+using NamesByKey = SmallVector<std::pair<std::string, SmallVector<StringRef>>>;
+
+void addName(NamesByKey &names, std::string key, StringRef name) {
+  auto it = llvm::find_if(names, [&](const auto &entry) {
+    return entry.first == key;
+  });
+  if (it == names.end())
+    names.push_back({std::move(key), {name}});
+  else
+    it->second.push_back(name);
+}
+
+} // namespace
+
+bool isLegalAfterSelection(const GroupCandidate &candidate, std::string &why) {
+  StringRef anchorName = candidate.anchor->getName().getStringRef();
+  for (const SpyreOpLoweringRule &rule : spyreOpLoweringRules())
+    if (rule.legal && rule.anchor == anchorName &&
+        !rule.legal(candidate, why))
+      return false;
+  return true;
+}
+
 FailureOr<GroupMatch> matchLowerableGroup(const GroupCandidate &candidate,
                                           std::string *why) {
-  // Each distinct reason once: the rules on one reader count, or on one
-  // anchor op, decline for the same one.
-  SmallVector<std::string> reasons;
+  StringRef anchorName = candidate.anchor->getName().getStringRef();
+  // The reasons of the rules whose ops the candidate has, when there are
+  // any; otherwise of every rule with a reader on the anchor.
+  NamesByKey onOps, onOthers;
   for (const SpyreOpLoweringRule &rule : spyreOpLoweringRules()) {
-    if (rule.readers.empty())
+    if (rule.readers.empty() || rule.anchor != anchorName)
       continue;
     std::string reason;
+    if (!opsMatch(rule, candidate, reason)) {
+      addName(onOthers, std::move(reason), rule.name);
+      continue;
+    }
     std::optional<ShapeCheckedRule> shape =
         ruleShapeMatches(rule, candidate, reason);
     if (shape && probeSpyreOpRule(*shape, reason))
       return GroupMatch{rule.name, {candidate.anchor}};
-    if (!llvm::is_contained(reasons, reason))
-      reasons.push_back(reason);
+    addName(onOps, std::move(reason), rule.name);
   }
-  if (why)
-    *why = llvm::join(reasons, "; ");
+  if (!why)
+    return failure();
+  const NamesByKey &reasons = onOps.empty() ? onOthers : onOps;
+  if (reasons.empty()) {
+    *why = ("no rule with a reader is anchored on '" + anchorName + "'").str();
+    return failure();
+  }
+  SmallVector<std::string> parts;
+  for (const auto &[reason, names] : reasons)
+    parts.push_back(llvm::join(names, ", ") + ": " + reason);
+  *why = llvm::join(parts, "; ");
   return failure();
+}
+
+std::string describeRulesWithReaders() {
+  NamesByKey byOps;
+  for (const SpyreOpLoweringRule &rule : spyreOpLoweringRules())
+    if (!rule.readers.empty())
+      addName(byOps,
+              (rule.anchor + " read by " + llvm::join(rule.readers, " and "))
+                  .str(),
+              rule.name);
+  SmallVector<std::string> parts;
+  for (const auto &[ops, names] : byOps)
+    parts.push_back(ops + " (" + llvm::join(names, ", ") + ")");
+  return llvm::join(parts, ", or ");
 }
 
 } // namespace mlir::triton::spyre

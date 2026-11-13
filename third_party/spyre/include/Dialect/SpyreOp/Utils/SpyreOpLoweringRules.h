@@ -26,17 +26,19 @@
 // The probe takes the ShapeCheckedRule that ruleShapeMatches makes, so it
 // cannot be asked about a candidate whose shape the rule does not lower.
 //
-// The remaining export is the question the rules share with LowerSpyreOps'
-// diagnostics: which spyreop predicate a cmpf predicate maps to.
+// An op no rule lowers is left for the backend, unless a rule says it is
+// illegal after selection (SpyreOpLoweringRule::legal); LowerSpyreOps asks the
+// rules once it converges.
+//
+// The passes' diagnostics about a group are made from the table: the rules
+// with a reader, by name, anchor and readers (describeRulesWithReaders), and
+// each rule's reason for declining a candidate (matchLowerableGroup).
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef TRITON_SPYRE_DIALECT_SPYREOP_UTILS_SPYREOPLOWERINGRULES_H
 #define TRITON_SPYRE_DIALECT_SPYREOP_UTILS_SPYREOPLOWERINGRULES_H
 
-#include "ktir/Dialect/SpyreOp/SpyreOp.h"
-
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -108,6 +110,15 @@ struct SpyreOpLoweringRule {
   /// attributes, its operands only from `operands`, and returns a value of the
   /// replaced op's type. probeSpyreOpRule checks this.
   Value (*build)(OpBuilder &, const GroupCandidate &, ValueRange operands);
+  /// Whether the anchor is legal once selection has converged and no rule
+  /// lowered it; null when it always is. An op the rules do not lower is
+  /// normally legal: it reaches the backend, which knows what the device can
+  /// take. It is not when its result has a type no spyreop op produces or
+  /// consumes, because then no rule anyone could add would ever remove it, and
+  /// the program is unlowerable, not merely unsupported. Returns false for
+  /// that, with `why` the reason. Never about whether some rule could lower
+  /// the anchor: that is `guard` and the probe.
+  bool (*legal)(const GroupCandidate &, std::string &why);
 };
 
 /// Every rule, kSpyreOpLoweringRules. The table is checked by
@@ -176,21 +187,27 @@ struct GroupMatch {
   SmallVector<Operation *> producerOps;
 };
 
+/// Whether `candidate`'s anchor is legal once selection has converged and no
+/// rule lowered it: every rule anchored on its op that has a `legal` check
+/// agrees. Sets `why` to the first such rule's reason when it is not.
+bool isLegalAfterSelection(const GroupCandidate &candidate, std::string &why);
+
 /// The rule with a reader that lowers `candidate`: the first in
 /// kSpyreOpLoweringRules for which ruleShapeMatches and probeSpyreOpRule both
 /// hold, tried in turn on this one candidate. Failure when none does, with
-/// `why`, when non-null, set to each such rule's reason.
+/// `why`, when non-null, set to the reasons of the rules with a reader on the
+/// candidate's anchor, each reason once, after the names of the rules that gave
+/// it, e.g. "compare-cast: the reader is 'arith.sitofp', not 'arith.uitofp'".
+/// When some of those rules name the candidate's anchor and readers, only their
+/// reasons are given.
 FailureOr<GroupMatch> matchLowerableGroup(const GroupCandidate &candidate,
                                           std::string *why = nullptr);
 
-/// The spyreop predicate computing the same thing as `p`, or nothing:
-///
-///   - an ordering maps from both spellings, e.g. `oeq` and `ueq` -> `equal`
-///     (they differ only on NaN, and no NaN reaches a compute body);
-///   - `ord`/`uno` ask about NaN and `false`/`true` about nothing, so they have
-///     no counterpart.
-std::optional<spyreop::ComparePredicate>
-spyrePredicateFor(arith::CmpFPredicate p);
+/// Every rule with a reader, by its ops and then its name, rules on the same
+/// ops together, in table order, e.g. "arith.cmpf read by arith.uitofp
+/// (compare-cast), or arith.cmpf read by arith.select
+/// (compare-select-zero-test, compare-select)".
+std::string describeRulesWithReaders();
 
 } // namespace mlir::triton::spyre
 

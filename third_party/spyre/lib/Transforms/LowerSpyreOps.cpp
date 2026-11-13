@@ -29,11 +29,13 @@
 // EVERYTHING UNMATCHED FLOWS THROUGH, WITH ONE EXCEPTION. There is no
 // conversion target: an op with no device form reaches the backend, which is
 // the component that actually knows what it can take, and it refuses there. So
-// this pass has no notion of an illegal input -- it selects what it can and
+// this pass has no notion of an unsupported input -- it selects what it can and
 // leaves the rest exactly as it found it. A type or a predicate this file does
 // not handle is a silent pass-through by design; see WHAT IS NOT SELECTED below
-// for the list and what each one costs. The exception is an `i1` left inside a
-// compute body, which rejectSurvivingBooleans reports.
+// for the list and what each one costs. The exception is an op a rule says is
+// illegal after selection (SpyreOpLoweringRule::legal): today an `i1` left
+// inside a compute body, which checkLegality reports once selection has
+// converged.
 //
 // WHAT THIS PASS RELIES ON ITS PREDECESSOR FOR. A rule matches ops in ONE body,
 // and ConvertElementwiseToLinalg gives every tensor-level op a body of its own
@@ -81,7 +83,7 @@
 //     - anything still tensor-typed, which only ConvertElementwiseToLinalg not
 //       having run can produce
 //
-//   A group rule declines and its members stay as they were:
+//   A rule with a condition declines and its ops stay as they were:
 //     - a divide whose numerator is not a constant one, or whose constant is
 //       the denominator: the realdiv rule takes it, which is right
 //     - a numerator that is a block argument, even one fed by a splat 1.0
@@ -96,7 +98,7 @@
 //
 //   The compare declines are the ones to know: each leaves an `i1` inside a
 //   body, so each is the exception above rather than a pass-through --
-//   rejectSurvivingBooleans reports it here, naming the predicate.
+//   checkLegality reports it here, with each rule's reason.
 //
 // `--debug-only=lower-spyre-ops` traces the decisions rather than the control
 // flow: one line per rule that fires, and for the rules with a reader, one
@@ -109,7 +111,6 @@
 #include "Dialect/SpyreOp/Utils/SpyreOpTypeProbe.h"
 #include "Transforms/Passes.h"
 
-#include "ktir/Dialect/SpyreOp/SpyreOp.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -137,7 +138,6 @@ namespace mlir::triton::spyre {
 
 using mlir::triton::spyre::GroupCandidate;
 using mlir::triton::spyre::SpyreOpLoweringRule;
-using mlir::triton::spyre::spyrePredicateFor;
 
 namespace {
 
@@ -162,7 +162,7 @@ namespace {
 /// when it fires; a rule without readers that declines says nothing.
 ///
 /// A declined compare read in the body is then reported by
-/// rejectSurvivingBooleans.
+/// checkLegality.
 struct LowerByRule : public RewritePattern {
   LowerByRule(const SpyreOpLoweringRule &rule, MLIRContext *ctx)
       : RewritePattern(rule.anchor, rule.benefit, ctx), rule(rule),
@@ -235,15 +235,21 @@ private:
 };
 
 //===----------------------------------------------------------------------===//
-// After selection: an i1 left in a compute body
+// After selection: what the rules left
 //===----------------------------------------------------------------------===//
 
-/// Reports an `i1` that selection left in a compute body, because no spyreop
-/// op takes that type, so the backend would refuse it without naming the
-/// predicate. Runs after the fixpoint, since until then such an `i1` is what
-/// the group rules match.
+/// Reports every op in a compute body that is illegal after selection,
+/// according to the rules anchored on it (isLegalAfterSelection). Runs after
+/// the fixpoint, since until then an op a rule would still lower is not yet a
+/// finding: for the compare rules, an `i1` is exactly what the group rules
+/// match.
 ///
-/// Reported, when made and read in the same body without being yielded:
+/// The error is the rule's own reason, at the op. A note at that op gives each
+/// rule with a reader's reason for declining it, by rule name
+/// (matchLowerableGroup), and one note names each op reading it.
+///
+/// Today the compare rules are the ones with a check, so what is reported is an
+/// `i1` made and read in one body without being yielded:
 ///
 ///   - `cmpf ogt` read by an i32 `arith.select`;
 ///   - `cmpf ord` read by `arith.uitofp` (no counterpart);
@@ -255,71 +261,35 @@ private:
 ///
 ///   - an `i1` block argument, e.g. `^bb0(%cond: i1, ...)`;
 ///   - an `i1` that is yielded, e.g. `linalg.yield %c : i1`.
-LogicalResult rejectSurvivingBooleans(ModuleOp mod) {
+///
+/// An op no rule is anchored on is not asked, whatever its type: it flows
+/// through to the backend like any op with no device form.
+LogicalResult checkLegality(ModuleOp mod) {
   LogicalResult result = success();
   mod.walk([&](linalg::GenericOp generic) {
     Block *body = generic.getBlock();
     if (!body)
       return;
-    // Op results only: an i1 block argument is the tensor form crossing into
-    // the body, which is not this pass's finding.
-    SmallVector<Value> values;
-    for (Operation &op : *body)
-      values.append(op.getResults().begin(), op.getResults().end());
-
-    for (Value v : values) {
-      if (!getElementTypeOrSelf(v.getType()).isInteger(1))
-        continue;
-      // Nor one that is yielded: that is the tensor form leaving the body.
-      if (llvm::any_of(v.getUsers(), [](Operation *user) {
-            return isa<linalg::YieldOp>(user);
-          }))
+    for (Operation &op : *body) {
+      GroupCandidate candidate{&op, generic,
+                               triton::spyre::distinctReaders(op.getUsers())};
+      std::string why;
+      if (triton::spyre::isLegalAfterSelection(candidate, why))
         continue;
       result = failure();
 
-      InFlightDiagnostic diag = mlir::emitError(v.getLoc());
-      diag << "lower-spyre-ops: an i1 value survives inside a compute body, "
-              "which the Spyre device has no form for at all -- no spyreop "
-              "intrinsic produces or consumes that type, so no selection rule "
-              "can ever remove it";
+      InFlightDiagnostic diag = mlir::emitError(op.getLoc());
+      diag << "lower-spyre-ops: " << why;
 
-      SmallVector<Operation *> readers =
-          triton::spyre::distinctReaders(v.getUsers());
+      // The rules' own reasons, which name the predicate, the reader or the
+      // types they refused.
+      std::string declined;
+      (void)triton::spyre::matchLowerableGroup(candidate, &declined);
+      diag.attachNote(op.getLoc())
+          << "no rule lowers this '" << op.getName()
+          << "' together with its readers: " << declined;
 
-      // Name the predicate: it is what an author can change.
-      if (auto cmp = v.getDefiningOp<arith::CmpFOp>()) {
-        StringRef pred = arith::stringifyCmpFPredicate(cmp.getPredicate());
-        if (spyrePredicateFor(cmp.getPredicate()) && readers.size() > 1)
-          diag.attachNote(cmp.getLoc())
-              << "the predicate '" << pred
-              << "' does have a spyreop.compare counterpart, but the compare "
-                 "is read by "
-              << readers.size()
-              << " ops, and a compare is lowered only together with exactly "
-                 "one reader";
-        else if (spyrePredicateFor(cmp.getPredicate())) {
-          // The rules' own reasons, the type probe's among them, say what
-          // about the reader they refused.
-          std::string why;
-          (void)triton::spyre::matchLowerableGroup(
-              GroupCandidate{cmp, generic, readers}, &why);
-          diag.attachNote(cmp.getLoc())
-              << "the predicate '" << pred
-              << "' does have a spyreop.compare counterpart, so this compare "
-                 "was selectable and something about its READER was not: the "
-                 "reader must be an arith.uitofp to, or an arith.select of, "
-                 "the width compared, at a type the spyreop op takes; the "
-                 "rules with a reader declined because "
-              << why;
-        } else
-          diag.attachNote(cmp.getLoc())
-              << "the predicate '" << pred
-              << "' has no spyreop.compare counterpart: `ord` and `uno` "
-                 "ask whether an operand is NaN, and `false`/`true` ask "
-                 "nothing, while that intrinsic only compares two values";
-      }
-
-      for (Operation *user : readers)
+      for (Operation *user : candidate.readers)
         diag.attachNote(user->getLoc())
             << "read here, by '" << user->getName() << "'";
     }
@@ -351,19 +321,21 @@ struct LowerSpyreOpsPass
     // a rule never has to see the intermediate state.
     linalg::populateEraseUnusedOperandsAndResultsPatterns(patterns);
 
-    // The greedy driver, not a dialect conversion. Nothing here is illegal: an
-    // op with no device form flows through to the backend, which is the
-    // component that knows what it can take. A failure from the driver would
-    // mean the rewrite diverged, not that an op went unhandled.
+    // The greedy driver, not a dialect conversion. Nothing is illegal merely
+    // for having no rule: an op with no device form flows through to the
+    // backend, which is the component that knows what it can take. A failure
+    // from the driver would mean the rewrite diverged, not that an op went
+    // unhandled.
     if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
       signalPassFailure();
       return;
     }
 
-    // The one thing this pass does report. Not a selection failure -- see
-    // rejectSurvivingBooleans on why an unrepresentable TYPE is a different
-    // kind of thing from an op the device happens not to do.
-    if (failed(rejectSurvivingBooleans(module)))
+    // Selection has converged. Each rule says whether its anchor is legal
+    // after selection (SpyreOpLoweringRule::legal); an op the device merely
+    // cannot do is, and flows to the backend. See EVERYTHING UNMATCHED FLOWS
+    // THROUGH.
+    if (failed(checkLegality(module)))
       signalPassFailure();
   }
 };

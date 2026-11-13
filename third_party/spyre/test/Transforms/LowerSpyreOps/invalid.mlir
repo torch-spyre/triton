@@ -26,8 +26,8 @@
 // Three kinds of way in, and the diagnostic distinguishes them: a predicate with
 // no counterpart at all, a predicate that HAS one where the READER was the
 // problem (both in this file), and a compare read by more than one op (in
-// not-yet-lowered.mlir). The note says which, because that is what an author can
-// act on.
+// not-yet-lowered.mlir). The note gives each rule's reason, by rule name, because
+// that is what an author can act on.
 //
 // THE SCOPE IS NARROWER THAN "any i1 in a body", and deliberately. The check reads
 // op RESULTS only, and skips one that is yielded -- so what it refuses is an i1
@@ -218,8 +218,8 @@ func.func @true_select_is_refused(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tens
 
 // Never lowerable: an i1 read as signed is 0 or -1, so `arith.sitofp` gives -1.0
 // where the predicate holds, which no spyreop.compare result is. The pair is not
-// one intrinsic, and the note points at the reader, since the predicate is not
-// what needs changing.
+// one intrinsic, and the note names the reader, since the predicate is not what
+// needs changing.
 func.func @sitofp_reader(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
   %0 = linalg.generic {
@@ -229,7 +229,7 @@ func.func @sitofp_reader(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> 
       ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
   ^bb0(%a: f16, %b: f16, %out: f16):
     // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{the predicate 'oeq' does have a spyreop.compare counterpart}}
+    // expected-note @below {{compare-cast: the reader is 'arith.sitofp', not 'arith.uitofp'; compare-select-zero-test, compare-select: the reader is 'arith.sitofp', not 'arith.select'}}
     %c = arith.cmpf oeq, %a, %b : f16
     // expected-note @below {{read here, by 'arith.sitofp'}}
     %f = arith.sitofp %c : i1 to f16
@@ -246,8 +246,8 @@ func.func @sitofp_reader(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> 
 
 // Never lowerable: a compare at one width cast to another. spyreop.compare has
 // SameOperandsAndResultType, so it cannot compare f32 and answer in f16, and
-// spyreop has no float-width conversion. The note's "at that same width" is the
-// actionable part.
+// spyreop has no float-width conversion. The note gives the verifier's refusal
+// of the spyreop.compare the rule would build.
 func.func @width_change(%x: tensor<4xf32>, %y: tensor<4xf32>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
   %0 = linalg.generic {
@@ -257,7 +257,7 @@ func.func @width_change(%x: tensor<4xf32>, %y: tensor<4xf32>) -> tensor<4xf16> {
       ins(%x, %y : tensor<4xf32>, tensor<4xf32>) outs(%init : tensor<4xf16>) {
   ^bb0(%a: f32, %b: f32, %out: f16):
     // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{the predicate 'oeq' does have a spyreop.compare counterpart}}
+    // expected-note @below {{compare-cast: 'spyreop.compare' does not take these types}}
     %c = arith.cmpf oeq, %a, %b : f32
     // expected-note @below {{read here, by 'arith.uitofp'}}
     %f = arith.uitofp %c : i1 to f16
@@ -278,7 +278,7 @@ func.func @select_width_mismatch(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tenso
       ins(%a, %b, %p, %q : tensor<4xf32>, tensor<4xf32>, tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
     ^bb0(%x: f32, %y: f32, %t: f16, %f: f16, %out: f16):
       // expected-error @below {{an i1 value survives inside a compute body}}
-      // expected-note @below {{the predicate 'oeq' does have a spyreop.compare counterpart}}
+      // expected-note @below {{compare-select: 'spyreop.compare' does not take these types}}
       %c = arith.cmpf oeq, %x, %y : f32
       // expected-note @below {{read here, by 'arith.select'}}
       %v = arith.select %c, %t, %f : f16
@@ -299,7 +299,7 @@ func.func @select_width_mismatch(%a: tensor<4xf32>, %b: tensor<4xf32>, %p: tenso
 // This differs from compare-select.mlir's @condition_from_outside_is_left_alone:
 //   - there: the `i1` is a block argument -> quiet decline;
 //   - here: the `i1` is made by an `arith.cmpf` in this body and read in it
-//     -> reported by rejectSurvivingBooleans.
+//     -> reported by checkLegality.
 #map = affine_map<(d0) -> (d0)>
 func.func @integer_values_are_refused(%a: tensor<8xf32>, %b: tensor<8xf32>,
                                       %p: tensor<8xi32>, %q: tensor<8xi32>) -> tensor<8xi32> {
@@ -312,7 +312,7 @@ func.func @integer_values_are_refused(%a: tensor<8xf32>, %b: tensor<8xf32>,
     // The reason is the probe's: the verifier of the spyreop.compare the rule
     // would build says its result must be a float, and not 'i32'.
     // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{'spyreop.compare' does not take these types: 'spyreop.compare' op result #0 must be 16-bit float or IBM df16 float or 32-bit float, but got 'i32'}}
+    // expected-note @below {{compare-select: 'spyreop.compare' does not take these types}}
     %c = arith.cmpf ogt, %x, %y : f32
     // expected-note @below {{read here, by 'arith.select'}}
     %s = arith.select %c, %t, %f : i32
@@ -339,7 +339,7 @@ func.func @reader_nested_in_scf_if(%x: tensor<4xf16>, %y: tensor<4xf16>, %flag: 
       ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
   ^bb0(%a: f16, %b: f16, %out: f16):
     // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{the predicate 'ogt' does have a spyreop.compare counterpart}}
+    // expected-note @below {{the reader is 'arith.select', which is not directly in the group's generic body}}
     %c = arith.cmpf ogt, %a, %b : f16
     %r = scf.if %flag -> f16 {
       // expected-note @below {{read here, by 'arith.select'}}

@@ -1,5 +1,5 @@
-# The spyreop lowering rules, kSpyreOpLoweringRules, and the questions they
-# share with LowerSpyreOps' diagnostics. A library of its own because two passes
+# The spyreop lowering rules, kSpyreOpLoweringRules, and the diagnostics text
+# both passes make from them. A library of its own because two passes
 # read it -- LowerSpyreOps lowers by it, and FuseGenerics fuses only what it
 # would lower -- so neither pass includes the other's code. Sits below
 # SpyreTransforms, and links no pass library.
