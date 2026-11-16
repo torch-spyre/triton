@@ -1,8 +1,8 @@
 """SIGNATURE + VARIANTS + reference oracle + input generator for transpose.
 
 ``y = x.permute(perm)`` of a stick-tiled fp16 tensor, one whole tensor per
-launch (``grid = [1]``, no distribution loop). Nothing else is computed, so
-each kernel is a pure data-movement copy.
+launch (``grid = [1]``, no distribution loop): a pure data-movement copy. The
+``add*_trans*`` variants at the end fuse that transpose into an add.
 
 What the cases exercise. A permutation that moves the stick dim (the
 innermost, contiguous one) is a *re-stick*: the output's stick dim is a
@@ -22,6 +22,12 @@ stick multiples because they never become the stick dim. Rank 4 has a
 transpose of the inner pair under two batch dims and a 4-cycle; rank 5 has
 one permutation that keeps the stick dim innermost and one that moves it to
 dim 0.
+
+The fused-add variants transpose the last two dims of some operands of an
+add, at ranks 2 and 3 (rank 3 swaps dims 1 and 2, ``.permute(0, 2, 1)``):
+``a + b.T`` and ``a.T + b`` (``add_trans*``), ``a + b.T + c.T``
+(``add3_trans*``), and ``x + x.T`` with ``x`` loaded once (``add_self_trans*``),
+which needs the two swapped dims equal.
 
 Values are integers in fp16's exact range, so the ``ktir_cpu`` copy is
 exact. The ``rtol`` of 0.1 is a temporary default.
@@ -146,6 +152,93 @@ class Permute(conftest.VariantFactory):
         _, perm = self._shape_and_perm(combo)
         return lambda inputs: np.ascontiguousarray(
             np.transpose(inputs["x_ptr"], perm))
+
+
+#: The input pointer names of the fused-add kernels, in kernel order; a kernel
+#: of *n* operands takes the first *n*.
+_OPERANDS = ("a_ptr", "b_ptr", "c_ptr")
+#: The ``TRANS_*`` flag naming whether the operand at the same index of
+#: :data:`_OPERANDS` is stored transposed.
+_TRANS_FLAGS = ("TRANS_A", "TRANS_B", "TRANS_C")
+#: The layout constexpr of the operand at the same index of :data:`_OPERANDS`.
+_OPERAND_LAYOUTS = ("A_LAYOUT", "B_LAYOUT", "C_LAYOUT")
+
+
+def _swap_last_two(array: np.ndarray) -> np.ndarray:
+    """*array* with its last two dims swapped: ``.T`` at rank 2,
+    ``.permute(0, 2, 1)`` at rank 3."""
+    return np.swapaxes(array, -1, -2)
+
+
+def add_signature(operands: int, shape_names: tuple) -> dict:
+    """``SIGNATURE`` of an ``add{,3}_trans{2,3}d_stick`` kernel: *operands* fp16
+    input pointers, the fp16 output, then every :func:`add_constexprs` name."""
+    return {**{name: "*fp16" for name in _OPERANDS[:operands]},
+            "y_ptr": "*fp16",
+            **{name: "constexpr" for name in add_constexprs(operands, shape_names)}}
+
+
+def add_constexprs(operands: int, shape_names: tuple) -> list:
+    """The constexpr argument names of an ``add{,3}_trans{2,3}d_stick`` kernel,
+    in kernel order: the output shape, one ``TRANS_*`` flag per operand, then
+    one layout per descriptor (each operand's, then ``Y_LAYOUT``)."""
+    return [*shape_names, *_TRANS_FLAGS[:operands],
+            *_OPERAND_LAYOUTS[:operands], "Y_LAYOUT"]
+
+
+@dataclass(frozen=True)
+class AddTransposed(conftest.VariantFactory):
+    """Inputs and oracle of ``y = op_0' + .. + op_(n-1)'``, where an operand whose
+    ``TRANS_*`` flag is set is stored with its last two dims swapped relative to
+    ``y`` and is swapped back before the add.
+
+    *shape_names* name the params giving ``y``'s shape (``("M", "N")`` or
+    ``("d0", "d1", "d2")``). With *self_add* the kernel instead takes one input
+    ``x`` of ``y``'s shape and computes ``x + swap(x)``, which needs ``y``'s last
+    two dims to be equal; *shape_names* then name the shape of ``x``, whose last
+    two entries may name the same param.
+    """
+
+    operands: int
+    shape_names: tuple
+    self_add: bool = False
+
+    def _shape(self, combo: dict) -> tuple:
+        return tuple(combo[name] for name in self.shape_names)
+
+    def inputs(self, **combo):
+        shape = self._shape(combo)
+        swapped = (*shape[:-2], shape[-1], shape[-2])
+
+        def make(**_):
+            rng = np.random.default_rng(0)
+
+            def draw(s):
+                return rng.integers(-_VALUE_RANGE, _VALUE_RANGE + 1,
+                                    size=s).astype(np.float16)
+            if self.self_add:
+                arrays = {"x_ptr": draw(shape)}
+            else:
+                arrays = {name: draw(swapped if combo[flag] else shape)
+                          for name, flag in zip(_OPERANDS[:self.operands],
+                                                _TRANS_FLAGS)}
+            arrays["y_ptr"] = np.zeros(shape, dtype=np.float16)
+            return arrays
+        return make
+
+    def reference(self, **combo):
+        if self.self_add:
+            return lambda inputs: (inputs["x_ptr"].astype(np.float32)
+                                   + _swap_last_two(inputs["x_ptr"])
+                                   ).astype(np.float16)
+
+        def oracle(inputs):
+            total = 0
+            for name, flag in zip(_OPERANDS[:self.operands], _TRANS_FLAGS):
+                value = inputs[name].astype(np.float32)
+                total = total + (_swap_last_two(value) if combo[flag] else value)
+            return np.ascontiguousarray(total.astype(np.float16))
+        return oracle
 
 
 VARIANTS = {
@@ -275,6 +368,124 @@ VARIANTS = {
             ],
             "X_LAYOUT": [stick_layout(5)],
             "Y_LAYOUT": [stick_layout(5)],
+        },
+    },
+    # -----------------------------------------------------------------------
+    # A transpose fused into an add
+    #
+    # Operands are integers in [-1000, 1000], so a sum of three is at most
+    # 3000 in magnitude; fp16 is exact on integers to 2048 and spaced 2 apart
+    # up to 4096, so the oracle rounds through fp16 the same way the kernel's
+    # fp16 add does.
+    # -----------------------------------------------------------------------
+    "add_trans2d": {
+        "base": None,
+        "summary": "y = a + b.T and y = a.T + b for [M, N] fp16 y.",
+        "kernel_fn": kernel.add_trans2d_stick,
+        "SIGNATURE": add_signature(2, ("M", "N")),
+        "factory": AddTransposed(operands=2, shape_names=("M", "N")),
+        "constexpr": add_constexprs(2, ("M", "N")),
+        "params": {
+            # The default variant's shapes: square, both non-square
+            # orientations, and an odd block count (3) along M.
+            ("M", "N"): [(64, 64), (128, 64), (64, 128), (192, 64)],
+            # a + b.T, then a.T + b.
+            ("TRANS_A", "TRANS_B"): [(False, True), (True, False)],
+            "A_LAYOUT": [stick_layout(2)],
+            "B_LAYOUT": [stick_layout(2)],
+            "Y_LAYOUT": [stick_layout(2)],
+        },
+        "grid": [1],
+        "compiles_to_binary": True,
+        "output_key": "y_ptr",
+        "rtol": 0.1,
+        "atol": 0.0,
+        "tags": ["descriptor-load-static", "descriptor-store-static",
+                 "simplified:no-loop", "spyre-tensor-layout", "restick"],
+    },
+    "add3_trans2d": {
+        "base": "add_trans2d",
+        "summary": "y = a + b.T + c.T for [M, N] fp16 y.",
+        "kernel_fn": kernel.add3_trans2d_stick,
+        "SIGNATURE": add_signature(3, ("M", "N")),
+        "factory": AddTransposed(operands=3, shape_names=("M", "N")),
+        "constexpr": add_constexprs(3, ("M", "N")),
+        "params": {
+            ("M", "N"): [(64, 64), (128, 64), (64, 128), (192, 64)],
+            ("TRANS_A", "TRANS_B", "TRANS_C"): [(False, True, True)],
+            "A_LAYOUT": [stick_layout(2)],
+            "B_LAYOUT": [stick_layout(2)],
+            "C_LAYOUT": [stick_layout(2)],
+            "Y_LAYOUT": [stick_layout(2)],
+        },
+    },
+    "add_self_trans2d": {
+        "base": "add_trans2d",
+        "summary": "y = x + x.T for square [N, N] fp16 x.",
+        "kernel_fn": kernel.add_self_trans2d_stick,
+        "SIGNATURE": {"x_ptr": "*fp16", "y_ptr": "*fp16",
+                      "N": "constexpr", "X_LAYOUT": "constexpr",
+                      "Y_LAYOUT": "constexpr"},
+        "factory": AddTransposed(operands=1, shape_names=("N", "N"),
+                                 self_add=True),
+        "constexpr": ["N", "X_LAYOUT", "Y_LAYOUT"],
+        "params": {
+            # x + x.T needs x square; 192 is the odd block count.
+            "N": [64, 128, 192],
+            "X_LAYOUT": [stick_layout(2)],
+            "Y_LAYOUT": [stick_layout(2)],
+        },
+    },
+    "add_trans3d": {
+        "base": "add_trans2d",
+        "summary": ("y = a + b.permute(0, 2, 1) and y = a.permute(0, 2, 1) + b "
+                    "for [d0, d1, d2] fp16 y."),
+        "kernel_fn": kernel.add_trans3d_stick,
+        "SIGNATURE": add_signature(2, ("d0", "d1", "d2")),
+        "factory": AddTransposed(operands=2, shape_names=("d0", "d1", "d2")),
+        "constexpr": add_constexprs(2, ("d0", "d1", "d2")),
+        "params": {
+            # d1 and d2 both become the stick dim of some operand, so both are
+            # stick multiples; d0 never moves and is a size-2 batch dim in the
+            # non-square rows. [64, 64, 64] is permute3d_64's shape.
+            ("d0", "d1", "d2"): [(64, 64, 64), (2, 64, 128), (2, 128, 64)],
+            ("TRANS_A", "TRANS_B"): [(False, True), (True, False)],
+            "A_LAYOUT": [stick_layout(3)],
+            "B_LAYOUT": [stick_layout(3)],
+            "Y_LAYOUT": [stick_layout(3)],
+        },
+    },
+    "add3_trans3d": {
+        "base": "add_trans2d",
+        "summary": ("y = a + b.permute(0, 2, 1) + c.permute(0, 2, 1) for "
+                    "[d0, d1, d2] fp16 y."),
+        "kernel_fn": kernel.add3_trans3d_stick,
+        "SIGNATURE": add_signature(3, ("d0", "d1", "d2")),
+        "factory": AddTransposed(operands=3, shape_names=("d0", "d1", "d2")),
+        "constexpr": add_constexprs(3, ("d0", "d1", "d2")),
+        "params": {
+            ("d0", "d1", "d2"): [(64, 64, 64), (2, 64, 128), (2, 128, 64)],
+            ("TRANS_A", "TRANS_B", "TRANS_C"): [(False, True, True)],
+            "A_LAYOUT": [stick_layout(3)],
+            "B_LAYOUT": [stick_layout(3)],
+            "C_LAYOUT": [stick_layout(3)],
+            "Y_LAYOUT": [stick_layout(3)],
+        },
+    },
+    "add_self_trans3d": {
+        "base": "add_trans2d",
+        "summary": "y = x + x.permute(0, 2, 1) for [d0, N, N] fp16 x.",
+        "kernel_fn": kernel.add_self_trans3d_stick,
+        "SIGNATURE": {"x_ptr": "*fp16", "y_ptr": "*fp16", "d0": "constexpr",
+                      "N": "constexpr", "X_LAYOUT": "constexpr",
+                      "Y_LAYOUT": "constexpr"},
+        "factory": AddTransposed(operands=1, shape_names=("d0", "N", "N"),
+                                 self_add=True),
+        "constexpr": ["d0", "N", "X_LAYOUT", "Y_LAYOUT"],
+        "params": {
+            ("d0", "N"): [(64, 64), (2, 128)],
+            "X_LAYOUT": [stick_layout(3)],
+            "Y_LAYOUT": [stick_layout(3)],
         },
     },
 }
