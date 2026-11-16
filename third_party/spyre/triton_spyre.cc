@@ -41,6 +41,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <unordered_map>
+
 namespace py = pybind11;
 
 void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
@@ -165,6 +167,80 @@ void init_triton_spyre_ir_builders(py::module &&m) {
       },
       py::arg("builder"), py::arg("value"), py::arg("memory_space"),
       py::arg("offset") = py::none());
+
+  // tl.spyre_op. Mirrors `tts::SpyreOpOp::verify()`'s own sequence --
+  // `verifySpyreIntrinsicCall` is the single source for "what does
+  // `spyreop.<name>` require and what does it return" -- so this builder
+  // asks it the same question rather than restating the answer, then
+  // constructs the real op with the result types it returns. If that
+  // succeeds, the result is by construction exactly what `SpyreOpOp::verify`
+  // would accept, so no second `mlir::verify()` call is needed here (unlike
+  // `create_pin`, which has no equivalent single source of truth to defer to).
+  m.def(
+      "create_spyre_op",
+      [](TritonOpBuilder &self, const std::string &name,
+         std::vector<mlir::Value> &operands,
+         std::unordered_map<std::string, py::object> &attrs,
+         std::optional<int64_t> axis) -> std::vector<mlir::Value> {
+        // LOAD, not register -- see create_tensor_layout above. `tts`'s own
+        // `dependentDialects` (TTSDialect.td) pulls `spyreop` in behind it,
+        // which is what lets `verifySpyreIntrinsicCall`'s
+        // `RegisteredOperationName::lookup` find `spyreop.<name>` below.
+        self.getContext()->loadDialect<mlir::triton::tts::TTSDialect>();
+
+        auto &builder = self.getBuilder();
+        mlir::MLIRContext *ctx = self.getContext();
+
+        mlir::SmallVector<mlir::NamedAttribute> namedAttrs;
+        for (auto &[key, value] : attrs) {
+          mlir::Attribute attr;
+          if (py::isinstance<py::bool_>(value))
+            attr = builder.getBoolAttr(value.cast<bool>());
+          else if (py::isinstance<py::int_>(value))
+            attr = builder.getI32IntegerAttr(value.cast<int32_t>());
+          else if (py::isinstance<py::float_>(value))
+            attr = builder.getF32FloatAttr(value.cast<float>());
+          else if (py::isinstance<py::str>(value))
+            attr = builder.getStringAttr(value.cast<std::string>());
+          else
+            throw std::invalid_argument(
+                "spyre_op: attribute '" + key +
+                "' must be a bool, int, float or str");
+          namedAttrs.emplace_back(builder.getStringAttr(key), attr);
+        }
+        mlir::DictionaryAttr extraAttrs =
+            namedAttrs.empty() ? mlir::DictionaryAttr()
+                               : builder.getDictionaryAttr(namedAttrs);
+
+        mlir::Location loc = self.getLastLoc();
+        auto emitError = [&]() { return mlir::emitError(loc); };
+
+        // Captured the same way `GluonOpBuilder::getChecked` captures a
+        // verifier's diagnostic (python/src/gluon_ir.cc) -- scoped to exactly
+        // this call, so the handler is gone before anything else in this
+        // function might emit through the same context.
+        std::string message;
+        mlir::FailureOr<mlir::SmallVector<mlir::Type>> resultTypes;
+        {
+          llvm::raw_string_ostream os(message);
+          mlir::ScopedDiagnosticHandler handler(
+              ctx, [&](mlir::Diagnostic &diag) {
+                os << diag;
+                return mlir::success();
+              });
+          resultTypes = mlir::triton::tts::verifySpyreIntrinsicCall(
+              name, operands, extraAttrs, axis, loc, emitError);
+        }
+        if (mlir::failed(resultTypes))
+          throw std::invalid_argument(message);
+
+        mlir::triton::tts::SpyreOpOp op = self.create<mlir::triton::tts::SpyreOpOp>(
+            *resultTypes, builder.getStringAttr(name), operands, extraAttrs,
+            axis ? builder.getI32IntegerAttr(*axis) : mlir::IntegerAttr());
+        return std::vector<mlir::Value>(op->result_begin(), op->result_end());
+      },
+      py::arg("builder"), py::arg("name"), py::arg("operands"),
+      py::arg("attrs"), py::arg("axis") = py::none());
 }
 
 /// One `tts.tensor_layout` marker, reduced to what a footprint is computed from.

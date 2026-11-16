@@ -3908,4 +3908,49 @@ def spyre_pin(v, memory_space, offset=None, _semantic=None):
     Only valid on the ``spyre`` backend — raises on any other target.
     """
     return _semantic.spyre_pin(v, memory_space, offset)
+
+
+@builtin
+@requires_backend("spyre")
+def spyre_op(op_name, *args, _semantic=None, **attrs):
+    """(Spyre only) Request one Spyre hardware intrinsic by name.
+
+    ``op_name`` identifies the real ``spyreop.<op_name>`` op to request —
+    a compile-time constant string (``"gelu"``, ``"exx2"``, ...). ``args``
+    are its tensor operands, in call order; every intrinsic this covers is
+    scalar-typed on the device side, so ``args`` are broadcast to one
+    common shape first, the same rule any other multi-operand ``tl.*``
+    function follows. ``attrs`` carries whatever has to be a compile-time
+    constant and belongs to the REAL op itself — ``beta``/``threshold`` for
+    ``"softplus"`` — as keyword arguments; an op with no attributes of its
+    own (most of them) takes none. ``axis``, if the named intrinsic needs
+    one (today, only ``"exx2"``), is also a keyword argument, but is NOT
+    one of the real op's own attributes: it names which tensor dimension
+    the request reduces over, a property of this call, not of
+    ``spyreop.<op_name>`` (confirmed against ``SpyreOp.td``: no op this
+    covers declares an ``axis`` attribute of its own).
+
+    ``op_name``'s arity, attribute names and types are not restated here as
+    a separate table — they are read live off the real op's own definition
+    (``RegisteredOperationName``/``InferTypeOpInterface``), so a call naming
+    an op that does not exist, or passing the wrong number of operands or
+    attributes for the one it names, fails at trace time with a diagnostic
+    naming the real op and the mismatch, not a ``NameError`` or a silent
+    misconstruction::
+
+        y = tl.spyre_op("gelu", x)
+        mean, msq = tl.spyre_op("exx2", x, axis=1)
+        y = tl.spyre_op("softplus", x, beta=1.0, threshold=20.0)
+
+    Traces to one TTIR op, ``tts.spyre_op``, converted directly into
+    ``linalg.generic { spyreop.<op_name> }`` inside ``_make_ktir``'s own
+    pipeline — no decomposition, no later re-matching pass. See
+    ``third_party/spyre/docs/spyreop-frontend-api.md`` for the full design,
+    including why this makes the cached ``ktir`` artifact Spyre-specific
+    rather than device-neutral, which is this design's interim tradeoff,
+    not an oversight.
+
+    Only valid on the ``spyre`` backend — raises on any other target.
+    """
+    return _semantic.spyre_op(op_name, args, attrs)
 # --- END --- added for spyre

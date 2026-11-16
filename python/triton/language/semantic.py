@@ -2106,4 +2106,77 @@ class TritonSemantic(Generic[TensorTy]):
         from triton._C.libtriton import spyre
         spyre.ir_builders.create_pin(self.builder, v.handle, space, off)
         return tl.tensor(None, tl.void)
+
+    def spyre_op(self, op_name, args, attrs):
+        """tl.spyre_op(op_name, *args, **attrs). See core.py for the full
+        contract; this builds the TTIR side of it.
+        """
+        name = tl._unwrap_if_constexpr(op_name)
+        if not isinstance(name, str):
+            raise ValueError(f"tl.spyre_op: op_name must be a string constexpr, got {name!r}")
+
+        if len(args) == 0:
+            raise ValueError(f"tl.spyre_op({name!r}): needs at least one tensor operand")
+        operands = [self.to_tensor(a) for a in args]
+        if any(not op.type.is_block() for op in operands):
+            raise ValueError(
+                f"tl.spyre_op({name!r}): every operand must be a tensor -- a scalar "
+                "request has no transparent route today; see LowerSpyreOps's existing "
+                "scalar-only intrinsics (addi32toi32 and friends) for the shape that "
+                "covers it instead.")
+
+        # Broadcast all operands to one shape, the same way any other
+        # multi-operand tl.* function does -- pairwise against the first,
+        # since broadcast_impl_value only takes two at a time.
+        for i in range(1, len(operands)):
+            operands[0], operands[i] = self.broadcast_impl_value(operands[0], operands[i])
+        for i in range(1, len(operands)):
+            if operands[i].shape != operands[0].shape:
+                operands[i], operands[0] = self.broadcast_impl_value(operands[i], operands[0])
+        result_shape = operands[0].shape
+
+        # axis, if present, is NOT one of the real op's own attributes (see
+        # core.py's docstring) -- pulled out of `attrs` before anything else
+        # in it is forwarded, so it never reaches the real-op attribute
+        # dictionary the C++ builder passes through.
+        axis = attrs.pop("axis", None)
+        axis = tl._unwrap_if_constexpr(axis)
+        if axis is not None:
+            if isinstance(axis, bool) or not isinstance(axis, int):
+                raise ValueError(f"tl.spyre_op({name!r}): axis must be a plain int, got {axis!r}")
+
+        # Every remaining entry is an attribute of the real op itself
+        # (`beta`/`threshold` for "softplus", and so on) -- a compile-time
+        # constant, same restriction `spyre_pin`'s offset states, and for
+        # the same reason: it becomes an MLIR attribute, not an SSA value.
+        attr_dict = {}
+        for key, value in attrs.items():
+            value = tl._unwrap_if_constexpr(value)
+            if isinstance(value, tl.tensor):
+                raise ValueError(
+                    f"tl.spyre_op({name!r}): '{key}' must be a compile-time constant, "
+                    "not a runtime value -- it becomes an attribute on the real "
+                    f"spyreop.{name} op, which has no SSA operand for it.")
+            if not isinstance(value, (bool, int, float, str)):
+                raise ValueError(
+                    f"tl.spyre_op({name!r}): '{key}' must be a bool, int, float or "
+                    f"str, got {value!r}")
+            attr_dict[key] = value
+
+        from triton._C.libtriton import spyre
+        handles = spyre.ir_builders.create_spyre_op(self.builder, name, [op.handle for op in operands],
+                                                     attr_dict, axis)
+
+        # Every result shares the first operand's element type at
+        # `result_shape` with `axis` dropped if reduction-shaped -- the same
+        # `SameOperandsAndResultType` fact `tts.spyre_op`'s own verifier
+        # relies on (see Dialect.h's note on `verifySpyreIntrinsicCall`).
+        # Computed independently here, not read back off the handles: the
+        # C++ side derives the identical answer from the same real op, so
+        # there is nothing to round-trip -- see core.py's docstring.
+        if axis is not None:
+            result_shape = result_shape[:axis] + result_shape[axis + 1:]
+        result_ty = tl.block_type(operands[0].dtype.scalar, result_shape)
+        results = tuple(tl.tensor(h, result_ty) for h in handles)
+        return results[0] if len(results) == 1 else results
     # --- END --- added for spyre

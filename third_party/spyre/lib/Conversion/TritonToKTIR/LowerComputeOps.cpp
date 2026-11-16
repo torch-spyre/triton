@@ -6,6 +6,7 @@
 //   Group A — Shape manipulation (no compute, 1:1 structural rewrites)
 //   Group B — Reduction (combiner region, identity element)
 //   Group C — Matrix multiply
+//   Group D — Spyre intrinsic requests (tts.spyre_op -> spyreop.* directly)
 //
 // Trivially dead ops left by prior passes are swept at the end of this pass.
 //
@@ -13,8 +14,12 @@
 
 #include "Conversion/TritonToKTIR/Passes.h"
 #include "ConversionUtils.h"
+#include "Dialect/TTS/IR/Dialect.h"
 #include "Utils/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+
+#include "ktir/Dialect/SpyreOp/SpyreOp.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -24,9 +29,11 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Twine.h"
 
 using namespace mlir;
 
@@ -495,6 +502,185 @@ struct ConvertTTDot : public OpConversionPattern<triton::DotOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// Group D — Spyre intrinsic requests
+//
+// `tts.spyre_op` names one real `spyreop.*` op by a STRING attribute, not by
+// C++ type -- its verifier (`verifySpyreIntrinsicCall`, Dialect.h/Ops.cpp)
+// has already confirmed, by the time this pass runs, that the name is
+// registered and that the call's operands/attrs/result types are exactly
+// what that real op accepts. So building it here is "construct the op the
+// verifier already checked," not a second independent check -- the same
+// `RegisteredOperationName::lookup` + `OperationState` + `builder.create`
+// idiom the verifier itself uses to build its throwaway probe op, except
+// this one is kept rather than erased, and its operands are this pattern's
+// real (scalar, block-argument) values rather than a scratch block's.
+//
+//   D1. tts.spyre_op (elementwise) → linalg.generic { spyreop.<name> }
+//       Every intrinsic in scope except `exx2` — same shape in and out,
+//       1-5 operands, 1 result (SameOperandsAndResultType).
+//   D2. tts.spyre_op ("exx2")      → linalg.generic { spyreop.exx2 }
+//       Reduction-shaped: modeled on ConvertTTReduce's own
+//       (tensor.empty-init, reduction-iterator) skeleton, but with the real
+//       op as the whole body applied to the UN-reduced input, not a
+//       per-step combiner — see spyreop-frontend-api.md's own worked
+//       example. Its init is bare `tensor.empty`, deliberately NOT
+//       `linalg.fill`-initialized the way ConvertTTReduce's is: `exx2`'s
+//       body never reads its accumulator block arguments at all, so there
+//       is no uninitialized-read hazard, and a `linalg.fill`-built init is
+//       exactly what DropReductionInitFill's own one-input/one-init gate
+//       (DropReductionInitFill.cpp) would silently fail to remove for a
+//       2-result op like this one, leaving a `linalg.fill` for the device
+//       scheduler's named-op allowlist to then reject.
+//===----------------------------------------------------------------------===//
+
+/// Builds the real `spyreop.<name>` op inside the current insertion point,
+/// applied to `operands` (already scalar-typed — the caller's block
+/// arguments), and returns its results. `resultTypes`/`attrs` are exactly
+/// what `tts::SpyreOpOp`'s own `extra_attrs` carried; `axis` is NOT among
+/// them (see TTSOps.td) and is never forwarded here, matching
+/// `verifySpyreIntrinsicCall`'s own treatment of it as lowering-only
+/// metadata.
+static Operation *buildSpyreIntrinsic(OpBuilder &builder, Location loc,
+                                      StringRef name, ValueRange operands,
+                                      TypeRange resultTypes,
+                                      DictionaryAttr extraAttrs) {
+  MLIRContext *ctx = builder.getContext();
+  std::string qualified = ("spyreop." + name).str();
+  std::optional<RegisteredOperationName> info =
+      RegisteredOperationName::lookup(qualified, ctx);
+  assert(info && "tts.spyre_op's own verifier already confirmed this name");
+
+  SmallVector<NamedAttribute> attrList;
+  if (extraAttrs)
+    attrList.assign(extraAttrs.begin(), extraAttrs.end());
+  OperationState state(loc, *info, operands, resultTypes, attrList);
+  Operation *op = builder.create(state);
+  assert(succeeded(verify(op, /*verifyRecursively=*/false)) &&
+        "tts.spyre_op's own verifier already confirmed this call");
+  return op;
+}
+
+/// D1. tts.spyre_op (elementwise) → linalg.generic { spyreop.<name> }
+///   tts.spyre_op {name = "gelu"} (%x) : (tensor<128xf16>) -> tensor<128xf16>
+///   becomes a linalg.generic over identity indexing maps, one scalar block
+///   argument per operand, with `spyreop.gelu` as the body.
+struct ConvertSpyreOpElementwise
+    : public OpConversionPattern<triton::tts::SpyreOpOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::tts::SpyreOpOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getAxis())
+      return failure(); // D2's case.
+
+    Location loc = op.getLoc();
+    auto resultType = cast<RankedTensorType>(op.getResult(0).getType());
+    int64_t rank = resultType.getRank();
+
+    SmallVector<Value> inits;
+    for (Type resultTy : op.getResultTypes())
+      inits.push_back(
+          createEmptyTensor(rewriter, loc, cast<RankedTensorType>(resultTy)));
+
+    AffineMap identity = rewriter.getMultiDimIdentityMap(rank);
+    SmallVector<AffineMap> indexingMaps(
+        adaptor.getOperands().size() + inits.size(), identity);
+    SmallVector<utils::IteratorType> iteratorTypes(
+        rank, utils::IteratorType::parallel);
+
+    StringRef name = op.getName();
+    DictionaryAttr extraAttrs = op.getExtraAttrsAttr();
+    SmallVector<Type> resultTypes(op.getResultTypes());
+
+    auto generic = linalg::GenericOp::create(
+        rewriter, loc, resultTypes, adaptor.getOperands(), inits,
+        indexingMaps, iteratorTypes,
+        [&](OpBuilder &b, Location loc, ValueRange blockArgs) {
+          ValueRange scalarOperands =
+              blockArgs.take_front(adaptor.getOperands().size());
+          Operation *intrinsic = buildSpyreIntrinsic(
+              b, loc, name, scalarOperands, resultType.getElementType(),
+              extraAttrs);
+          linalg::YieldOp::create(b, loc, intrinsic->getResults());
+        });
+    rewriter.replaceOp(op, generic->getResults());
+    return success();
+  }
+};
+
+/// D2. tts.spyre_op ("exx2") → linalg.generic { spyreop.exx2 }
+///   tts.spyre_op {name = "exx2", axis = 1} (%x)
+///       : (tensor<4x8xf16>) -> (tensor<4xf16>, tensor<4xf16>)
+///   becomes a reduction-shaped linalg.generic -- one `reduction` iterator
+///   over `axis` -- with `spyreop.exx2` applied once per row of the
+///   UN-reduced input as the whole body, not as a per-step combiner. The
+///   body's accumulator block arguments are never read, matching the real
+///   device kernel this is modeled on (spyreop-frontend-api.md).
+struct ConvertSpyreOpReduction
+    : public OpConversionPattern<triton::tts::SpyreOpOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::tts::SpyreOpOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    std::optional<uint32_t> axis = op.getAxis();
+    if (!axis)
+      return failure(); // D1's case.
+
+    Location loc = op.getLoc();
+    Value input = adaptor.getOperands()[0];
+    auto inputType = cast<RankedTensorType>(input.getType());
+    int64_t rank = inputType.getRank();
+
+    // Bare tensor.empty inits -- see the Group D header comment on why no
+    // linalg.fill is built here.
+    SmallVector<Value> inits;
+    SmallVector<Type> resultTypes(op.getResultTypes());
+    for (Type resultTy : resultTypes)
+      inits.push_back(
+          createEmptyTensor(rewriter, loc, cast<RankedTensorType>(resultTy)));
+
+    AffineMap inputMap = rewriter.getMultiDimIdentityMap(rank);
+    AffineMap outputMap = inputMap.dropResult(*axis);
+    SmallVector<AffineMap> indexingMaps(1, inputMap);
+    indexingMaps.append(inits.size(), outputMap);
+
+    SmallVector<utils::IteratorType> iteratorTypes(
+        rank, utils::IteratorType::parallel);
+    iteratorTypes[*axis] = utils::IteratorType::reduction;
+
+    StringRef name = op.getName();
+    DictionaryAttr extraAttrs = op.getExtraAttrsAttr();
+
+    // One scalar result TYPE per tensor result -- `spyreop.exx2`'s own
+    // results are scalar (SameOperandsAndResultType with the scalar
+    // operand), not tensors, so this is each result tensor's element type,
+    // not the tensor type itself. Same tensor/scalar distinction the
+    // verifier's own `verifySpyreIntrinsicCall` draws.
+    SmallVector<Type> scalarResultTypes;
+    for (Type resultTy : resultTypes)
+      scalarResultTypes.push_back(
+          cast<RankedTensorType>(resultTy).getElementType());
+
+    auto generic = linalg::GenericOp::create(
+        rewriter, loc, resultTypes, ValueRange{input}, inits, indexingMaps,
+        iteratorTypes,
+        [&](OpBuilder &b, Location loc, ValueRange blockArgs) {
+          // [input, acc0, acc1, ...] -- the accumulators are never read;
+          // the real op is applied to the input alone.
+          Value scalarInput = blockArgs[0];
+          Operation *intrinsic =
+              buildSpyreIntrinsic(b, loc, name, ValueRange{scalarInput},
+                                  scalarResultTypes, extraAttrs);
+          linalg::YieldOp::create(b, loc, intrinsic->getResults());
+        });
+    rewriter.replaceOp(op, generic->getResults());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
 
@@ -511,17 +697,20 @@ struct LowerComputeOpsPass
     //   Group A (shape): splat, reshape, expand_dims, broadcast, trans, join, split
     //   Group B (reduce): reduce + reduce.return (region replaced wholesale)
     //   Group C (matmul): dot
+    //   Group D (spyre intrinsics): tts.spyre_op
     target.addIllegalOp<triton::SplatOp, triton::ReshapeOp,
                         triton::ExpandDimsOp, triton::BroadcastOp,
                         triton::TransOp, triton::JoinOp, triton::SplitOp,
                         triton::ReduceOp, triton::ReduceReturnOp,
-                        triton::DotOp>();
+                        triton::DotOp, triton::tts::SpyreOpOp>();
     // Legal: output dialects that conversion patterns lower into.
-    //   linalg (fill, broadcast, transpose, reduce, matmul),
+    //   linalg (fill, broadcast, transpose, reduce, matmul, generic),
     //   tensor (reshape, expand_shape, collapse_shape, extract_slice, concat, empty),
-    //   arith/math (constants, index casts, cloned combiner body ops)
+    //   arith/math (constants, index casts, cloned combiner body ops),
+    //   spyreop (the real intrinsic op Group D's generic body calls)
     target.addLegalDialect<linalg::LinalgDialect, tensor::TensorDialect,
-                           arith::ArithDialect, math::MathDialect>();
+                           arith::ArithDialect, math::MathDialect,
+                           spyreop::SpyreOpDialect>();
     target.addLegalOp<ModuleOp, UnrealizedConversionCastOp>();
 
     RewritePatternSet patterns(ctx);
@@ -529,7 +718,9 @@ struct LowerComputeOpsPass
                  ConvertTTExpandDims, ConvertTTBroadcast,
                  ConvertTTTrans, ConvertTTJoin, ConvertTTSplit,
                  ConvertTTReduce,                          // Group B
-                 ConvertTTDot>(ctx);                       // Group C
+                 ConvertTTDot,                             // Group C
+                 ConvertSpyreOpElementwise,                // Group D
+                 ConvertSpyreOpReduction>(ctx);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
       module.emitError("LowerComputeOps: failed to convert compute ops");

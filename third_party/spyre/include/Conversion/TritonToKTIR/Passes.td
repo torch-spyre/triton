@@ -113,6 +113,13 @@ def LowerComputeOps : Pass<"lower-compute-ops", "mlir::ModuleOp"> {
         Lowering (Group C — matrix multiply):
         - tt.dot → linalg.matmul
 
+        Lowering (Group D — Spyre intrinsic requests):
+        - tts.spyre_op (elementwise) → linalg.generic { spyreop.<name> }
+        - tts.spyre_op ("exx2", reduction-shaped) → linalg.generic { spyreop.exx2 }
+        Directly: the real spyreop.* op this names is already final once
+        built here, with no later pass retagging or regrouping it. See
+        spyreop-frontend-api.md.
+
         Trivially dead ops left by prior passes are swept at the end.
 
         Output: remaining triton ops (tt.func, tt.return, tt.get_program_id)
@@ -124,7 +131,8 @@ def LowerComputeOps : Pass<"lower-compute-ops", "mlir::ModuleOp"> {
         "mlir::linalg::LinalgDialect",
         "mlir::tensor::TensorDialect",
         "mlir::arith::ArithDialect",
-        "mlir::math::MathDialect"
+        "mlir::math::MathDialect",
+        "mlir::spyreop::SpyreOpDialect"
     ];
 }
 

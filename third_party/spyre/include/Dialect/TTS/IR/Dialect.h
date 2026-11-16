@@ -32,11 +32,14 @@
 // definition machinery, and TensorLayoutOp's operand is a Triton type -- so both
 // have to be complete before Ops.h.inc below, not merely declared. PinOp's
 // memory_space is a builtin string, so nothing of ktdp's is needed here; the one
-// place that symbolizes the name includes KTDPAttrs.h itself.
+// place that symbolizes the name includes KTDPAttrs.h itself. SpyreOpOp is
+// `Pure`, which needs SideEffectInterfaces.h the same way spyreop's own
+// intrinsic ops do (see ktir/Dialect/SpyreOp/SpyreOp.h).
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 
 #include "Dialect/TTS/IR/Dialect.h.inc"
@@ -246,6 +249,28 @@ LogicalResult verifyTensorLayoutArrays(
 LogicalResult readTensorLayoutArrays(
     Attribute value, ArrayRef<int64_t> &physSrc, ArrayRef<int64_t> &physOp,
     ArrayRef<int64_t> &physArg,
+    llvm::function_ref<InFlightDiagnostic()> emitError);
+
+/// Builds and verifies the real, scalar `spyreop.<name>` op `operands`
+/// (tensors; checked by element type) and `extraAttrs` ask for -- the one
+/// place `tts.spyre_op`'s verifier and the `tl.spyre_op` frontend builder
+/// both resolve a request against the real op, rather than restating its
+/// arity/attributes as a parallel table. `name` is the bare intrinsic name
+/// (`"gelu"`). `axis`, the reduce dimension for a reduction-shaped
+/// intrinsic (`"exx2"`, see `isReductionShapedIntrinsic`), is lowering-only
+/// and never forwarded to the real op.
+///
+/// Fails, via `emitError`, on an unregistered `name`, an `extraAttrs` entry
+/// the real op doesn't declare, a present/absent/out-of-range `axis`, or
+/// the real op's own build+verify failing (type/arity mismatch, a confined
+/// attribute like `softplus`'s non-zero `beta`).
+///
+/// On success, returns `tts.spyre_op`'s tensor result types: the real op's
+/// inferred scalar result types lifted onto the first operand's shape,
+/// with `axis` dropped if reduction-shaped.
+FailureOr<SmallVector<Type>> verifySpyreIntrinsicCall(
+    StringRef name, ValueRange operands, DictionaryAttr extraAttrs,
+    std::optional<int64_t> axis, Location loc,
     llvm::function_ref<InFlightDiagnostic()> emitError);
 
 } // namespace mlir::triton::tts
