@@ -440,8 +440,9 @@ private:
 /// Reports, as an error at the consumer, every `ins` of element type i1 that a
 /// linalg.generic defines. The notes name the op that made the i1 in the
 /// producer, or the operand the producer forwards; each op reading it in the
-/// consumer; and the rules LowerSpyreOps lowers an i1 by. Returns
-/// failure when it reported anything.
+/// consumer; and the rules LowerSpyreOps lowers an i1 by, every rule with a
+/// reader in kSpyreOpLoweringRules (describeRulesWithReaders). Returns failure
+/// when it reported anything.
 LogicalResult checkNoBooleanBetweenGenerics(ModuleOp mod) {
   LogicalResult result = success();
   mod.walk([&](linalg::GenericOp consumer) {
@@ -478,9 +479,9 @@ LogicalResult checkNoBooleanBetweenGenerics(ModuleOp mod) {
         diag.attachNote(reader->getLoc())
             << "read here, by '" << reader->getName() << "'";
       diag.attachNote()
-          << "LowerSpyreOps lowers an i1 only within a group: an arith.cmpf "
-             "read by arith.uitofp, or by arith.select, at the compared width "
-             "(compare-cast, compare-select)";
+          << "LowerSpyreOps lowers an i1 only within a group: "
+          << triton::spyre::describeRulesWithReaders()
+          << "; each at the types its spyreop ops accept";
     }
   });
   return result;
