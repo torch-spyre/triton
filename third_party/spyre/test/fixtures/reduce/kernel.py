@@ -321,6 +321,45 @@ def stat_chain_off_stick(
 
 
 @triton.jit
+def stat_chain_off_stick_pinned(
+    x_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    STICK_LAYOUT: tl.constexpr,
+    PIN_OFFSET: tl.constexpr,
+):
+    """``out[m, n] = x[m, n] - sum(x[:, n])``, the statistic in the scratchpad.
+
+    :func:`stat_chain_off_stick` with its statistic descriptor replaced by a pin.
+    The two groups are the sibling's: G1 folds M, G2 applies the result down every
+    row. What differs is where the statistic is held between them -- a
+    ``ct_local`` buffer at element ``PIN_OFFSET`` rather than ``stat_ptr`` -- so
+    the kernel takes no statistic pointer and no ``STAT_LAYOUT``. The pin's buffer
+    is the compiler's, and takes its layout from its neighbours.
+
+    ``x`` is still loaded twice, once per group, for the sibling's reason.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    tl.spyre_tensor_layout(x_desc, STICK_LAYOUT)
+    tl.spyre_tensor_layout(out_desc, STICK_LAYOUT)
+
+    # G1: fold the non-stick axis, the statistic into the scratchpad.
+    x1 = x_desc.load([0, 0])
+    s = tl.sum(x1, axis=0)
+    tl.spyre_pin(s, "ct_local", offset=PIN_OFFSET)
+
+    # G2: read it back and apply it down every row.
+    x2 = x_desc.load([0, 0])
+    out_desc.store([0, 0], x2 - s[None, :])
+
+
+@triton.jit
 def stat_chain_on_stick(
     x_ptr,
     stat_ptr,
@@ -426,6 +465,53 @@ def max_shift_exp_on_stick(
 
 
 @triton.jit
+def max_shift_exp_on_stick_pinned(
+    x_ptr,
+    max_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    STICK_LAYOUT: tl.constexpr,
+    STAT_LAYOUT: tl.constexpr,
+    PIN_OFFSET: tl.constexpr,
+):
+    """``out[m, n] = exp(x[m, n] - max(x[m, :]))``, the shift in the scratchpad.
+
+    :func:`max_shift_exp_on_stick` with the ``diff`` descriptor replaced by a pin:
+    G2's shifted ``[M, N]`` tile is held in a ``ct_local`` buffer at element
+    ``PIN_OFFSET``, and G3 reads it from there. The pin's buffer takes
+    ``STICK_LAYOUT`` from its neighbours, the tiles on either side of it.
+
+    The statistic stays in HBM, through the sibling's one rank-1 descriptor.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    max_desc = tl.make_tensor_descriptor(
+        max_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    tl.spyre_tensor_layout(x_desc, STICK_LAYOUT)
+    tl.spyre_tensor_layout(out_desc, STICK_LAYOUT)
+    tl.spyre_tensor_layout(max_desc, STAT_LAYOUT)
+
+    # G1: the row maximum.
+    x1 = x_desc.load([0, 0])
+    max_desc.store([0], tl.reduce(x1, 1, _maximum))
+
+    # G2: every value shifted by its row's maximum, into the scratchpad.
+    x2 = x_desc.load([0, 0])
+    m = max_desc.load([0])
+    d = x2 - m[:, None]
+    tl.spyre_pin(d, "ct_local", offset=PIN_OFFSET)
+
+    # G3: the exponential, of the shift read back from the scratchpad.
+    out_desc.store([0, 0], tl.exp(d))
+
+
+@triton.jit
 def softmax_on_stick(
     x_ptr,
     max_ptr,
@@ -512,3 +598,137 @@ def softmax_on_stick(
     e2 = exp_desc.load([0, 0])
     r = recip_desc.load([0])
     out_desc.store([0, 0], e2 * r[:, None])
+
+
+@triton.jit
+def softmax_on_stick_pinned(
+    x_ptr,
+    max_ptr,
+    sum_ptr,
+    recip_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    STICK_LAYOUT: tl.constexpr,
+    STAT_LAYOUT: tl.constexpr,
+    DIFF_OFFSET: tl.constexpr,
+    EXP_OFFSET: tl.constexpr,
+):
+    """:func:`softmax_on_stick` with its two full-tile intermediates pinned.
+
+    The same six groups. ``diff`` and ``exp`` -- the two ``[M, N]`` tiles -- are
+    held in the scratchpad instead of HBM, each in a ``ct_local`` buffer of its
+    own: ``diff`` at element ``DIFF_OFFSET`` and ``exp`` at ``EXP_OFFSET``. Each
+    buffer is ``M * N`` elements, so the two offsets are at least that far apart
+    and the buffers do not overlap. Both take ``STICK_LAYOUT`` from their
+    neighbours.
+
+    ``exp`` has TWO consumers, G4's sum and G6's multiply, and the pin gives each
+    its own load of the one buffer.
+
+    The three statistics stay in HBM, each through the sibling's one rank-1
+    descriptor. Five buffers, where the sibling has seven.
+
+    The reciprocal group is the sibling's verbatim, and its numerator of exactly
+    one is load-bearing for the reason given there.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    max_desc = tl.make_tensor_descriptor(
+        max_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    sum_desc = tl.make_tensor_descriptor(
+        sum_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    recip_desc = tl.make_tensor_descriptor(
+        recip_ptr, shape=[M], strides=[1], block_shape=[M],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    tl.spyre_tensor_layout(x_desc, STICK_LAYOUT)
+    tl.spyre_tensor_layout(out_desc, STICK_LAYOUT)
+    tl.spyre_tensor_layout(max_desc, STAT_LAYOUT)
+    tl.spyre_tensor_layout(sum_desc, STAT_LAYOUT)
+    tl.spyre_tensor_layout(recip_desc, STAT_LAYOUT)
+
+    # G1: the row maximum.
+    x1 = x_desc.load([0, 0])
+    max_desc.store([0], tl.reduce(x1, 1, _maximum))
+
+    # G2: every value shifted by its row's maximum, into the scratchpad.
+    x2 = x_desc.load([0, 0])
+    m = max_desc.load([0])
+    d = x2 - m[:, None]
+    tl.spyre_pin(d, "ct_local", offset=DIFF_OFFSET)
+
+    # G3: the exponential, into the scratchpad for the two groups below.
+    e = tl.exp(d)
+    tl.spyre_pin(e, "ct_local", offset=EXP_OFFSET)
+
+    # G4: the total of the exponentials.
+    sum_desc.store([0], tl.sum(e, axis=1))
+
+    # G5: one over that total.
+    s = sum_desc.load([0])
+    one = tl.full([M], 1.0, dtype=s.dtype)
+    recip_desc.store([0], tl.fdiv(one, s))
+
+    # G6: every exponential scaled by its row's reciprocal.
+    r = recip_desc.load([0])
+    out_desc.store([0, 0], e * r[:, None])
+
+
+# ---------------------------------------------------------------------------
+# The reduce's PRODUCER, through the scratchpad.
+#
+# The statistic chains above put a compute AFTER the reduce and hand the value
+# through HBM, with a descriptor the kernel writes and reads itself. This puts one
+# BEFORE it and hands the value through the scratchpad, with no descriptor at all:
+# the intermediate is anonymous, and ``tl.spyre_pin`` is what names where it goes.
+#
+# The pin is also what makes it two compute groups. Unpinned, ``x * y`` would fuse
+# into the reduce's own generic; pinned, the product is stored into a ``ct_local``
+# view by the first group and loaded back from it by the second.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def pinned_mul_sum(
+    x_ptr,
+    y_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    IN_LAYOUT: tl.constexpr,
+    OUT_LAYOUT: tl.constexpr,
+    PIN_OFFSET: tl.constexpr,
+):
+    """``out[n] = sum(x[:, n] * y[:, n])``, the product held in the scratchpad.
+
+    Two compute groups handing one whole ``[M, N]`` tile through the scratchpad:
+    the first multiplies and stores the product into a ``ct_local`` view at
+    ``PIN_OFFSET``, the second loads it back and folds the non-stick axis.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    y_desc = tl.make_tensor_descriptor(
+        y_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        out_ptr, shape=[N], strides=[1], block_shape=[N],
+    )
+    tl.spyre_tensor_layout(x_desc, IN_LAYOUT)
+    tl.spyre_tensor_layout(y_desc, IN_LAYOUT)
+    tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
+
+    # G1: the product, into the scratchpad.
+    x = x_desc.load([0, 0])
+    y = y_desc.load([0, 0])
+    p = x * y
+    tl.spyre_pin(p, "ct_local", offset=PIN_OFFSET)
+
+    # G2: read it back and fold the non-stick axis.
+    out_desc.store([0], tl.sum(p, axis=0))

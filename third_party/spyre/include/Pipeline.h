@@ -54,6 +54,18 @@ struct SpyrecodePipelineOptions {
   /// The addresses to bind, as element indices, positionally. Read only when
   /// bindBaseAddresses.
   std::vector<int64_t> baseAddresses;
+
+  /// Bytes of LX scratchpad a `tl.spyre_pin` may reach, per core. 0 does not
+  /// check.
+  ///
+  /// No default worth the name, and that is the point. `SpyreUtils
+  /// .get_device_properties` states that the scratchpad "is sized by the device
+  /// description and allocated by the scheduler", so this tree does not know the
+  /// number; and how much of it a kernel may spend on pins is a budget that
+  /// differs from kernel to kernel, so it is not a device constant either. 0
+  /// therefore means the capacity question is not asked, rather than that it is
+  /// answered with a figure the compiler invented.
+  int64_t lxCapacityBytes = 0;
 };
 
 /// Builds the `ktir` stage: Triton IR in, KTIR out.

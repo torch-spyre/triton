@@ -128,6 +128,29 @@ void collectViewAccesses(Operation *memView,
   }
 }
 
+Operation *viewBehindAccess(Operation *loadOrStore) {
+  Value tile;
+  if (auto load = dyn_cast_or_null<mlir::ktdp::LoadOp>(loadOrStore))
+    tile = load.getAccessTile();
+  else if (auto store = dyn_cast_or_null<mlir::ktdp::StoreOp>(loadOrStore))
+    tile = store.getAccessTile();
+  else
+    return nullptr;
+
+  Operation *tileOp = tile.getDefiningOp();
+  Value base;
+  if (auto direct = dyn_cast_or_null<mlir::ktdp::ConstructAccessTilesOp>(tileOp))
+    base = direct.getBase();
+  else if (auto indirect =
+               dyn_cast_or_null<mlir::ktdp::ConstructIndirectAccessTilesOp>(
+                   tileOp))
+    base = indirect.getBase();
+  else
+    return nullptr;
+
+  return base.getDefiningOp<mlir::ktdp::ConstructMemoryViewOp>();
+}
+
 void collectAdjacentGenerics(ArrayRef<Operation *> memViews,
                              SmallVectorImpl<Operation *> &out) {
   SmallPtrSet<Operation *, 8> seen;
