@@ -304,12 +304,16 @@ copies, no placement tiles a box, and the kernel is rejected (§10).
 **Phase 4 — transfer and land.**
 Input: the access tile and the composed destination.
 Lowering: one `ktdp.load`, which **is** the transfer. Where the access tile's region spans
-several partitions the lowering resolves it into per-partition transfers, so fan-in does
-not multiply the load count — it stays one load. For a **copy** the load is followed by a
-`ktdp.store` into the composed destination, at the receiving tile's own region, and both
-sit under an `scf.if` on `ktdp.get_compute_tile_id` that admits the receivers. The landing
-is mandatory, for the reason §2 gives. A **reduction** is exempt, because the folded value
-can feed the next computation directly. §7 turns on that exemption.
+several partitions the lowering resolves it into per-partition transfers, so fan-in does not
+multiply the load count — it stays one load. For a **copy** the load is followed by a
+`ktdp.store` into the composed destination, at the region the tile addresses, with no guard:
+a store through a distributed view is performed only by the holder of the view it lands in
+(§4). On a tile that holds no destination view the store therefore does nothing, and the
+load, whose only use is that store, moves nothing; the lowering treats the pair as one
+transfer, performed only by the receivers. The Triton `if` that chooses the receivers is
+read in phase 3 and does not reach KTIR. The landing is mandatory, for the reason §2 gives.
+A **reduction** is exempt, because the folded value can feed the next computation directly.
+§7 turns on that exemption.
 Output: for a copy, the data in place for the next operation to read locally; for a
 reduction, a value.
 
@@ -360,12 +364,12 @@ the whole tensor, so the destination has two copies to lay apart. Laid out along
     {coordinate_set = #dst1, memory_space = #ktdp.memory_space<ct_local, ct_id = 2>} : ...
 %to = ktdp.construct_distributed_memory_view (%d0, %d1 : ...) : memref<1x8x64xf16>
 
-scf.if %part {                                   // tid % 2 == 0
-  %rt  = ktdp.construct_access_tile %from[%c0, %c0, %c0] {...}
-  %val = ktdp.load %rt
-  %wt  = ktdp.construct_access_tile %to[%c0, %o_mb, %c0] {...}   // %o_mb = 4 * (tid / 2)
-  ktdp.store %val, %wt
-}
+// no guard: on tiles 1 and 3, %o_mb addresses the region of tile 0 or 2, so the store is
+// not performed there, and the load feeding it moves nothing
+%rt  = ktdp.construct_access_tile %from[%c0, %c0, %c0] {...}
+%val = ktdp.load %rt
+%wt  = ktdp.construct_access_tile %to[%c0, %o_mb, %c0] {...}     // %o_mb = 4 * (tid / 2)
+ktdp.store %val, %wt
 ```
 
 and laid out along `out // 64` instead, every line is the same except:
@@ -373,13 +377,14 @@ and laid out along `out // 64` instead, every line is the same except:
 ```mlir
 // copy r on tile 2r covers out // 64 = r
 %to = ktdp.construct_distributed_memory_view (%d0, %d1 : ...) : memref<2x4x64xf16>
-  %wt  = ktdp.construct_access_tile %to[%q, %c0, %c0] {...}      // %q = tid / 2
+%wt  = ktdp.construct_access_tile %to[%q, %c0, %c0] {...}        // %q = tid / 2
 ```
 
 with `#dst1` naming `d0 = 1` rather than `d1 ∈ [4, 8)`. Both are correct: the views are
-disjoint and tile the composed type, the guard admits exactly tiles 0 and 2, and each stores
-into its own region. They agree on everything the kernel states and differ only in what it
-does not, which is why the choice is the lowering's.
+disjoint and tile the composed type, and each receiver stores into its own region; tiles 1
+and 3 address regions that tiles 0 and 2 hold, so they perform no store and no transfer.
+They agree on everything the kernel states and differ only in what it does not, which is why
+the choice is the lowering's.
 
 ### Where the phases live
 
@@ -392,6 +397,13 @@ stage lowers inter-tile communication.
 Data crosses a core boundary only by a read: a tile reads another tile's region of the
 source. A store always lands in the executing tile's own region of the destination. The
 destination is composed, but no tile writes any region of it but its own.
+
+In KTIR this is a rule of the dialect, not a guard: a store through a distributed view is
+performed only by the holder of the view it lands in. A store that every tile executes under
+SPMD therefore still writes only the regions its own tile holds, and never becomes a remote
+write. The cost is that a wrongly computed region becomes a silent no-op instead of a
+rejected remote write; the analysis result stated in the IR (§3) is where such a region
+shows up.
 
 Push would need a core to write into another core's scratchpad. Cross-core **reads** are
 what the interconnect is described as supporting; remote writes are unverified. If they
@@ -553,8 +565,10 @@ tile, the load and the fold, so non-holders issue no transfer. Two things make a
 construct the right carrier rather than an attribute. The saving is in the *transfer*, so
 whatever carries it has to enclose the load. And `construct_access_tile` — the one op in that
 chain that could plausibly hold an attribute — is general addressing machinery usable for any
-tile: its subject is where data *is*, and who *executes* is a different question. Whether a
-copy's composed destination still needs its guard in KTIR is §8's third decision.
+tile: its subject is where data *is*, and who *executes* is a different question. A copy
+needs no such guard in KTIR: its store carries the holder through the destination view (§4),
+and the load feeding it moves nothing where the store is not performed. A reduction has no
+destination to carry it, so its guard stays.
 
 One dependency this creates, worth stating rather than discovering: the pipeline is
 branch-averse today. `LowerScalarLoad` documents that no runtime branch is ever emitted for a
@@ -638,16 +652,6 @@ KTIR itself, which lands upstream in `ktir-mlir-frontend`.
    **dynamic `ct_id`** is a far smaller change, but `ct_id` is part of the memref type, so
    partitions of different cores would share one type and the operand list would stop
    carrying ownership. Neither changes the Triton surface.
-3. **Whether a copy's composed destination needs its guard in KTIR.** The destination
-   views state their holders by `ct_id`, so a tile that holds no view — tiles 1 and 3 in
-   §3's worked example — is known statically, and the compiler could emit no store for it.
-   Under SPMD, though, an unguarded `ktdp.store` runs on every tile, and on such a tile it
-   lands in another tile's view: a remote write. Dropping the guard therefore needs a
-   dialect rule: a store through a distributed view is performed only by the holder of the
-   view it lands in. That removes the `scf.if` the downstream pipeline would otherwise have
-   to accept, at the cost of turning a wrongly computed region into a silent no-op instead
-   of a rejected remote write.
-
 ## 9. Designs rejected
 
 **Exposing the compose itself in Triton.** `construct_distributed_memory_view` takes memref
@@ -667,6 +671,11 @@ failing on emitted accesses, with every number green.
 **A mode enum per communication pattern.** §11.
 
 **A distributed descriptor on the destination too.** The appendix.
+
+**A guard on a copy's store in KTIR.** The destination views already state their holders by
+`ct_id`, so the guard would repeat what the types say, and it would decide the transport:
+"store only if I am the holder" is pull, which the composed destination does not choose.
+Dropping it rests on §4's store rule, at the cost recorded there.
 
 ## 10. Rejected inputs
 
